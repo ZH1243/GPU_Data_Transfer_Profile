@@ -15,6 +15,23 @@ Intent:
 Typical launch on one 8-GPU node:
   torchrun --standalone --nproc_per_node=8 nvlink_copy_engine_test.py --nbytes 1G --iters 100
 
+Use nsys to profile (a sample command)
+   nsys profile \
+    -s none \
+    --cpuctxsw=none \
+    --trace=cuda,nvtx,cudnn,cublas \
+    -o nvlink_p2p_copy_100m \
+    --gpu-metrics-devices=0 \
+    --gpu-metrics-set=gh100 \
+    --gpu-metrics-frequency=10000 \
+    --force-overwrite=true \
+    torchrun --standalone --nproc_per_node=8 nvlink_copy_engine_test.py \
+    --nbytes 100M \
+    --iters 100 \
+    --warmup 10 \
+    --mode ring \
+    --check
+
 Notes:
   - This requires CUDA-capable PyTorch.
   - P2P access must be supported between the selected GPU pairs.
