@@ -3,7 +3,7 @@
 nvlink_copy_engine_test.py
 
 Benchmark / sanity-test GPU-to-GPU P2P copies using CUDA Runtime
-cudaMemcpyPeerAsync from Python.
+cudaMemcpyPeerAsync or cudaMemcpyBatchAsync from Python.
 
 Intent:
   - Move data between NVIDIA GPUs over P2P/NVLink using the CUDA copy engine.
@@ -14,6 +14,12 @@ Intent:
 
 Typical launch on one 8-GPU node:
   torchrun --standalone --nproc_per_node=8 nvlink_copy_engine_test.py --nbytes 1G --iters 100
+
+Compare separate and batched API launches:
+  torchrun --standalone --nproc_per_node=8 nvlink_copy_engine_test.py \
+    --copy-size 16M --copies-per-iter 8 --copy-mode separate
+  torchrun --standalone --nproc_per_node=8 nvlink_copy_engine_test.py \
+    --copy-size 16M --copies-per-iter 8 --copy-mode batch
 
 Use nsys to profile (a sample command)
    nsys profile \
@@ -44,7 +50,7 @@ import ctypes
 import os
 import sys
 import time
-from typing import Tuple
+from typing import Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -57,6 +63,7 @@ import torch.distributed as dist
 def _load_libcudart():
     candidates = [
         "libcudart.so",
+        "libcudart.so.13",
         "libcudart.so.12",
         "libcudart.so.11.0",
     ]
@@ -74,8 +81,28 @@ _cudart = _load_libcudart()
 _cudaError_t = ctypes.c_int
 _cudaStream_t = ctypes.c_void_p
 
+
+class _CudaMemLocation(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("id", ctypes.c_int),
+    ]
+
+
+class _CudaMemcpyAttributes(ctypes.Structure):
+    _fields_ = [
+        ("srcAccessOrder", ctypes.c_int),
+        ("srcLocHint", _CudaMemLocation),
+        ("dstLocHint", _CudaMemLocation),
+        ("flags", ctypes.c_uint),
+    ]
+
+
 _cudart.cudaGetErrorString.argtypes = [_cudaError_t]
 _cudart.cudaGetErrorString.restype = ctypes.c_char_p
+
+_cudart.cudaRuntimeGetVersion.argtypes = [ctypes.POINTER(ctypes.c_int)]
+_cudart.cudaRuntimeGetVersion.restype = _cudaError_t
 
 _cudart.cudaSetDevice.argtypes = [ctypes.c_int]
 _cudart.cudaSetDevice.restype = _cudaError_t
@@ -106,6 +133,12 @@ _cudart.cudaStreamSynchronize.restype = _cudaError_t
 
 CUDA_SUCCESS = 0
 CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED = 704
+CUDA_MEMCPY_SRC_ACCESS_ORDER_STREAM = 1
+CUDA_MEMCPY_BATCH_MIN_RUNTIME_VERSION = 12080
+CUDA_13_RUNTIME_VERSION = 13000
+
+_cuda_memcpy_batch_async_fn = None
+_cuda_memcpy_batch_runtime_version = None
 
 
 def cuda_check(code: int, what: str) -> None:
@@ -117,6 +150,61 @@ def cuda_check(code: int, what: str) -> None:
 
 def cuda_set_device(dev: int) -> None:
     cuda_check(_cudart.cudaSetDevice(dev), f"cudaSetDevice({dev})")
+
+
+def cuda_runtime_version() -> int:
+    version = ctypes.c_int(0)
+    cuda_check(_cudart.cudaRuntimeGetVersion(ctypes.byref(version)), "cudaRuntimeGetVersion")
+    return version.value
+
+
+def _get_cuda_memcpy_batch_async():
+    """
+    Bind cudaMemcpyBatchAsync lazily so separate mode still works with CUDA < 12.8.
+
+    CUDA 12.8/12.9 include a failIdx argument. CUDA 13.x removed it from the C API.
+    """
+    global _cuda_memcpy_batch_async_fn, _cuda_memcpy_batch_runtime_version
+
+    if _cuda_memcpy_batch_async_fn is not None:
+        return _cuda_memcpy_batch_async_fn, _cuda_memcpy_batch_runtime_version
+
+    runtime_version = cuda_runtime_version()
+    if runtime_version < CUDA_MEMCPY_BATCH_MIN_RUNTIME_VERSION:
+        raise RuntimeError(
+            "cudaMemcpyBatchAsync requires CUDA Runtime 12.8 or newer; "
+            f"loaded runtime version is {runtime_version}."
+        )
+
+    try:
+        fn = _cudart.cudaMemcpyBatchAsync
+    except AttributeError as exc:
+        raise RuntimeError(
+            "The loaded CUDA Runtime does not export cudaMemcpyBatchAsync. "
+            "Use --copy-mode separate or load CUDA Runtime 12.8 or newer."
+        ) from exc
+
+    common_argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),       # dsts
+        ctypes.POINTER(ctypes.c_void_p),       # srcs
+        ctypes.POINTER(ctypes.c_size_t),       # sizes
+        ctypes.c_size_t,                       # count
+        ctypes.POINTER(_CudaMemcpyAttributes), # attrs
+        ctypes.POINTER(ctypes.c_size_t),       # attrsIdxs
+        ctypes.c_size_t,                       # numAttrs
+    ]
+    if runtime_version < CUDA_13_RUNTIME_VERSION:
+        fn.argtypes = common_argtypes + [
+            ctypes.POINTER(ctypes.c_size_t),   # failIdx
+            _cudaStream_t,
+        ]
+    else:
+        fn.argtypes = common_argtypes + [_cudaStream_t]
+    fn.restype = _cudaError_t
+
+    _cuda_memcpy_batch_async_fn = fn
+    _cuda_memcpy_batch_runtime_version = runtime_version
+    return fn, runtime_version
 
 
 def cuda_can_access_peer(dev: int, peer: int) -> bool:
@@ -140,25 +228,89 @@ def cuda_enable_peer_access(dev: int, peer: int) -> None:
     cuda_check(code, f"cudaDeviceEnablePeerAccess(dev={dev}, peer={peer})")
 
 
-def cuda_memcpy_peer_async(dst_tensor: torch.Tensor,
+def cuda_memcpy_peer_async(dst_ptr: int,
                            dst_device: int,
-                           src_tensor: torch.Tensor,
+                           src_ptr: int,
                            src_device: int,
                            nbytes: int,
                            stream: torch.cuda.Stream) -> None:
     """
     Enqueue cudaMemcpyPeerAsync(dst@dst_device <- src@src_device) on stream.
     """
-    cuda_set_device(dst_device)
     code = _cudart.cudaMemcpyPeerAsync(
-        ctypes.c_void_p(dst_tensor.data_ptr()),
+        ctypes.c_void_p(dst_ptr),
         ctypes.c_int(dst_device),
-        ctypes.c_void_p(src_tensor.data_ptr()),
+        ctypes.c_void_p(src_ptr),
         ctypes.c_int(src_device),
         ctypes.c_size_t(nbytes),
         _cudaStream_t(stream.cuda_stream),
     )
     cuda_check(code, "cudaMemcpyPeerAsync")
+
+
+class MemcpyBatch:
+    """Own the host-side argument arrays used by repeated cudaMemcpyBatchAsync calls."""
+
+    def __init__(self,
+                 dst_ptrs: Sequence[int],
+                 src_ptrs: Sequence[int],
+                 nbytes: int) -> None:
+        if len(dst_ptrs) != len(src_ptrs):
+            raise ValueError("source and destination pointer counts must match")
+        if not dst_ptrs:
+            raise ValueError("a memcpy batch must contain at least one copy")
+
+        self.count = len(dst_ptrs)
+        self.dsts = (ctypes.c_void_p * self.count)(*dst_ptrs)
+        self.srcs = (ctypes.c_void_p * self.count)(*src_ptrs)
+        self.sizes = (ctypes.c_size_t * self.count)(*([nbytes] * self.count))
+
+        # All copies use stable device pointers and the same stream-ordering attribute.
+        self.attrs = (_CudaMemcpyAttributes * 1)()
+        self.attrs[0].srcAccessOrder = CUDA_MEMCPY_SRC_ACCESS_ORDER_STREAM
+        self.attrs_idxs = (ctypes.c_size_t * 1)(0)
+
+
+def cuda_memcpy_batch_async(batch: MemcpyBatch,
+                            stream: torch.cuda.Stream) -> None:
+    """
+    Enqueue one cudaMemcpyBatchAsync containing all independent copies in batch.
+    """
+    fn, runtime_version = _get_cuda_memcpy_batch_async()
+
+    args = [
+        batch.dsts,
+        batch.srcs,
+        batch.sizes,
+        ctypes.c_size_t(batch.count),
+        batch.attrs,
+        batch.attrs_idxs,
+        ctypes.c_size_t(1),
+    ]
+    if runtime_version < CUDA_13_RUNTIME_VERSION:
+        fail_idx = ctypes.c_size_t(-1)
+        code = fn(*args, ctypes.byref(fail_idx), _cudaStream_t(stream.cuda_stream))
+        failure_detail = f", fail_idx={fail_idx.value}" if code != CUDA_SUCCESS else ""
+    else:
+        code = fn(*args, _cudaStream_t(stream.cuda_stream))
+        failure_detail = ""
+    cuda_check(code, f"cudaMemcpyBatchAsync{failure_detail}")
+
+
+def enqueue_iteration(copy_mode: str,
+                      dst_ptrs: Sequence[int],
+                      dst_device: int,
+                      src_ptrs: Sequence[int],
+                      src_device: int,
+                      nbytes: int,
+                      batch: MemcpyBatch,
+                      stream: torch.cuda.Stream) -> None:
+    if copy_mode == "batch":
+        cuda_memcpy_batch_async(batch, stream)
+        return
+
+    for dst_ptr, src_ptr in zip(dst_ptrs, src_ptrs):
+        cuda_memcpy_peer_async(dst_ptr, dst_device, src_ptr, src_device, nbytes, stream)
 
 
 def cuda_stream_synchronize(stream: torch.cuda.Stream) -> None:
@@ -247,8 +399,14 @@ def choose_pair(local_rank: int, world_size: int, mode: str) -> Tuple[int, int]:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--nbytes", type=parse_nbytes, default=parse_nbytes("1G"),
+    p.add_argument("--nbytes", "--copy-size", dest="nbytes",
+                   type=parse_nbytes, default=parse_nbytes("1G"),
                    help="bytes per copy, supports K/M/G, KB/MB/GB, KiB/MiB/GiB. Default: 1G")
+    p.add_argument("--copies-per-iter", type=int, default=1,
+                   help="number of independent memory copies in each iteration. Default: 1")
+    p.add_argument("--copy-mode", choices=["separate", "batch"], default="separate",
+                   help="separate: one cudaMemcpyPeerAsync call per copy; "
+                        "batch: one cudaMemcpyBatchAsync call per iteration. Default: separate")
     p.add_argument("--iters", type=int, default=100, help="timed iterations")
     p.add_argument("--warmup", type=int, default=10, help="warmup iterations")
     p.add_argument("--mode", choices=["ring", "reverse-ring", "pair"], default="ring",
@@ -270,33 +428,52 @@ def main() -> None:
 
     if args.nbytes <= 0:
         raise ValueError("--nbytes must be positive")
+    if args.copies_per_iter <= 0:
+        raise ValueError("--copies-per-iter must be positive")
     if args.iters <= 0:
         raise ValueError("--iters must be positive")
+    if args.warmup < 0:
+        raise ValueError("--warmup must be non-negative")
+
+    if args.copy_mode == "batch":
+        # Fail before allocating large GPU buffers when the runtime cannot run this mode.
+        _get_cuda_memcpy_batch_async()
 
     src_dev, dst_dev = choose_pair(local_rank, world_size, args.mode)
 
-    # Check and enable peer access in both directions. The transfer needs src/dst peer capability;
-    # enabling both directions is convenient for bidirectional/pair experiments.
+    # Copies are submitted on a destination-device stream, so dst must be able to access src.
+    # Enable the reverse direction too when available for bidirectional/pair experiments.
     can_src_to_dst = cuda_can_access_peer(src_dev, dst_dev)
     can_dst_to_src = cuda_can_access_peer(dst_dev, src_dev)
 
-    if not can_src_to_dst:
+    if not can_dst_to_src:
         raise RuntimeError(
-            f"GPU {src_dev} cannot access peer GPU {dst_dev}. "
+            f"Destination GPU {dst_dev} cannot access source peer GPU {src_dev}. "
             "Check CUDA_VISIBLE_DEVICES and nvidia-smi topo -m."
         )
 
-    cuda_enable_peer_access(src_dev, dst_dev)
-    if can_dst_to_src:
-        cuda_enable_peer_access(dst_dev, src_dev)
+    cuda_enable_peer_access(dst_dev, src_dev)
+    if can_src_to_dst:
+        cuda_enable_peer_access(src_dev, dst_dev)
 
-    # Allocate one byte tensor on src and one on dst. uint8 makes nbytes exact.
+    # Allocate one contiguous source/destination region, split into independent copies.
+    # uint8 makes both the per-copy size and pointer offsets exact.
+    total_nbytes = args.nbytes * args.copies_per_iter
     torch.cuda.set_device(src_dev)
-    src = torch.empty(args.nbytes, dtype=torch.uint8, device=f"cuda:{src_dev}")
+    src = torch.empty(total_nbytes, dtype=torch.uint8, device=f"cuda:{src_dev}")
     src.fill_((rank + 17) % 251)
 
     torch.cuda.set_device(dst_dev)
-    dst = torch.empty(args.nbytes, dtype=torch.uint8, device=f"cuda:{dst_dev}")
+    dst = torch.empty(total_nbytes, dtype=torch.uint8, device=f"cuda:{dst_dev}")
+    dst.fill_((rank + 18) % 251)
+
+    # The copy stream is on dst_dev, so finish initialization on both devices explicitly.
+    torch.cuda.synchronize(src_dev)
+    torch.cuda.synchronize(dst_dev)
+
+    src_ptrs = tuple(src.data_ptr() + i * args.nbytes for i in range(args.copies_per_iter))
+    dst_ptrs = tuple(dst.data_ptr() + i * args.nbytes for i in range(args.copies_per_iter))
+    batch = MemcpyBatch(dst_ptrs, src_ptrs, args.nbytes)
 
     # Use a non-default stream on the destination device to make profiler timelines easy to read.
     torch.cuda.set_device(dst_dev)
@@ -310,22 +487,28 @@ def main() -> None:
         time.sleep(args.sleep_before)
     barrier()
 
+    cuda_set_device(dst_dev)
     for _ in range(args.warmup):
-        cuda_memcpy_peer_async(dst, dst_dev, src, src_dev, args.nbytes, stream)
+        enqueue_iteration(
+            args.copy_mode, dst_ptrs, dst_dev, src_ptrs, src_dev, args.nbytes, batch, stream
+        )
     cuda_stream_synchronize(stream)
     barrier()
 
     # Time with wall-clock around a batch of async copies + stream synchronize.
     # This avoids inserting timing kernels/events into the copy stream.
+    cuda_set_device(dst_dev)
     t0 = time.perf_counter()
     for _ in range(args.iters):
-        cuda_memcpy_peer_async(dst, dst_dev, src, src_dev, args.nbytes, stream)
+        enqueue_iteration(
+            args.copy_mode, dst_ptrs, dst_dev, src_ptrs, src_dev, args.nbytes, batch, stream
+        )
     cuda_stream_synchronize(stream)
     t1 = time.perf_counter()
     barrier()
 
     elapsed = t1 - t0
-    local_gib = (args.nbytes * args.iters) / (1024**3)
+    local_gib = (total_nbytes * args.iters) / (1024**3)
     local_bw = local_gib / elapsed
 
     # For concurrent torchrun results:
@@ -340,7 +523,10 @@ def main() -> None:
     ok = True
     if args.check:
         torch.cuda.set_device(dst_dev)
-        sample = dst[: min(4096, args.nbytes)].cpu()
+        copy_starts = torch.arange(
+            args.copies_per_iter, dtype=torch.int64, device=f"cuda:{dst_dev}"
+        ) * args.nbytes
+        sample = dst[copy_starts].cpu()
         expected = (rank + 17) % 251
         ok = bool(torch.all(sample == expected).item())
 
@@ -350,9 +536,11 @@ def main() -> None:
             print(
                 f"rank={rank:02d} local_rank={local_rank:02d} "
                 f"copy cuda:{src_dev} -> cuda:{dst_dev} "
-                f"bytes/copy={fmt_bytes(args.nbytes)} iters={args.iters} "
+                f"mode={args.copy_mode} copies/iter={args.copies_per_iter} "
+                f"bytes/copy={fmt_bytes(args.nbytes)} bytes/iter={fmt_bytes(total_nbytes)} "
+                f"iters={args.iters} "
                 f"elapsed={elapsed:.6f}s local_bw={local_bw:.2f} GiB/s "
-                f"p2p={int(can_src_to_dst)} check={'OK' if ok else 'FAIL'}",
+                f"p2p={int(can_dst_to_src)} check={'OK' if ok else 'FAIL'}",
                 flush=True,
             )
         barrier()
@@ -364,8 +552,9 @@ def main() -> None:
             flush=True,
         )
         print(
-            "\nProfiler expectation: Nsight Systems should show cudaMemcpyPeerAsync / GPU Memcpy PtoP "
-            "activity for the transfer, not an SM copy kernel.",
+            f"\nProfiler expectation: Nsight Systems should show "
+            f"{'cudaMemcpyBatchAsync' if args.copy_mode == 'batch' else 'cudaMemcpyPeerAsync'} "
+            "/ GPU Memcpy PtoP activity for the transfer, not an SM copy kernel.",
             flush=True,
         )
 
