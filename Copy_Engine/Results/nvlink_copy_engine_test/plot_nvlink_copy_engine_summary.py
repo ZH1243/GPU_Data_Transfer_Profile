@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot copy-engine summary graphs for the 1m, 10m, and 100m reports."""
+"""Plot copy-engine summary graphs for the available message-size reports."""
 
 from __future__ import annotations
 
@@ -26,6 +26,9 @@ import analyze_nvlink_copy_engine_report as analyzer
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_SQLITES = [
+    SCRIPT_DIR / "1*8k.sqlite",
+    SCRIPT_DIR / "1*80k.sqlite",
+    SCRIPT_DIR / "1*500k.sqlite",
     SCRIPT_DIR / "1*1m.sqlite",
     SCRIPT_DIR / "1*10m.sqlite",
     SCRIPT_DIR / "1*100m.sqlite",
@@ -44,7 +47,10 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         type=Path,
         default=DEFAULT_SQLITES,
-        help="SQLite files to plot. Defaults to ./1*1m.sqlite ./1*10m.sqlite ./1*100m.sqlite.",
+        help=(
+            "SQLite files to plot. Defaults to ./1*8k.sqlite ./1*80k.sqlite "
+            "./1*500k.sqlite ./1*1m.sqlite ./1*10m.sqlite ./1*100m.sqlite."
+        ),
     )
     parser.add_argument(
         "--gpu-bus-id",
