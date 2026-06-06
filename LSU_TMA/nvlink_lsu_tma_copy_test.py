@@ -14,6 +14,9 @@ Typical launch on one 8-GPU Hopper node:
     --copy-size 1G --iters 100 --method lsu --executor dst --num-sms 0 --check
   torchrun --standalone --nproc_per_node=8 LSU_TMA/nvlink_lsu_tma_copy_test.py \
     --copy-size 1G --iters 100 --method tma --executor src --num-sms 0 --tma-tile-bytes 64K --check
+  torchrun --standalone --nproc_per_node=8 LSU_TMA/nvlink_lsu_tma_copy_test.py \
+    --copy-size 1G --iters 100 --method tma --executor src --num-sms 0 \
+    --tma-tile-bytes 64K --tma-inter-tile-bytes 8K --check
 
 Nsight Systems expectation:
   - lsu should show an SM kernel doing global loads/stores.
@@ -24,7 +27,7 @@ A sample command using the nsys profiling:
     -s none \
     --cpuctxsw=none \
     --trace=cuda,nvtx,cudnn,cublas \
-    -o tma_persistent_sm*3_1m*100 \
+    -o tma_persistent_sm*3_intra_64k_inter_8k_1m*100 \
     --gpu-metrics-devices=0 \
     --gpu-metrics-set=gh100 \
     --gpu-metrics-frequency=10000 \
@@ -35,6 +38,8 @@ A sample command using the nsys profiling:
     --method tma \
     --executor src \
     --num-sms 3 \
+    --tma-tile-bytes 64K \
+    --tma-inter-tile-bytes 8K \
     --persistent-kernel \
     --check
 
@@ -49,6 +54,9 @@ Notes:
     GPU selected by --executor.
   - --persistent-kernel launches one warmup kernel and one timed kernel, with
     each kernel looping over the requested number of copy iterations on device.
+  - In TMA source-executor mode, --tma-tile-bytes controls the local
+    global->shared staging tile, while --tma-inter-tile-bytes controls the
+    shared->peer-global store chunk.
 """
 
 import argparse
@@ -203,7 +211,8 @@ __global__ void tma_copy_kernel(
     unsigned char* __restrict__ dst,
     const unsigned char* __restrict__ src,
     size_t nbytes,
-    size_t tile_bytes,
+    size_t intra_tile_bytes,
+    size_t inter_tile_bytes,
     int64_t iteration_count) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   extern __shared__ __align__(16) unsigned char smem[];
@@ -216,12 +225,12 @@ __global__ void tma_copy_kernel(
   __syncthreads();
 
   for (int64_t iter = 0; iter < iteration_count; ++iter) {
-    size_t block_stride = static_cast<size_t>(gridDim.x) * tile_bytes;
-    for (size_t offset = static_cast<size_t>(blockIdx.x) * tile_bytes;
+    size_t block_stride = static_cast<size_t>(gridDim.x) * intra_tile_bytes;
+    for (size_t offset = static_cast<size_t>(blockIdx.x) * intra_tile_bytes;
          offset < nbytes;
          offset += block_stride) {
       size_t remaining = nbytes - offset;
-      size_t bytes = remaining < tile_bytes ? remaining : tile_bytes;
+      size_t bytes = remaining < intra_tile_bytes ? remaining : intra_tile_bytes;
 
       if (elected_thread()) {
         cuda::memcpy_async(
@@ -238,14 +247,20 @@ __global__ void tma_copy_kernel(
       __syncthreads();
 
       if (elected_thread()) {
-        ptx::cp_async_bulk(
-            ptx::space_global,
-            ptx::space_shared,
-            dst + offset,
-            smem,
-            bytes);
-        ptx::cp_async_bulk_commit_group();
-        ptx::cp_async_bulk_wait_group(ptx::n32_t<0>());
+        for (size_t inner = 0; inner < bytes; inner += inter_tile_bytes) {
+          size_t store_remaining = bytes - inner;
+          size_t store_bytes = store_remaining < inter_tile_bytes
+              ? store_remaining
+              : inter_tile_bytes;
+          ptx::cp_async_bulk(
+              ptx::space_global,
+              ptx::space_shared,
+              dst + offset + inner,
+              smem + inner,
+              store_bytes);
+          ptx::cp_async_bulk_commit_group();
+          ptx::cp_async_bulk_wait_group(ptx::n32_t<0>());
+        }
       }
       __syncthreads();
     }
@@ -254,7 +269,8 @@ __global__ void tma_copy_kernel(
   (void)dst;
   (void)src;
   (void)nbytes;
-  (void)tile_bytes;
+  (void)intra_tile_bytes;
+  (void)inter_tile_bytes;
   (void)iteration_count;
 #endif
 }
@@ -313,13 +329,23 @@ void launch_tma_copy(
     int64_t nbytes,
     int64_t num_ctas,
     int64_t threads,
-    int64_t tile_bytes,
+    int64_t intra_tile_bytes,
+    int64_t inter_tile_bytes,
     int64_t iteration_count,
     int64_t executor_device) {
   validate_common(dst, src, nbytes, num_ctas, threads, iteration_count);
   TORCH_CHECK((nbytes % 16) == 0, "TMA nbytes must be a multiple of 16");
-  TORCH_CHECK((tile_bytes % 16) == 0, "TMA tile_bytes must be a multiple of 16");
-  TORCH_CHECK(tile_bytes > 0, "TMA tile_bytes must be positive");
+  TORCH_CHECK(
+      (intra_tile_bytes % 16) == 0,
+      "TMA intra_tile_bytes must be a multiple of 16");
+  TORCH_CHECK(
+      (inter_tile_bytes % 16) == 0,
+      "TMA inter_tile_bytes must be a multiple of 16");
+  TORCH_CHECK(intra_tile_bytes > 0, "TMA intra_tile_bytes must be positive");
+  TORCH_CHECK(inter_tile_bytes > 0, "TMA inter_tile_bytes must be positive");
+  TORCH_CHECK(
+      intra_tile_bytes >= inter_tile_bytes,
+      "TMA intra_tile_bytes must be >= inter_tile_bytes");
 
   uintptr_t dst_addr = reinterpret_cast<uintptr_t>(dst.data_ptr());
   uintptr_t src_addr = reinterpret_cast<uintptr_t>(src.data_ptr());
@@ -341,23 +367,24 @@ void launch_tma_copy(
       cudaDevAttrMaxSharedMemoryPerBlockOptin,
       executor_device));
   TORCH_CHECK(
-      tile_bytes <= max_smem,
-      "TMA tile_bytes exceeds device opt-in dynamic shared memory limit");
+      intra_tile_bytes <= max_smem,
+      "TMA intra_tile_bytes exceeds device opt-in dynamic shared memory limit");
 
   C10_CUDA_CHECK(cudaFuncSetAttribute(
       tma_copy_kernel,
       cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(tile_bytes)));
+      static_cast<int>(intra_tile_bytes)));
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream(executor_device);
   tma_copy_kernel<<<static_cast<unsigned int>(num_ctas),
                     static_cast<unsigned int>(threads),
-                    static_cast<size_t>(tile_bytes),
+                    static_cast<size_t>(intra_tile_bytes),
                     stream>>>(
       static_cast<unsigned char*>(dst.data_ptr()),
       static_cast<const unsigned char*>(src.data_ptr()),
       static_cast<size_t>(nbytes),
-      static_cast<size_t>(tile_bytes),
+      static_cast<size_t>(intra_tile_bytes),
+      static_cast<size_t>(inter_tile_bytes),
       iteration_count);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -395,7 +422,8 @@ void launch_tma_copy(
     int64_t nbytes,
     int64_t num_ctas,
     int64_t threads,
-    int64_t tile_bytes,
+    int64_t intra_tile_bytes,
+    int64_t inter_tile_bytes,
     int64_t iteration_count,
     int64_t executor_device);
 """,
@@ -414,7 +442,8 @@ def enqueue_iteration(method: str,
                       total_nbytes: int,
                       num_ctas: int,
                       threads_per_cta: int,
-                      tma_tile_bytes: int,
+                      tma_intra_tile_bytes: int,
+                      tma_inter_tile_bytes: int,
                       iteration_count: int,
                       executor_device: int,
                       stream: torch.cuda.Stream) -> None:
@@ -428,7 +457,8 @@ def enqueue_iteration(method: str,
         elif method == "tma":
             ext.launch_tma_copy(
                 dst, src, total_nbytes, num_ctas, threads_per_cta,
-                tma_tile_bytes, iteration_count, executor_device
+                tma_intra_tile_bytes, tma_inter_tile_bytes,
+                iteration_count, executor_device
             )
         else:
             raise ValueError(f"Unknown method: {method}")
@@ -440,7 +470,8 @@ def enqueue_iterations(method: str,
                        total_nbytes: int,
                        num_ctas: int,
                        threads_per_cta: int,
-                       tma_tile_bytes: int,
+                       tma_intra_tile_bytes: int,
+                       tma_inter_tile_bytes: int,
                        executor_device: int,
                        stream: torch.cuda.Stream,
                        iteration_count: int,
@@ -450,14 +481,16 @@ def enqueue_iterations(method: str,
     if persistent_kernel:
         enqueue_iteration(
             method, dst, src, total_nbytes, num_ctas, threads_per_cta,
-            tma_tile_bytes, iteration_count, executor_device, stream
+            tma_intra_tile_bytes, tma_inter_tile_bytes, iteration_count,
+            executor_device, stream
         )
         return
 
     for _ in range(iteration_count):
         enqueue_iteration(
             method, dst, src, total_nbytes, num_ctas, threads_per_cta,
-            tma_tile_bytes, 1, executor_device, stream
+            tma_intra_tile_bytes, tma_inter_tile_bytes, 1, executor_device,
+            stream
         )
 
 
@@ -549,13 +582,33 @@ def resolve_num_ctas(executor_device: int, requested_num_sms: int) -> Tuple[int,
     return requested_num_sms, sm_count
 
 
-def check_tma_constraints(total_nbytes: int, tma_tile_bytes: int) -> None:
+def check_tma_constraints(total_nbytes: int,
+                          tma_intra_tile_bytes: int,
+                          tma_inter_tile_bytes: int,
+                          executor: str,
+                          inter_tile_was_set: bool) -> None:
     if total_nbytes % 16 != 0:
         raise ValueError("--method tma requires total bytes per iteration to be a multiple of 16")
-    if tma_tile_bytes <= 0:
+    if tma_intra_tile_bytes <= 0:
         raise ValueError("--tma-tile-bytes must be positive")
-    if tma_tile_bytes % 16 != 0:
+    if tma_intra_tile_bytes % 16 != 0:
         raise ValueError("--tma-tile-bytes must be a multiple of 16")
+    if tma_inter_tile_bytes <= 0:
+        raise ValueError("--tma-inter-tile-bytes must be positive")
+    if tma_inter_tile_bytes % 16 != 0:
+        raise ValueError("--tma-inter-tile-bytes must be a multiple of 16")
+
+    if inter_tile_was_set:
+        if executor != "src":
+            raise ValueError("--tma-inter-tile-bytes is only supported with --executor src")
+        if tma_intra_tile_bytes <= tma_inter_tile_bytes:
+            raise ValueError(
+                "--tma-tile-bytes must be larger than --tma-inter-tile-bytes"
+            )
+        if tma_intra_tile_bytes % tma_inter_tile_bytes != 0:
+            raise ValueError(
+                "--tma-tile-bytes must be a multiple of --tma-inter-tile-bytes"
+            )
 
 
 def main() -> None:
@@ -576,8 +629,15 @@ def main() -> None:
                         "0 means all SMs on the executor GPU. Default: 0")
     p.add_argument("--threads-per-cta", type=int, default=256,
                    help="threads per CTA. Default: 256")
-    p.add_argument("--tma-tile-bytes", type=parse_nbytes, default=parse_nbytes("64K"),
-                   help="dynamic shared-memory tile size for --method tma. Default: 64K")
+    p.add_argument("--tma-tile-bytes", "--tma-intra-tile-bytes",
+                   dest="tma_intra_tile_bytes",
+                   type=parse_nbytes, default=parse_nbytes("64K"),
+                   help="intra-GPU global->shared staging tile size for --method tma. "
+                        "Default: 64K")
+    p.add_argument("--tma-inter-tile-bytes", type=parse_nbytes, default=None,
+                   help="source-executor TMA shared->peer-global store chunk size. "
+                        "Only supported with --method tma --executor src. "
+                        "If omitted, uses --tma-tile-bytes.")
     p.add_argument("--persistent-kernel", action="store_true",
                    help="launch one kernel per benchmark phase and loop over copy iterations "
                         "inside the kernel. Warmup, if nonzero, is a separate warmup kernel.")
@@ -612,8 +672,22 @@ def main() -> None:
 
     src_dev, dst_dev = choose_pair(local_rank, world_size, args.mode)
     total_nbytes = args.nbytes * args.copies_per_iter
+    tma_inter_tile_was_set = args.tma_inter_tile_bytes is not None
+    tma_inter_tile_bytes = (
+        args.tma_inter_tile_bytes
+        if args.tma_inter_tile_bytes is not None
+        else args.tma_intra_tile_bytes
+    )
+    if tma_inter_tile_was_set and args.method != "tma":
+        raise ValueError("--tma-inter-tile-bytes is only supported with --method tma")
     if args.method == "tma":
-        check_tma_constraints(total_nbytes, args.tma_tile_bytes)
+        check_tma_constraints(
+            total_nbytes,
+            args.tma_intra_tile_bytes,
+            tma_inter_tile_bytes,
+            args.executor,
+            tma_inter_tile_was_set,
+        )
 
     executor_dev = src_dev if args.executor == "src" else dst_dev
     peer_dev = dst_dev if args.executor == "src" else src_dev
@@ -665,7 +739,7 @@ def main() -> None:
     cuda_set_device(executor_dev)
     enqueue_iterations(
         args.method, dst, src, total_nbytes, num_ctas, args.threads_per_cta,
-        args.tma_tile_bytes, executor_dev, stream, args.warmup,
+        args.tma_intra_tile_bytes, tma_inter_tile_bytes, executor_dev, stream, args.warmup,
         args.persistent_kernel
     )
     cuda_stream_synchronize(stream)
@@ -675,7 +749,7 @@ def main() -> None:
     t0 = time.perf_counter()
     enqueue_iterations(
         args.method, dst, src, total_nbytes, num_ctas, args.threads_per_cta,
-        args.tma_tile_bytes, executor_dev, stream, args.iters,
+        args.tma_intra_tile_bytes, tma_inter_tile_bytes, executor_dev, stream, args.iters,
         args.persistent_kernel
     )
     cuda_stream_synchronize(stream)
@@ -705,7 +779,8 @@ def main() -> None:
         barrier()
         if rank == r:
             tma_detail = (
-                f" tma_tile={fmt_bytes(args.tma_tile_bytes)}"
+                f" tma_intra_tile={fmt_bytes(args.tma_intra_tile_bytes)} "
+                f"tma_inter_tile={fmt_bytes(tma_inter_tile_bytes)}"
                 if args.method == "tma"
                 else ""
             )
