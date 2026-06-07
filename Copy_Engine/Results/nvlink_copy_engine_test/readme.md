@@ -2,8 +2,10 @@
 
 This folder stores Nsight Systems reports and derived summaries for
 `nvlink_copy_engine_test.py`. The reports measure peer-to-peer GPU copies over
-NVLink in a ring pattern with one copy per iteration and 100 measured
-iterations after 10 warmup iterations.
+NVLink in a ring pattern. In this test, each GPU sends data to exactly one
+other GPU, so the traffic is one-to-one per GPU rather than one-to-many fan-out.
+Each run uses one copy per iteration and 100 measured iterations after 10
+warmup iterations.
 
 The report names encode the copy size. For example, `1*8m.nsys-rep` is the run
 with `--copies-per-iter 1` and `--copy-size 8M`. The current sweep includes:
@@ -108,4 +110,3 @@ Observations:
   `2m`, `42%` at `4m`, `49%` at `6m`, and `54%` at `8m`.
 - `100m` reaches the highest observed NVLink metric level, about `78%` of peak
   for both RX and TX.
-
