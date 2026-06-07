@@ -25,13 +25,19 @@ import analyze_nvlink_copy_engine_report as analyzer
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_SQLITES = [
-    SCRIPT_DIR / "1*8k.sqlite",
-    SCRIPT_DIR / "1*80k.sqlite",
-    SCRIPT_DIR / "1*500k.sqlite",
-    SCRIPT_DIR / "1*1m.sqlite",
-    SCRIPT_DIR / "1*10m.sqlite",
-    SCRIPT_DIR / "1*100m.sqlite",
+FALLBACK_SQLITE_NAMES = [
+    "1*8k.sqlite",
+    "1*80k.sqlite",
+    "1*500k.sqlite",
+    "1*1m.sqlite",
+    "1*2m.sqlite",
+    "1*3m.sqlite",
+    "1*4m.sqlite",
+    "1*5m.sqlite",
+    "1*6m.sqlite",
+    "1*8m.sqlite",
+    "1*10m.sqlite",
+    "1*100m.sqlite",
 ]
 
 
@@ -46,10 +52,10 @@ def parse_args() -> argparse.Namespace:
         "sqlite",
         nargs="*",
         type=Path,
-        default=DEFAULT_SQLITES,
+        default=default_sqlites(),
         help=(
-            "SQLite files to plot. Defaults to ./1*8k.sqlite ./1*80k.sqlite "
-            "./1*500k.sqlite ./1*1m.sqlite ./1*10m.sqlite ./1*100m.sqlite."
+            "SQLite files to plot. Defaults to all ./1*<size>.sqlite files, "
+            "sorted by message size."
         ),
     )
     parser.add_argument(
@@ -97,6 +103,16 @@ def message_size_bytes(label: str) -> float:
     return value * multiplier
 
 
+def default_sqlites() -> list[Path]:
+    discovered = list(SCRIPT_DIR.glob("1*.sqlite"))
+    if not discovered:
+        return [SCRIPT_DIR / name for name in FALLBACK_SQLITE_NAMES]
+    return sorted(
+        discovered,
+        key=lambda path: (message_size_bytes(message_size_label(path)), path.name),
+    )
+
+
 def load_summary(path: Path, gpu_bus_id: str, skip_warmup_copies: int) -> dict[str, Any]:
     path = path.expanduser().resolve()
     if not path.exists():
@@ -119,7 +135,7 @@ def line_plot(
     output_path: Path,
     color: str,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(7.2, 4.4), dpi=160)
+    fig, ax = plt.subplots(figsize=plot_size(labels), dpi=160)
     x_values = list(range(len(labels)))
     ax.plot(x_values, values, marker="o", linewidth=2.2, color=color)
     ax.set_xticks(x_values)
@@ -149,7 +165,7 @@ def timing_plot(
     duration_values: list[float],
     output_path: Path,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(7.2, 4.4), dpi=160)
+    fig, ax = plt.subplots(figsize=plot_size(labels), dpi=160)
     x_values = list(range(len(labels)))
     ax.plot(
         x_values,
@@ -175,20 +191,29 @@ def timing_plot(
     ax.grid(True, axis="y", alpha=0.3)
     ax.legend()
     add_y_margin(ax, gap_values + duration_values)
-    for values, offset, color in (
-        (gap_values, 9, "#5f8f3f"),
-        (duration_values, -14, "#7c4fa3"),
+    for x_value, gap_value, duration_value in zip(
+        x_values, gap_values, duration_values
     ):
-        for x_value, value in zip(x_values, values):
-            ax.annotate(
-                f"{value:.3f}",
-                (x_value, value),
-                textcoords="offset points",
-                xytext=(0, offset),
-                ha="center",
-                fontsize=8,
-                color=color,
-            )
+        gap_offset = 9 if gap_value > duration_value else -14
+        duration_offset = 9 if duration_value >= gap_value else -14
+        ax.annotate(
+            f"{gap_value:.3f}",
+            (x_value, gap_value),
+            textcoords="offset points",
+            xytext=(0, gap_offset),
+            ha="center",
+            fontsize=8,
+            color="#5f8f3f",
+        )
+        ax.annotate(
+            f"{duration_value:.3f}",
+            (x_value, duration_value),
+            textcoords="offset points",
+            xytext=(0, duration_offset),
+            ha="center",
+            fontsize=8,
+            color="#7c4fa3",
+        )
     fig.tight_layout()
     fig.savefig(output_path)
     plt.close(fig)
@@ -205,6 +230,10 @@ def add_y_margin(ax: plt.Axes, values: list[float]) -> None:
     ax.set_ylim(low - span * 0.12, high + span * 0.18)
 
 
+def plot_size(labels: list[str]) -> tuple[float, float]:
+    return (max(7.2, len(labels) * 0.7), 4.4)
+
+
 def nvlink_plot(
     labels: list[str],
     rx_values: list[float],
@@ -212,7 +241,7 @@ def nvlink_plot(
     title: str,
     output_path: Path,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(7.2, 4.4), dpi=160)
+    fig, ax = plt.subplots(figsize=plot_size(labels), dpi=160)
     x_values = list(range(len(labels)))
     ax.plot(x_values, rx_values, marker="o", linewidth=2.2, label="RX", color="#2f6fbb")
     ax.plot(x_values, tx_values, marker="s", linewidth=2.2, label="TX", color="#d17c29")
