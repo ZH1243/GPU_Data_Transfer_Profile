@@ -44,6 +44,10 @@ nsys profile \
 The gaps are inside one allocation on each GPU. This guarantees non-contiguous
 addresses without depending on allocator placement. Each source chunk has a
 different value, and destination gaps use a sentinel checked by --check.
+
+By default, every copy in an iteration uses --copy-size. Use
+--non-uniform-copy-size with --copy-sizes 64K,128K,1M to give each copy in an
+iteration its own byte count.
 """
 
 import argparse
@@ -84,20 +88,47 @@ DESTINATION_GAP_SENTINEL = 253
 
 def build_layout(layout: str,
                  copies_per_iter: int,
-                 nbytes: int,
+                 copy_sizes: Sequence[int],
                  gap_size: int) -> Tuple[Tuple[int, ...], Tuple[int, ...], int, int]:
     src_discontinuous = layout in ("src-discontinuous", "both-discontinuous")
     dst_discontinuous = layout in ("dst-discontinuous", "both-discontinuous")
 
-    src_stride = nbytes + gap_size if src_discontinuous else nbytes
-    dst_stride = nbytes + gap_size if dst_discontinuous else nbytes
-    src_offsets = tuple(index * src_stride for index in range(copies_per_iter))
-    dst_offsets = tuple(index * dst_stride for index in range(copies_per_iter))
+    if len(copy_sizes) != copies_per_iter:
+        raise ValueError("copy size count must match --copies-per-iter")
+
+    src_offsets_list: List[int] = []
+    dst_offsets_list: List[int] = []
+    src_offset = 0
+    dst_offset = 0
+    for index, copy_size in enumerate(copy_sizes):
+        src_offsets_list.append(src_offset)
+        dst_offsets_list.append(dst_offset)
+        if index + 1 < copies_per_iter:
+            src_offset += copy_size + (gap_size if src_discontinuous else 0)
+            dst_offset += copy_size + (gap_size if dst_discontinuous else 0)
+
+    src_offsets = tuple(src_offsets_list)
+    dst_offsets = tuple(dst_offsets_list)
+    first_size = copy_sizes[0]
+    src_stride = first_size + gap_size if src_discontinuous else first_size
+    dst_stride = first_size + gap_size if dst_discontinuous else first_size
     return src_offsets, dst_offsets, src_stride, dst_stride
 
 
-def allocation_size(offsets: Sequence[int], nbytes: int) -> int:
-    return offsets[-1] + nbytes
+def allocation_size(offsets: Sequence[int], copy_sizes: Sequence[int]) -> int:
+    return offsets[-1] + copy_sizes[-1]
+
+
+def parse_copy_sizes(spec: str) -> Tuple[int, ...]:
+    values = [part.strip() for part in spec.split(",")]
+    if any(not value for value in values):
+        raise argparse.ArgumentTypeError(
+            "--copy-sizes must be a comma-separated list like 64K,128K,1M"
+        )
+    try:
+        return tuple(parse_nbytes(value) for value in values)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def chunk_value(rank: int, chunk_index: int) -> int:
@@ -109,37 +140,38 @@ def enqueue_iteration(copy_mode: str,
                       dst_device: int,
                       src_ptrs: Sequence[int],
                       src_device: int,
-                      nbytes: int,
+                      copy_sizes: Sequence[int],
                       batch: MemcpyBatch,
                       stream: torch.cuda.Stream) -> None:
     if copy_mode == "batch":
         cuda_memcpy_batch_async(batch, stream)
         return
 
-    for dst_ptr, src_ptr in zip(dst_ptrs, src_ptrs):
+    for dst_ptr, src_ptr, copy_size in zip(dst_ptrs, src_ptrs, copy_sizes):
         cuda_memcpy_peer_async(
-            dst_ptr, dst_device, src_ptr, src_device, nbytes, stream
+            dst_ptr, dst_device, src_ptr, src_device, copy_size, stream
         )
 
 
 def check_destination(dst: torch.Tensor,
                       dst_offsets: Sequence[int],
-                      dst_stride: int,
-                      nbytes: int,
+                      copy_sizes: Sequence[int],
                       rank: int) -> Tuple[bool, str]:
     sample_indices: List[int] = []
     expected_values: List[int] = []
 
-    for chunk_index, offset in enumerate(dst_offsets):
-        for within_chunk in sorted({0, nbytes // 2, nbytes - 1}):
+    for chunk_index, (offset, copy_size) in enumerate(zip(dst_offsets, copy_sizes)):
+        for within_chunk in sorted({0, copy_size // 2, copy_size - 1}):
             sample_indices.append(offset + within_chunk)
             expected_values.append(chunk_value(rank, chunk_index))
 
-    if dst_stride > nbytes:
-        gap_size = dst_stride - nbytes
-        for offset in dst_offsets[:-1]:
+    for offset, copy_size, next_offset in zip(
+        dst_offsets, copy_sizes, dst_offsets[1:]
+    ):
+        gap_size = next_offset - (offset + copy_size)
+        if gap_size > 0:
             for within_gap in sorted({0, gap_size // 2, gap_size - 1}):
-                sample_indices.append(offset + nbytes + within_gap)
+                sample_indices.append(offset + copy_size + within_gap)
                 expected_values.append(DESTINATION_GAP_SENTINEL)
 
     index_tensor = torch.tensor(sample_indices, dtype=torch.int64, device=dst.device)
@@ -164,6 +196,11 @@ def main() -> None:
                    help="bytes per copy. Default: 1M")
     p.add_argument("--copies-per-iter", type=int, default=8,
                    help="number of copies in each iteration. Default: 8")
+    p.add_argument("--non-uniform-copy-size", action="store_true",
+                   help="use per-copy sizes from --copy-sizes instead of --copy-size")
+    p.add_argument("--copy-sizes", type=parse_copy_sizes,
+                   help="comma-separated bytes for each copy in one iteration, "
+                        "for example 64K,128K,1M; requires --non-uniform-copy-size")
     p.add_argument("--layout", choices=LAYOUTS, default="contiguous",
                    help="source/destination address layout. Default: contiguous")
     p.add_argument("--gap-size", type=parse_nbytes, default=parse_nbytes("64K"),
@@ -193,6 +230,20 @@ def main() -> None:
         raise ValueError("--nbytes must be positive")
     if args.copies_per_iter <= 0:
         raise ValueError("--copies-per-iter must be positive")
+    if args.non_uniform_copy_size:
+        if args.copy_sizes is None:
+            raise ValueError("--non-uniform-copy-size requires --copy-sizes")
+        if len(args.copy_sizes) != args.copies_per_iter:
+            raise ValueError(
+                "--copy-sizes must specify exactly --copies-per-iter values"
+            )
+        if any(copy_size <= 0 for copy_size in args.copy_sizes):
+            raise ValueError("--copy-sizes values must be positive")
+        copy_sizes = args.copy_sizes
+    else:
+        if args.copy_sizes is not None:
+            raise ValueError("--copy-sizes requires --non-uniform-copy-size")
+        copy_sizes = tuple(args.nbytes for _ in range(args.copies_per_iter))
     if args.gap_size <= 0 and args.layout != "contiguous":
         raise ValueError("--gap-size must be positive for a discontinuous layout")
     if args.iters <= 0:
@@ -212,17 +263,17 @@ def main() -> None:
     cuda_enable_peer_access(dst_device, src_device)
 
     src_offsets, dst_offsets, src_stride, dst_stride = build_layout(
-        args.layout, args.copies_per_iter, args.nbytes, args.gap_size
+        args.layout, args.copies_per_iter, copy_sizes, args.gap_size
     )
-    src_allocation_size = allocation_size(src_offsets, args.nbytes)
-    dst_allocation_size = allocation_size(dst_offsets, args.nbytes)
-    bytes_per_iter = args.nbytes * args.copies_per_iter
+    src_allocation_size = allocation_size(src_offsets, copy_sizes)
+    dst_allocation_size = allocation_size(dst_offsets, copy_sizes)
+    bytes_per_iter = sum(copy_sizes)
 
     torch.cuda.set_device(src_device)
     src = torch.empty(src_allocation_size, dtype=torch.uint8, device=f"cuda:{src_device}")
     src.fill_(SOURCE_GAP_SENTINEL)
-    for chunk_index, offset in enumerate(src_offsets):
-        src[offset:offset + args.nbytes].fill_(chunk_value(rank, chunk_index))
+    for chunk_index, (offset, copy_size) in enumerate(zip(src_offsets, copy_sizes)):
+        src[offset:offset + copy_size].fill_(chunk_value(rank, chunk_index))
 
     torch.cuda.set_device(dst_device)
     dst = torch.empty(dst_allocation_size, dtype=torch.uint8, device=f"cuda:{dst_device}")
@@ -233,7 +284,7 @@ def main() -> None:
 
     src_ptrs = tuple(src.data_ptr() + offset for offset in src_offsets)
     dst_ptrs = tuple(dst.data_ptr() + offset for offset in dst_offsets)
-    batch = MemcpyBatch(dst_ptrs, src_ptrs, args.nbytes)
+    batch = MemcpyBatch(dst_ptrs, src_ptrs, copy_sizes)
 
     torch.cuda.set_device(dst_device)
     stream = torch.cuda.Stream(device=dst_device)
@@ -249,7 +300,7 @@ def main() -> None:
     for _ in range(args.warmup):
         enqueue_iteration(
             args.copy_mode, dst_ptrs, dst_device, src_ptrs, src_device,
-            args.nbytes, batch, stream
+            copy_sizes, batch, stream
         )
     cuda_stream_synchronize(stream)
     barrier()
@@ -259,7 +310,7 @@ def main() -> None:
     for _ in range(args.iters):
         enqueue_iteration(
             args.copy_mode, dst_ptrs, dst_device, src_ptrs, src_device,
-            args.nbytes, batch, stream
+            copy_sizes, batch, stream
         )
     cuda_stream_synchronize(stream)
     t1 = time.perf_counter()
@@ -279,8 +330,20 @@ def main() -> None:
     if args.check:
         torch.cuda.set_device(dst_device)
         ok, failure_detail = check_destination(
-            dst, dst_offsets, dst_stride, args.nbytes, rank
+            dst, dst_offsets, copy_sizes, rank
         )
+
+    if args.non_uniform_copy_size:
+        copy_size_detail = (
+            f"bytes/iter={fmt_bytes(bytes_per_iter)} "
+            f"copy_sizes={','.join(fmt_bytes(size) for size in copy_sizes)} "
+        )
+        src_stride_detail = "src_stride=variable "
+        dst_stride_detail = "dst_stride=variable "
+    else:
+        copy_size_detail = f"bytes/copy={fmt_bytes(args.nbytes)} "
+        src_stride_detail = f"src_stride={fmt_bytes(src_stride)} "
+        dst_stride_detail = f"dst_stride={fmt_bytes(dst_stride)} "
 
     torch.cuda.set_device(local_rank)
     for output_rank in range(world_size):
@@ -289,8 +352,8 @@ def main() -> None:
             print(
                 f"rank={rank:02d} copy=cuda:{src_device}->cuda:{dst_device} "
                 f"layout={args.layout} mode={args.copy_mode} "
-                f"copies/iter={args.copies_per_iter} bytes/copy={fmt_bytes(args.nbytes)} "
-                f"src_stride={fmt_bytes(src_stride)} dst_stride={fmt_bytes(dst_stride)} "
+                f"copies/iter={args.copies_per_iter} {copy_size_detail}"
+                f"{src_stride_detail}{dst_stride_detail}"
                 f"src_alloc={fmt_bytes(src_allocation_size)} "
                 f"dst_alloc={fmt_bytes(dst_allocation_size)} "
                 f"elapsed={elapsed:.6f}s local_bw={local_bw:.2f} GiB/s "

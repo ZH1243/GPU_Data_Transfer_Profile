@@ -50,7 +50,7 @@ import ctypes
 import os
 import sys
 import time
-from typing import Sequence, Tuple
+from typing import Sequence, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -254,16 +254,23 @@ class MemcpyBatch:
     def __init__(self,
                  dst_ptrs: Sequence[int],
                  src_ptrs: Sequence[int],
-                 nbytes: int) -> None:
+                 nbytes: Union[int, Sequence[int]]) -> None:
         if len(dst_ptrs) != len(src_ptrs):
             raise ValueError("source and destination pointer counts must match")
         if not dst_ptrs:
             raise ValueError("a memcpy batch must contain at least one copy")
 
         self.count = len(dst_ptrs)
+        if isinstance(nbytes, int):
+            sizes = [nbytes] * self.count
+        else:
+            sizes = list(nbytes)
+            if len(sizes) != self.count:
+                raise ValueError("copy-size count must match pointer count")
+
         self.dsts = (ctypes.c_void_p * self.count)(*dst_ptrs)
         self.srcs = (ctypes.c_void_p * self.count)(*src_ptrs)
-        self.sizes = (ctypes.c_size_t * self.count)(*([nbytes] * self.count))
+        self.sizes = (ctypes.c_size_t * self.count)(*sizes)
 
         # All copies use stable device pointers and the same stream-ordering attribute.
         self.attrs = (_CudaMemcpyAttributes * 1)()
@@ -302,15 +309,17 @@ def enqueue_iteration(copy_mode: str,
                       dst_device: int,
                       src_ptrs: Sequence[int],
                       src_device: int,
-                      nbytes: int,
+                      copy_sizes: Sequence[int],
                       batch: MemcpyBatch,
                       stream: torch.cuda.Stream) -> None:
     if copy_mode == "batch":
         cuda_memcpy_batch_async(batch, stream)
         return
 
-    for dst_ptr, src_ptr in zip(dst_ptrs, src_ptrs):
-        cuda_memcpy_peer_async(dst_ptr, dst_device, src_ptr, src_device, nbytes, stream)
+    for dst_ptr, src_ptr, copy_size in zip(dst_ptrs, src_ptrs, copy_sizes):
+        cuda_memcpy_peer_async(
+            dst_ptr, dst_device, src_ptr, src_device, copy_size, stream
+        )
 
 
 def cuda_stream_synchronize(stream: torch.cuda.Stream) -> None:
@@ -349,6 +358,27 @@ def fmt_bytes(n: float) -> str:
             return f"{n:.2f} {unit}"
         n /= 1024.0
     return f"{n:.2f} PiB"
+
+
+def parse_copy_sizes(spec: str) -> Tuple[int, ...]:
+    values = [part.strip() for part in spec.split(",")]
+    if any(not value for value in values):
+        raise argparse.ArgumentTypeError(
+            "--copy-sizes must be a comma-separated list like 64K,128K,1M"
+        )
+    try:
+        return tuple(parse_nbytes(value) for value in values)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def build_contiguous_offsets(copy_sizes: Sequence[int]) -> Tuple[int, ...]:
+    offsets = []
+    offset = 0
+    for copy_size in copy_sizes:
+        offsets.append(offset)
+        offset += copy_size
+    return tuple(offsets)
 
 
 def get_rank_info() -> Tuple[int, int, int]:
@@ -404,6 +434,11 @@ def main() -> None:
                    help="bytes per copy, supports K/M/G, KB/MB/GB, KiB/MiB/GiB. Default: 1G")
     p.add_argument("--copies-per-iter", type=int, default=1,
                    help="number of independent memory copies in each iteration. Default: 1")
+    p.add_argument("--non-uniform-copy-size", action="store_true",
+                   help="use per-copy sizes from --copy-sizes instead of --copy-size")
+    p.add_argument("--copy-sizes", type=parse_copy_sizes,
+                   help="comma-separated bytes for each copy in one iteration, "
+                        "for example 64K,128K,1M; requires --non-uniform-copy-size")
     p.add_argument("--copy-mode", choices=["separate", "batch"], default="separate",
                    help="separate: one cudaMemcpyPeerAsync call per copy; "
                         "batch: one cudaMemcpyBatchAsync call per iteration. Default: separate")
@@ -430,6 +465,20 @@ def main() -> None:
         raise ValueError("--nbytes must be positive")
     if args.copies_per_iter <= 0:
         raise ValueError("--copies-per-iter must be positive")
+    if args.non_uniform_copy_size:
+        if args.copy_sizes is None:
+            raise ValueError("--non-uniform-copy-size requires --copy-sizes")
+        if len(args.copy_sizes) != args.copies_per_iter:
+            raise ValueError(
+                "--copy-sizes must specify exactly --copies-per-iter values"
+            )
+        if any(copy_size <= 0 for copy_size in args.copy_sizes):
+            raise ValueError("--copy-sizes values must be positive")
+        copy_sizes = args.copy_sizes
+    else:
+        if args.copy_sizes is not None:
+            raise ValueError("--copy-sizes requires --non-uniform-copy-size")
+        copy_sizes = tuple(args.nbytes for _ in range(args.copies_per_iter))
     if args.iters <= 0:
         raise ValueError("--iters must be positive")
     if args.warmup < 0:
@@ -458,7 +507,8 @@ def main() -> None:
 
     # Allocate one contiguous source/destination region, split into independent copies.
     # uint8 makes both the per-copy size and pointer offsets exact.
-    total_nbytes = args.nbytes * args.copies_per_iter
+    total_nbytes = sum(copy_sizes)
+    copy_offsets = build_contiguous_offsets(copy_sizes)
     torch.cuda.set_device(src_dev)
     src = torch.empty(total_nbytes, dtype=torch.uint8, device=f"cuda:{src_dev}")
     src.fill_((rank + 17) % 251)
@@ -471,9 +521,9 @@ def main() -> None:
     torch.cuda.synchronize(src_dev)
     torch.cuda.synchronize(dst_dev)
 
-    src_ptrs = tuple(src.data_ptr() + i * args.nbytes for i in range(args.copies_per_iter))
-    dst_ptrs = tuple(dst.data_ptr() + i * args.nbytes for i in range(args.copies_per_iter))
-    batch = MemcpyBatch(dst_ptrs, src_ptrs, args.nbytes)
+    src_ptrs = tuple(src.data_ptr() + offset for offset in copy_offsets)
+    dst_ptrs = tuple(dst.data_ptr() + offset for offset in copy_offsets)
+    batch = MemcpyBatch(dst_ptrs, src_ptrs, copy_sizes)
 
     # Use a non-default stream on the destination device to make profiler timelines easy to read.
     torch.cuda.set_device(dst_dev)
@@ -490,7 +540,8 @@ def main() -> None:
     cuda_set_device(dst_dev)
     for _ in range(args.warmup):
         enqueue_iteration(
-            args.copy_mode, dst_ptrs, dst_dev, src_ptrs, src_dev, args.nbytes, batch, stream
+            args.copy_mode, dst_ptrs, dst_dev, src_ptrs, src_dev,
+            copy_sizes, batch, stream
         )
     cuda_stream_synchronize(stream)
     barrier()
@@ -501,7 +552,8 @@ def main() -> None:
     t0 = time.perf_counter()
     for _ in range(args.iters):
         enqueue_iteration(
-            args.copy_mode, dst_ptrs, dst_dev, src_ptrs, src_dev, args.nbytes, batch, stream
+            args.copy_mode, dst_ptrs, dst_dev, src_ptrs, src_dev,
+            copy_sizes, batch, stream
         )
     cuda_stream_synchronize(stream)
     t1 = time.perf_counter()
@@ -523,12 +575,22 @@ def main() -> None:
     ok = True
     if args.check:
         torch.cuda.set_device(dst_dev)
-        copy_starts = torch.arange(
-            args.copies_per_iter, dtype=torch.int64, device=f"cuda:{dst_dev}"
-        ) * args.nbytes
+        copy_starts = torch.tensor(
+            copy_offsets, dtype=torch.int64, device=f"cuda:{dst_dev}"
+        )
         sample = dst[copy_starts].cpu()
         expected = (rank + 17) % 251
         ok = bool(torch.all(sample == expected).item())
+
+    if args.non_uniform_copy_size:
+        copy_size_detail = (
+            f"bytes/iter={fmt_bytes(total_nbytes)} "
+            f"copy_sizes={','.join(fmt_bytes(size) for size in copy_sizes)} "
+        )
+    else:
+        copy_size_detail = (
+            f"bytes/copy={fmt_bytes(args.nbytes)} bytes/iter={fmt_bytes(total_nbytes)} "
+        )
 
     for r in range(world_size):
         barrier()
@@ -537,7 +599,7 @@ def main() -> None:
                 f"rank={rank:02d} local_rank={local_rank:02d} "
                 f"copy cuda:{src_dev} -> cuda:{dst_dev} "
                 f"mode={args.copy_mode} copies/iter={args.copies_per_iter} "
-                f"bytes/copy={fmt_bytes(args.nbytes)} bytes/iter={fmt_bytes(total_nbytes)} "
+                f"{copy_size_detail}"
                 f"iters={args.iters} "
                 f"elapsed={elapsed:.6f}s local_bw={local_bw:.2f} GiB/s "
                 f"p2p={int(can_dst_to_src)} check={'OK' if ok else 'FAIL'}",

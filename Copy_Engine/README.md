@@ -154,6 +154,8 @@ Each script prints per-rank timing/bandwidth and an aggregate summary:
 | --- | --- | --- |
 | `--nbytes`, `--copy-size` | `1G` | Bytes per copy. Supports byte suffixes listed above. |
 | `--copies-per-iter` | `1` | Number of independent copies submitted in each iteration. |
+| `--non-uniform-copy-size` | disabled | Use per-copy sizes from `--copy-sizes` instead of one uniform `--copy-size`. |
+| `--copy-sizes` | unset | Comma-separated byte sizes for the copies in one iteration, for example `64K,128K,1M`. Must contain exactly `--copies-per-iter` values when non-uniform mode is enabled. |
 | `--copy-mode` | `separate` | `separate` for one `cudaMemcpyPeerAsync` per copy, or `batch` for one `cudaMemcpyBatchAsync` per iteration. |
 | `--iters` | `100` | Number of timed iterations. |
 | `--warmup` | `10` | Number of warmup iterations before timing. |
@@ -178,6 +180,8 @@ Each script prints per-rank timing/bandwidth and an aggregate summary:
 | --- | --- | --- |
 | `--nbytes`, `--copy-size` | `1M` | Bytes per copy. Supports byte suffixes listed above. |
 | `--copies-per-iter` | `8` | Number of copies in each iteration. |
+| `--non-uniform-copy-size` | disabled | Use per-copy sizes from `--copy-sizes` instead of one uniform `--copy-size`. |
+| `--copy-sizes` | unset | Comma-separated byte sizes for the copies in one iteration, for example `64K,128K,1M`. Must contain exactly `--copies-per-iter` values when non-uniform mode is enabled. |
 | `--layout` | `contiguous` | Address layout: `contiguous`, `src-discontinuous`, `dst-discontinuous`, or `both-discontinuous`. |
 | `--gap-size` | `64K` | Gap between discontinuous copy regions. Used for discontinuous layouts. |
 | `--copy-mode` | `batch` | `separate` for one `cudaMemcpyPeerAsync` per copy, or `batch` for one `cudaMemcpyBatchAsync` per iteration. |
