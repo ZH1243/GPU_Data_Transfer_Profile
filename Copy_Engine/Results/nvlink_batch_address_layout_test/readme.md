@@ -75,6 +75,18 @@ Example:
 python plot_nvlink_batch_address_layout_summary.py
 ```
 
+`plot_nvlink_copies_per_iter_comparison.py` focuses on the
+`src-discontinuous / batch` runs and compares `--copies-per-iter 1`, `2`, `4`,
+and `8` at the same total transfer size per iteration. The x-axis is
+`copies_per_iter * copy_size`, so points such as `1*32k`, `2*16k`, `4*8k`, and
+`8*4k` are compared at the same `32k` total transfer size.
+
+Example:
+
+```bash
+python plot_nvlink_copies_per_iter_comparison.py
+```
+
 ## Summary Figures
 
 ### Average Memcpy PtoP Source Throughput
@@ -127,3 +139,22 @@ Observations:
 - RX and TX usually track closely. One notable asymmetry appears at
   `1024k` for `both-discontinuous / batch`, where RX is `40.941%` and TX is
   `50.941%`.
+
+### NVLink Utilization at Equal Total Transfer Size
+
+![NVLink utilization by copies per iteration](average_nvlink_copies_per_iter_comparison.png)
+
+Observations:
+
+- This figure compares `src-discontinuous / batch` runs while keeping the total
+  bytes per iteration fixed on the x-axis.
+- At small total sizes, fewer copies per iteration are generally more efficient.
+  For total `128k`, `1` copy per iteration reaches RX `5.000%` and TX
+  `5.200%`, while `8` copies per iteration reaches RX `3.000%` and TX
+  `2.778%`.
+- Around total `1024k` to `4096k`, all four copy counts are close. At total
+  `4096k`, RX ranges from `49.000%` to `52.125%`, and TX ranges from
+  `51.000%` to `53.688%`.
+- At total `8192k`, `1`, `2`, and `8` copies per iteration are all around
+  `61%` to `63%` of peak, while the `4` copies-per-iteration point is lower at
+  RX `42.024%` and TX `41.951%`.
