@@ -30,6 +30,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPORT_RE = re.compile(
     r"(?P<copies>\d+)\*(?P<size>\d+(?:\.\d+)?[kKmMgG])_(?P<mode>[A-Za-z0-9-]+)\.sqlite$"
 )
+NON_UNIFORM_REPORT_RE = re.compile(
+    r"total_(?P<total>\d+(?:\.\d+)?[kKmMgG])_"
+    r"(?P<mode>[A-Za-z0-9-]+)_"
+    r"(?P<copies>\d+)x(?P<small>\d+(?:\.\d+)?[kKmMgG])\+"
+    r"(?P<last>\d+(?:\.\d+)?[kKmMgG])\.sqlite$"
+)
 LAYOUT_ALIASES = {
     "src-discontinuous": "src_discontinuous",
     "src_discontinuous": "src_discontinuous",
@@ -37,17 +43,20 @@ LAYOUT_ALIASES = {
     "both_discontinuous": "both_discontinuous",
 }
 COLORS = {
-    1: "#d17c29",
-    2: "#31688e",
-    4: "#35b779",
-    8: "#7c4fa3",
+    "uniform-1": "#d17c29",
+    "uniform-2": "#31688e",
+    "uniform-4": "#35b779",
+    "uniform-8": "#7c4fa3",
+    "nonuniform-4": "#c44e52",
 }
 MARKERS = {
-    1: "^",
-    2: "o",
-    4: "s",
-    8: "D",
+    "uniform-1": "^",
+    "uniform-2": "o",
+    "uniform-4": "s",
+    "uniform-8": "D",
+    "nonuniform-4": "X",
 }
+SERIES_ORDER = ("uniform-1", "uniform-2", "uniform-4", "uniform-8", "nonuniform-4")
 
 
 @dataclass(frozen=True)
@@ -56,11 +65,15 @@ class ReportInfo:
     copies_per_iter: int
     size_label: str
     size_bytes: float
+    total_size_bytes_value: float
     mode: str
+    series_id: str
+    series_label: str
+    copy_size_description: str
 
     @property
     def total_size_bytes(self) -> float:
-        return self.copies_per_iter * self.size_bytes
+        return self.total_size_bytes_value
 
 
 @dataclass(frozen=True)
@@ -158,16 +171,46 @@ def transfer_size_label(size_bytes: float) -> str:
 
 def parse_report_path(path: Path) -> ReportInfo:
     match = REPORT_RE.fullmatch(path.name)
-    if match is None:
-        raise ValueError(f"Cannot parse {path.name}. Expected names like 2*256k_batch.sqlite.")
+    if match is not None:
+        copies_per_iter = int(match.group("copies"))
+        size_label = match.group("size").lower()
+        size_bytes = message_size_bytes(size_label)
+        return ReportInfo(
+            path=path,
+            copies_per_iter=copies_per_iter,
+            size_label=size_label,
+            size_bytes=size_bytes,
+            total_size_bytes_value=copies_per_iter * size_bytes,
+            mode=match.group("mode"),
+            series_id=f"uniform-{copies_per_iter}",
+            series_label=f"{copies_per_iter} equal-size copies/iter",
+            copy_size_description=size_label,
+        )
 
-    size_label = match.group("size").lower()
-    return ReportInfo(
-        path=path,
-        copies_per_iter=int(match.group("copies")),
-        size_label=size_label,
-        size_bytes=message_size_bytes(size_label),
-        mode=match.group("mode"),
+    match = NON_UNIFORM_REPORT_RE.fullmatch(path.name)
+    if match is not None:
+        copies_per_iter = int(match.group("copies"))
+        total_label = match.group("total").lower()
+        small_label = match.group("small").lower()
+        last_label = match.group("last").lower()
+        return ReportInfo(
+            path=path,
+            copies_per_iter=copies_per_iter,
+            size_label=f"{small_label}+{last_label}",
+            size_bytes=float("nan"),
+            total_size_bytes_value=message_size_bytes(total_label),
+            mode=match.group("mode"),
+            series_id=f"nonuniform-{copies_per_iter}",
+            series_label=(
+                f"{copies_per_iter} non-uniform copies/iter "
+                f"({copies_per_iter - 1}x{small_label}+remainder)"
+            ),
+            copy_size_description=f"{copies_per_iter - 1}x{small_label}+{last_label}",
+        )
+
+    raise ValueError(
+        f"Cannot parse {path.name}. Expected names like 2*256k_batch.sqlite "
+        "or total_512k_batch_4x8k+488k.sqlite."
     )
 
 
@@ -270,9 +313,21 @@ def add_y_margin(ax: plt.Axes, values: list[float]) -> None:
 def plot(points: list[ReportPoint], layout: str, copy_mode: str, output_path: Path, include_protocol: bool) -> None:
     total_sizes = sorted({point.info.total_size_bytes for point in points})
     labels = [transfer_size_label(total_size) for total_size in total_sizes]
-    copies_values = sorted({point.info.copies_per_iter for point in points})
+    series_ids = sorted(
+        {point.info.series_id for point in points},
+        key=lambda series_id: (
+            SERIES_ORDER.index(series_id)
+            if series_id in SERIES_ORDER
+            else len(SERIES_ORDER),
+            series_id,
+        ),
+    )
+    series_labels = {
+        point.info.series_id: point.info.series_label
+        for point in points
+    }
     by_key = {
-        (point.info.copies_per_iter, point.info.total_size_bytes): point
+        (point.info.series_id, point.info.total_size_bytes): point
         for point in points
     }
 
@@ -287,24 +342,24 @@ def plot(points: list[ReportPoint], layout: str, copy_mode: str, output_path: Pa
     all_rx_values: list[float] = []
     all_tx_values: list[float] = []
 
-    for copies_per_iter in copies_values:
-        color = COLORS.get(copies_per_iter)
-        marker = MARKERS.get(copies_per_iter, "o")
+    for series_id in series_ids:
+        color = COLORS.get(series_id)
+        marker = MARKERS.get(series_id, "o")
         rx_values = [
-            by_key.get((copies_per_iter, total_size)).rx_percent
-            if by_key.get((copies_per_iter, total_size)) is not None
+            by_key.get((series_id, total_size)).rx_percent
+            if by_key.get((series_id, total_size)) is not None
             else math.nan
             for total_size in total_sizes
         ]
         tx_values = [
-            by_key.get((copies_per_iter, total_size)).tx_percent
-            if by_key.get((copies_per_iter, total_size)) is not None
+            by_key.get((series_id, total_size)).tx_percent
+            if by_key.get((series_id, total_size)) is not None
             else math.nan
             for total_size in total_sizes
         ]
         all_rx_values.extend(rx_values)
         all_tx_values.extend(tx_values)
-        label = f"{copies_per_iter} copies/iter"
+        label = series_labels[series_id]
         axes[0].plot(
             x_values,
             rx_values,
@@ -346,10 +401,19 @@ def plot(points: list[ReportPoint], layout: str, copy_mode: str, output_path: Pa
 
 def print_values(points: list[ReportPoint]) -> None:
     print("Values:")
-    for point in sorted(points, key=lambda item: (item.info.total_size_bytes, item.info.copies_per_iter)):
+    for point in sorted(
+        points,
+        key=lambda item: (
+            item.info.total_size_bytes,
+            SERIES_ORDER.index(item.info.series_id)
+            if item.info.series_id in SERIES_ORDER
+            else len(SERIES_ORDER),
+            item.info.series_id,
+        ),
+    ):
         print(
             f"  total={transfer_size_label(point.info.total_size_bytes)}, "
-            f"{point.info.copies_per_iter} copies/iter, copy_size={point.info.size_label}: "
+            f"{point.info.series_label}, copy_sizes={point.info.copy_size_description}: "
             f"events={point.measured_copy_events}, skipped={point.skipped_warmup_events}, "
             f"NVLink RX={point.rx_percent:.3f}%, TX={point.tx_percent:.3f}%"
         )

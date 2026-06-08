@@ -5,9 +5,14 @@ This folder stores Nsight Systems reports and derived summaries for
 copies over NVLink in a ring pattern while changing the source/destination
 address layout and the copy submission mode.
 
-Each run uses `--copies-per-iter 4`, 100 measured iterations, and 10 warmup
-iterations. The current sweep includes copy sizes `8k`, `32k`, `128k`, `256k`,
-`512k`, `1024k`, and `2048k`. The collected layout folders are:
+The reports use 100 measured iterations after 10 warmup iterations. The main
+layout/mode sweep uses `--copies-per-iter 4` with copy sizes `8k`, `32k`,
+`128k`, `256k`, `512k`, `1024k`, and `2048k`. The
+copies-per-iteration comparison additionally includes `--copies-per-iter 1`,
+`2`, and `8` runs, plus a non-uniform copy-size run where one batch iteration
+contains three small `8K` copies and one large remainder copy.
+
+The collected layout folders are:
 
 - `src_discontinuous`: results collected with `--layout src-discontinuous`
 - `both_discontinuous`: results collected with `--layout both-discontinuous`
@@ -16,6 +21,12 @@ The report filenames encode the copy count, copy size, and copy mode. For
 example, `both_discontinuous/4*8k_separate.nsys-rep` is the run with
 `--copies-per-iter 4`, `--copy-size 8K`, `--layout both-discontinuous`, and
 `--copy-mode separate`.
+
+The non-uniform filenames encode the total bytes moved in one iteration and
+the per-copy size pattern. For example,
+`src_discontinuous/total_512k_batch_4x8k+488k.nsys-rep` is a batch-mode run
+with `--copies-per-iter 4`, total transfer size `512K` per iteration, and
+copy sizes `8K,8K,8K,488K`.
 
 Each `.nsys-rep` file is an Nsight Systems profile containing CUDA runtime
 events, NVTX ranges, cuDNN/cuBLAS tracing, and GH100 GPU metrics sampled from
@@ -41,6 +52,41 @@ nsys profile \
     --gap-size 10M \
     --copy-mode separate \
     --check
+```
+
+A sample command pattern used to collect the non-uniform results is:
+
+```bash
+num_copy_iters=4
+
+for i in 128 256 512 1024 2048; do
+  total_k=$((num_copy_iters * i))
+  last_copy_size=$((total_k - (num_copy_iters - 1) * 8))
+
+  copy_sizes=""
+  for ((j = 0; j < num_copy_iters - 1; j++)); do
+    copy_sizes+="8K,"
+  done
+  copy_sizes+="${last_copy_size}K"
+
+  nsys profile \
+    -s none \
+    --cpuctxsw=none \
+    --trace=cuda,nvtx,cudnn,cublas \
+    -o "./nvlink_batch_address_layout_test/src_discontinuous/total_${total_k}k_batch_${num_copy_iters}x8k+${last_copy_size}k" \
+    --gpu-metrics-devices=0 \
+    --gpu-metrics-set=gh100 \
+    --gpu-metrics-frequency=10000 \
+    --force-overwrite=true \
+    torchrun --standalone --nproc_per_node=8 nvlink_batch_address_layout_test.py \
+      --non-uniform-copy-size \
+      --copy-sizes "${copy_sizes}" \
+      --copies-per-iter "${num_copy_iters}" \
+      --layout src-discontinuous \
+      --gap-size 10M \
+      --copy-mode batch \
+      --check
+done
 ```
 
 ## Scripts
@@ -79,7 +125,9 @@ python plot_nvlink_batch_address_layout_summary.py
 `src-discontinuous / batch` runs and compares `--copies-per-iter 1`, `2`, `4`,
 and `8` at the same total transfer size per iteration. The x-axis is
 `copies_per_iter * copy_size`, so points such as `1*32k`, `2*16k`, `4*8k`, and
-`8*4k` are compared at the same `32k` total transfer size.
+`8*4k` are compared at the same `32k` total transfer size. The same plot also
+adds the non-uniform `4`-copy batch series, where each iteration uses
+`8K,8K,8K,<remainder>` while keeping the same total transfer size.
 
 Example:
 
@@ -147,14 +195,21 @@ Observations:
 Observations:
 
 - This figure compares `src-discontinuous / batch` runs while keeping the total
-  bytes per iteration fixed on the x-axis.
-- At small total sizes, fewer copies per iteration are generally more efficient.
-  For total `128k`, `1` copy per iteration reaches RX `5.000%` and TX
-  `5.200%`, while `8` copies per iteration reaches RX `3.000%` and TX
-  `2.778%`.
-- Around total `1024k` to `4096k`, all four copy counts are close. At total
-  `4096k`, RX ranges from `49.000%` to `52.125%`, and TX ranges from
+  bytes per iteration fixed on the x-axis. The equal-size lines change the
+  number of same-size copies. The non-uniform line keeps four copies but uses
+  three `8K` copies and one large remainder copy.
+- At small total sizes, fewer and larger equal-size copies are generally more
+  efficient. For total `128k`, `1` equal-size copy reaches RX `5.000%` and TX
+  `5.200%`, while `8` equal-size copies reaches RX `3.000%` and TX `2.778%`.
+- The non-uniform four-copy run behaves like a low-overhead small-copy case at
+  low totals, but catches up once the remainder copy is large. It is below the
+  equal-size four-copy run at total `512k` (`11.556%` RX, `11.778%` TX versus
+  `15.500%` RX, `16.000%` TX), but is slightly higher at total `1024k`
+  (`28.429%` RX, `28.571%` TX versus `27.857%` RX, `28.143%` TX).
+- Around total `2048k` to `4096k`, most series cluster near each other. At
+  total `4096k`, RX ranges from `49.000%` to `52.125%`, and TX ranges from
   `51.000%` to `53.688%`.
-- At total `8192k`, `1`, `2`, and `8` copies per iteration are all around
-  `61%` to `63%` of peak, while the `4` copies-per-iteration point is lower at
-  RX `42.024%` and TX `41.951%`.
+- At total `8192k`, the non-uniform four-copy run reaches the highest measured
+  utilization in this comparison, RX `63.556%` and TX `63.222%`. The
+  `1`-copy and `8`-copy equal-size runs are also around `63%`, while the
+  equal-size `4`-copy point is much lower at RX `42.024%` and TX `41.951%`.
