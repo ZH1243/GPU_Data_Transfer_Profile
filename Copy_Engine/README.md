@@ -122,11 +122,16 @@ source buffer goes to GPU `(i + 1) % world_size`, the second goes to GPU
 `(i + 2) % world_size`, and so on.
 
 The logical source buffers are separated by an explicit gap, but the sub-buffers
-inside each logical source buffer are contiguous. In batch mode, each rank
-submits one `cudaMemcpyBatchAsync` per destination GPU per iteration. For
-example, with 8 GPUs and `--num-source-buffers 4`, each rank submits 7 batch
-calls per iteration, and each batch contains 4 entries: A_k/B_k/C_k/D_k for one
-destination.
+inside each logical source buffer are contiguous. By default, sizes are selected
+per source buffer: A1/A2/... share one size, B1/B2/... share another size, and
+so on. With `--destination-buffer-sizes`, sizes are selected per destination
+index instead: A1/B1/C1/D1 share one size, A2/B2/C2/D2 share the next size, and
+so on.
+
+In batch mode, each rank submits one `cudaMemcpyBatchAsync` per destination GPU
+per iteration. For example, with 8 GPUs and `--num-source-buffers 4`, each rank
+submits 7 batch calls per iteration, and each batch contains 4 entries:
+A_k/B_k/C_k/D_k for one destination.
 
 Example:
 
@@ -134,6 +139,19 @@ Example:
 torchrun --standalone --nproc_per_node=8 Copy_Engine/nvlink_multi_source_all_to_all_batch_test.py \
   --num_source_buffers 4 \
   --source-buffer-sizes 64K,128K,256K,512K \
+  --copy-mode batch \
+  --iters 100 \
+  --warmup 10 \
+  --check
+```
+
+Destination-indexed size example, where A1/B1/C1/D1 are 64K,
+A2/B2/C2/D2 are 128K, and so on:
+
+```bash
+torchrun --standalone --nproc_per_node=8 Copy_Engine/nvlink_multi_source_all_to_all_batch_test.py \
+  --num_source_buffers 4 \
+  --destination-buffer-sizes 64K,128K,256K,512K,1M,2M,4M \
   --copy-mode batch \
   --iters 100 \
   --warmup 10 \
@@ -228,6 +246,7 @@ Each script prints per-rank timing/bandwidth and an aggregate summary:
 | `--num-source-buffers`, `--num_source_buffers` | `4` | Number of logical source buffers per GPU, such as A/B/C/D. |
 | `--nbytes`, `--copy-size` | `1M` | Bytes per source sub-buffer when `--source-buffer-sizes` is not set. For example, this is the size of each A_i/B_i/C_i/D_i chunk. |
 | `--source-buffer-sizes`, `--source_buffer_sizes` | unset | Comma-separated per-source sub-buffer sizes, for example `64K,128K,256K,512K` for A_i/B_i/C_i/D_i. Must contain exactly `--num-source-buffers` values. |
+| `--destination-buffer-sizes`, `--destination_buffer_sizes` | unset | Enables destination-indexed sizing. Comma-separated sizes for A1/B1/..., A2/B2/..., etc. Must contain exactly `world_size - 1` values and cannot be combined with `--source-buffer-sizes`. |
 | `--source-buffer-gap-size`, `--source_buffer_gap_size` | `64K` | Gap between logical source buffers A/B/C/... so the logical source buffers are not contiguous. Sub-buffers within each logical source buffer remain contiguous. |
 | `--copy-mode` | `batch` | `separate` for one `cudaMemcpyPeerAsync` per source buffer per destination, or `batch` for one `cudaMemcpyBatchAsync` per destination. |
 | `--iters` | `100` | Number of timed iterations. |

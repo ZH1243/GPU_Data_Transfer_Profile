@@ -23,6 +23,11 @@ each rank submits world_size - 1 batched calls per iteration. With
 --copy-mode separate, the same grouped order is used, but each entry is a
 cudaMemcpyPeerAsync.
 
+By default, sub-buffer sizes are selected per source buffer: A1..A7 share the
+same size, B1..B7 share another size, and so on. When
+--destination-buffer-sizes is set, sizes are selected per destination index:
+A1/B1/C1/D1 share one size, A2/B2/C2/D2 share the next size, and so on.
+
 Example on one 8-GPU node:
   torchrun --standalone --nproc_per_node=8 nvlink_multi_source_all_to_all_batch_test.py \
     --num_source_buffers 4 \
@@ -79,7 +84,7 @@ def enqueue_iteration(copy_mode: str,
                       dst_devices: Sequence[int],
                       src_ptr_groups: Dict[int, Tuple[int, ...]],
                       dst_ptr_groups: Dict[int, Tuple[int, ...]],
-                      sub_buffer_sizes: Sequence[int],
+                      copy_size_groups: Dict[int, Tuple[int, ...]],
                       batches: Dict[int, MemcpyBatch],
                       stream: torch.cuda.Stream) -> None:
     for dst_device in dst_devices:
@@ -90,7 +95,7 @@ def enqueue_iteration(copy_mode: str,
         for src_ptr, dst_ptr, nbytes in zip(
             src_ptr_groups[dst_device],
             dst_ptr_groups[dst_device],
-            sub_buffer_sizes,
+            copy_size_groups[dst_device],
         ):
             cuda_memcpy_peer_async(
                 dst_ptr, dst_device, src_ptr, src_device, nbytes, stream
@@ -98,9 +103,9 @@ def enqueue_iteration(copy_mode: str,
 
 
 def check_destinations(destinations: Dict[int, torch.Tensor],
-                       dst_offsets: Sequence[int],
+                       dst_offset_groups: Dict[int, Tuple[int, ...]],
                        dst_devices: Sequence[int],
-                       sub_buffer_sizes: Sequence[int],
+                       copy_size_groups: Dict[int, Tuple[int, ...]],
                        rank: int) -> Tuple[bool, str]:
     for destination_index, dst_device in enumerate(dst_devices):
         dst = destinations[dst_device]
@@ -108,7 +113,7 @@ def check_destinations(destinations: Dict[int, torch.Tensor],
         expected_values: List[int] = []
 
         for source_index, (offset, nbytes) in enumerate(
-            zip(dst_offsets, sub_buffer_sizes)
+            zip(dst_offset_groups[dst_device], copy_size_groups[dst_device])
         ):
             for within_chunk in sorted({0, nbytes // 2, nbytes - 1}):
                 sample_indices.append(offset + within_chunk)
@@ -140,6 +145,14 @@ def format_source_sizes(sub_buffer_sizes: Sequence[int]) -> str:
     return ",".join(parts)
 
 
+def format_destination_sizes(destination_sizes: Sequence[int]) -> str:
+    parts = [
+        f"{source_buffer_name(0)}{index + 1}/...={fmt_bytes(nbytes)}"
+        for index, nbytes in enumerate(destination_sizes)
+    ]
+    return ",".join(parts)
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--num-source-buffers", "--num_source_buffers",
@@ -153,6 +166,11 @@ def main() -> None:
                    type=parse_copy_sizes,
                    help="comma-separated per-source sub-buffer sizes, for example "
                         "64K,128K,256K,512K for Ai,Bi,Ci,Di")
+    p.add_argument("--destination-buffer-sizes", "--destination_buffer_sizes",
+                   type=parse_copy_sizes,
+                   help="enable per-destination-index sub-buffer sizes. Values "
+                        "are comma-separated sizes for A1/B1/..., A2/B2/..., "
+                        "and so on, and must contain world_size - 1 entries")
     p.add_argument("--source-buffer-gap-size", "--source_buffer_gap_size",
                    type=parse_nbytes, default=parse_nbytes("64K"),
                    help="gap between logical source buffers A/B/C/... to guarantee "
@@ -185,6 +203,10 @@ def main() -> None:
         raise ValueError("--nbytes must be positive")
     if args.source_buffer_gap_size < 0:
         raise ValueError("--source-buffer-gap-size must be non-negative")
+    if args.source_buffer_sizes is not None and args.destination_buffer_sizes is not None:
+        raise ValueError(
+            "--source-buffer-sizes and --destination-buffer-sizes are mutually exclusive"
+        )
     if args.source_buffer_sizes is not None:
         if len(args.source_buffer_sizes) != args.num_source_buffers:
             raise ValueError(
@@ -192,9 +214,9 @@ def main() -> None:
             )
         if any(nbytes <= 0 for nbytes in args.source_buffer_sizes):
             raise ValueError("--source-buffer-sizes values must be positive")
-        sub_buffer_sizes = args.source_buffer_sizes
+        source_sub_buffer_sizes = args.source_buffer_sizes
     else:
-        sub_buffer_sizes = tuple(args.nbytes for _ in range(args.num_source_buffers))
+        source_sub_buffer_sizes = tuple(args.nbytes for _ in range(args.num_source_buffers))
     if args.iters <= 0:
         raise ValueError("--iters must be positive")
     if args.warmup < 0:
@@ -206,11 +228,35 @@ def main() -> None:
     src_device = local_rank
     dst_devices = destination_order(src_device, world_size)
     num_destinations = len(dst_devices)
+    if args.destination_buffer_sizes is not None:
+        if len(args.destination_buffer_sizes) != num_destinations:
+            raise ValueError(
+                "--destination-buffer-sizes must specify exactly world_size - 1 values"
+            )
+        if any(nbytes <= 0 for nbytes in args.destination_buffer_sizes):
+            raise ValueError("--destination-buffer-sizes values must be positive")
+        size_layout = "destination-indexed"
+        copy_sizes_by_destination = tuple(
+            tuple(nbytes for _ in range(args.num_source_buffers))
+            for nbytes in args.destination_buffer_sizes
+        )
+    else:
+        size_layout = "source-indexed"
+        copy_sizes_by_destination = tuple(
+            source_sub_buffer_sizes for _ in range(num_destinations)
+        )
+
     entries_per_batch = args.num_source_buffers
     batches_per_iter = num_destinations
     copies_per_iter = batches_per_iter * entries_per_batch
-    bytes_per_destination = sum(sub_buffer_sizes)
-    bytes_per_iter = bytes_per_destination * num_destinations
+    bytes_per_destination_by_index = tuple(sum(sizes) for sizes in copy_sizes_by_destination)
+    if args.destination_buffer_sizes is None:
+        bytes_per_destination_text = fmt_bytes(bytes_per_destination_by_index[0])
+    else:
+        bytes_per_destination_text = ",".join(
+            fmt_bytes(nbytes) for nbytes in bytes_per_destination_by_index
+        )
+    bytes_per_iter = sum(bytes_per_destination_by_index)
 
     unsupported_peers = [
         device for device in dst_devices
@@ -225,7 +271,20 @@ def main() -> None:
     for dst_device in dst_devices:
         cuda_enable_peer_access(src_device, dst_device)
 
-    source_buffer_extents = tuple(nbytes * num_destinations for nbytes in sub_buffer_sizes)
+    source_sub_offsets = tuple(
+        build_contiguous_offsets(
+            copy_sizes_by_destination[destination_index][source_index]
+            for destination_index in range(num_destinations)
+        )
+        for source_index in range(args.num_source_buffers)
+    )
+    source_buffer_extents = tuple(
+        sum(
+            copy_sizes_by_destination[destination_index][source_index]
+            for destination_index in range(num_destinations)
+        )
+        for source_index in range(args.num_source_buffers)
+    )
     source_buffer_offsets: List[int] = []
     source_backing_size = 0
     for source_index, extent in enumerate(source_buffer_extents):
@@ -243,23 +302,29 @@ def main() -> None:
     source_backing.fill_((rank + 211) % 251)
 
     source_buffers: List[torch.Tensor] = []
-    for source_index, (source_offset, sub_buffer_size, source_extent) in enumerate(
-        zip(source_buffer_offsets, sub_buffer_sizes, source_buffer_extents)
+    for source_index, (source_offset, source_extent) in enumerate(
+        zip(source_buffer_offsets, source_buffer_extents)
     ):
         src = source_backing[source_offset:source_offset + source_extent]
         for destination_index in range(num_destinations):
-            offset = destination_index * sub_buffer_size
-            src[offset:offset + sub_buffer_size].fill_(
+            offset = source_sub_offsets[source_index][destination_index]
+            nbytes = copy_sizes_by_destination[destination_index][source_index]
+            src[offset:offset + nbytes].fill_(
                 chunk_value(rank, source_index, destination_index)
             )
         source_buffers.append(src)
 
-    dst_offsets = build_contiguous_offsets(sub_buffer_sizes)
     destinations: Dict[int, torch.Tensor] = {}
-    for dst_device in dst_devices:
+    dst_offset_groups: Dict[int, Tuple[int, ...]] = {}
+    copy_size_groups: Dict[int, Tuple[int, ...]] = {}
+    for destination_index, dst_device in enumerate(dst_devices):
+        destination_copy_sizes = copy_sizes_by_destination[destination_index]
+        copy_size_groups[dst_device] = destination_copy_sizes
+        dst_offset_groups[dst_device] = build_contiguous_offsets(destination_copy_sizes)
+
         torch.cuda.set_device(dst_device)
         dst = torch.empty(
-            bytes_per_destination,
+            bytes_per_destination_by_index[destination_index],
             dtype=torch.uint8,
             device=f"cuda:{dst_device}",
         )
@@ -276,16 +341,16 @@ def main() -> None:
     for destination_index, dst_device in enumerate(dst_devices):
         src_ptrs = tuple(
             source_buffers[source_index].data_ptr()
-            + destination_index * sub_buffer_sizes[source_index]
+            + source_sub_offsets[source_index][destination_index]
             for source_index in range(args.num_source_buffers)
         )
         dst_ptrs = tuple(
-            destinations[dst_device].data_ptr() + dst_offsets[source_index]
+            destinations[dst_device].data_ptr() + dst_offset_groups[dst_device][source_index]
             for source_index in range(args.num_source_buffers)
         )
         src_ptr_groups[dst_device] = src_ptrs
         dst_ptr_groups[dst_device] = dst_ptrs
-        batches[dst_device] = MemcpyBatch(dst_ptrs, src_ptrs, sub_buffer_sizes)
+        batches[dst_device] = MemcpyBatch(dst_ptrs, src_ptrs, copy_size_groups[dst_device])
 
     torch.cuda.set_device(src_device)
     stream = torch.cuda.Stream(device=src_device)
@@ -301,7 +366,7 @@ def main() -> None:
     for _ in range(args.warmup):
         enqueue_iteration(
             args.copy_mode, src_device, dst_devices, src_ptr_groups,
-            dst_ptr_groups, sub_buffer_sizes, batches, stream
+            dst_ptr_groups, copy_size_groups, batches, stream
         )
     cuda_stream_synchronize(stream)
     barrier()
@@ -311,7 +376,7 @@ def main() -> None:
     for _ in range(args.iters):
         enqueue_iteration(
             args.copy_mode, src_device, dst_devices, src_ptr_groups,
-            dst_ptr_groups, sub_buffer_sizes, batches, stream
+            dst_ptr_groups, copy_size_groups, batches, stream
         )
     cuda_stream_synchronize(stream)
     t1 = time.perf_counter()
@@ -331,7 +396,7 @@ def main() -> None:
     failure_detail = ""
     if args.check:
         ok, failure_detail = check_destinations(
-            destinations, dst_offsets, dst_devices, sub_buffer_sizes, rank
+            destinations, dst_offset_groups, dst_devices, copy_size_groups, rank
         )
 
     torch.cuda.set_device(src_device)
@@ -341,12 +406,15 @@ def main() -> None:
             print(
                 f"rank={rank:02d} source=cuda:{src_device} destinations={list(dst_devices)} "
                 f"mode={args.copy_mode} source_buffers={args.num_source_buffers} "
+                f"size_layout={size_layout} "
                 f"batches/iter={batches_per_iter} entries/batch={entries_per_batch} "
-                f"copies/iter={copies_per_iter} bytes/destination={fmt_bytes(bytes_per_destination)} "
+                f"copies/iter={copies_per_iter} "
+                f"bytes/destination={bytes_per_destination_text} "
                 f"bytes/iter={fmt_bytes(bytes_per_iter)} "
                 f"source_alloc={fmt_bytes(source_backing_size)} "
                 f"source_gap={fmt_bytes(args.source_buffer_gap_size)} "
-                f"sub_buffer_sizes={format_source_sizes(sub_buffer_sizes)} "
+                f"sub_buffer_sizes="
+                f"{format_destination_sizes(args.destination_buffer_sizes) if args.destination_buffer_sizes is not None else format_source_sizes(source_sub_buffer_sizes)} "
                 f"iters={args.iters} elapsed={elapsed:.6f}s "
                 f"egress_bw={local_egress_bw:.2f} GiB/s "
                 f"check={'OK' if ok else f'FAIL:{failure_detail}'}",

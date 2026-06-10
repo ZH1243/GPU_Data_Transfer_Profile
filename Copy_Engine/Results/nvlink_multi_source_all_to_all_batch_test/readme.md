@@ -10,7 +10,7 @@ buffer is split into 7 contiguous sub-buffers, one for each other GPU in an
 destination GPU. Each batch contains the 4 source-buffer chunks for that
 destination.
 
-The current sweep compares two source-buffer size layouts:
+The first sweep compares two source-buffer size layouts:
 
 - `3x8K + remainder`: three source buffers contribute `8K` chunks and the
   fourth contributes the remaining bytes.
@@ -33,6 +33,14 @@ reports, each `cudaMemcpyBatchAsync` destination batch appears as one coalesced
 source-side `Memcpy PtoP` activity, not as 4 separate activities for A/B/C/D.
 Therefore the analyzer reports `ptop_events/batch=1` and
 `source_buffers/batch=4`.
+
+The newer destination-indexed sweep uses the benchmark's
+`--destination-buffer-sizes` mode. It keeps the total bytes per source buffer at
+`1792K` while changing the size distribution across the 7 destination-indexed
+chunks. For example,
+`total_1792k_different_dst_sizes_batch_6*64k+1408k.nsys-rep` means chunks
+1 through 6 are `64K`, chunk 7 is `1408K`, and each source buffer A/B/C/D uses
+that same destination-indexed pattern.
 
 Sample commands used to collect the two layouts are:
 
@@ -100,6 +108,40 @@ for i in 128 256 512 1024 2048; do
 done
 ```
 
+Sample command used to collect the destination-indexed layout sweep:
+
+```bash
+num_dst_buffers=7
+
+for i in 8 32 64 128 256; do
+  total_k=$((7*1024/4))
+  last_dst_buffer_size=$((total_k - (num_dst_buffers - 1) * i))
+
+  dst_buffer_sizes=""
+  for ((j = 0; j < num_dst_buffers - 1; j++)); do
+    dst_buffer_sizes+="${i}K,"
+  done
+  dst_buffer_sizes+="${last_dst_buffer_size}K"
+
+  nsys profile \
+    -s none \
+    --cpuctxsw=none \
+    --trace=cuda,nvtx,cudnn,cublas \
+    -o "./nvlink_multi_source_all_to_all_batch_test/total_${total_k}k_different_dst_sizes_batch_6*${i}k+${last_dst_buffer_size}k" \
+    --gpu-metrics-devices=0 \
+    --gpu-metrics-set=gh100 \
+    --gpu-metrics-frequency=10000 \
+    --force-overwrite=true \
+    torchrun --standalone --nproc_per_node=8 nvlink_multi_source_all_to_all_batch_test.py \
+      --num_source_buffers 4 \
+      --destination-buffer-sizes "${dst_buffer_sizes}" \
+      --copy-mode batch \
+      --iters 100 \
+      --warmup 10 \
+      --check
+done
+```
+
 ## Scripts
 
 `analyze_nvlink_multi_source_all_to_all_batch_report.py` analyzes one
@@ -127,6 +169,17 @@ Example:
 
 ```bash
 python plot_nvlink_multi_source_all_to_all_batch_summary.py
+```
+
+`plot_nvlink_multi_source_different_dst_sizes.py` loads
+`total_*_different_dst_sizes_batch_*.sqlite` files, sorts them by the repeated
+small destination chunk size, and generates the destination-indexed NVLink
+RX/TX utilization figure.
+
+Example:
+
+```bash
+python plot_nvlink_multi_source_different_dst_sizes.py
 ```
 
 ## Summary Figures
@@ -177,3 +230,18 @@ Observations:
 - At `1024k` and `2048k`, the `3x8K + remainder` layout reaches higher sampled
   NVLink metrics in this run. At `2048k`, it reports about `30.9%` RX and
   `31.7%` TX, while the uniform run reports about `25.9%` RX and `26.0%` TX.
+
+### Destination-Indexed NVLink RX/TX Metrics
+
+![Destination-indexed NVLink RX/TX metrics](different_dst_sizes_nvlink_rx_tx_metrics.png)
+
+Observations:
+
+- This sweep keeps each source buffer's total destination-indexed extent fixed
+  at `1792K`, so the x-axis changes layout shape rather than total bytes.
+- The most skewed destination-indexed layout, `6x8k+1744k`, has the highest
+  sampled NVLink utilization: `31.449%` RX and `31.429%` TX.
+- Utilization generally decreases as the destination chunks become more
+  balanced. The `6x256k+256k` layout reports `24.516%` RX and `24.532%` TX.
+- RX and TX track each other closely across the sweep, with the largest small
+  separation at `6x64k+1408k`: `29.412%` RX and `29.863%` TX.
