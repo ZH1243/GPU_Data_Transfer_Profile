@@ -111,6 +111,35 @@ torchrun --standalone --nproc_per_node=8 Copy_Engine/nvlink_batch_address_layout
   --check
 ```
 
+### `nvlink_multi_source_all_to_all_batch_test.py`
+
+Multi-source all-to-all batched copy benchmark.
+
+Each rank owns one source GPU with multiple logical source buffers, such as
+A/B/C/D. Each logical source buffer is split into `world_size - 1` contiguous
+sub-buffers, one per peer GPU. For GPU `i`, the first sub-buffer from every
+source buffer goes to GPU `(i + 1) % world_size`, the second goes to GPU
+`(i + 2) % world_size`, and so on.
+
+The logical source buffers are separated by an explicit gap, but the sub-buffers
+inside each logical source buffer are contiguous. In batch mode, each rank
+submits one `cudaMemcpyBatchAsync` per destination GPU per iteration. For
+example, with 8 GPUs and `--num-source-buffers 4`, each rank submits 7 batch
+calls per iteration, and each batch contains 4 entries: A_k/B_k/C_k/D_k for one
+destination.
+
+Example:
+
+```bash
+torchrun --standalone --nproc_per_node=8 Copy_Engine/nvlink_multi_source_all_to_all_batch_test.py \
+  --num_source_buffers 4 \
+  --source-buffer-sizes 64K,128K,256K,512K \
+  --copy-mode batch \
+  --iters 100 \
+  --warmup 10 \
+  --check
+```
+
 ## Differences Between Scripts
 
 | Script | Traffic pattern | Main question | Copies per rank per iteration |
@@ -118,6 +147,7 @@ torchrun --standalone --nproc_per_node=8 Copy_Engine/nvlink_batch_address_layout
 | `nvlink_copy_engine_test.py` | One source GPU to one destination GPU | Baseline P2P copy-engine bandwidth and API comparison | `--copies-per-iter` |
 | `nvlink_all_to_all_copy_engine_test.py` | One source GPU to every other GPU | Aggregate all-to-all traffic and launch mode comparison | `world_size - 1` |
 | `nvlink_batch_address_layout_test.py` | One source GPU to one destination GPU with configurable address layout | Whether batch copies are coalesced/split by address contiguity | `--copies-per-iter` |
+| `nvlink_multi_source_all_to_all_batch_test.py` | Multiple logical source buffers on one GPU to every other GPU, grouped by destination | How per-destination batched calls behave when source buffers are non-contiguous but each source's sub-buffers are contiguous | `(world_size - 1) * --num-source-buffers` |
 
 ## Common Concepts
 
@@ -125,7 +155,7 @@ torchrun --standalone --nproc_per_node=8 Copy_Engine/nvlink_batch_address_layout
 
 - `separate`: enqueue one `cudaMemcpyPeerAsync` for each copy.
 - `batch`: enqueue one `cudaMemcpyBatchAsync` containing all copies for that
-  iteration.
+  iteration or destination group, depending on the script.
 
 ### Pair Modes
 
@@ -189,6 +219,20 @@ Each script prints per-rank timing/bandwidth and an aggregate summary:
 | `--warmup` | `10` | Number of warmup iterations before timing. |
 | `--mode` | `ring` | GPU-pair pattern: `ring`, `reverse-ring`, or `pair`. |
 | `--check` | disabled | Verify each destination chunk and destination gaps. |
+| `--sleep-before` | `0.0` | Seconds to sleep before benchmark, useful for attaching profilers. |
+
+### `nvlink_multi_source_all_to_all_batch_test.py`
+
+| Argument | Default | Description |
+| --- | --- | --- |
+| `--num-source-buffers`, `--num_source_buffers` | `4` | Number of logical source buffers per GPU, such as A/B/C/D. |
+| `--nbytes`, `--copy-size` | `1M` | Bytes per source sub-buffer when `--source-buffer-sizes` is not set. For example, this is the size of each A_i/B_i/C_i/D_i chunk. |
+| `--source-buffer-sizes`, `--source_buffer_sizes` | unset | Comma-separated per-source sub-buffer sizes, for example `64K,128K,256K,512K` for A_i/B_i/C_i/D_i. Must contain exactly `--num-source-buffers` values. |
+| `--source-buffer-gap-size`, `--source_buffer_gap_size` | `64K` | Gap between logical source buffers A/B/C/... so the logical source buffers are not contiguous. Sub-buffers within each logical source buffer remain contiguous. |
+| `--copy-mode` | `batch` | `separate` for one `cudaMemcpyPeerAsync` per source buffer per destination, or `batch` for one `cudaMemcpyBatchAsync` per destination. |
+| `--iters` | `100` | Number of timed iterations. |
+| `--warmup` | `10` | Number of warmup iterations before timing. |
+| `--check` | disabled | Verify copied bytes on every destination GPU. |
 | `--sleep-before` | `0.0` | Seconds to sleep before benchmark, useful for attaching profilers. |
 
 ## Nsight Systems Example
