@@ -71,6 +71,23 @@ def destination_order(src_device: int,
     return tuple((src_device + offset) % world_size for offset in range(1, world_size))
 
 
+def parse_gpu_ids(spec: str) -> tuple[int, ...]:
+    values = [part.strip() for part in spec.split(",")]
+    if any(not value for value in values):
+        raise argparse.ArgumentTypeError(
+            "GPU IDs must be a comma-separated list like 0 or 0,2,4"
+        )
+    try:
+        gpu_ids = tuple(int(value) for value in values)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "GPU IDs must be integers in a comma-separated list like 0 or 0,2,4"
+        ) from exc
+    if any(gpu_id < 0 for gpu_id in gpu_ids):
+        raise argparse.ArgumentTypeError("GPU IDs must be non-negative")
+    return tuple(dict.fromkeys(gpu_ids))
+
+
 def check_destinations(destinations: Dict[int, torch.Tensor],
                        nbytes: int,
                        expected: int) -> List[int]:
@@ -104,6 +121,10 @@ def main() -> None:
     p.add_argument("--rotate-destination-order", action="store_true",
                    help="send from GPU i to (i+1)%%world_size, ..., (i-1)%%world_size. "
                         "By default destinations are ascending GPU IDs with the source omitted.")
+    p.add_argument("--active-source-gpus", nargs="?", const="0", default=None,
+                   type=parse_gpu_ids, metavar="IDS",
+                   help="restrict copying to comma-separated source GPU IDs. If enabled "
+                        "without IDS, only GPU 0 copies. Default: all GPUs copy.")
     args = p.parse_args()
 
     rank, world_size, local_rank = get_rank_info()
@@ -123,49 +144,70 @@ def main() -> None:
     if args.warmup < 0:
         raise ValueError("--warmup must be non-negative")
 
-    if args.copy_mode == "batch":
+    src_device = local_rank
+    torch.cuda.set_device(src_device)
+    if args.active_source_gpus is None:
+        active_source_gpus = tuple(range(world_size))
+    else:
+        active_source_gpus = args.active_source_gpus
+        invalid_gpus = [
+            gpu_id for gpu_id in active_source_gpus
+            if gpu_id >= world_size
+        ]
+        if invalid_gpus:
+            raise ValueError(
+                f"--active-source-gpus contains GPU ID(s) outside this run's "
+                f"0..{world_size - 1} range: {invalid_gpus}"
+            )
+    source_is_active = src_device in set(active_source_gpus)
+    if args.copy_mode == "batch" and source_is_active:
         _get_cuda_memcpy_batch_async()
 
-    src_device = local_rank
-    dst_devices = destination_order(
-        src_device, world_size, args.rotate_destination_order
+    dst_devices = (
+        destination_order(src_device, world_size, args.rotate_destination_order)
+        if source_is_active
+        else ()
     )
     copies_per_iter = len(dst_devices)
     bytes_per_iter = args.nbytes * copies_per_iter
 
-    unsupported_peers = [
-        device for device in dst_devices
-        if not cuda_can_access_peer(src_device, device)
-    ]
-    if unsupported_peers:
-        raise RuntimeError(
-            f"Source GPU {src_device} cannot access destination peer GPU(s) "
-            f"{unsupported_peers}. Check CUDA_VISIBLE_DEVICES and nvidia-smi topo -m."
-        )
-
-    for dst_device in dst_devices:
-        cuda_enable_peer_access(src_device, dst_device)
-
-    torch.cuda.set_device(src_device)
-    src = torch.empty(args.nbytes, dtype=torch.uint8, device=f"cuda:{src_device}")
     expected = (rank + 17) % 251
-    src.fill_(expected)
-
+    src_ptr = 0
+    dst_ptrs: tuple[int, ...] = ()
+    batch = None
     destinations: Dict[int, torch.Tensor] = {}
-    for dst_device in dst_devices:
-        torch.cuda.set_device(dst_device)
-        dst = torch.empty(args.nbytes, dtype=torch.uint8, device=f"cuda:{dst_device}")
-        dst.fill_((expected + 1) % 251)
-        destinations[dst_device] = dst
+    if source_is_active:
+        unsupported_peers = [
+            device for device in dst_devices
+            if not cuda_can_access_peer(src_device, device)
+        ]
+        if unsupported_peers:
+            raise RuntimeError(
+                f"Source GPU {src_device} cannot access destination peer GPU(s) "
+                f"{unsupported_peers}. Check CUDA_VISIBLE_DEVICES and nvidia-smi topo -m."
+            )
 
-    torch.cuda.synchronize(src_device)
-    for dst_device in dst_devices:
-        torch.cuda.synchronize(dst_device)
+        for dst_device in dst_devices:
+            cuda_enable_peer_access(src_device, dst_device)
 
-    src_ptr = src.data_ptr()
-    src_ptrs = (src_ptr,) * copies_per_iter
-    dst_ptrs = tuple(destinations[device].data_ptr() for device in dst_devices)
-    batch = MemcpyBatch(dst_ptrs, src_ptrs, args.nbytes)
+        torch.cuda.set_device(src_device)
+        src = torch.empty(args.nbytes, dtype=torch.uint8, device=f"cuda:{src_device}")
+        src.fill_(expected)
+
+        for dst_device in dst_devices:
+            torch.cuda.set_device(dst_device)
+            dst = torch.empty(args.nbytes, dtype=torch.uint8, device=f"cuda:{dst_device}")
+            dst.fill_((expected + 1) % 251)
+            destinations[dst_device] = dst
+
+        torch.cuda.synchronize(src_device)
+        for dst_device in dst_devices:
+            torch.cuda.synchronize(dst_device)
+
+        src_ptr = src.data_ptr()
+        src_ptrs = (src_ptr,) * copies_per_iter
+        dst_ptrs = tuple(destinations[device].data_ptr() for device in dst_devices)
+        batch = MemcpyBatch(dst_ptrs, src_ptrs, args.nbytes)
 
     # One source-device stream owns all outgoing copies from this rank.
     torch.cuda.set_device(src_device)
@@ -179,28 +221,34 @@ def main() -> None:
     barrier()
 
     cuda_set_device(src_device)
-    for _ in range(args.warmup):
-        enqueue_iteration(
-            args.copy_mode, src_ptr, src_device, dst_ptrs, dst_devices,
-            args.nbytes, batch, stream
-        )
-    cuda_stream_synchronize(stream)
+    if source_is_active:
+        assert batch is not None
+        for _ in range(args.warmup):
+            enqueue_iteration(
+                args.copy_mode, src_ptr, src_device, dst_ptrs, dst_devices,
+                args.nbytes, batch, stream
+            )
+        cuda_stream_synchronize(stream)
     barrier()
 
     cuda_set_device(src_device)
-    t0 = time.perf_counter()
-    for _ in range(args.iters):
-        enqueue_iteration(
-            args.copy_mode, src_ptr, src_device, dst_ptrs, dst_devices,
-            args.nbytes, batch, stream
-        )
-    cuda_stream_synchronize(stream)
-    t1 = time.perf_counter()
+    if source_is_active:
+        assert batch is not None
+        t0 = time.perf_counter()
+        for _ in range(args.iters):
+            enqueue_iteration(
+                args.copy_mode, src_ptr, src_device, dst_ptrs, dst_devices,
+                args.nbytes, batch, stream
+            )
+        cuda_stream_synchronize(stream)
+        t1 = time.perf_counter()
+        elapsed = t1 - t0
+    else:
+        elapsed = 0.0
     barrier()
 
-    elapsed = t1 - t0
     local_gib = (bytes_per_iter * args.iters) / (1024**3)
-    local_egress_bw = local_gib / elapsed
+    local_egress_bw = local_gib / elapsed if elapsed > 0 else 0.0
 
     ref_device = torch.device(f"cuda:{local_rank}")
     max_elapsed = all_reduce_max_float(elapsed, ref_device)
@@ -219,6 +267,7 @@ def main() -> None:
         if rank == output_rank:
             print(
                 f"rank={rank:02d} source=cuda:{src_device} destinations={list(dst_devices)} "
+                f"active={source_is_active} active_sources={list(active_source_gpus)} "
                 f"mode={args.copy_mode} copies/iter={copies_per_iter} "
                 f"bytes/copy={fmt_bytes(args.nbytes)} bytes/iter={fmt_bytes(bytes_per_iter)} "
                 f"iters={args.iters} elapsed={elapsed:.6f}s "
@@ -232,18 +281,20 @@ def main() -> None:
         submission_description = (
             "one cudaMemcpyBatchAsync"
             if args.copy_mode == "batch"
-            else f"{copies_per_iter} cudaMemcpyPeerAsync calls"
+            else f"{world_size - 1} cudaMemcpyPeerAsync calls"
         )
+        aggregate_copies_per_iter = len(active_source_gpus) * (world_size - 1)
         print(
-            f"\nAggregate all-to-all traffic over {world_size} ranks: "
-            f"copies/iteration={world_size * copies_per_iter}, "
+            f"\nAggregate all-to-all traffic over {world_size} ranks "
+            f"with {len(active_source_gpus)} active source rank(s): "
+            f"copies/iteration={aggregate_copies_per_iter}, "
             f"moved={sum_gib:.2f} GiB, slowest_elapsed={max_elapsed:.6f}s, "
             f"aggregate_bw={aggregate_bw:.2f} GiB/s",
             flush=True,
         )
         print(
-            f"\nProfiler expectation: each rank submits "
-            f"{submission_description} per iteration.",
+            f"\nProfiler expectation: each active rank submits "
+            f"{submission_description} per iteration; inactive ranks submit no copies.",
             flush=True,
         )
 

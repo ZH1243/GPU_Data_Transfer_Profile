@@ -66,6 +66,11 @@ By default, each rank visits destination GPUs in ascending ID order, omitting it
 own source GPU. Use `--rotate-destination-order` to make source GPU `i` visit
 `(i + 1) % world_size`, ..., `(i - 1) % world_size` instead.
 
+By default all ranks submit copy work. Use `--active-source-gpus` to restrict
+submission to GPU 0, or pass a comma-separated list such as
+`--active-source-gpus 0,4` to select specific source GPUs. Non-selected ranks
+still join synchronization and reporting, but submit no copies.
+
 Per rank and iteration:
 
 - `separate`: submits `world_size - 1` `cudaMemcpyPeerAsync` calls.
@@ -226,6 +231,7 @@ Each script prints per-rank timing/bandwidth and an aggregate summary:
 | `--check` | disabled | Verify copied bytes on every destination GPU. |
 | `--sleep-before` | `0.0` | Seconds to sleep before benchmark, useful for attaching profilers. |
 | `--rotate-destination-order` | disabled | Send from GPU `i` to `(i + 1) % world_size`, ..., `(i - 1) % world_size` instead of ascending destination GPU IDs with the source omitted. |
+| `--active-source-gpus [IDS]` | disabled | Restrict copy submission to selected source GPU IDs. If the flag is passed without `IDS`, only GPU 0 copies. With `IDS`, use a comma-separated list such as `0,4`. |
 
 ### `nvlink_batch_address_layout_test.py`
 
