@@ -62,6 +62,10 @@ to one private destination buffer on every other participating GPU. Across all
 ranks, this creates concurrent all-to-all traffic. Use this script when you want
 to stress aggregate node traffic instead of a single pair pattern.
 
+By default, each rank visits destination GPUs in ascending ID order, omitting its
+own source GPU. Use `--rotate-destination-order` to make source GPU `i` visit
+`(i + 1) % world_size`, ..., `(i - 1) % world_size` instead.
+
 Per rank and iteration:
 
 - `separate`: submits `world_size - 1` `cudaMemcpyPeerAsync` calls.
@@ -221,6 +225,7 @@ Each script prints per-rank timing/bandwidth and an aggregate summary:
 | `--warmup` | `10` | Number of warmup iterations before timing. |
 | `--check` | disabled | Verify copied bytes on every destination GPU. |
 | `--sleep-before` | `0.0` | Seconds to sleep before benchmark, useful for attaching profilers. |
+| `--rotate-destination-order` | disabled | Send from GPU `i` to `(i + 1) % world_size`, ..., `(i - 1) % world_size` instead of ascending destination GPU IDs with the source omitted. |
 
 ### `nvlink_batch_address_layout_test.py`
 

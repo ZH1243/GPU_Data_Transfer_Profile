@@ -63,6 +63,14 @@ def enqueue_iteration(copy_mode: str,
         )
 
 
+def destination_order(src_device: int,
+                      world_size: int,
+                      rotate_by_source: bool) -> tuple[int, ...]:
+    if not rotate_by_source:
+        return tuple(device for device in range(world_size) if device != src_device)
+    return tuple((src_device + offset) % world_size for offset in range(1, world_size))
+
+
 def check_destinations(destinations: Dict[int, torch.Tensor],
                        nbytes: int,
                        expected: int) -> List[int]:
@@ -93,6 +101,9 @@ def main() -> None:
                    help="verify copied bytes on every destination GPU")
     p.add_argument("--sleep-before", type=float, default=0.0,
                    help="seconds to sleep before benchmark, useful for attaching profilers")
+    p.add_argument("--rotate-destination-order", action="store_true",
+                   help="send from GPU i to (i+1)%%world_size, ..., (i-1)%%world_size. "
+                        "By default destinations are ascending GPU IDs with the source omitted.")
     args = p.parse_args()
 
     rank, world_size, local_rank = get_rank_info()
@@ -116,7 +127,9 @@ def main() -> None:
         _get_cuda_memcpy_batch_async()
 
     src_device = local_rank
-    dst_devices = tuple(device for device in range(world_size) if device != src_device)
+    dst_devices = destination_order(
+        src_device, world_size, args.rotate_destination_order
+    )
     copies_per_iter = len(dst_devices)
     bytes_per_iter = args.nbytes * copies_per_iter
 
