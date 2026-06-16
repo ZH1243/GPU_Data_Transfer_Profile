@@ -12,6 +12,13 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from routing import (
+    add_routing_arguments,
+    make_fake_routing,
+    routing_mode_summary,
+    validate_routing_args,
+)
+
 
 _DEEPEP_BUFFER = None
 
@@ -83,6 +90,7 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
     )
+    add_routing_arguments(parser)
     return parser.parse_args()
 
 
@@ -119,6 +127,7 @@ def validate_args(args: argparse.Namespace, world_size: int) -> None:
     for ok, message in checks:
         if not ok:
             raise ValueError(message)
+    validate_routing_args(args)
 
 
 def init_distributed() -> tuple[int, int, int]:
@@ -152,20 +161,6 @@ def create_ep_group(ep_size: int) -> tuple[dist.ProcessGroup, int, int]:
     if ep_group is None:
         raise RuntimeError("Failed to create EP process group.")
     return ep_group, ep_group_id, ep_rank
-
-
-def make_random_routing(
-    num_tokens: int,
-    num_experts: int,
-    topk: int,
-    device: torch.device,
-    topk_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    scores = torch.rand((num_tokens, num_experts), device=device, dtype=torch.float32)
-    token_indices = torch.topk(scores, k=topk, dim=-1, sorted=False).indices.to(topk_dtype)
-    raw_probs = torch.rand((num_tokens, topk), device=device, dtype=torch.float32)
-    token_probs = raw_probs / raw_probs.sum(dim=-1, keepdim=True).clamp_min(1.0e-20)
-    return token_indices, token_probs
 
 
 def wait_if_async(event: Any, async_finish: bool) -> None:
@@ -278,12 +273,17 @@ def main() -> int:
     torch.manual_seed(args.seed + rank)
     torch.cuda.manual_seed_all(args.seed + rank)
     input_tokens = torch.randn((args.num_local_tokens, args.token_hidden), device=device, dtype=dtype)
-    token_indices, token_probs = make_random_routing(
+    token_indices, token_probs = make_fake_routing(
         args.num_local_tokens,
         args.num_of_experts,
         args.topk,
         device,
         topk_dtype,
+        ep_size=args.ep,
+        ep_rank=ep_rank,
+        uniform=args.uniform_routing,
+        exclude_local_node=args.exclude_local_node_routing,
+        routing_ranks_per_node=args.routing_ranks_per_node,
     )
     buffer = get_buffer(ep_group, hidden_bytes(input_tokens))
 
@@ -295,19 +295,24 @@ def main() -> int:
             f"ep_rank={ep_rank}/{args.ep} mode={'inter-node' if args.ep > 8 else 'intra-node'} "
             f"tokens={args.num_local_tokens} hidden={args.token_hidden} "
             f"experts={args.num_of_experts} local_experts={num_local_experts} "
-            f"topk={args.topk} dtype={args.dtype}"
+            f"topk={args.topk} dtype={args.dtype} routing={routing_mode_summary(args)}"
         ),
     )
 
     dist.barrier(group=ep_group)
     for _ in range(args.warmup_iters):
         if args.rerandomize_routing_each_iter:
-            token_indices, token_probs = make_random_routing(
+            token_indices, token_probs = make_fake_routing(
                 args.num_local_tokens,
                 args.num_of_experts,
                 args.topk,
                 device,
                 topk_dtype,
+                ep_size=args.ep,
+                ep_rank=ep_rank,
+                uniform=args.uniform_routing,
+                exclude_local_node=args.exclude_local_node_routing,
+                routing_ranks_per_node=args.routing_ranks_per_node,
             )
         run_dispatch(args, buffer, input_tokens, token_indices, token_probs)
     dist.barrier(group=ep_group)
@@ -316,12 +321,17 @@ def main() -> int:
     last_meta = None
     for _ in range(args.benchmark_iters):
         if args.rerandomize_routing_each_iter:
-            token_indices, token_probs = make_random_routing(
+            token_indices, token_probs = make_fake_routing(
                 args.num_local_tokens,
                 args.num_of_experts,
                 args.topk,
                 device,
                 topk_dtype,
+                ep_size=args.ep,
+                ep_rank=ep_rank,
+                uniform=args.uniform_routing,
+                exclude_local_node=args.exclude_local_node_routing,
+                routing_ranks_per_node=args.routing_ranks_per_node,
             )
         ms, last_meta = run_dispatch(args, buffer, input_tokens, token_indices, token_probs)
         timings.append(ms)

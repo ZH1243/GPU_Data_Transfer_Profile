@@ -96,6 +96,7 @@ For default `bf16`, each hidden element is 2 bytes. With
 4. Creates fake top-k router metadata:
    - `token_indices`: `[num_local_tokens, topk]`
    - `token_probs`: `[num_local_tokens, topk]`
+   By default, the fake router randomly selects experts.
 5. Allocates a DeepEP V1 `Buffer`.
 6. Calls `buffer.get_dispatch_layout(...)`.
 7. Calls `buffer.dispatch(...)`.
@@ -126,6 +127,16 @@ For default `bf16`, each hidden element is 2 bytes. With
 - `--rerandomize-routing-each-iter`: dispatch test only; regenerate fake router
   metadata every iteration.
 - `--fake-expert-output {identity,random}`: combine test only.
+- `--uniform-routing / --no-uniform-routing`: route local token `i` to
+  consecutive eligible expert IDs. Expert IDs are zero-based in the tensors, so
+  with `--topk 2`, token 0 routes to experts `[0, 1]`, token 1 to `[1, 2]`,
+  and so on, wrapping at the end.
+- `--exclude-local-node-routing / --no-exclude-local-node-routing`: exclude
+  experts owned by ranks in the same routing node as the source token. When this
+  is combined with `--uniform-routing`, tokens are uniformly distributed only
+  across experts on other routing nodes.
+- `--routing-ranks-per-node`: number of ranks treated as one routing node for
+  `--exclude-local-node-routing`, default `8`.
 
 `--allocate-on-comm-stream` requires `--async-finish`, matching the DeepEP V1
 event dependency requirements.
@@ -140,5 +151,7 @@ event dependency requirements.
 - `--ep` must divide `WORLD_SIZE`.
 - `--num-of-experts` must divide `--ep`.
 - `--topk` must be less than or equal to `--num-of-experts`.
+- With `--exclude-local-node-routing`, `--topk` must fit in the minimum number
+  of experts outside any local routing node.
 - Expert TP is fixed to 1.
 - Expert computation is intentionally skipped.
