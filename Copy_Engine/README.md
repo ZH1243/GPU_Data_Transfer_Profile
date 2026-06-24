@@ -88,6 +88,49 @@ torchrun --standalone --nproc_per_node=8 Copy_Engine/nvlink_all_to_all_copy_engi
   --check
 ```
 
+### `nvlink_all_to_all_multistream_batch_copy_engine_test.py`
+
+All-to-all benchmark using one `cudaMemcpyBatchAsync` per enabled destination.
+
+Each rank owns one source GPU. In every iteration, the rank submits one batched
+copy-engine request for each enabled peer destination. The
+`--destination-copy-specs` argument controls the batch payload for each peer:
+`0` disables that destination, `SIZE` submits one copy of that size, and
+`COUNT*SIZE` submits one batch containing `COUNT` independent copies of `SIZE`.
+The number of comma-separated entries must be exactly `world_size - 1`.
+
+By default, every enabled destination gets a dedicated source-device CUDA
+stream. This is useful for checking whether host-side `cudaMemcpyBatchAsync`
+metadata handoff and GPU `Memcpy PtoP` work can overlap across streams. Use
+`--single-stream` to submit all destination batches on one shared source-device
+CUDA stream instead. That mode is useful when you want stream ordering to
+serialize the per-destination batch submissions.
+
+Source copy regions inside each destination batch are separated by
+`--source-buffer-gap-size` bytes by default, while destination regions are
+contiguous.
+
+Example:
+
+```bash
+torchrun --standalone --nproc_per_node=8 Copy_Engine/nvlink_all_to_all_multistream_batch_copy_engine_test.py \
+  --destination-copy-specs "1*1024K,2*512K,0,2*512K,2*512K,2*512K,32*8K" \
+  --iters 100 \
+  --warmup 10 \
+  --check
+```
+
+Single-stream comparison:
+
+```bash
+torchrun --standalone --nproc_per_node=8 Copy_Engine/nvlink_all_to_all_multistream_batch_copy_engine_test.py \
+  --destination-copy-specs "1*1024K,2*512K,0,2*512K,2*512K,2*512K,32*8K" \
+  --single-stream \
+  --iters 100 \
+  --warmup 10 \
+  --check
+```
+
 ### `nvlink_batch_address_layout_test.py`
 
 Batch address-layout experiment.
@@ -173,6 +216,7 @@ torchrun --standalone --nproc_per_node=8 Copy_Engine/nvlink_multi_source_all_to_
 | --- | --- | --- | --- |
 | `nvlink_copy_engine_test.py` | One source GPU to one destination GPU | Baseline P2P copy-engine bandwidth and API comparison | `--copies-per-iter` |
 | `nvlink_all_to_all_copy_engine_test.py` | One source GPU to every other GPU | Aggregate all-to-all traffic and launch mode comparison | `world_size - 1` |
+| `nvlink_all_to_all_multistream_batch_copy_engine_test.py` | One source GPU to every other GPU, grouped into one batch per destination | Whether per-destination batch calls and P2P copies overlap across CUDA streams | Sum of enabled entries in `--destination-copy-specs` |
 | `nvlink_batch_address_layout_test.py` | One source GPU to one destination GPU with configurable address layout | Whether batch copies are coalesced/split by address contiguity | `--copies-per-iter` |
 | `nvlink_multi_source_all_to_all_batch_test.py` | Multiple logical source buffers on one GPU to every other GPU, grouped by destination | How per-destination batched calls behave when source buffers are non-contiguous but each source's sub-buffers are contiguous | `(world_size - 1) * --num-source-buffers` |
 
@@ -231,6 +275,21 @@ Each script prints per-rank timing/bandwidth and an aggregate summary:
 | `--check` | disabled | Verify copied bytes on every destination GPU. |
 | `--sleep-before` | `0.0` | Seconds to sleep before benchmark, useful for attaching profilers. |
 | `--rotate-destination-order` | disabled | Send from GPU `i` to `(i + 1) % world_size`, ..., `(i - 1) % world_size` instead of ascending destination GPU IDs with the source omitted. |
+| `--active-source-gpus [IDS]` | disabled | Restrict copy submission to selected source GPU IDs. If the flag is passed without `IDS`, only GPU 0 copies. With `IDS`, use a comma-separated list such as `0,4`. |
+
+### `nvlink_all_to_all_multistream_batch_copy_engine_test.py`
+
+| Argument | Default | Description |
+| --- | --- | --- |
+| `--destination-copy-specs`, `--destination_copy_specs` | `1*1024K,2*512K,0,2*512K,2*512K,2*512K,32*8K` | Per-destination batch specification. Each entry is `0`, `SIZE`, or `COUNT*SIZE`. Must contain exactly `world_size - 1` entries. |
+| `--source-buffer-gap-size`, `--source_buffer_gap_size` | `64K` | Gap inserted between source copy regions inside each destination batch. Use `0` for contiguous source regions. |
+| `--iters` | `100` | Number of timed iterations. |
+| `--warmup` | `10` | Number of warmup iterations before timing. |
+| `--check` | disabled | Verify copied bytes on every enabled destination GPU. |
+| `--sleep-before` | `0.0` | Seconds to sleep before benchmark, useful for attaching profilers. |
+| `--concurrent-host-submission` | disabled | Submit one `cudaMemcpyBatchAsync` per enabled destination from separate host threads released by a per-iteration barrier. By default, the main thread submits destination batches sequentially. |
+| `--single-stream` | disabled | Submit all enabled destination batches on one shared source-device CUDA stream. By default, each enabled destination gets its own source-device CUDA stream. |
+| `--rotate-destination-order` | disabled | Map spec entries to `(src + 1) % world_size`, ..., `(src - 1) % world_size` instead of ascending destination GPU IDs with the source omitted. |
 | `--active-source-gpus [IDS]` | disabled | Restrict copy submission to selected source GPU IDs. If the flag is passed without `IDS`, only GPU 0 copies. With `IDS`, use a comma-separated list such as `0,4`. |
 
 ### `nvlink_batch_address_layout_test.py`
