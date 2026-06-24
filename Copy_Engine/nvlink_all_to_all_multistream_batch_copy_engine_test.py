@@ -25,9 +25,12 @@ independent 8 KiB copies. Entry "0" disables traffic to that peer.
 """
 
 import argparse
+import mmap
+import os
+import struct
 import threading
 import time
-from typing import Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -175,7 +178,8 @@ def enqueue_iterations_concurrent(num_iterations: int,
                                   src_device: int,
                                   enabled_dst_devices: Sequence[int],
                                   batches: Dict[int, MemcpyBatch],
-                                  streams: Dict[int, torch.cuda.Stream]) -> None:
+                                  streams: Dict[int, torch.cuda.Stream],
+                                  after_iteration: Callable[[], None] | None = None) -> None:
     if num_iterations <= 0:
         return
     if not enabled_dst_devices:
@@ -223,6 +227,8 @@ def enqueue_iterations_concurrent(num_iterations: int,
         for _ in range(num_iterations):
             start_barrier.wait()
             done_barrier.wait()
+            if after_iteration is not None:
+                after_iteration()
     except threading.BrokenBarrierError as exc:
         original_error = first_worker_error()
         if original_error is not None:
@@ -258,6 +264,177 @@ def synchronize_streams(streams: Dict[int, torch.cuda.Stream]) -> None:
 
 def count_unique_streams(streams: Dict[int, torch.cuda.Stream]) -> int:
     return len({stream.cuda_stream for stream in streams.values()})
+
+
+class SharedMemorySpinBarrier:
+    """Single-node process barrier using one shared generation slot per rank."""
+
+    WORD_SIZE = 4
+
+    def __init__(self,
+                 rank: int,
+                 world_size: int,
+                 path: str | None = None,
+                 yield_every: int = 1000) -> None:
+        self.rank = rank
+        self.world_size = world_size
+        self.path = path or self._default_path(world_size)
+        self.yield_every = yield_every
+        self.generation = 0
+        self.size = self.world_size * self.WORD_SIZE
+
+        if rank == 0:
+            fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                os.ftruncate(fd, self.size)
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, b"\x00" * self.size)
+            finally:
+                os.close(fd)
+
+        # One setup barrier is fine outside the timed copy loop. It prevents
+        # non-zero ranks from opening the mmap file before rank 0 creates it.
+        barrier()
+
+        fd = os.open(self.path, os.O_RDWR)
+        try:
+            self.mapping = mmap.mmap(fd, self.size, access=mmap.ACCESS_WRITE)
+        finally:
+            os.close(fd)
+
+        barrier()
+
+    @staticmethod
+    def _default_path(world_size: int) -> str:
+        base_dir = (
+            "/dev/shm"
+            if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK)
+            else "/tmp"
+        )
+        parts = [
+            os.environ.get("MASTER_ADDR", "localhost"),
+            os.environ.get("MASTER_PORT", "unknown"),
+            os.environ.get("TORCHELASTIC_RUN_ID", "standalone"),
+            str(world_size),
+        ]
+        safe_name = "".join(
+            ch if ch.isalnum() or ch in "._-" else "_"
+            for ch in "_".join(parts)
+        )
+        return os.path.join(
+            base_dir,
+            f"nvlink_a2a_multistream_iter_barrier_{os.getuid()}_{safe_name}",
+        )
+
+    def wait(self) -> None:
+        self.generation += 1
+        offset = self.rank * self.WORD_SIZE
+        struct.pack_into("<I", self.mapping, offset, self.generation)
+
+        spins = 0
+        while True:
+            all_arrived = True
+            for peer_rank in range(self.world_size):
+                peer_offset = peer_rank * self.WORD_SIZE
+                value = struct.unpack_from("<I", self.mapping, peer_offset)[0]
+                if value < self.generation:
+                    all_arrived = False
+                    break
+            if all_arrived:
+                return
+
+            spins += 1
+            if self.yield_every > 0 and spins % self.yield_every == 0:
+                time.sleep(0)
+
+    def close(self) -> None:
+        self.mapping.close()
+        if self.rank == 0:
+            try:
+                os.unlink(self.path)
+            except FileNotFoundError:
+                pass
+
+
+def create_gloo_process_barrier() -> Tuple[Callable[[], None], object | None]:
+    if not (dist.is_available() and dist.is_initialized()):
+        return barrier, None
+
+    try:
+        cpu_group = dist.new_group(backend="gloo")
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "--sync-each-iter requires a CPU-side Gloo process group, but "
+            "PyTorch could not create one. Check that this PyTorch build has "
+            "distributed Gloo support."
+        ) from exc
+
+    def cpu_process_barrier() -> None:
+        dist.barrier(group=cpu_group)
+
+    return cpu_process_barrier, cpu_group
+
+
+def create_iteration_barrier(backend: str,
+                             rank: int,
+                             world_size: int,
+                             shared_memory_path: str | None) -> Tuple[Callable[[], None], object | None]:
+    if backend == "gloo":
+        return create_gloo_process_barrier()
+    if backend == "shared-memory":
+        shared_barrier = SharedMemorySpinBarrier(
+            rank, world_size, path=shared_memory_path
+        )
+        return shared_barrier.wait, shared_barrier
+    raise ValueError(f"unknown iteration barrier backend {backend!r}")
+
+
+def run_iterations(num_iterations: int,
+                   src_device: int,
+                   source_is_active: bool,
+                   sync_each_iter: bool,
+                   concurrent_host_submission: bool,
+                   dst_devices: Sequence[int],
+                   enabled_dst_devices: Sequence[int],
+                   batches: Dict[int, MemcpyBatch],
+                   streams: Dict[int, torch.cuda.Stream],
+                   iteration_barrier: Callable[[], None]) -> None:
+    cuda_set_device(src_device)
+
+    if sync_each_iter:
+        if source_is_active:
+            if concurrent_host_submission:
+                def after_iteration() -> None:
+                    synchronize_streams(streams)
+                    iteration_barrier()
+
+                enqueue_iterations_concurrent(
+                    num_iterations,
+                    src_device,
+                    enabled_dst_devices,
+                    batches,
+                    streams,
+                    after_iteration=after_iteration,
+                )
+            else:
+                for _ in range(num_iterations):
+                    enqueue_iteration(dst_devices, batches, streams)
+                    synchronize_streams(streams)
+                    iteration_barrier()
+        else:
+            for _ in range(num_iterations):
+                iteration_barrier()
+        return
+
+    if source_is_active:
+        if concurrent_host_submission:
+            enqueue_iterations_concurrent(
+                num_iterations, src_device, enabled_dst_devices, batches, streams
+            )
+        else:
+            for _ in range(num_iterations):
+                enqueue_iteration(dst_devices, batches, streams)
+        synchronize_streams(streams)
 
 
 def check_destinations(destinations: Dict[int, torch.Tensor],
@@ -342,6 +519,22 @@ def main() -> None:
     p.add_argument("--single-stream", action="store_true",
                    help="submit all enabled destination batches on one source-device "
                         "CUDA stream. Default: use one stream per enabled destination.")
+    p.add_argument("--sync-each-iter", action="store_true",
+                   help="after each iteration, synchronize local copy streams and then "
+                        "run a CPU-side process barrier so the next iteration starts "
+                        "only after all ranks finish the previous iteration. Default: "
+                        "enqueue all iterations and synchronize once at the end.")
+    p.add_argument("--iteration-barrier-backend",
+                   choices=("gloo", "shared-memory"),
+                   default="gloo",
+                   help="process barrier backend used by --sync-each-iter. "
+                        "gloo uses a CPU-side torch.distributed process group. "
+                        "shared-memory uses a single-node mmap spin barrier. "
+                        "Default: gloo")
+    p.add_argument("--shared-memory-barrier-path", default=None,
+                   help="optional mmap file path for --iteration-barrier-backend "
+                        "shared-memory. Default: derive a path under /dev/shm, "
+                        "falling back to /tmp.")
     p.add_argument("--rotate-destination-order", action="store_true",
                    help="map spec entries to (src+1)%%world_size, ..., "
                         "(src-1)%%world_size. By default entries map to ascending "
@@ -373,6 +566,16 @@ def main() -> None:
         raise ValueError("--iters must be positive")
     if args.warmup < 0:
         raise ValueError("--warmup must be non-negative")
+
+    iteration_barrier = barrier
+    iteration_barrier_resource = None
+    if args.sync_each_iter:
+        iteration_barrier, iteration_barrier_resource = create_iteration_barrier(
+            args.iteration_barrier_backend,
+            rank,
+            world_size,
+            args.shared_memory_barrier_path,
+        )
 
     src_device = local_rank
     torch.cuda.set_device(src_device)
@@ -513,33 +716,35 @@ def main() -> None:
         time.sleep(args.sleep_before)
     barrier()
 
-    cuda_set_device(src_device)
-    if source_is_active:
-        if args.concurrent_host_submission:
-            enqueue_iterations_concurrent(
-                args.warmup, src_device, enabled_dst_devices, batches, streams
-            )
-        else:
-            for _ in range(args.warmup):
-                enqueue_iteration(dst_devices, batches, streams)
-        synchronize_streams(streams)
+    run_iterations(
+        args.warmup,
+        src_device,
+        source_is_active,
+        args.sync_each_iter,
+        args.concurrent_host_submission,
+        dst_devices,
+        enabled_dst_devices,
+        batches,
+        streams,
+        iteration_barrier,
+    )
     barrier()
 
-    cuda_set_device(src_device)
-    if source_is_active:
-        t0 = time.perf_counter()
-        if args.concurrent_host_submission:
-            enqueue_iterations_concurrent(
-                args.iters, src_device, enabled_dst_devices, batches, streams
-            )
-        else:
-            for _ in range(args.iters):
-                enqueue_iteration(dst_devices, batches, streams)
-        synchronize_streams(streams)
-        t1 = time.perf_counter()
-        elapsed = t1 - t0
-    else:
-        elapsed = 0.0
+    t0 = time.perf_counter()
+    run_iterations(
+        args.iters,
+        src_device,
+        source_is_active,
+        args.sync_each_iter,
+        args.concurrent_host_submission,
+        dst_devices,
+        enabled_dst_devices,
+        batches,
+        streams,
+        iteration_barrier,
+    )
+    t1 = time.perf_counter()
+    elapsed = t1 - t0 if source_is_active or args.sync_each_iter else 0.0
     barrier()
 
     local_gib = (bytes_per_iter * args.iters) / (1024**3)
@@ -571,6 +776,8 @@ def main() -> None:
                 f"active={source_is_active} active_sources={list(active_source_gpus)} "
                 f"destination_plan={plan_text} streams={count_unique_streams(streams)} "
                 f"stream_mode={'single' if args.single_stream else 'per-destination'} "
+                f"iteration_sync={'each' if args.sync_each_iter else 'end'} "
+                f"iteration_barrier={args.iteration_barrier_backend if args.sync_each_iter else 'none'} "
                 f"host_submission="
                 f"{'concurrent' if args.concurrent_host_submission else 'sequential'} "
                 f"batches/iter={batches_per_iter} copies/iter={copies_per_iter} "
@@ -607,10 +814,18 @@ def main() -> None:
             f"Host submission is "
             f"{'barrier-released from one thread per enabled destination' if args.concurrent_host_submission else 'sequential from the main thread'}, "
             f"and destination batches use "
-            f"{'one shared source-device CUDA stream' if args.single_stream else 'one dedicated source-device CUDA stream per enabled destination'}.",
+            f"{'one shared source-device CUDA stream' if args.single_stream else 'one dedicated source-device CUDA stream per enabled destination'}. "
+            f"Iteration synchronization is "
+            f"{'local stream sync plus ' + args.iteration_barrier_backend + ' process barrier after every iteration' if args.sync_each_iter else 'one local stream sync after all iterations'}.",
             flush=True,
         )
 
+    if iteration_barrier_resource is not None:
+        barrier()
+        if isinstance(iteration_barrier_resource, SharedMemorySpinBarrier):
+            iteration_barrier_resource.close()
+        elif dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group(iteration_barrier_resource)
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
 

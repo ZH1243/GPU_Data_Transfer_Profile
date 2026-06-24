@@ -106,6 +106,18 @@ metadata handoff and GPU `Memcpy PtoP` work can overlap across streams. Use
 CUDA stream instead. That mode is useful when you want stream ordering to
 serialize the per-destination batch submissions.
 
+Use `--sync-each-iter` when you want strict iteration boundaries. In that mode,
+each rank waits for its local copy streams after every iteration and then enters
+a CPU-side Gloo process barrier, so iteration `N + 1` starts only after all
+ranks finish iteration `N` without adding an NCCL collective between copy
+iterations.
+
+For single-node runs, `--iteration-barrier-backend shared-memory` replaces the
+Gloo per-iteration barrier with an mmap spin barrier. Each rank writes its own
+generation slot after `cudaStreamSynchronize` and polls the other rank slots.
+This can reduce barrier overhead, but it assumes all ranks can access the same
+local filesystem path, such as `/dev/shm`.
+
 Source copy regions inside each destination batch are separated by
 `--source-buffer-gap-size` bytes by default, while destination regions are
 contiguous.
@@ -289,6 +301,9 @@ Each script prints per-rank timing/bandwidth and an aggregate summary:
 | `--sleep-before` | `0.0` | Seconds to sleep before benchmark, useful for attaching profilers. |
 | `--concurrent-host-submission` | disabled | Submit one `cudaMemcpyBatchAsync` per enabled destination from separate host threads released by a per-iteration barrier. By default, the main thread submits destination batches sequentially. |
 | `--single-stream` | disabled | Submit all enabled destination batches on one shared source-device CUDA stream. By default, each enabled destination gets its own source-device CUDA stream. |
+| `--sync-each-iter` | disabled | After each iteration, synchronize local copy streams and run a CPU-side Gloo process barrier so the next iteration starts only after all ranks finish the previous iteration. |
+| `--iteration-barrier-backend` | `gloo` | Process barrier backend used by `--sync-each-iter`: `gloo` or `shared-memory`. The shared-memory backend is intended for single-node runs. |
+| `--shared-memory-barrier-path` | auto | Optional mmap file path for `--iteration-barrier-backend shared-memory`. By default, the script derives a path under `/dev/shm`, falling back to `/tmp`. |
 | `--rotate-destination-order` | disabled | Map spec entries to `(src + 1) % world_size`, ..., `(src - 1) % world_size` instead of ascending destination GPU IDs with the source omitted. |
 | `--active-source-gpus [IDS]` | disabled | Restrict copy submission to selected source GPU IDs. If the flag is passed without `IDS`, only GPU 0 copies. With `IDS`, use a comma-separated list such as `0,4`. |
 
