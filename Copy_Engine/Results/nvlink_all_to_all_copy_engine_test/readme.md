@@ -14,6 +14,23 @@ The sweep compares two submission modes:
   which appears in Nsight Systems as 7 source-side `Memcpy PtoP` activities for
   GPU 0.
 
+The `rotate_order/` subdirectory stores additional Nsight Systems reports that
+use the newer destination-order and active-source controls in
+`nvlink_all_to_all_copy_engine_test.py`:
+
+- `--rotate-destination-order`: source GPU `i` visits destinations in rotated
+  order, `(i + 1) % world_size`, ..., `(i - 1) % world_size`, instead of
+  ascending GPU IDs with the source omitted.
+- `--active-source-gpus`: restricts copy submission to selected source GPUs.
+  Passing the flag without IDs selects GPU 0; passing a comma-separated list
+  such as `0,1` selects those source GPUs. Non-selected ranks still join
+  synchronization and reporting, but submit no copies.
+
+Current rotated-order reports include full all-source batched runs for
+`1M` through `7M` and `50M`, a full all-source separate run for `50M`, and
+restricted-source runs such as `activegpus_0`, `activegpus_0,1`, and
+`activegpus_0_separate`.
+
 Each run uses 100 measured iterations after 10 warmup iterations. The report
 names encode the copy mode and message size. For example,
 `a2a_batch_8M.nsys-rep` is the batched all-to-all run with `--nbytes 8M`, while
@@ -58,6 +75,45 @@ nsys profile \
   torchrun --standalone --nproc_per_node=8 nvlink_all_to_all_copy_engine_test.py \
   --nbytes 8M \
   --copy-mode separate \
+  --iters 100 \
+  --check
+```
+
+Sample commands used to collect rotated-order reports are:
+
+```bash
+nsys profile \
+  -s none \
+  --cpuctxsw=none \
+  --trace=cuda,nvtx,cudnn,cublas \
+  -o "rotate_order/a2a_rotate_batch_50M" \
+  --gpu-metrics-devices=0 \
+  --gpu-metrics-set=gh100 \
+  --gpu-metrics-frequency=10000 \
+  --force-overwrite=true \
+  torchrun --standalone --nproc_per_node=8 nvlink_all_to_all_copy_engine_test.py \
+  --nbytes 50M \
+  --copy-mode batch \
+  --rotate-destination-order \
+  --iters 100 \
+  --check
+```
+
+```bash
+nsys profile \
+  -s none \
+  --cpuctxsw=none \
+  --trace=cuda,nvtx,cudnn,cublas \
+  -o "rotate_order/a2a_rotate_activegpus_0_batch_50M" \
+  --gpu-metrics-devices=0 \
+  --gpu-metrics-set=gh100 \
+  --gpu-metrics-frequency=10000 \
+  --force-overwrite=true \
+  torchrun --standalone --nproc_per_node=8 nvlink_all_to_all_copy_engine_test.py \
+  --nbytes 50M \
+  --copy-mode batch \
+  --rotate-destination-order \
+  --active-source-gpus 0 \
   --iters 100 \
   --check
 ```
