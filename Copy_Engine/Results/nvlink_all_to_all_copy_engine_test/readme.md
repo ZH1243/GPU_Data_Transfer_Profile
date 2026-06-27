@@ -208,3 +208,32 @@ Observations:
 - The large-copy points show the highest observed NVLink metrics. At `50m`,
   both modes are around `40%` RX/TX. At `100m`, both modes are around
   `42-43%` RX/TX, with `separate` slightly higher on the sampled GPU metrics.
+
+### Rotated Destination Order Observations
+
+The `Average NVLink RX/TX Metrics` results suggest that NVLink utilization has
+an upper limit even for large messages. One likely cause is contention among
+source GPUs. In these copy-engine P2P transfers, a source GPU appears to make
+progress to one destination GPU at a time. Because this benchmark sends data in
+large token chunks, usually a few MiB rather than single-token 8 KiB messages,
+each transfer can occupy a destination for long enough to create visible
+contention.
+
+For example, if GPU A and GPU B send to GPU C at the same time, GPU C's receive
+bandwidth becomes the bottleneck while some other destination GPU may be idle.
+This motivates arranging the local GPU send order so that sources are less
+likely to collide on the same destination at the same time.
+
+The `--rotate-destination-order` and `--active-source-gpus` flags were added to
+test this hypothesis. With only one active source GPU, where there is no
+inter-source destination contention, the observed bandwidth utilization is high.
+With multiple active source GPUs, contention can reappear even when
+`--rotate-destination-order` is enabled: the NVLink utilization curve fluctuates
+instead of staying steady.
+
+The likely reason is that the benchmark runs 100 copy iterations without
+synchronizing the source GPUs between iterations. Even if the first iteration
+starts with a collision-free rotated order, source GPUs can drift over time, and
+later iterations can collide on the same destination again. This suggests a next
+experiment: synchronize the source GPUs after each copy iteration so that every
+source starts the next rotated send sequence at the same time.
