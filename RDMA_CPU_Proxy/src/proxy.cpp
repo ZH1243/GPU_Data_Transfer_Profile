@@ -148,6 +148,7 @@ void Proxy::run_iteration(uint64_t iteration) {
     for (const auto& peer : peers_) {
         baselines.push_back(capture_baselines(peer, chunks));
     }
+    synchronize_iteration_start(iteration);
 
     const auto start = std::chrono::steady_clock::now();
     for (std::size_t i = 0; i < peers_.size(); ++i) {
@@ -183,6 +184,37 @@ void Proxy::fill_iteration_send_buffers(uint64_t iteration) {
     for (const auto& buffers : cuda_buffers_.peer_buffers()) {
         cuda_buffers_.fill_test_pattern(buffers.peer_rank, config_.node_rank, buffers.peer_rank, iteration);
     }
+}
+
+void Proxy::synchronize_iteration_start(uint64_t iteration) const {
+    if (peers_.empty()) return;
+
+    std::ostringstream local;
+    local << "iteration_start"
+          << " rank=" << config_.node_rank
+          << " gpu=" << config_.local_gpu_index
+          << " iteration=" << iteration;
+    const auto expected_phase = "iteration_start";
+    const auto expected_iteration = "iteration=" + std::to_string(iteration);
+
+    RDMA_PROXY_LOG_INFO("iteration=", iteration, " waiting for ", peers_.size(), " peer start barrier(s)");
+    for (const auto& peer : peers_) {
+        const auto it = std::find_if(config_.peers.begin(), config_.peers.end(), [&](const PeerAddress& p) {
+            return p.node_rank == peer.peer_rank;
+        });
+        if (it == config_.peers.end()) {
+            throw std::runtime_error("cannot synchronize unknown peer rank " + std::to_string(peer.peer_rank));
+        }
+
+        const auto remote = connection_manager_.exchange_control_message(
+            *it, local.str(), config_.completion_timeout_ms);
+        if (remote.find(expected_phase) == std::string::npos ||
+            remote.find(expected_iteration) == std::string::npos) {
+            throw std::runtime_error("peer start synchronization mismatch: " + remote);
+        }
+        RDMA_PROXY_LOG_DEBUG("iteration=", iteration, " start synchronized with peer=", peer.peer_rank);
+    }
+    RDMA_PROXY_LOG_INFO("iteration=", iteration, " peer start barrier complete");
 }
 
 void Proxy::synchronize_iteration(uint64_t iteration) const {

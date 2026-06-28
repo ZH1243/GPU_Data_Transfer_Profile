@@ -51,6 +51,7 @@ private:
     void setup_peer(PeerGpuBuffers& buffers);
     void synchronize_peer_ready(const PeerAddress& peer_addr, const PeerState& peer) const;
     void run_iteration(uint64_t iteration);
+    void synchronize_iteration_start(uint64_t iteration) const;
     void synchronize_iteration(uint64_t iteration) const;
     void fill_iteration_send_buffers(uint64_t iteration);
     std::vector<ChunkDescriptor> make_chunks() const;

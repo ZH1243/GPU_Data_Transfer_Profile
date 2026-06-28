@@ -89,6 +89,7 @@ The immediate value currently encodes the chunk index as a 32-bit unsigned value
 The executable runs `num_iterations` measured iterations. Each iteration:
 
 - fills per-peer send buffers with deterministic test data when `fill_test_data=true`
+- captures completion counter baselines, then exchanges a TCP iteration-start barrier so no peer can post measured RDMA writes before the receiver has captured its baseline
 - enqueues every chunk across the peer QPs
 - waits for all local data send completions and one receive-side drain marker per QP
 - sends one zero-payload immediate marker per QP after the data chunks
