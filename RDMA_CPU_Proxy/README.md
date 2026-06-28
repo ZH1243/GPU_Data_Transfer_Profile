@@ -21,6 +21,7 @@ For each peer node, the proxy creates `num_qps_per_peer` RC QPs. For each QP it 
 
 The CQ worker reposts receive WRs after receive/immediate completions so the responder keeps enough receive WQEs available.
 The measured run waits until every chunk has produced both a send completion and a receive-with-immediate completion on the local QPs before reporting an iteration complete.
+Before the first measured send, peers also exchange a TCP ready barrier after QPs are connected and receive WQEs are posted.
 
 ## GPU Buffer Layout
 

@@ -106,8 +106,35 @@ void Proxy::setup_peer(PeerGpuBuffers& buffers) {
         peer.workers.emplace_back(std::move(worker));
     }
 
+    synchronize_peer_ready(peer_addr, peer);
     RDMA_PROXY_LOG_INFO("peer ", buffers.peer_rank, " initialized with ", peer.qps.size(), " RC QPs");
     peers_.push_back(std::move(peer));
+}
+
+void Proxy::synchronize_peer_ready(const PeerAddress& peer_addr, const PeerState& peer) const {
+    std::ostringstream local;
+    local << "peer_ready"
+          << " rank=" << config_.node_rank
+          << " gpu=" << config_.local_gpu_index
+          << " peer_rank=" << peer.peer_rank
+          << " remote_gpu=" << peer.remote_gpu_index;
+    const auto expected_rank = "rank=" + std::to_string(peer.peer_rank);
+    const auto expected_gpu = "gpu=" + std::to_string(peer.remote_gpu_index);
+
+    RDMA_PROXY_LOG_INFO("local_rank=", config_.node_rank,
+                        " local_gpu=", config_.local_gpu_index,
+                        " waiting for peer ready remote_rank=", peer.peer_rank,
+                        " remote_gpu=", peer.remote_gpu_index);
+    const auto remote = connection_manager_.exchange_control_message(
+        peer_addr, local.str(), config_.completion_timeout_ms);
+    if (remote.find(expected_rank) == std::string::npos ||
+        remote.find(expected_gpu) == std::string::npos) {
+        throw std::runtime_error("peer ready synchronization mismatch: " + remote);
+    }
+    RDMA_PROXY_LOG_INFO("local_rank=", config_.node_rank,
+                        " local_gpu=", config_.local_gpu_index,
+                        " peer ready remote_rank=", peer.peer_rank,
+                        " remote_gpu=", peer.remote_gpu_index);
 }
 
 void Proxy::run_iteration(uint64_t iteration) {
@@ -252,7 +279,10 @@ void Proxy::wait_for_iteration(
                 worker->cq_errors() != baselines[q].cq_errors ||
                 worker->unexpected_immediate_completions() != baselines[q].unexpected_imms) {
                 const auto error = worker->last_error();
-                throw std::runtime_error("QP error peer=" + std::to_string(peer.peer_rank) +
+                throw std::runtime_error("QP error local_rank=" + std::to_string(config_.node_rank) +
+                                         " local_gpu=" + std::to_string(config_.local_gpu_index) +
+                                         " remote_rank=" + std::to_string(peer.peer_rank) +
+                                         " remote_gpu=" + std::to_string(peer.remote_gpu_index) +
                                          " qp=" + std::to_string(q) +
                                          (error.empty() ? "" : " last_error=" + error));
             }
@@ -265,7 +295,10 @@ void Proxy::wait_for_iteration(
         if (complete) return;
         if (std::chrono::steady_clock::now() >= deadline) {
             std::ostringstream out;
-            out << "timed out waiting for completions from peer=" << peer.peer_rank;
+            out << "timed out waiting for completions local_rank=" << config_.node_rank
+                << " local_gpu=" << config_.local_gpu_index
+                << " remote_rank=" << peer.peer_rank
+                << " remote_gpu=" << peer.remote_gpu_index;
             for (std::size_t q = 0; q < peer.workers.size(); ++q) {
                 out << " qp" << q
                     << " send=" << (peer.workers[q]->send_completions() - baselines[q].sends)
