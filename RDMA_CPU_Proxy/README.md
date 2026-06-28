@@ -93,6 +93,7 @@ The executable runs `num_iterations` measured iterations. Each iteration:
 - verifies that every expected chunk immediate was observed on the expected QP
 - validates received bytes when `validate_data=true`
 - reports elapsed time, aggregate bandwidth, completion counters, and error counters per QP
+- exchanges a TCP iteration-done barrier with every peer before starting the next iteration or tearing down RDMA resources
 
 Set `num_iterations` to `0` for an indefinite loop. `completion_timeout_ms` bounds how long an iteration waits for completions before failing with per-QP progress details.
 

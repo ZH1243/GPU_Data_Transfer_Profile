@@ -47,6 +47,7 @@ private:
     PeerConnectionInfo make_local_peer_info(const PeerState& peer) const;
     void setup_peer(PeerGpuBuffers& buffers);
     void run_iteration(uint64_t iteration);
+    void synchronize_iteration(uint64_t iteration) const;
     void fill_iteration_send_buffers(uint64_t iteration);
     std::vector<ChunkDescriptor> make_chunks() const;
     std::vector<QPCompletionBaseline> capture_baselines(

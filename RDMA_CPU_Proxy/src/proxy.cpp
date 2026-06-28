@@ -37,6 +37,7 @@ void Proxy::initialize() {
 void Proxy::run_once() {
     if (!initialized_) throw std::runtime_error("proxy is not initialized");
     run_iteration(0);
+    synchronize_iteration(0);
 }
 
 void Proxy::run() {
@@ -45,6 +46,7 @@ void Proxy::run() {
          config_.num_iterations == 0 || iteration < static_cast<uint64_t>(config_.num_iterations);
          ++iteration) {
         run_iteration(iteration);
+        synchronize_iteration(iteration);
     }
 }
 
@@ -148,6 +150,35 @@ void Proxy::fill_iteration_send_buffers(uint64_t iteration) {
     for (const auto& buffers : cuda_buffers_.peer_buffers()) {
         cuda_buffers_.fill_test_pattern(buffers.peer_rank, config_.node_rank, buffers.peer_rank, iteration);
     }
+}
+
+void Proxy::synchronize_iteration(uint64_t iteration) const {
+    if (peers_.empty()) return;
+
+    std::ostringstream local;
+    local << "iteration_done"
+          << " rank=" << config_.node_rank
+          << " gpu=" << config_.local_gpu_index
+          << " iteration=" << iteration;
+    const auto expected_iteration = "iteration=" + std::to_string(iteration);
+
+    RDMA_PROXY_LOG_INFO("iteration=", iteration, " waiting for ", peers_.size(), " peer synchronization barrier(s)");
+    for (const auto& peer : peers_) {
+        const auto it = std::find_if(config_.peers.begin(), config_.peers.end(), [&](const PeerAddress& p) {
+            return p.node_rank == peer.peer_rank;
+        });
+        if (it == config_.peers.end()) {
+            throw std::runtime_error("cannot synchronize unknown peer rank " + std::to_string(peer.peer_rank));
+        }
+
+        const auto remote = connection_manager_.exchange_control_message(
+            *it, local.str(), config_.completion_timeout_ms);
+        if (remote.find(expected_iteration) == std::string::npos) {
+            throw std::runtime_error("peer synchronization iteration mismatch: " + remote);
+        }
+        RDMA_PROXY_LOG_DEBUG("iteration=", iteration, " synchronized with peer=", peer.peer_rank);
+    }
+    RDMA_PROXY_LOG_INFO("iteration=", iteration, " peer synchronization complete");
 }
 
 std::vector<ChunkDescriptor> Proxy::make_chunks() const {

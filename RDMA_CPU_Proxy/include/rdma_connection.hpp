@@ -65,6 +65,10 @@ public:
     PeerConnectionInfo exchange_peer_info(
         const PeerAddress& peer,
         const PeerConnectionInfo& local_info) const;
+    std::string exchange_control_message(
+        const PeerAddress& peer,
+        const std::string& local_payload,
+        uint64_t timeout_ms) const;
 
 private:
     ProxyConfig config_;

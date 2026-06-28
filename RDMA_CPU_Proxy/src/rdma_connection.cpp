@@ -9,6 +9,7 @@
 #include <netdb.h>
 #include <random>
 #include <stdexcept>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
@@ -63,26 +64,33 @@ void recv_all(int fd, void* data, std::size_t bytes) {
     }
 }
 
-std::string exchange_payload_client(const PeerAddress& peer, const std::string& payload) {
-    addrinfo hints{};
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_family = AF_UNSPEC;
-    addrinfo* result = nullptr;
-    const auto port = std::to_string(peer.port);
-    if (getaddrinfo(peer.host.c_str(), port.c_str(), &hints, &result) != 0) {
-        throw std::runtime_error("getaddrinfo failed for peer " + peer.host);
-    }
-
+std::string exchange_payload_client(const PeerAddress& peer, const std::string& payload, uint64_t timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     int fd = -1;
-    for (auto* rp = result; rp; rp = rp->ai_next) {
-        fd = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd == -1) continue;
-        if (::connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
-        ::close(fd);
-        fd = -1;
+    while (fd < 0) {
+        addrinfo hints{};
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_family = AF_UNSPEC;
+        addrinfo* result = nullptr;
+        const auto port = std::to_string(peer.port);
+        if (getaddrinfo(peer.host.c_str(), port.c_str(), &hints, &result) != 0) {
+            throw std::runtime_error("getaddrinfo failed for peer " + peer.host);
+        }
+
+        for (auto* rp = result; rp; rp = rp->ai_next) {
+            fd = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+            if (fd == -1) continue;
+            if (::connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
+            ::close(fd);
+            fd = -1;
+        }
+        freeaddrinfo(result);
+        if (fd >= 0) break;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw std::runtime_error("timed out connecting to peer metadata endpoint");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
-    freeaddrinfo(result);
-    if (fd < 0) throw std::runtime_error("failed to connect to peer metadata endpoint");
 
     const uint64_t len = host_to_be64(payload.size());
     send_all(fd, &len, sizeof(len));
@@ -96,7 +104,7 @@ std::string exchange_payload_client(const PeerAddress& peer, const std::string& 
     return remote;
 }
 
-std::string exchange_payload_server(uint16_t listen_port, const std::string& payload) {
+std::string exchange_payload_server(uint16_t listen_port, const std::string& payload, uint64_t timeout_ms) {
     const int fd = ::socket(AF_INET6, SOCK_STREAM, 0);
     if (fd < 0) throw std::runtime_error("socket failed");
     int one = 1;
@@ -113,6 +121,19 @@ std::string exchange_payload_server(uint16_t listen_port, const std::string& pay
     if (::listen(fd, 1) != 0) {
         ::close(fd);
         throw std::runtime_error("listen failed for metadata listener");
+    }
+
+    fd_set read_set;
+    FD_ZERO(&read_set);
+    FD_SET(fd, &read_set);
+    timeval timeout{};
+    timeout.tv_sec = static_cast<time_t>(timeout_ms / 1000);
+    timeout.tv_usec = static_cast<suseconds_t>((timeout_ms % 1000) * 1000);
+    const int ready = ::select(fd + 1, &read_set, nullptr, nullptr, &timeout);
+    if (ready <= 0) {
+        ::close(fd);
+        if (ready == 0) throw std::runtime_error("timed out waiting for peer metadata endpoint");
+        throw std::runtime_error("select failed for metadata listener");
     }
 
     const int peer_fd = ::accept(fd, nullptr, nullptr);
@@ -354,15 +375,29 @@ PeerConnectionInfo ConnectionManager::exchange_peer_info(
 
     if (config_.node_rank < peer.node_rank) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        remote_payload = exchange_payload_client(peer, local_payload);
+        remote_payload = exchange_payload_client(peer, local_payload, config_.completion_timeout_ms);
     } else {
-        remote_payload = exchange_payload_server(config_.listen_port, local_payload);
+        remote_payload = exchange_payload_server(config_.listen_port, local_payload, config_.completion_timeout_ms);
     }
     auto remote = deserialize_peer_info(remote_payload);
     if (remote.node_rank != peer.node_rank || remote.gpu_index != config_.local_gpu_index) {
         throw std::runtime_error("peer metadata rank/gpu mismatch");
     }
     return remote;
+}
+
+std::string ConnectionManager::exchange_control_message(
+    const PeerAddress& peer,
+    const std::string& local_payload,
+    uint64_t timeout_ms) const {
+    if (config_.mock_mode) {
+        return local_payload;
+    }
+
+    if (config_.node_rank < peer.node_rank) {
+        return exchange_payload_client(peer, local_payload, timeout_ms);
+    }
+    return exchange_payload_server(config_.listen_port, local_payload, timeout_ms);
 }
 
 }  // namespace rdma_proxy
