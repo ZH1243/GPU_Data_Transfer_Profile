@@ -237,8 +237,25 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "rdma_port") config.rdma_port = static_cast<uint8_t>(std::stoi(value));
     else if (key == "gid_index") config.gid_index = std::stoi(value);
     else if (key == "cuda_device_id") config.cuda_device_id = std::stoi(value);
-    else if (key == "listen_port") config.listen_port = static_cast<uint16_t>(std::stoi(value));
+    else if (key == "listen_port") {
+        config.listen_port = static_cast<uint16_t>(std::stoi(value));
+        for (auto& peer : config.peers) {
+            peer.port = config.listen_port;
+        }
+    }
     else if (key == "connection_manager_port") config.connection_manager_port = static_cast<uint16_t>(std::stoi(value));
+    else if (key == "peer_port") {
+        const auto port = static_cast<uint16_t>(std::stoi(value));
+        for (auto& peer : config.peers) {
+            peer.port = port;
+        }
+    }
+    else if (key == "peer_host") {
+        if (config.peers.size() != 1) {
+            throw std::runtime_error("--peer_host is only supported when the config has exactly one peer");
+        }
+        config.peers[0].host = value;
+    }
     else if (key == "completion_poll_batch_size") config.completion_poll_batch_size = std::stoi(value);
     else if (key == "send_queue_depth") config.send_queue_depth = std::stoi(value);
     else if (key == "recv_queue_depth") config.recv_queue_depth = std::stoi(value);

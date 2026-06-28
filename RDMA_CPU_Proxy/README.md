@@ -157,7 +157,7 @@ Required parameters are represented in `config/example_config.json`:
 - `dtype`
 - `mock_mode`
 
-Command-line overrides use `--key=value`.
+Command-line overrides use `--key=value`. `--listen_port=value` also updates every `peers[].port`, matching the common launch convention where GPU `k` uses the same metadata port on every node. You can also use `--peer_port=value` to update every peer port explicitly. `--peer_host=value` is supported only when the config has exactly one peer.
 
 ## Current Limitations and TODOs
 
@@ -167,4 +167,3 @@ Command-line overrides use `--key=value`.
 - CUDA copy staging currently uses a generic byte-copy kernel. Integrate the real token producer path if tokens are already in the registered send buffer.
 - Mock mode self-completes WQEs for development visibility; it does not simulate fabric ordering, remote process state, or real memory movement between processes.
 - Error recovery is fail-fast. Production use should add QP teardown/reconnect and health reporting.
-
