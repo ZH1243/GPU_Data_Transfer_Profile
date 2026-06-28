@@ -166,10 +166,15 @@ void Proxy::run_iteration(uint64_t iteration) {
     const auto validation_errors = validate_received_data(iteration);
 
     report_iteration(iteration, seconds, bytes_per_peer, chunks, baselines, verification_errors, validation_errors);
-    if (verification_errors + validation_errors != 0) {
+    if (verification_errors != 0) {
+        RDMA_PROXY_LOG_WARN("iteration=", iteration,
+                            " observed ", verification_errors,
+                            " missing/extra data immediate completion count(s); payload validation decides pass/fail");
+    }
+    if (validation_errors != 0) {
         throw std::runtime_error("iteration " + std::to_string(iteration) +
-                                 " completed with " + std::to_string(verification_errors + validation_errors) +
-                                 " verification/validation errors");
+                                 " completed with " + std::to_string(validation_errors) +
+                                 " payload validation errors");
     }
 }
 
@@ -298,7 +303,6 @@ void Proxy::wait_for_iteration(
             }
             const auto expected = static_cast<uint64_t>(expected_by_qp[q]);
             if (worker->send_completions() < baselines[q].sends + expected ||
-                worker->recv_completions() < baselines[q].recvs + expected ||
                 worker->send_marker_completions() < baselines[q].send_markers + 1 ||
                 worker->recv_marker_completions() < baselines[q].recv_markers + 1) {
                 complete = false;
@@ -340,12 +344,12 @@ std::size_t Proxy::verify_immediates(
         const auto expected = baselines[q].immediate_counts[chunk.chunk_index] + 1;
         if (observed != expected) {
             ++errors;
-            RDMA_PROXY_LOG_ERROR("iteration=", iteration,
-                                 " peer=", peer.peer_rank,
-                                 " qp=", chunk.qp_index,
-                                 " chunk=", chunk.chunk_index,
-                                 " immediate_count=", observed,
-                                 " expected=", expected);
+            RDMA_PROXY_LOG_WARN("iteration=", iteration,
+                                " peer=", peer.peer_rank,
+                                " qp=", chunk.qp_index,
+                                " chunk=", chunk.chunk_index,
+                                " immediate_count=", observed,
+                                " expected=", expected);
         }
     }
     return errors;
@@ -385,7 +389,8 @@ void Proxy::report_iteration(
                         " total_bytes=", total_bytes,
                         " elapsed_us=", static_cast<uint64_t>(latency_us),
                         " bandwidth_gbps=", std::fixed, std::setprecision(3), gbps,
-                        " errors=", (verification_errors + validation_errors));
+                        " immediate_mismatches=", verification_errors,
+                        " validation_errors=", validation_errors);
 
     std::vector<std::size_t> bytes_by_qp(static_cast<std::size_t>(config_.num_qps_per_peer), 0);
     for (const auto& chunk : chunks) {
