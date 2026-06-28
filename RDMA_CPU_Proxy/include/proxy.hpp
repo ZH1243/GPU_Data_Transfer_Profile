@@ -28,6 +28,7 @@ public:
 private:
     struct PeerState {
         int peer_rank{-1};
+        int remote_gpu_index{-1};
         MemoryRegionInfo local_send_mr;
         MemoryRegionInfo local_recv_mr;
         MemoryRegionInfo remote_recv_mr;

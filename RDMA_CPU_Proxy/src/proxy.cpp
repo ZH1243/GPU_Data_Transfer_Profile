@@ -95,6 +95,7 @@ void Proxy::setup_peer(PeerGpuBuffers& buffers) {
         throw std::runtime_error("remote QP count does not match local QP count");
     }
     peer.remote_recv_mr = remote_info.recv_buffer;
+    peer.remote_gpu_index = remote_info.gpu_index;
 
     for (std::size_t q = 0; q < peer.qps.size(); ++q) {
         peer.qps[q]->connect(remote_info.qps[q]);
@@ -330,6 +331,8 @@ void Proxy::report_iteration(
     const double latency_us = seconds * 1.0e6;
 
     RDMA_PROXY_LOG_INFO("iteration=", iteration,
+                        " local_rank=", config_.node_rank,
+                        " local_gpu=", config_.local_gpu_index,
                         " total_bytes=", total_bytes,
                         " elapsed_us=", static_cast<uint64_t>(latency_us),
                         " bandwidth_gbps=", std::fixed, std::setprecision(3), gbps,
@@ -354,7 +357,11 @@ void Proxy::report_iteration(
             const double qp_gbps = seconds > 0.0 ?
                 (static_cast<double>(bytes_by_qp[q]) * 8.0 / seconds / 1.0e9) : 0.0;
             RDMA_PROXY_LOG_INFO("qp_report iteration=", iteration,
+                                " local_rank=", config_.node_rank,
+                                " local_gpu=", config_.local_gpu_index,
                                 " peer=", peer.peer_rank,
+                                " remote_rank=", peer.peer_rank,
+                                " remote_gpu=", peer.remote_gpu_index,
                                 " qp=", q,
                                 " bytes=", bytes_by_qp[q],
                                 " elapsed_us=", static_cast<uint64_t>(latency_us),
