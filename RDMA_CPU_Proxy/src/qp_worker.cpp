@@ -6,6 +6,15 @@
 #include <stdexcept>
 
 namespace rdma_proxy {
+namespace {
+
+constexpr uint64_t kMarkerWrIdBit = 1ULL << 63;
+
+bool is_marker_wr_id(uint64_t wr_id) {
+    return (wr_id & kMarkerWrIdBit) != 0;
+}
+
+}  // namespace
 
 void SendQueue::push(SendTask task) {
     {
@@ -86,14 +95,18 @@ void QPWorker::send_loop() {
             continue;
         }
         try {
-            qp_.post_write_with_immediate(
-                task.wr_id,
-                task.local_base + task.chunk.src_offset_bytes,
-                task.local_lkey,
-                task.remote_base + task.chunk.dst_offset_bytes,
-                task.remote_rkey,
-                task.chunk.length_bytes,
-                task.chunk.imm_data);
+            if (task.marker) {
+                qp_.post_send_with_immediate(task.wr_id | kMarkerWrIdBit, encode_marker_immediate());
+            } else {
+                qp_.post_write_with_immediate(
+                    task.wr_id,
+                    task.local_base + task.chunk.src_offset_bytes,
+                    task.local_lkey,
+                    task.remote_base + task.chunk.dst_offset_bytes,
+                    task.remote_rkey,
+                    task.chunk.length_bytes,
+                    task.chunk.imm_data);
+            }
         } catch (const std::exception& e) {
             post_errors_.fetch_add(1);
             {
@@ -120,21 +133,29 @@ void QPWorker::cq_loop() {
             }
             for (const auto& c : completions) {
                 if (c.kind == CompletionKind::kSend) {
-                    send_completions_.fetch_add(1);
-                } else {
-                    recv_completions_.fetch_add(1);
-                    const auto chunk_index = decode_immediate(c.imm_data);
-                    {
-                        std::lock_guard<std::mutex> lock(stats_mutex_);
-                        if (chunk_index < immediate_counts_.size()) {
-                            ++immediate_counts_[chunk_index];
-                        } else {
-                            unexpected_immediate_completions_.fetch_add(1);
-                        }
+                    if (is_marker_wr_id(c.wr_id)) {
+                        send_marker_completions_.fetch_add(1);
+                    } else {
+                        send_completions_.fetch_add(1);
                     }
-                    RDMA_PROXY_LOG_DEBUG("recv imm completion peer=", qp_.peer_rank(),
-                                         " qp=", qp_.qp_index(),
-                                         " chunk=", chunk_index);
+                } else {
+                    if (is_marker_immediate(c.imm_data)) {
+                        recv_marker_completions_.fetch_add(1);
+                    } else {
+                        recv_completions_.fetch_add(1);
+                        const auto chunk_index = decode_immediate(c.imm_data);
+                        {
+                            std::lock_guard<std::mutex> lock(stats_mutex_);
+                            if (chunk_index < immediate_counts_.size()) {
+                                ++immediate_counts_[chunk_index];
+                            } else {
+                                unexpected_immediate_completions_.fetch_add(1);
+                            }
+                        }
+                        RDMA_PROXY_LOG_DEBUG("recv imm completion peer=", qp_.peer_rank(),
+                                             " qp=", qp_.qp_index(),
+                                             " chunk=", chunk_index);
+                    }
                     qp_.post_receive(next_recv_wr_id_.fetch_add(1));
                 }
             }

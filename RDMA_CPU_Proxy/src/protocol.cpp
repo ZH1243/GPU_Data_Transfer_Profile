@@ -7,14 +7,22 @@
 namespace rdma_proxy {
 
 uint32_t encode_immediate(std::size_t chunk_index) {
-    if (chunk_index > 0xffffffffULL) {
-        throw std::runtime_error("chunk index exceeds 32-bit immediate data capacity");
+    if (chunk_index >= 0xffffffffULL) {
+        throw std::runtime_error("chunk index exceeds immediate data capacity");
     }
     return static_cast<uint32_t>(chunk_index);
 }
 
 std::size_t decode_immediate(uint32_t imm_data) {
     return static_cast<std::size_t>(imm_data);
+}
+
+uint32_t encode_marker_immediate() {
+    return 0xffffffffU;
+}
+
+bool is_marker_immediate(uint32_t imm_data) {
+    return imm_data == encode_marker_immediate();
 }
 
 std::vector<ChunkDescriptor> compute_chunks(

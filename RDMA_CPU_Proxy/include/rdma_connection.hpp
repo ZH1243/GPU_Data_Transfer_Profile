@@ -44,6 +44,7 @@ public:
         uint32_t remote_rkey,
         std::size_t length,
         uint32_t imm_data);
+    void post_send_with_immediate(uint64_t wr_id, uint32_t imm_data);
     int poll(std::vector<Completion>& completions, int max_entries);
 
     int peer_rank() const { return peer_rank_; }

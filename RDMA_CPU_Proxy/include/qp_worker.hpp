@@ -21,6 +21,7 @@ struct SendTask {
     uint32_t local_lkey{0};
     uintptr_t remote_base{0};
     uint32_t remote_rkey{0};
+    bool marker{false};
 };
 
 class SendQueue {
@@ -52,6 +53,8 @@ public:
 
     uint64_t send_completions() const { return send_completions_.load(); }
     uint64_t recv_completions() const { return recv_completions_.load(); }
+    uint64_t send_marker_completions() const { return send_marker_completions_.load(); }
+    uint64_t recv_marker_completions() const { return recv_marker_completions_.load(); }
     uint64_t post_errors() const { return post_errors_.load(); }
     uint64_t cq_errors() const { return cq_errors_.load(); }
     uint64_t unexpected_immediate_completions() const { return unexpected_immediate_completions_.load(); }
@@ -71,6 +74,8 @@ private:
     std::atomic<uint64_t> next_recv_wr_id_{1};
     std::atomic<uint64_t> send_completions_{0};
     std::atomic<uint64_t> recv_completions_{0};
+    std::atomic<uint64_t> send_marker_completions_{0};
+    std::atomic<uint64_t> recv_marker_completions_{0};
     std::atomic<uint64_t> post_errors_{0};
     std::atomic<uint64_t> cq_errors_{0};
     std::atomic<uint64_t> unexpected_immediate_completions_{0};
