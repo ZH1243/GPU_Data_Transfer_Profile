@@ -1,0 +1,40 @@
+{
+  "node_rank": 0,
+  "num_nodes": 4,
+  "local_gpu_index": 0,
+  "num_gpus_per_node": 8,
+  "num_tokens": 5000,
+  "token_dimension": 128,
+  "tokens_per_chunk": 32,
+  "num_qps_per_peer": 10,
+  "rdma_device_name": "mlx5_0",
+  "rdma_port": 1,
+  "gid_index": 3,
+  "cuda_device_id": 0,
+  "listen_port": 18515,
+  "connection_manager_port": 18515,
+  "completion_poll_batch_size": 16,
+  "send_queue_depth": 256,
+  "recv_queue_depth": 256,
+  "cq_depth": 512,
+  "dtype": "bf16",
+  "mock_mode": true,
+  "log_level": "info",
+  "peers": [
+    {
+      "node_rank": 1,
+      "host": "node-b.example.com",
+      "port": 18515
+    },
+    {
+      "node_rank": 2,
+      "host": "node-c.example.com",
+      "port": 18515
+    },
+    {
+      "node_rank": 3,
+      "host": "node-d.example.com",
+      "port": 18515
+    }
+  ]
+}
