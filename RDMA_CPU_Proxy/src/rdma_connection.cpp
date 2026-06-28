@@ -372,7 +372,8 @@ int RdmaQueuePair::poll(std::vector<Completion>& completions, int max_entries) {
         Completion c;
         c.wr_id = wc[i].wr_id;
         c.byte_len = wc[i].byte_len;
-        if (wc[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+        if (wc[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM ||
+            (wc[i].opcode == IBV_WC_RECV && (wc[i].wc_flags & IBV_WC_WITH_IMM))) {
             c.kind = CompletionKind::kRecvWithImmediate;
             c.imm_data = ntohl(wc[i].imm_data);
         } else {
