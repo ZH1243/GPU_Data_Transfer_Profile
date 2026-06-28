@@ -91,6 +91,7 @@ The executable runs `num_iterations` measured iterations. Each iteration:
 - fills per-peer send buffers with deterministic test data when `fill_test_data=true`
 - enqueues every chunk across the peer QPs
 - waits for all local send completions and all local receive-with-immediate completions
+- sends one zero-payload immediate marker per QP after the data chunks to drain ordered receive completions
 - verifies that every expected chunk immediate was observed on the expected QP
 - validates received bytes when `validate_data=true`
 - reports elapsed time, aggregate bandwidth, completion counters, and error counters per QP

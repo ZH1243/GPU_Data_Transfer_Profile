@@ -323,6 +323,32 @@ void RdmaQueuePair::post_write_with_immediate(
 #endif
 }
 
+void RdmaQueuePair::post_send_with_immediate(uint64_t wr_id, uint32_t imm_data) {
+    if (config_.mock_mode) {
+        std::lock_guard<std::mutex> lock(impl_->mock_mutex);
+        impl_->mock_completions.push_back(Completion{CompletionKind::kSend, wr_id, imm_data, 0});
+        impl_->mock_completions.push_back(Completion{CompletionKind::kRecvWithImmediate, wr_id, imm_data, 0});
+        return;
+    }
+
+#if RDMA_PROXY_HAVE_VERBS
+    ibv_send_wr wr{};
+    wr.wr_id = wr_id;
+    wr.sg_list = nullptr;
+    wr.num_sge = 0;
+    wr.opcode = IBV_WR_SEND_WITH_IMM;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.imm_data = htonl(imm_data);
+
+    ibv_send_wr* bad = nullptr;
+    if (ibv_post_send(impl_->qp, &wr, &bad)) throw std::runtime_error("ibv_post_send SEND_WITH_IMM failed");
+#else
+    (void)wr_id;
+    (void)imm_data;
+    throw std::runtime_error("RDMA send requested but libibverbs support was not built");
+#endif
+}
+
 int RdmaQueuePair::poll(std::vector<Completion>& completions, int max_entries) {
     if (config_.mock_mode) {
         std::lock_guard<std::mutex> lock(impl_->mock_mutex);

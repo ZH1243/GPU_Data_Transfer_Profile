@@ -39,6 +39,8 @@ private:
     struct QPCompletionBaseline {
         uint64_t sends{0};
         uint64_t recvs{0};
+        uint64_t send_markers{0};
+        uint64_t recv_markers{0};
         uint64_t post_errors{0};
         uint64_t cq_errors{0};
         uint64_t unexpected_imms{0};

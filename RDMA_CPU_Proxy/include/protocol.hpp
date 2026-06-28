@@ -41,6 +41,8 @@ struct ChunkDescriptor {
 
 uint32_t encode_immediate(std::size_t chunk_index);
 std::size_t decode_immediate(uint32_t imm_data);
+uint32_t encode_marker_immediate();
+bool is_marker_immediate(uint32_t imm_data);
 
 std::vector<ChunkDescriptor> compute_chunks(
     std::size_t num_tokens,
