@@ -32,6 +32,13 @@ public:
 
     void initialize();
     void copy_tokens_to_send_buffer(int peer_rank, const void* src_device_or_host, std::size_t bytes);
+    void fill_test_pattern(int peer_rank, int source_rank, int destination_rank, uint64_t iteration);
+    bool validate_recv_pattern(
+        int peer_rank,
+        int source_rank,
+        int destination_rank,
+        uint64_t iteration,
+        std::string* error) const;
 
     const std::vector<PeerGpuBuffers>& peer_buffers() const { return buffers_; }
     std::vector<PeerGpuBuffers>& peer_buffers() { return buffers_; }

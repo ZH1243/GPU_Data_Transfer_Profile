@@ -3,7 +3,11 @@
 #include "logging.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
+#include <thread>
 
 namespace rdma_proxy {
 
@@ -32,8 +36,15 @@ void Proxy::initialize() {
 
 void Proxy::run_once() {
     if (!initialized_) throw std::runtime_error("proxy is not initialized");
-    for (std::size_t i = 0; i < peers_.size(); ++i) {
-        enqueue_chunks(peers_[i], cuda_buffers_.peer_buffers()[i]);
+    run_iteration(0);
+}
+
+void Proxy::run() {
+    if (!initialized_) throw std::runtime_error("proxy is not initialized");
+    for (uint64_t iteration = 0;
+         config_.num_iterations == 0 || iteration < static_cast<uint64_t>(config_.num_iterations);
+         ++iteration) {
+        run_iteration(iteration);
     }
 }
 
@@ -86,6 +97,7 @@ void Proxy::setup_peer(PeerGpuBuffers& buffers) {
     for (std::size_t q = 0; q < peer.qps.size(); ++q) {
         peer.qps[q]->connect(remote_info.qps[q]);
         auto worker = std::make_unique<QPWorker>(*peer.qps[q], config_.completion_poll_batch_size);
+        worker->configure_expected_chunks(make_chunks().size());
         worker->post_initial_receives(config_.recv_queue_depth);
         worker->start();
         peer.workers.emplace_back(std::move(worker));
@@ -95,13 +107,82 @@ void Proxy::setup_peer(PeerGpuBuffers& buffers) {
     peers_.push_back(std::move(peer));
 }
 
-void Proxy::enqueue_chunks(PeerState& peer, const PeerGpuBuffers& buffers) {
-    const auto chunks = compute_chunks(
+void Proxy::run_iteration(uint64_t iteration) {
+    const auto chunks = make_chunks();
+    const auto bytes_per_peer = cuda_buffers_.token_buffer_bytes();
+
+    fill_iteration_send_buffers(iteration);
+
+    std::vector<std::vector<QPCompletionBaseline>> baselines;
+    baselines.reserve(peers_.size());
+    for (const auto& peer : peers_) {
+        baselines.push_back(capture_baselines(peer, chunks));
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < peers_.size(); ++i) {
+        enqueue_chunks(peers_[i], cuda_buffers_.peer_buffers()[i], chunks);
+    }
+    for (std::size_t i = 0; i < peers_.size(); ++i) {
+        wait_for_iteration(peers_[i], chunks, baselines[i]);
+    }
+    const auto end = std::chrono::steady_clock::now();
+    const auto seconds = std::chrono::duration<double>(end - start).count();
+
+    std::size_t verification_errors = 0;
+    for (std::size_t i = 0; i < peers_.size(); ++i) {
+        verification_errors += verify_immediates(peers_[i], chunks, baselines[i], iteration);
+    }
+    const auto validation_errors = validate_received_data(iteration);
+
+    report_iteration(iteration, seconds, bytes_per_peer, chunks, baselines, verification_errors, validation_errors);
+    if (verification_errors + validation_errors != 0) {
+        throw std::runtime_error("iteration " + std::to_string(iteration) +
+                                 " completed with " + std::to_string(verification_errors + validation_errors) +
+                                 " verification/validation errors");
+    }
+}
+
+void Proxy::fill_iteration_send_buffers(uint64_t iteration) {
+    if (!config_.fill_test_data) return;
+    for (const auto& buffers : cuda_buffers_.peer_buffers()) {
+        cuda_buffers_.fill_test_pattern(buffers.peer_rank, config_.node_rank, buffers.peer_rank, iteration);
+    }
+}
+
+std::vector<ChunkDescriptor> Proxy::make_chunks() const {
+    return compute_chunks(
         config_.num_tokens,
         config_.token_dimension,
         dtype_size(config_.dtype),
         config_.tokens_per_chunk,
         config_.num_qps_per_peer);
+}
+
+std::vector<Proxy::QPCompletionBaseline> Proxy::capture_baselines(
+    const PeerState& peer,
+    const std::vector<ChunkDescriptor>& chunks) const {
+    std::vector<QPCompletionBaseline> baselines(peer.workers.size());
+    for (std::size_t q = 0; q < peer.workers.size(); ++q) {
+        const auto& worker = peer.workers[q];
+        auto& baseline = baselines[q];
+        baseline.sends = worker->send_completions();
+        baseline.recvs = worker->recv_completions();
+        baseline.post_errors = worker->post_errors();
+        baseline.cq_errors = worker->cq_errors();
+        baseline.unexpected_imms = worker->unexpected_immediate_completions();
+        baseline.immediate_counts.resize(chunks.size());
+        for (const auto& chunk : chunks) {
+            baseline.immediate_counts[chunk.chunk_index] = worker->received_immediate_count(chunk.chunk_index);
+        }
+    }
+    return baselines;
+}
+
+void Proxy::enqueue_chunks(
+    PeerState& peer,
+    const PeerGpuBuffers& buffers,
+    const std::vector<ChunkDescriptor>& chunks) {
 
     uint64_t wr_id = 1;
     for (const auto& chunk : chunks) {
@@ -118,6 +199,143 @@ void Proxy::enqueue_chunks(PeerState& peer, const PeerGpuBuffers& buffers) {
         peer.workers.at(static_cast<std::size_t>(chunk.qp_index))->enqueue(task);
     }
     RDMA_PROXY_LOG_INFO("enqueued ", chunks.size(), " chunks for peer ", peer.peer_rank);
+}
+
+void Proxy::wait_for_iteration(
+    const PeerState& peer,
+    const std::vector<ChunkDescriptor>& chunks,
+    const std::vector<QPCompletionBaseline>& baselines) const {
+    std::vector<std::size_t> expected_by_qp(peer.workers.size(), 0);
+    for (const auto& chunk : chunks) {
+        ++expected_by_qp.at(static_cast<std::size_t>(chunk.qp_index));
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(config_.completion_timeout_ms);
+    while (true) {
+        bool complete = true;
+        for (std::size_t q = 0; q < peer.workers.size(); ++q) {
+            const auto& worker = peer.workers[q];
+            if (worker->post_errors() != baselines[q].post_errors ||
+                worker->cq_errors() != baselines[q].cq_errors ||
+                worker->unexpected_immediate_completions() != baselines[q].unexpected_imms) {
+                const auto error = worker->last_error();
+                throw std::runtime_error("QP error peer=" + std::to_string(peer.peer_rank) +
+                                         " qp=" + std::to_string(q) +
+                                         (error.empty() ? "" : " last_error=" + error));
+            }
+            const auto expected = static_cast<uint64_t>(expected_by_qp[q]);
+            if (worker->send_completions() < baselines[q].sends + expected ||
+                worker->recv_completions() < baselines[q].recvs + expected) {
+                complete = false;
+            }
+        }
+        if (complete) return;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            std::ostringstream out;
+            out << "timed out waiting for completions from peer=" << peer.peer_rank;
+            for (std::size_t q = 0; q < peer.workers.size(); ++q) {
+                out << " qp" << q
+                    << " send=" << (peer.workers[q]->send_completions() - baselines[q].sends)
+                    << "/" << expected_by_qp[q]
+                    << " recv=" << (peer.workers[q]->recv_completions() - baselines[q].recvs)
+                    << "/" << expected_by_qp[q];
+            }
+            throw std::runtime_error(out.str());
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+}
+
+std::size_t Proxy::verify_immediates(
+    const PeerState& peer,
+    const std::vector<ChunkDescriptor>& chunks,
+    const std::vector<QPCompletionBaseline>& baselines,
+    uint64_t iteration) const {
+    std::size_t errors = 0;
+    for (const auto& chunk : chunks) {
+        const auto q = static_cast<std::size_t>(chunk.qp_index);
+        const auto observed = peer.workers[q]->received_immediate_count(chunk.chunk_index);
+        const auto expected = baselines[q].immediate_counts[chunk.chunk_index] + 1;
+        if (observed != expected) {
+            ++errors;
+            RDMA_PROXY_LOG_ERROR("iteration=", iteration,
+                                 " peer=", peer.peer_rank,
+                                 " qp=", chunk.qp_index,
+                                 " chunk=", chunk.chunk_index,
+                                 " immediate_count=", observed,
+                                 " expected=", expected);
+        }
+    }
+    return errors;
+}
+
+std::size_t Proxy::validate_received_data(uint64_t iteration) const {
+    if (!config_.validate_data) return 0;
+    std::size_t errors = 0;
+    for (const auto& buffers : cuda_buffers_.peer_buffers()) {
+        std::string error;
+        const int expected_source = config_.mock_mode ? config_.node_rank : buffers.peer_rank;
+        const int expected_destination = config_.mock_mode ? buffers.peer_rank : config_.node_rank;
+        if (!cuda_buffers_.validate_recv_pattern(
+                buffers.peer_rank, expected_source, expected_destination, iteration, &error)) {
+            ++errors;
+            RDMA_PROXY_LOG_ERROR("receive validation failed: ", error);
+        }
+    }
+    return errors;
+}
+
+void Proxy::report_iteration(
+    uint64_t iteration,
+    double seconds,
+    std::size_t bytes_per_peer,
+    const std::vector<ChunkDescriptor>& chunks,
+    const std::vector<std::vector<QPCompletionBaseline>>& baselines,
+    std::size_t verification_errors,
+    std::size_t validation_errors) const {
+    const auto total_bytes = bytes_per_peer * peers_.size();
+    const double gbps = seconds > 0.0 ? (static_cast<double>(total_bytes) * 8.0 / seconds / 1.0e9) : 0.0;
+    const double latency_us = seconds * 1.0e6;
+
+    RDMA_PROXY_LOG_INFO("iteration=", iteration,
+                        " total_bytes=", total_bytes,
+                        " elapsed_us=", static_cast<uint64_t>(latency_us),
+                        " bandwidth_gbps=", std::fixed, std::setprecision(3), gbps,
+                        " errors=", (verification_errors + validation_errors));
+
+    std::vector<std::size_t> bytes_by_qp(static_cast<std::size_t>(config_.num_qps_per_peer), 0);
+    for (const auto& chunk : chunks) {
+        bytes_by_qp.at(static_cast<std::size_t>(chunk.qp_index)) += chunk.length_bytes;
+    }
+
+    for (std::size_t peer_index = 0; peer_index < peers_.size(); ++peer_index) {
+        const auto& peer = peers_[peer_index];
+        for (std::size_t q = 0; q < peer.workers.size(); ++q) {
+            const auto& worker = peer.workers[q];
+            const auto send_delta = worker->send_completions() - baselines[peer_index][q].sends;
+            const auto recv_delta = worker->recv_completions() - baselines[peer_index][q].recvs;
+            const auto post_error_delta = worker->post_errors() - baselines[peer_index][q].post_errors;
+            const auto cq_error_delta = worker->cq_errors() - baselines[peer_index][q].cq_errors;
+            const auto unexpected_delta =
+                worker->unexpected_immediate_completions() - baselines[peer_index][q].unexpected_imms;
+            const auto errors = post_error_delta + cq_error_delta + unexpected_delta;
+            const double qp_gbps = seconds > 0.0 ?
+                (static_cast<double>(bytes_by_qp[q]) * 8.0 / seconds / 1.0e9) : 0.0;
+            RDMA_PROXY_LOG_INFO("qp_report iteration=", iteration,
+                                " peer=", peer.peer_rank,
+                                " qp=", q,
+                                " bytes=", bytes_by_qp[q],
+                                " elapsed_us=", static_cast<uint64_t>(latency_us),
+                                " bandwidth_gbps=", std::fixed, std::setprecision(3), qp_gbps,
+                                " send_completions=", send_delta,
+                                " recv_immediate_completions=", recv_delta,
+                                " post_errors=", post_error_delta,
+                                " cq_errors=", cq_error_delta,
+                                " unexpected_immediates=", unexpected_delta,
+                                " errors=", errors);
+        }
+    }
 }
 
 }  // namespace rdma_proxy

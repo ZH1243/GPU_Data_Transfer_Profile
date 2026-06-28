@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <sstream>
 #include <stdexcept>
 
 #if RDMA_PROXY_HAVE_CUDA
@@ -20,6 +21,31 @@ void check_cuda(cudaError_t status, const char* what) {
     }
 }
 #endif
+
+uint8_t test_pattern_byte(int source_rank, int destination_rank, int gpu_index, uint64_t iteration, std::size_t offset) {
+    uint64_t x = static_cast<uint64_t>(offset);
+    x ^= (iteration + 1) * 0x9e3779b97f4a7c15ULL;
+    x ^= (static_cast<uint64_t>(source_rank + 1) << 48);
+    x ^= (static_cast<uint64_t>(destination_rank + 1) << 32);
+    x ^= (static_cast<uint64_t>(gpu_index + 1) << 16);
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    return static_cast<uint8_t>(x & 0xffU);
+}
+
+std::vector<uint8_t> make_test_pattern(
+    std::size_t bytes,
+    int source_rank,
+    int destination_rank,
+    int gpu_index,
+    uint64_t iteration) {
+    std::vector<uint8_t> pattern(bytes);
+    for (std::size_t i = 0; i < bytes; ++i) {
+        pattern[i] = test_pattern_byte(source_rank, destination_rank, gpu_index, iteration, i);
+    }
+    return pattern;
+}
 
 }  // namespace
 
@@ -67,6 +93,57 @@ void CudaBuffers::copy_tokens_to_send_buffer(int peer_rank, const void* src_devi
         throw std::runtime_error("copy exceeds send buffer size");
     }
     launch_copy_tokens(peer.send.ptr, src_device_or_host, bytes, config_.mock_mode);
+}
+
+void CudaBuffers::fill_test_pattern(int peer_rank, int source_rank, int destination_rank, uint64_t iteration) {
+    auto& peer = buffers_for_peer(peer_rank);
+    const auto pattern = make_test_pattern(peer.send.bytes, source_rank, destination_rank, config_.local_gpu_index, iteration);
+    if (config_.mock_mode) {
+        std::memcpy(peer.send.ptr, pattern.data(), pattern.size());
+        return;
+    }
+#if RDMA_PROXY_HAVE_CUDA
+    check_cuda(cudaMemcpy(peer.send.ptr, pattern.data(), pattern.size(), cudaMemcpyHostToDevice), "cudaMemcpy H2D test pattern");
+#else
+    throw std::runtime_error("CUDA test-pattern fill requested but CUDA support was not built");
+#endif
+}
+
+bool CudaBuffers::validate_recv_pattern(
+    int peer_rank,
+    int source_rank,
+    int destination_rank,
+    uint64_t iteration,
+    std::string* error) const {
+    const auto& peer = buffers_for_peer(peer_rank);
+    std::vector<uint8_t> actual(peer.recv.bytes);
+    if (config_.mock_mode) {
+        std::memcpy(actual.data(), peer.recv.ptr, actual.size());
+    } else {
+#if RDMA_PROXY_HAVE_CUDA
+        check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize before validation");
+        check_cuda(cudaMemcpy(actual.data(), peer.recv.ptr, actual.size(), cudaMemcpyDeviceToHost),
+                   "cudaMemcpy D2H recv validation");
+#else
+        throw std::runtime_error("CUDA receive validation requested but CUDA support was not built");
+#endif
+    }
+
+    for (std::size_t i = 0; i < actual.size(); ++i) {
+        const auto expected = test_pattern_byte(source_rank, destination_rank, config_.local_gpu_index, iteration, i);
+        if (actual[i] != expected) {
+            if (error) {
+                std::ostringstream out;
+                out << "peer=" << peer_rank
+                    << " offset=" << i
+                    << " expected=0x" << std::hex << static_cast<unsigned>(expected)
+                    << " actual=0x" << static_cast<unsigned>(actual[i]);
+                *error = out.str();
+            }
+            return false;
+        }
+    }
+    return true;
 }
 
 PeerGpuBuffers& CudaBuffers::buffers_for_peer(int peer_rank) {

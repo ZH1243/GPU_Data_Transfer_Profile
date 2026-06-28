@@ -40,9 +40,13 @@ struct ProxyConfig {
     int send_queue_depth{128};
     int recv_queue_depth{128};
     int cq_depth{256};
+    std::size_t num_iterations{1};
+    uint64_t completion_timeout_ms{30000};
 
     DataType dtype{DataType::kBF16};
     bool mock_mode{false};
+    bool fill_test_data{true};
+    bool validate_data{true};
     std::string log_level{"info"};
     std::vector<PeerAddress> peers;
 };

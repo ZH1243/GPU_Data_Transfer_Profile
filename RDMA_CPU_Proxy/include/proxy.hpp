@@ -21,6 +21,7 @@ public:
     Proxy& operator=(const Proxy&) = delete;
 
     void initialize();
+    void run();
     void run_once();
     void shutdown();
 
@@ -34,9 +35,42 @@ private:
         std::vector<std::unique_ptr<QPWorker>> workers;
     };
 
+    struct QPCompletionBaseline {
+        uint64_t sends{0};
+        uint64_t recvs{0};
+        uint64_t post_errors{0};
+        uint64_t cq_errors{0};
+        uint64_t unexpected_imms{0};
+        std::vector<uint64_t> immediate_counts;
+    };
+
     PeerConnectionInfo make_local_peer_info(const PeerState& peer) const;
     void setup_peer(PeerGpuBuffers& buffers);
-    void enqueue_chunks(PeerState& peer, const PeerGpuBuffers& buffers);
+    void run_iteration(uint64_t iteration);
+    void fill_iteration_send_buffers(uint64_t iteration);
+    std::vector<ChunkDescriptor> make_chunks() const;
+    std::vector<QPCompletionBaseline> capture_baselines(
+        const PeerState& peer,
+        const std::vector<ChunkDescriptor>& chunks) const;
+    void enqueue_chunks(PeerState& peer, const PeerGpuBuffers& buffers, const std::vector<ChunkDescriptor>& chunks);
+    void wait_for_iteration(
+        const PeerState& peer,
+        const std::vector<ChunkDescriptor>& chunks,
+        const std::vector<QPCompletionBaseline>& baselines) const;
+    std::size_t verify_immediates(
+        const PeerState& peer,
+        const std::vector<ChunkDescriptor>& chunks,
+        const std::vector<QPCompletionBaseline>& baselines,
+        uint64_t iteration) const;
+    std::size_t validate_received_data(uint64_t iteration) const;
+    void report_iteration(
+        uint64_t iteration,
+        double seconds,
+        std::size_t bytes_per_peer,
+        const std::vector<ChunkDescriptor>& chunks,
+        const std::vector<std::vector<QPCompletionBaseline>>& baselines,
+        std::size_t verification_errors,
+        std::size_t validation_errors) const;
 
     ProxyConfig config_;
     CudaBuffers cuda_buffers_;

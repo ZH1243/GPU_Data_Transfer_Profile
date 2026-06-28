@@ -260,8 +260,12 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "send_queue_depth") config.send_queue_depth = std::stoi(value);
     else if (key == "recv_queue_depth") config.recv_queue_depth = std::stoi(value);
     else if (key == "cq_depth") config.cq_depth = std::stoi(value);
+    else if (key == "num_iterations") config.num_iterations = static_cast<std::size_t>(std::stoull(value));
+    else if (key == "completion_timeout_ms") config.completion_timeout_ms = static_cast<uint64_t>(std::stoull(value));
     else if (key == "dtype") config.dtype = dtype_from_string(value);
     else if (key == "mock_mode") config.mock_mode = (value == "1" || value == "true" || value == "yes");
+    else if (key == "fill_test_data") config.fill_test_data = (value == "1" || value == "true" || value == "yes");
+    else if (key == "validate_data") config.validate_data = (value == "1" || value == "true" || value == "yes");
     else if (key == "log_level") config.log_level = value;
 }
 
@@ -327,8 +331,13 @@ ProxyConfig load_config_file(const std::string& path) {
     config.send_queue_depth = number_as<int>(object, "send_queue_depth", config.send_queue_depth);
     config.recv_queue_depth = number_as<int>(object, "recv_queue_depth", config.recv_queue_depth);
     config.cq_depth = number_as<int>(object, "cq_depth", config.cq_depth);
+    config.num_iterations = number_as<std::size_t>(object, "num_iterations", config.num_iterations);
+    config.completion_timeout_ms = number_as<uint64_t>(
+        object, "completion_timeout_ms", config.completion_timeout_ms);
     config.dtype = dtype_from_string(get_string(object, "dtype", to_string(config.dtype)));
     config.mock_mode = get_bool(object, "mock_mode", config.mock_mode);
+    config.fill_test_data = get_bool(object, "fill_test_data", config.fill_test_data);
+    config.validate_data = get_bool(object, "validate_data", config.validate_data);
     config.log_level = get_string(object, "log_level", config.log_level);
 
     if (has(object, "peers")) {
@@ -390,6 +399,7 @@ void validate_config(const ProxyConfig& config) {
     if (config.send_queue_depth <= 0 || config.recv_queue_depth <= 0 || config.cq_depth <= 0) {
         throw std::runtime_error("queue and CQ depths must be > 0");
     }
+    if (config.completion_timeout_ms == 0) throw std::runtime_error("completion_timeout_ms must be > 0");
     if (config.num_nodes > 1 && static_cast<int>(config.peers.size()) != config.num_nodes - 1) {
         throw std::runtime_error("peers must contain exactly num_nodes - 1 entries");
     }
@@ -403,6 +413,7 @@ std::string config_summary(const ProxyConfig& config) {
         << " dim=" << config.token_dimension
         << " chunk_tokens=" << config.tokens_per_chunk
         << " qps_per_peer=" << config.num_qps_per_peer
+        << " iterations=" << config.num_iterations
         << " dtype=" << to_string(config.dtype)
         << " mock_mode=" << (config.mock_mode ? "true" : "false");
     return out.str();

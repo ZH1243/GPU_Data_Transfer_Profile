@@ -20,6 +20,7 @@ For each peer node, the proxy creates `num_qps_per_peer` RC QPs. For each QP it 
 - one CQ polling thread that polls send completions and receive/immediate completions
 
 The CQ worker reposts receive WRs after receive/immediate completions so the responder keeps enough receive WQEs available.
+The measured run waits until every chunk has produced both a send completion and a receive-with-immediate completion on the local QPs before reporting an iteration complete.
 
 ## GPU Buffer Layout
 
@@ -40,7 +41,7 @@ Buffer size is:
 num_tokens * token_dimension * sizeof(dtype)
 ```
 
-The CUDA path uses `cudaMalloc` and a byte-copy CUDA kernel for staging token data into the registered send buffer. In mock mode, host memory is allocated instead.
+The CUDA path uses `cudaMalloc` and host-to-device copies for generated test payloads. In mock mode, host memory is allocated instead. When `fill_test_data` is enabled, every iteration fills each peer send buffer with deterministic byte data keyed by source rank, destination rank, GPU index, iteration, and byte offset. When `validate_data` is enabled, the receive buffer is copied back and checked after all expected immediate completions arrive.
 
 ## RDMA and GPUDirect RDMA
 
@@ -81,6 +82,19 @@ chunk 10 -> QP 0
 ```
 
 The immediate value currently encodes the chunk index as a 32-bit unsigned value. Extend `protocol.hpp` if you need flags, stream IDs, or sequence numbers.
+
+## Measured Iterations
+
+The executable runs `num_iterations` measured iterations. Each iteration:
+
+- fills per-peer send buffers with deterministic test data when `fill_test_data=true`
+- enqueues every chunk across the peer QPs
+- waits for all local send completions and all local receive-with-immediate completions
+- verifies that every expected chunk immediate was observed on the expected QP
+- validates received bytes when `validate_data=true`
+- reports elapsed time, aggregate bandwidth, completion counters, and error counters per QP
+
+Set `num_iterations` to `0` for an indefinite loop. `completion_timeout_ms` bounds how long an iteration waits for completions before failing with per-QP progress details.
 
 ## Why Receive WRs Are Required
 
@@ -154,8 +168,10 @@ Required parameters are represented in `config/example_config.json`:
 - `peers`
 - `completion_poll_batch_size`
 - `send_queue_depth`, `recv_queue_depth`, `cq_depth`
+- `num_iterations`, `completion_timeout_ms`
 - `dtype`
 - `mock_mode`
+- `fill_test_data`, `validate_data`
 
 Command-line overrides use `--key=value`. `--listen_port=value` also updates every `peers[].port`, matching the common launch convention where GPU `k` uses the same metadata port on every node. You can also use `--peer_port=value` to update every peer port explicitly. `--peer_host=value` is supported only when the config has exactly one peer.
 
@@ -165,5 +181,5 @@ Command-line overrides use `--key=value`. `--listen_port=value` also updates eve
 - The server side accepts one metadata connection at a time. Multi-peer simultaneous bring-up may need a threaded or event-driven connection manager.
 - QP attributes such as MTU, SL, traffic class, timeout, retry count, and GID handling should be tuned per fabric.
 - CUDA copy staging currently uses a generic byte-copy kernel. Integrate the real token producer path if tokens are already in the registered send buffer.
-- Mock mode self-completes WQEs for development visibility; it does not simulate fabric ordering, remote process state, or real memory movement between processes.
+- Mock mode copies payload bytes locally and self-completes WQEs for development visibility; it does not simulate fabric ordering or remote process state.
 - Error recovery is fail-fast. Production use should add QP teardown/reconnect and health reporting.

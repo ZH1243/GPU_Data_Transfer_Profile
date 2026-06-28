@@ -266,6 +266,7 @@ void RdmaQueuePair::post_write_with_immediate(
     std::size_t length,
     uint32_t imm_data) {
     if (config_.mock_mode) {
+        std::memcpy(reinterpret_cast<void*>(remote_addr), reinterpret_cast<const void*>(local_addr), length);
         std::lock_guard<std::mutex> lock(impl_->mock_mutex);
         impl_->mock_completions.push_back(Completion{CompletionKind::kSend, wr_id, imm_data, length});
         impl_->mock_completions.push_back(Completion{CompletionKind::kRecvWithImmediate, wr_id, imm_data, length});

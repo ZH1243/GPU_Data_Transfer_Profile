@@ -16,8 +16,12 @@ int main(int argc, char** argv) {
     assert(config.token_dimension == 128);
     assert(config.tokens_per_chunk == 32);
     assert(config.num_qps_per_peer == 10);
+    assert(config.num_iterations == 1);
+    assert(config.completion_timeout_ms == 30000);
     assert(config.dtype == rdma_proxy::DataType::kBF16);
     assert(config.mock_mode);
+    assert(config.fill_test_data);
+    assert(config.validate_data);
     assert(config.peers.size() == 3);
     assert(config.peers[0].node_rank == 1);
     assert(config.peers[0].host == "node-b.example.com");
@@ -87,11 +91,17 @@ int main(int argc, char** argv) {
         "--config",
         argv[1],
         "--peer_port=18521",
+        "--num_iterations=3",
+        "--completion_timeout_ms=1000",
+        "--validate_data=false",
     };
-    const auto peer_port_config = rdma_proxy::load_config(4, const_cast<char**>(peer_port_args));
+    const auto peer_port_config = rdma_proxy::load_config(7, const_cast<char**>(peer_port_args));
     for (const auto& peer : peer_port_config.peers) {
         assert(peer.port == 18521);
     }
+    assert(peer_port_config.num_iterations == 3);
+    assert(peer_port_config.completion_timeout_ms == 1000);
+    assert(!peer_port_config.validate_data);
 
     std::cout << rdma_proxy::config_summary(config) << '\n';
     std::cout << "test_config passed\n";

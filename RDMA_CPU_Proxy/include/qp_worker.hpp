@@ -8,7 +8,9 @@
 #include <cstdint>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
+#include <vector>
 
 namespace rdma_proxy {
 
@@ -46,9 +48,15 @@ public:
     void stop();
     void enqueue(SendTask task);
     void post_initial_receives(int recv_queue_depth);
+    void configure_expected_chunks(std::size_t num_chunks);
 
     uint64_t send_completions() const { return send_completions_.load(); }
     uint64_t recv_completions() const { return recv_completions_.load(); }
+    uint64_t post_errors() const { return post_errors_.load(); }
+    uint64_t cq_errors() const { return cq_errors_.load(); }
+    uint64_t unexpected_immediate_completions() const { return unexpected_immediate_completions_.load(); }
+    uint64_t received_immediate_count(std::size_t chunk_index) const;
+    std::string last_error() const;
 
 private:
     void send_loop();
@@ -63,6 +71,12 @@ private:
     std::atomic<uint64_t> next_recv_wr_id_{1};
     std::atomic<uint64_t> send_completions_{0};
     std::atomic<uint64_t> recv_completions_{0};
+    std::atomic<uint64_t> post_errors_{0};
+    std::atomic<uint64_t> cq_errors_{0};
+    std::atomic<uint64_t> unexpected_immediate_completions_{0};
+    mutable std::mutex stats_mutex_;
+    std::vector<uint64_t> immediate_counts_;
+    std::string last_error_;
 };
 
 }  // namespace rdma_proxy

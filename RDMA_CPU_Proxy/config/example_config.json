@@ -17,8 +17,12 @@
   "send_queue_depth": 256,
   "recv_queue_depth": 256,
   "cq_depth": 512,
+  "num_iterations": 1,
+  "completion_timeout_ms": 30000,
   "dtype": "bf16",
   "mock_mode": true,
+  "fill_test_data": true,
+  "validate_data": true,
   "log_level": "info",
   "peers": [
     {

@@ -63,6 +63,22 @@ void QPWorker::post_initial_receives(int recv_queue_depth) {
     }
 }
 
+void QPWorker::configure_expected_chunks(std::size_t num_chunks) {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    immediate_counts_.assign(num_chunks, 0);
+}
+
+uint64_t QPWorker::received_immediate_count(std::size_t chunk_index) const {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    if (chunk_index >= immediate_counts_.size()) return 0;
+    return immediate_counts_[chunk_index];
+}
+
+std::string QPWorker::last_error() const {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    return last_error_;
+}
+
 void QPWorker::send_loop() {
     while (!stop_.load()) {
         SendTask task;
@@ -79,6 +95,11 @@ void QPWorker::send_loop() {
                 task.chunk.length_bytes,
                 task.chunk.imm_data);
         } catch (const std::exception& e) {
+            post_errors_.fetch_add(1);
+            {
+                std::lock_guard<std::mutex> lock(stats_mutex_);
+                last_error_ = e.what();
+            }
             RDMA_PROXY_LOG_ERROR("send worker peer=", qp_.peer_rank(), " qp=", qp_.qp_index(), " failed: ", e.what());
             stop_.store(true);
         }
@@ -102,13 +123,27 @@ void QPWorker::cq_loop() {
                     send_completions_.fetch_add(1);
                 } else {
                     recv_completions_.fetch_add(1);
+                    const auto chunk_index = decode_immediate(c.imm_data);
+                    {
+                        std::lock_guard<std::mutex> lock(stats_mutex_);
+                        if (chunk_index < immediate_counts_.size()) {
+                            ++immediate_counts_[chunk_index];
+                        } else {
+                            unexpected_immediate_completions_.fetch_add(1);
+                        }
+                    }
                     RDMA_PROXY_LOG_DEBUG("recv imm completion peer=", qp_.peer_rank(),
                                          " qp=", qp_.qp_index(),
-                                         " chunk=", decode_immediate(c.imm_data));
+                                         " chunk=", chunk_index);
                     qp_.post_receive(next_recv_wr_id_.fetch_add(1));
                 }
             }
         } catch (const std::exception& e) {
+            cq_errors_.fetch_add(1);
+            {
+                std::lock_guard<std::mutex> lock(stats_mutex_);
+                last_error_ = e.what();
+            }
             RDMA_PROXY_LOG_ERROR("CQ worker peer=", qp_.peer_rank(), " qp=", qp_.qp_index(), " failed: ", e.what());
             stop_.store(true);
         }

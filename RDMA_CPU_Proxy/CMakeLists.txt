@@ -79,6 +79,10 @@ if(RDMA_PROXY_BUILD_TESTS)
   add_executable(test_config tests/test_config.cpp)
   target_link_libraries(test_config PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_config COMMAND test_config ${CMAKE_CURRENT_SOURCE_DIR}/config/example_config.json)
+
+  add_executable(test_measured_run tests/test_measured_run.cpp)
+  target_link_libraries(test_measured_run PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_measured_run COMMAND test_measured_run)
 endif()
 
 message(STATUS "RDMA_PROXY_HAVE_CUDA=${RDMA_PROXY_HAVE_CUDA}")

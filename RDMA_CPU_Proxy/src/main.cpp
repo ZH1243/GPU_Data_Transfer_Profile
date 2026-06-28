@@ -12,7 +12,7 @@ int main(int argc, char** argv) {
 
         rdma_proxy::Proxy proxy(config);
         proxy.initialize();
-        proxy.run_once();
+        proxy.run();
         proxy.shutdown();
         return 0;
     } catch (const std::exception& e) {
