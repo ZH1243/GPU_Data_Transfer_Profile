@@ -227,6 +227,8 @@ std::vector<Proxy::QPCompletionBaseline> Proxy::capture_baselines(
         auto& baseline = baselines[q];
         baseline.sends = worker->send_completions();
         baseline.recvs = worker->recv_completions();
+        baseline.send_markers = worker->send_marker_completions();
+        baseline.recv_markers = worker->recv_marker_completions();
         baseline.post_errors = worker->post_errors();
         baseline.cq_errors = worker->cq_errors();
         baseline.unexpected_imms = worker->unexpected_immediate_completions();
@@ -256,6 +258,14 @@ void Proxy::enqueue_chunks(
         task.remote_base = static_cast<uintptr_t>(peer.remote_recv_mr.addr);
         task.remote_rkey = peer.remote_recv_mr.rkey;
         peer.workers.at(static_cast<std::size_t>(chunk.qp_index))->enqueue(task);
+    }
+    for (std::size_t q = 0; q < peer.workers.size(); ++q) {
+        SendTask marker;
+        marker.marker = true;
+        marker.wr_id = (static_cast<uint64_t>(peer.peer_rank) << 48) |
+                       (static_cast<uint64_t>(q) << 32) |
+                       0xffffffffULL;
+        peer.workers[q]->enqueue(marker);
     }
     RDMA_PROXY_LOG_INFO("enqueued ", chunks.size(), " chunks for peer ", peer.peer_rank);
 }
@@ -288,7 +298,9 @@ void Proxy::wait_for_iteration(
             }
             const auto expected = static_cast<uint64_t>(expected_by_qp[q]);
             if (worker->send_completions() < baselines[q].sends + expected ||
-                worker->recv_completions() < baselines[q].recvs + expected) {
+                worker->recv_completions() < baselines[q].recvs + expected ||
+                worker->send_marker_completions() < baselines[q].send_markers + 1 ||
+                worker->recv_marker_completions() < baselines[q].recv_markers + 1) {
                 complete = false;
             }
         }
@@ -304,7 +316,11 @@ void Proxy::wait_for_iteration(
                     << " send=" << (peer.workers[q]->send_completions() - baselines[q].sends)
                     << "/" << expected_by_qp[q]
                     << " recv=" << (peer.workers[q]->recv_completions() - baselines[q].recvs)
-                    << "/" << expected_by_qp[q];
+                    << "/" << expected_by_qp[q]
+                    << " send_marker=" << (peer.workers[q]->send_marker_completions() - baselines[q].send_markers)
+                    << "/1"
+                    << " recv_marker=" << (peer.workers[q]->recv_marker_completions() - baselines[q].recv_markers)
+                    << "/1";
             }
             throw std::runtime_error(out.str());
         }
@@ -382,6 +398,10 @@ void Proxy::report_iteration(
             const auto& worker = peer.workers[q];
             const auto send_delta = worker->send_completions() - baselines[peer_index][q].sends;
             const auto recv_delta = worker->recv_completions() - baselines[peer_index][q].recvs;
+            const auto send_marker_delta =
+                worker->send_marker_completions() - baselines[peer_index][q].send_markers;
+            const auto recv_marker_delta =
+                worker->recv_marker_completions() - baselines[peer_index][q].recv_markers;
             const auto post_error_delta = worker->post_errors() - baselines[peer_index][q].post_errors;
             const auto cq_error_delta = worker->cq_errors() - baselines[peer_index][q].cq_errors;
             const auto unexpected_delta =
@@ -401,6 +421,8 @@ void Proxy::report_iteration(
                                 " bandwidth_gbps=", std::fixed, std::setprecision(3), qp_gbps,
                                 " send_completions=", send_delta,
                                 " recv_immediate_completions=", recv_delta,
+                                " send_marker_completions=", send_marker_delta,
+                                " recv_marker_completions=", recv_marker_delta,
                                 " post_errors=", post_error_delta,
                                 " cq_errors=", cq_error_delta,
                                 " unexpected_immediates=", unexpected_delta,
