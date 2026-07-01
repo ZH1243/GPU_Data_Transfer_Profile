@@ -4,6 +4,7 @@
 #include "rdma_connection.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -60,6 +61,8 @@ public:
     uint64_t cq_errors() const { return cq_errors_.load(); }
     uint64_t unexpected_immediate_completions() const { return unexpected_immediate_completions_.load(); }
     uint64_t received_immediate_count(std::size_t chunk_index) const;
+    std::chrono::steady_clock::time_point latest_send_marker_time() const;
+    std::chrono::steady_clock::time_point latest_recv_marker_time() const;
     std::string last_error() const;
 
 private:
@@ -82,6 +85,8 @@ private:
     std::atomic<uint64_t> unexpected_immediate_completions_{0};
     mutable std::mutex stats_mutex_;
     std::vector<uint64_t> immediate_counts_;
+    std::chrono::steady_clock::time_point latest_send_marker_time_{};
+    std::chrono::steady_clock::time_point latest_recv_marker_time_{};
     std::string last_error_;
 };
 

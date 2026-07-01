@@ -34,6 +34,7 @@ public:
     RdmaQueuePair& operator=(const RdmaQueuePair&) = delete;
 
     QPInfo local_info() const;
+    QPInfo remote_info() const;
     void connect(const QPInfo& remote);
     void post_receive(uint64_t wr_id);
     void post_write_with_immediate(

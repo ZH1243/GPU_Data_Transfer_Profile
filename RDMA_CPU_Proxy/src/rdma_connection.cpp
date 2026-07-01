@@ -5,9 +5,11 @@
 #include <arpa/inet.h>
 #include <chrono>
 #include <cstring>
+#include <iomanip>
 #include <mutex>
 #include <netdb.h>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -24,6 +26,16 @@ namespace {
 uint32_t make_psn() {
     std::random_device rd;
     return rd() & 0x00ffffffU;
+}
+
+std::string gid_to_string(const uint8_t gid[16]) {
+    std::ostringstream out;
+    out << std::hex << std::setfill('0');
+    for (int i = 0; i < 16; ++i) {
+        if (i > 0 && i % 2 == 0) out << ':';
+        out << std::setw(2) << static_cast<unsigned>(gid[i]);
+    }
+    return out.str();
 }
 
 uint64_t host_to_be64(uint64_t value) {
@@ -174,6 +186,14 @@ RdmaQueuePair::RdmaQueuePair(RdmaContext& context, const ProxyConfig& config, in
     if (config_.mock_mode) {
         impl_->local_info.qp_num =
             0x100000U + static_cast<uint32_t>(config_.node_rank * 4096 + peer_rank * 64 + qp_index);
+        RDMA_PROXY_LOG_INFO("created mock QP local_rank=", config_.node_rank,
+                            " local_gpu=", config_.local_gpu_index,
+                            " peer=", peer_rank_,
+                            " qp=", qp_index_,
+                            " local_qpn=", impl_->local_info.qp_num,
+                            " local_lid=", impl_->local_info.lid,
+                            " local_psn=", impl_->local_info.psn,
+                            " local_gid=", gid_to_string(impl_->local_info.gid));
         return;
     }
 
@@ -195,6 +215,20 @@ RdmaQueuePair::RdmaQueuePair(RdmaContext& context, const ProxyConfig& config, in
     impl_->qp = ibv_create_qp(pd, &qp_attr);
     if (!impl_->qp) throw std::runtime_error("ibv_create_qp failed");
     impl_->local_info.qp_num = impl_->qp->qp_num;
+    RDMA_PROXY_LOG_INFO("created QP local_rank=", config_.node_rank,
+                        " local_gpu=", config_.local_gpu_index,
+                        " peer=", peer_rank_,
+                        " qp=", qp_index_,
+                        " local_qpn=", impl_->local_info.qp_num,
+                        " local_lid=", impl_->local_info.lid,
+                        " local_psn=", impl_->local_info.psn,
+                        " local_gid=", gid_to_string(impl_->local_info.gid),
+                        " send_wr=", qp_attr.cap.max_send_wr,
+                        " recv_wr=", qp_attr.cap.max_recv_wr,
+                        " send_sge=", qp_attr.cap.max_send_sge,
+                        " recv_sge=", qp_attr.cap.max_recv_sge,
+                        " inline=", qp_attr.cap.max_inline_data,
+                        " cq_depth=", config_.cq_depth);
 
     ibv_qp_attr init_attr{};
     init_attr.qp_state = IBV_QPS_INIT;
@@ -225,9 +259,24 @@ QPInfo RdmaQueuePair::local_info() const {
     return impl_->local_info;
 }
 
+QPInfo RdmaQueuePair::remote_info() const {
+    return impl_->remote_info;
+}
+
 void RdmaQueuePair::connect(const QPInfo& remote) {
     impl_->remote_info = remote;
-    if (config_.mock_mode) return;
+    if (config_.mock_mode) {
+        RDMA_PROXY_LOG_INFO("connected mock QP local_rank=", config_.node_rank,
+                            " local_gpu=", config_.local_gpu_index,
+                            " peer=", peer_rank_,
+                            " qp=", qp_index_,
+                            " local_qpn=", impl_->local_info.qp_num,
+                            " remote_qpn=", remote.qp_num,
+                            " remote_lid=", remote.lid,
+                            " remote_psn=", remote.psn,
+                            " remote_gid=", gid_to_string(remote.gid));
+        return;
+    }
 
 #if RDMA_PROXY_HAVE_VERBS
     ibv_qp_attr rtr{};
@@ -261,6 +310,27 @@ void RdmaQueuePair::connect(const QPInfo& remote) {
     flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
             IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
     if (ibv_modify_qp(impl_->qp, &rts, flags)) throw std::runtime_error("ibv_modify_qp RTS failed");
+    RDMA_PROXY_LOG_INFO("connected QP local_rank=", config_.node_rank,
+                        " local_gpu=", config_.local_gpu_index,
+                        " peer=", peer_rank_,
+                        " qp=", qp_index_,
+                        " local_qpn=", impl_->local_info.qp_num,
+                        " remote_qpn=", remote.qp_num,
+                        " local_lid=", impl_->local_info.lid,
+                        " remote_lid=", remote.lid,
+                        " local_psn=", impl_->local_info.psn,
+                        " remote_psn=", remote.psn,
+                        " local_gid=", gid_to_string(impl_->local_info.gid),
+                        " remote_gid=", gid_to_string(remote.gid),
+                        " mtu=4096",
+                        " sl=", rtr.ah_attr.sl,
+                        " src_path_bits=", rtr.ah_attr.src_path_bits,
+                        " gid_index=", config_.gid_index,
+                        " rdma_port=", static_cast<int>(config_.rdma_port),
+                        " timeout=", rts.timeout,
+                        " retry_cnt=", rts.retry_cnt,
+                        " rnr_retry=", rts.rnr_retry,
+                        " min_rnr_timer=", rtr.min_rnr_timer);
 #endif
 }
 

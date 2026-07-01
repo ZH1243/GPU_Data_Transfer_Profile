@@ -166,7 +166,8 @@ void Proxy::run_iteration(uint64_t iteration) {
     }
     const auto validation_errors = validate_received_data(iteration);
 
-    report_iteration(iteration, seconds, bytes_per_peer, chunks, baselines, verification_errors, validation_errors);
+    report_iteration(
+        iteration, start, seconds, bytes_per_peer, chunks, baselines, verification_errors, validation_errors);
     if (verification_errors != 0) {
         RDMA_PROXY_LOG_WARN("iteration=", iteration,
                             " observed ", verification_errors,
@@ -417,6 +418,7 @@ std::size_t Proxy::validate_received_data(uint64_t iteration) const {
 
 void Proxy::report_iteration(
     uint64_t iteration,
+    std::chrono::steady_clock::time_point start,
     double seconds,
     std::size_t bytes_per_peer,
     const std::vector<ChunkDescriptor>& chunks,
@@ -454,6 +456,21 @@ void Proxy::report_iteration(
         const auto& peer = peers_[peer_index];
         for (std::size_t q = 0; q < peer.workers.size(); ++q) {
             const auto& worker = peer.workers[q];
+            const auto local_qp = peer.qps[q]->local_info();
+            const auto remote_qp = peer.qps[q]->remote_info();
+            const auto send_marker_time = worker->latest_send_marker_time();
+            const auto recv_marker_time = worker->latest_recv_marker_time();
+            const auto empty_time = std::chrono::steady_clock::time_point{};
+            const auto send_marker_elapsed_us = send_marker_time == empty_time ? -1 :
+                static_cast<int64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(send_marker_time - start).count());
+            const auto recv_marker_elapsed_us = recv_marker_time == empty_time ? -1 :
+                static_cast<int64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(recv_marker_time - start).count());
+            const auto marker_gap_us =
+                send_marker_elapsed_us >= 0 && recv_marker_elapsed_us >= 0 ?
+                    recv_marker_elapsed_us - send_marker_elapsed_us :
+                    0;
             const auto send_delta = worker->send_completions() - baselines[peer_index][q].sends;
             const auto recv_delta = worker->recv_completions() - baselines[peer_index][q].recvs;
             const auto send_marker_delta =
@@ -474,8 +491,17 @@ void Proxy::report_iteration(
                                 " remote_rank=", peer.peer_rank,
                                 " remote_gpu=", peer.remote_gpu_index,
                                 " qp=", q,
+                                " local_qpn=", local_qp.qp_num,
+                                " remote_qpn=", remote_qp.qp_num,
+                                " local_lid=", local_qp.lid,
+                                " remote_lid=", remote_qp.lid,
+                                " local_psn=", local_qp.psn,
+                                " remote_psn=", remote_qp.psn,
                                 " bytes=", bytes_by_qp[q],
                                 " elapsed_us=", static_cast<uint64_t>(latency_us),
+                                " send_marker_elapsed_us=", send_marker_elapsed_us,
+                                " recv_marker_elapsed_us=", recv_marker_elapsed_us,
+                                " marker_gap_us=", marker_gap_us,
                                 " bandwidth_gbps=", std::fixed, std::setprecision(3), qp_gbps,
                                 " send_completions=", send_delta,
                                 " expected_data_send_completions=", expected_send_completions_by_qp[q],

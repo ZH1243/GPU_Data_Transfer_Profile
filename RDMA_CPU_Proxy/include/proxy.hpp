@@ -7,6 +7,7 @@
 #include "rdma_connection.hpp"
 #include "rdma_context.hpp"
 
+#include <chrono>
 #include <memory>
 #include <vector>
 
@@ -71,6 +72,7 @@ private:
     std::size_t validate_received_data(uint64_t iteration) const;
     void report_iteration(
         uint64_t iteration,
+        std::chrono::steady_clock::time_point start,
         double seconds,
         std::size_t bytes_per_peer,
         const std::vector<ChunkDescriptor>& chunks,
