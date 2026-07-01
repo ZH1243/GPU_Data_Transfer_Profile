@@ -82,7 +82,7 @@ private:
 
 class QPWorker {
 public:
-    QPWorker(RdmaQueuePair& qp, int poll_batch_size);
+    QPWorker(RdmaQueuePair& qp, int poll_batch_size, int max_in_flight_chunks);
     ~QPWorker();
 
     QPWorker(const QPWorker&) = delete;
@@ -115,6 +115,7 @@ private:
 
     RdmaQueuePair& qp_;
     int poll_batch_size_{16};
+    int max_in_flight_chunks_{1};
     SendQueue send_queue_;
     std::atomic<bool> stop_{false};
     std::thread send_thread_;

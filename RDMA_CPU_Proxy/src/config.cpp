@@ -258,6 +258,7 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     }
     else if (key == "completion_poll_batch_size") config.completion_poll_batch_size = std::stoi(value);
     else if (key == "data_signal_interval") config.data_signal_interval = std::stoi(value);
+    else if (key == "max_in_flight_chunks_per_qp") config.max_in_flight_chunks_per_qp = std::stoi(value);
     else if (key == "send_queue_depth") config.send_queue_depth = std::stoi(value);
     else if (key == "recv_queue_depth") config.recv_queue_depth = std::stoi(value);
     else if (key == "cq_depth") config.cq_depth = std::stoi(value);
@@ -331,6 +332,8 @@ ProxyConfig load_config_file(const std::string& path) {
     config.connection_manager_port = number_as<uint16_t>(object, "connection_manager_port", config.connection_manager_port);
     config.completion_poll_batch_size = number_as<int>(object, "completion_poll_batch_size", config.completion_poll_batch_size);
     config.data_signal_interval = number_as<int>(object, "data_signal_interval", config.data_signal_interval);
+    config.max_in_flight_chunks_per_qp = number_as<int>(
+        object, "max_in_flight_chunks_per_qp", config.max_in_flight_chunks_per_qp);
     config.send_queue_depth = number_as<int>(object, "send_queue_depth", config.send_queue_depth);
     config.recv_queue_depth = number_as<int>(object, "recv_queue_depth", config.recv_queue_depth);
     config.cq_depth = number_as<int>(object, "cq_depth", config.cq_depth);
@@ -401,8 +404,14 @@ void validate_config(const ProxyConfig& config) {
     if (config.num_qps_per_peer <= 0) throw std::runtime_error("num_qps_per_peer must be > 0");
     if (config.completion_poll_batch_size <= 0) throw std::runtime_error("completion_poll_batch_size must be > 0");
     if (config.data_signal_interval < 0) throw std::runtime_error("data_signal_interval must be >= 0");
+    if (config.max_in_flight_chunks_per_qp <= 0) {
+        throw std::runtime_error("max_in_flight_chunks_per_qp must be > 0");
+    }
     if (config.send_queue_depth <= 0 || config.recv_queue_depth <= 0 || config.cq_depth <= 0) {
         throw std::runtime_error("queue and CQ depths must be > 0");
+    }
+    if (config.max_in_flight_chunks_per_qp > config.send_queue_depth) {
+        throw std::runtime_error("max_in_flight_chunks_per_qp must be <= send_queue_depth");
     }
     if (config.completion_timeout_ms == 0) throw std::runtime_error("completion_timeout_ms must be > 0");
     if (config.num_nodes > 1 && static_cast<int>(config.peers.size()) != config.num_nodes - 1) {
@@ -419,6 +428,7 @@ std::string config_summary(const ProxyConfig& config) {
         << " chunk_tokens=" << config.tokens_per_chunk
         << " qps_per_peer=" << config.num_qps_per_peer
         << " data_signal_interval=" << config.data_signal_interval
+        << " max_in_flight_chunks_per_qp=" << config.max_in_flight_chunks_per_qp
         << " iterations=" << config.num_iterations
         << " dtype=" << to_string(config.dtype)
         << " cpu_affinity=" << (config.cpu_affinity.empty() ? "none" : config.cpu_affinity)

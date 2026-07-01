@@ -99,7 +99,10 @@ void Proxy::setup_peer(PeerGpuBuffers& buffers) {
 
     for (std::size_t q = 0; q < peer.qps.size(); ++q) {
         peer.qps[q]->connect(remote_info.qps[q]);
-        auto worker = std::make_unique<QPWorker>(*peer.qps[q], config_.completion_poll_batch_size);
+        auto worker = std::make_unique<QPWorker>(
+            *peer.qps[q],
+            config_.completion_poll_batch_size,
+            config_.max_in_flight_chunks_per_qp);
         worker->configure_expected_chunks(make_chunks().size());
         worker->post_initial_receives(config_.recv_queue_depth);
         worker->start();

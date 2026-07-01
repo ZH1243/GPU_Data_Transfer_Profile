@@ -17,6 +17,7 @@ int main(int argc, char** argv) {
     assert(config.tokens_per_chunk == 32);
     assert(config.num_qps_per_peer == 10);
     assert(config.data_signal_interval == 16);
+    assert(config.max_in_flight_chunks_per_qp == 4);
     assert(config.num_iterations == 1);
     assert(config.completion_timeout_ms == 30000);
     assert(config.dtype == rdma_proxy::DataType::kBF16);
@@ -60,6 +61,7 @@ int main(int argc, char** argv) {
   "connection_manager_port": 18515,
   "completion_poll_batch_size": 16,
   "data_signal_interval": 0,
+  "max_in_flight_chunks_per_qp": 2,
   "send_queue_depth": 256,
   "recv_queue_depth": 256,
   "cq_depth": 512,
@@ -113,9 +115,11 @@ int main(int argc, char** argv) {
         "--config",
         argv[1],
         "--data_signal_interval=0",
+        "--max_in_flight_chunks_per_qp=8",
     };
-    const auto signal_interval_config = rdma_proxy::load_config(4, const_cast<char**>(signal_interval_args));
+    const auto signal_interval_config = rdma_proxy::load_config(5, const_cast<char**>(signal_interval_args));
     assert(signal_interval_config.data_signal_interval == 0);
+    assert(signal_interval_config.max_in_flight_chunks_per_qp == 8);
 
     std::cout << rdma_proxy::config_summary(config) << '\n';
     std::cout << "test_config passed\n";

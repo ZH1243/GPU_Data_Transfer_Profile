@@ -2,6 +2,7 @@
 
 #include "logging.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <stdexcept>
 #include <utility>
@@ -120,8 +121,10 @@ std::size_t DynamicChunkDistributor::chunk_count() const {
     return chunks_.size();
 }
 
-QPWorker::QPWorker(RdmaQueuePair& qp, int poll_batch_size)
-    : qp_(qp), poll_batch_size_(poll_batch_size) {}
+QPWorker::QPWorker(RdmaQueuePair& qp, int poll_batch_size, int max_in_flight_chunks)
+    : qp_(qp),
+      poll_batch_size_(poll_batch_size),
+      max_in_flight_chunks_(std::max(1, max_in_flight_chunks)) {}
 
 QPWorker::~QPWorker() {
     stop();
@@ -219,13 +222,35 @@ void QPWorker::post_task(const SendTask& task) {
 }
 
 void QPWorker::run_dynamic_iteration(const std::shared_ptr<DynamicChunkDistributor>& distributor) {
-    while (!stop_.load()) {
-        SendTask task;
-        if (!distributor->next(qp_.qp_index(), task)) break;
+    const auto max_in_flight = static_cast<std::size_t>(max_in_flight_chunks_);
+    std::size_t in_flight = 0;
+    uint64_t observed_send_completions = send_completions_.load();
+    bool distributor_drained = false;
 
-        const auto send_baseline = send_completions_.load();
-        post_task(task);
-        if (!wait_for_send_completion(send_baseline)) return;
+    auto retire_completed = [&] {
+        const auto completed = send_completions_.load();
+        if (completed <= observed_send_completions) return;
+
+        const auto delta = static_cast<std::size_t>(completed - observed_send_completions);
+        in_flight = delta >= in_flight ? 0 : in_flight - delta;
+        observed_send_completions = completed;
+    };
+
+    while (!stop_.load()) {
+        retire_completed();
+
+        while (!stop_.load() && !distributor_drained && in_flight < max_in_flight) {
+            SendTask task;
+            if (!distributor->next(qp_.qp_index(), task)) {
+                distributor_drained = true;
+                break;
+            }
+            post_task(task);
+            ++in_flight;
+        }
+
+        if (distributor_drained && in_flight == 0) break;
+        if (!wait_for_send_completion(observed_send_completions)) return;
     }
 
     SendTask marker;

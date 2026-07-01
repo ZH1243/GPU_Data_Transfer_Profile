@@ -72,18 +72,18 @@ length   = num_tokens_in_chunk * token_dimension * sizeof(dtype)
 imm_data = chunk_index
 ```
 
-Chunks are not statically bound to QPs when the chunk list is built. For each peer and iteration, the proxy creates one shared dynamic chunk distributor. Each QP send worker asks the distributor for the next chunk, posts a signaled RDMA Write with Immediate for that chunk, waits until its CQ worker observes the send CQE, and then asks for more work. Faster QPs therefore pull more chunks during that iteration.
+Chunks are not statically bound to QPs when the chunk list is built. For each peer and iteration, the proxy creates one shared dynamic chunk distributor. Each QP send worker asks the distributor for chunks while its local in-flight count is below `max_in_flight_chunks_per_qp`. The worker posts signaled RDMA Write-with-Immediate WRs, its CQ worker observes send CQEs, and each send CQE frees one in-flight slot so the send worker can pull more chunks. Faster QPs therefore pull more chunks during that iteration.
 
 ```text
-QP 0 finishes its current chunk -> asks distributor -> receives next unassigned chunk
-QP 3 finishes its current chunk -> asks distributor -> receives next unassigned chunk
+QP 0 in_flight < max window -> asks distributor -> receives next unassigned chunk
+QP 3 observes a send CQE     -> frees a slot    -> receives next unassigned chunk
 ```
 
 After the distributor has no chunks left, each QP worker posts one final zero-payload `SEND_WITH_IMM` marker. The iteration waits for one local send marker completion and one receive-side marker completion per QP.
 
 The immediate value still encodes the chunk index as a 32-bit unsigned value. Extend `protocol.hpp` if you need flags, stream IDs, or sequence numbers.
 
-Dynamic distribution needs a CQE before a QP asks for more work, so dynamically assigned data WRs are signaled one chunk at a time. The `data_signal_interval` setting is still parsed for configuration compatibility, but the dynamic path does not use reduced data-signaling cadence. The final per-QP `SEND_WITH_IMM` marker is also signaled, so each iteration has a local send-side completion that proves earlier WRs on that QP have drained.
+Dynamic distribution needs send CQEs to manage the per-QP in-flight window, so dynamically assigned data WRs are signaled. The `data_signal_interval` setting is still parsed for configuration compatibility, but the dynamic path does not use reduced data-signaling cadence. The final per-QP `SEND_WITH_IMM` marker is also signaled, so each iteration has a local send-side completion that proves earlier WRs on that QP have drained.
 
 ## Measured Iterations
 
@@ -181,6 +181,7 @@ Required parameters are represented in `config/example_config.json`:
 - `peers`
 - `completion_poll_batch_size`
 - `data_signal_interval`
+- `max_in_flight_chunks_per_qp`
 - `send_queue_depth`, `recv_queue_depth`, `cq_depth`
 - `num_iterations`, `completion_timeout_ms`
 - `dtype`
