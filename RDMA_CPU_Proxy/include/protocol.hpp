@@ -35,7 +35,7 @@ struct ChunkDescriptor {
     std::size_t src_offset_bytes{0};
     std::size_t dst_offset_bytes{0};
     std::size_t length_bytes{0};
-    int qp_index{0};
+    int qp_index{-1};
     uint32_t imm_data{0};
 };
 

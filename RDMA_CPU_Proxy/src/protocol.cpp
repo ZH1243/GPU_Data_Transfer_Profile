@@ -49,7 +49,7 @@ std::vector<ChunkDescriptor> compute_chunks(
         desc.src_offset_bytes = start * token_bytes;
         desc.dst_offset_bytes = start * token_bytes;
         desc.length_bytes = count * token_bytes;
-        desc.qp_index = static_cast<int>(chunk % static_cast<std::size_t>(num_qps_per_peer));
+        desc.qp_index = -1;
         desc.imm_data = encode_immediate(chunk);
         chunks.push_back(desc);
     }

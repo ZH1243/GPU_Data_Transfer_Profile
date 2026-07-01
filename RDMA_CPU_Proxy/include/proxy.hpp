@@ -59,15 +59,19 @@ private:
     std::vector<QPCompletionBaseline> capture_baselines(
         const PeerState& peer,
         const std::vector<ChunkDescriptor>& chunks) const;
-    void enqueue_chunks(PeerState& peer, const PeerGpuBuffers& buffers, const std::vector<ChunkDescriptor>& chunks);
+    std::shared_ptr<DynamicChunkDistributor> enqueue_chunks(
+        PeerState& peer,
+        const PeerGpuBuffers& buffers,
+        const std::vector<ChunkDescriptor>& chunks);
     void wait_for_iteration(
         const PeerState& peer,
-        const std::vector<ChunkDescriptor>& chunks,
-        const std::vector<QPCompletionBaseline>& baselines) const;
+        const std::vector<QPCompletionBaseline>& baselines,
+        const std::shared_ptr<DynamicChunkDistributor>& distributor) const;
     std::size_t verify_immediates(
         const PeerState& peer,
         const std::vector<ChunkDescriptor>& chunks,
         const std::vector<QPCompletionBaseline>& baselines,
+        const IterationAssignment& assignment,
         uint64_t iteration) const;
     std::size_t validate_received_data(uint64_t iteration) const;
     void report_iteration(
@@ -75,8 +79,8 @@ private:
         std::chrono::steady_clock::time_point start,
         double seconds,
         std::size_t bytes_per_peer,
-        const std::vector<ChunkDescriptor>& chunks,
         const std::vector<std::vector<QPCompletionBaseline>>& baselines,
+        const std::vector<IterationAssignment>& assignments,
         std::size_t verification_errors,
         std::size_t validation_errors) const;
 

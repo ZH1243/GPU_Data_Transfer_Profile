@@ -59,7 +59,7 @@ The real path uses libibverbs/rdma-core APIs:
 
 Registering CUDA device memory with `ibv_reg_mr` depends on the host/NIC/driver stack. If registration fails, the proxy reports an explicit error mentioning GPUDirect RDMA requirements. It does not silently fall back to host staging.
 
-## Chunking and QP Distribution
+## Chunking and Dynamic QP Distribution
 
 The send buffer contains `num_tokens` rows. Tokens are grouped into contiguous chunks of `tokens_per_chunk`, except the final chunk may be smaller.
 
@@ -72,25 +72,18 @@ length   = num_tokens_in_chunk * token_dimension * sizeof(dtype)
 imm_data = chunk_index
 ```
 
-Chunks are distributed round-robin across QPs for each peer:
+Chunks are not statically bound to QPs when the chunk list is built. For each peer and iteration, the proxy creates one shared dynamic chunk distributor. Each QP send worker asks the distributor for the next chunk, posts a signaled RDMA Write with Immediate for that chunk, waits until its CQ worker observes the send CQE, and then asks for more work. Faster QPs therefore pull more chunks during that iteration.
 
 ```text
-chunk 0  -> QP 0
-chunk 1  -> QP 1
-...
-chunk 9  -> QP 9
-chunk 10 -> QP 0
+QP 0 finishes its current chunk -> asks distributor -> receives next unassigned chunk
+QP 3 finishes its current chunk -> asks distributor -> receives next unassigned chunk
 ```
 
-The immediate value currently encodes the chunk index as a 32-bit unsigned value. Extend `protocol.hpp` if you need flags, stream IDs, or sequence numbers.
+After the distributor has no chunks left, each QP worker posts one final zero-payload `SEND_WITH_IMM` marker. The iteration waits for one local send marker completion and one receive-side marker completion per QP.
 
-Data RDMA Write-with-Immediate WRs can be signaled at a reduced cadence with `data_signal_interval`:
+The immediate value still encodes the chunk index as a 32-bit unsigned value. Extend `protocol.hpp` if you need flags, stream IDs, or sequence numbers.
 
-- `1` signals every data WR and matches the original behavior.
-- `N > 1` signals every Nth data WR per QP.
-- `0` leaves all data WRs unsignaled.
-
-The final per-QP `SEND_WITH_IMM` marker is always signaled, so each iteration still has a local send-side completion that proves earlier WRs on that QP have drained.
+Dynamic distribution needs a CQE before a QP asks for more work, so dynamically assigned data WRs are signaled one chunk at a time. The `data_signal_interval` setting is still parsed for configuration compatibility, but the dynamic path does not use reduced data-signaling cadence. The final per-QP `SEND_WITH_IMM` marker is also signaled, so each iteration has a local send-side completion that proves earlier WRs on that QP have drained.
 
 ## Measured Iterations
 
@@ -98,9 +91,9 @@ The executable runs `num_iterations` measured iterations. Each iteration:
 
 - fills per-peer send buffers with deterministic test data when `fill_test_data=true`
 - captures completion counter baselines, then exchanges a TCP iteration-start barrier so no peer can post measured RDMA writes before the receiver has captured its baseline
-- enqueues every chunk across the peer QPs, followed by one zero-payload immediate marker per QP
-- waits for the configured local data send completions and one receive-side drain marker per QP
-- reports whether every expected data immediate was observed on the expected QP
+- starts one dynamic chunk distributor per peer and one distributor task per QP worker
+- waits for one local send-side drain marker and one receive-side drain marker per QP
+- reports whether every expected data immediate was observed across the peer QPs
 - validates received bytes when `validate_data=true`
 - reports elapsed time, aggregate bandwidth, completion counters, and error counters per QP
 - exchanges a TCP iteration-done barrier with every peer before starting the next iteration or tearing down RDMA resources

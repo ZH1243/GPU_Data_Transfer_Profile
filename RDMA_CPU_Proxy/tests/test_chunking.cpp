@@ -1,4 +1,5 @@
 #include "protocol.hpp"
+#include "qp_worker.hpp"
 
 #include <cassert>
 #include <cstddef>
@@ -21,11 +22,9 @@ int main() {
     assert(chunks[0].src_offset_bytes == 0);
     assert(chunks[0].dst_offset_bytes == 0);
     assert(chunks[0].length_bytes == 32 * 128 * 2);
-    assert(chunks[0].qp_index == 0);
+    assert(chunks[0].qp_index == -1);
     assert(decode_immediate(chunks[0].imm_data) == 0);
 
-    assert(chunks[9].qp_index == 9);
-    assert(chunks[10].qp_index == 0);
     assert(chunks.back().chunk_index == 156);
     assert(chunks.back().start_token == 4992);
     assert(chunks.back().num_tokens == 8);
@@ -50,6 +49,33 @@ int main() {
     assert(decoded.recv_buffer.rkey == info.recv_buffer.rkey);
     assert(decoded.qps.size() == 1);
     assert(decoded.qps[0].gid[15] == 42);
+
+    DynamicChunkDistributor distributor(
+        chunks,
+        /*peer_rank=*/2,
+        /*qp_count=*/10,
+        /*local_base=*/0x1000,
+        /*local_lkey=*/11,
+        /*remote_base=*/0x2000,
+        /*remote_rkey=*/22);
+    SendTask task;
+    assert(distributor.next(/*qp_index=*/7, task));
+    assert(task.chunk.chunk_index == 0);
+    assert(task.chunk.qp_index == 7);
+    assert(task.signaled);
+    assert(task.local_base == 0x1000);
+    assert(task.remote_base == 0x2000);
+    assert(distributor.next(/*qp_index=*/3, task));
+    assert(task.chunk.chunk_index == 1);
+    assert(task.chunk.qp_index == 3);
+    const auto assignment = distributor.assignment();
+    assert(assignment.assigned_chunks() == 2);
+    assert(assignment.qp_by_chunk[0] == 7);
+    assert(assignment.qp_by_chunk[1] == 3);
+    assert(assignment.chunks_by_qp[7] == 1);
+    assert(assignment.chunks_by_qp[3] == 1);
+    assert(assignment.expected_send_completions_by_qp[7] == 1);
+    assert(assignment.expected_send_completions_by_qp[3] == 1);
 
     std::cout << "test_chunking passed\n";
     return 0;

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -14,6 +15,17 @@
 #include <vector>
 
 namespace rdma_proxy {
+
+class DynamicChunkDistributor;
+
+struct IterationAssignment {
+    std::vector<int> qp_by_chunk;
+    std::vector<std::size_t> chunks_by_qp;
+    std::vector<std::size_t> bytes_by_qp;
+    std::vector<std::size_t> expected_send_completions_by_qp;
+
+    std::size_t assigned_chunks() const;
+};
 
 struct SendTask {
     uint64_t wr_id{0};
@@ -24,6 +36,7 @@ struct SendTask {
     uint32_t remote_rkey{0};
     bool signaled{true};
     bool marker{false};
+    std::shared_ptr<DynamicChunkDistributor> distributor;
 };
 
 class SendQueue {
@@ -37,6 +50,34 @@ private:
     std::condition_variable cv_;
     std::queue<SendTask> queue_;
     bool closed_{false};
+};
+
+class DynamicChunkDistributor {
+public:
+    DynamicChunkDistributor(
+        std::vector<ChunkDescriptor> chunks,
+        int peer_rank,
+        std::size_t qp_count,
+        uintptr_t local_base,
+        uint32_t local_lkey,
+        uintptr_t remote_base,
+        uint32_t remote_rkey);
+
+    bool next(int qp_index, SendTask& task);
+    uint64_t marker_wr_id(int qp_index) const;
+    IterationAssignment assignment() const;
+    std::size_t chunk_count() const;
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<ChunkDescriptor> chunks_;
+    int peer_rank_{-1};
+    uintptr_t local_base_{0};
+    uint32_t local_lkey_{0};
+    uintptr_t remote_base_{0};
+    uint32_t remote_rkey_{0};
+    std::size_t next_chunk_{0};
+    IterationAssignment assignment_;
 };
 
 class QPWorker {
@@ -68,6 +109,9 @@ public:
 private:
     void send_loop();
     void cq_loop();
+    void post_task(const SendTask& task);
+    void run_dynamic_iteration(const std::shared_ptr<DynamicChunkDistributor>& distributor);
+    bool wait_for_send_completion(uint64_t baseline);
 
     RdmaQueuePair& qp_;
     int poll_batch_size_{16};
@@ -83,6 +127,8 @@ private:
     std::atomic<uint64_t> post_errors_{0};
     std::atomic<uint64_t> cq_errors_{0};
     std::atomic<uint64_t> unexpected_immediate_completions_{0};
+    std::condition_variable completion_cv_;
+    std::mutex completion_mutex_;
     mutable std::mutex stats_mutex_;
     std::vector<uint64_t> immediate_counts_;
     std::chrono::steady_clock::time_point latest_send_marker_time_{};

@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <stdexcept>
+#include <utility>
 
 namespace rdma_proxy {
 namespace {
@@ -15,6 +16,12 @@ bool is_marker_wr_id(uint64_t wr_id) {
 }
 
 }  // namespace
+
+std::size_t IterationAssignment::assigned_chunks() const {
+    std::size_t total = 0;
+    for (const auto count : chunks_by_qp) total += count;
+    return total;
+}
 
 void SendQueue::push(SendTask task) {
     {
@@ -42,6 +49,77 @@ void SendQueue::close() {
     cv_.notify_all();
 }
 
+DynamicChunkDistributor::DynamicChunkDistributor(
+    std::vector<ChunkDescriptor> chunks,
+    int peer_rank,
+    std::size_t qp_count,
+    uintptr_t local_base,
+    uint32_t local_lkey,
+    uintptr_t remote_base,
+    uint32_t remote_rkey)
+    : chunks_(std::move(chunks)),
+      peer_rank_(peer_rank),
+      local_base_(local_base),
+      local_lkey_(local_lkey),
+      remote_base_(remote_base),
+      remote_rkey_(remote_rkey) {
+    assignment_.qp_by_chunk.assign(chunks_.size(), -1);
+    assignment_.chunks_by_qp.assign(qp_count, 0);
+    assignment_.bytes_by_qp.assign(qp_count, 0);
+    assignment_.expected_send_completions_by_qp.assign(qp_count, 0);
+}
+
+bool DynamicChunkDistributor::next(int qp_index, SendTask& task) {
+    if (qp_index < 0) throw std::runtime_error("invalid QP index");
+    const auto q = static_cast<std::size_t>(qp_index);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (q >= assignment_.chunks_by_qp.size()) {
+        throw std::runtime_error("QP index exceeds dynamic distributor size");
+    }
+    if (next_chunk_ >= chunks_.size()) return false;
+
+    auto chunk = chunks_[next_chunk_++];
+    chunk.qp_index = qp_index;
+    if (chunk.chunk_index >= assignment_.qp_by_chunk.size()) {
+        throw std::runtime_error("chunk index exceeds dynamic assignment size");
+    }
+
+    assignment_.qp_by_chunk[chunk.chunk_index] = qp_index;
+    ++assignment_.chunks_by_qp[q];
+    assignment_.bytes_by_qp[q] += chunk.length_bytes;
+    ++assignment_.expected_send_completions_by_qp[q];
+
+    task = SendTask{};
+    task.wr_id = (static_cast<uint64_t>(peer_rank_) << 48) |
+                 (static_cast<uint64_t>(q) << 32) |
+                 static_cast<uint64_t>(chunk.chunk_index);
+    if (task.wr_id == 0) task.wr_id = 1;
+    task.chunk = chunk;
+    task.local_base = local_base_;
+    task.local_lkey = local_lkey_;
+    task.remote_base = remote_base_;
+    task.remote_rkey = remote_rkey_;
+    task.signaled = true;
+    return true;
+}
+
+uint64_t DynamicChunkDistributor::marker_wr_id(int qp_index) const {
+    if (qp_index < 0) throw std::runtime_error("invalid QP index");
+    return (static_cast<uint64_t>(peer_rank_) << 48) |
+           (static_cast<uint64_t>(static_cast<std::size_t>(qp_index)) << 32) |
+           0xffffffffULL;
+}
+
+IterationAssignment DynamicChunkDistributor::assignment() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return assignment_;
+}
+
+std::size_t DynamicChunkDistributor::chunk_count() const {
+    return chunks_.size();
+}
+
 QPWorker::QPWorker(RdmaQueuePair& qp, int poll_batch_size)
     : qp_(qp), poll_batch_size_(poll_batch_size) {}
 
@@ -58,6 +136,7 @@ void QPWorker::start() {
 void QPWorker::stop() {
     stop_.store(true);
     send_queue_.close();
+    completion_cv_.notify_all();
     if (send_thread_.joinable()) send_thread_.join();
     if (cq_thread_.joinable()) cq_thread_.join();
 }
@@ -105,18 +184,10 @@ void QPWorker::send_loop() {
             continue;
         }
         try {
-            if (task.marker) {
-                qp_.post_send_with_immediate(task.wr_id | kMarkerWrIdBit, encode_marker_immediate());
+            if (task.distributor) {
+                run_dynamic_iteration(task.distributor);
             } else {
-                qp_.post_write_with_immediate(
-                    task.wr_id,
-                    task.local_base + task.chunk.src_offset_bytes,
-                    task.local_lkey,
-                    task.remote_base + task.chunk.dst_offset_bytes,
-                    task.remote_rkey,
-                    task.chunk.length_bytes,
-                    task.chunk.imm_data,
-                    task.signaled);
+                post_task(task);
             }
         } catch (const std::exception& e) {
             post_errors_.fetch_add(1);
@@ -126,8 +197,53 @@ void QPWorker::send_loop() {
             }
             RDMA_PROXY_LOG_ERROR("send worker peer=", qp_.peer_rank(), " qp=", qp_.qp_index(), " failed: ", e.what());
             stop_.store(true);
+            completion_cv_.notify_all();
         }
     }
+}
+
+void QPWorker::post_task(const SendTask& task) {
+    if (task.marker) {
+        qp_.post_send_with_immediate(task.wr_id | kMarkerWrIdBit, encode_marker_immediate());
+    } else {
+        qp_.post_write_with_immediate(
+            task.wr_id,
+            task.local_base + task.chunk.src_offset_bytes,
+            task.local_lkey,
+            task.remote_base + task.chunk.dst_offset_bytes,
+            task.remote_rkey,
+            task.chunk.length_bytes,
+            task.chunk.imm_data,
+            task.signaled);
+    }
+}
+
+void QPWorker::run_dynamic_iteration(const std::shared_ptr<DynamicChunkDistributor>& distributor) {
+    while (!stop_.load()) {
+        SendTask task;
+        if (!distributor->next(qp_.qp_index(), task)) break;
+
+        const auto send_baseline = send_completions_.load();
+        post_task(task);
+        if (!wait_for_send_completion(send_baseline)) return;
+    }
+
+    SendTask marker;
+    marker.marker = true;
+    marker.wr_id = distributor->marker_wr_id(qp_.qp_index());
+    marker.signaled = true;
+    post_task(marker);
+}
+
+bool QPWorker::wait_for_send_completion(uint64_t baseline) {
+    std::unique_lock<std::mutex> lock(completion_mutex_);
+    completion_cv_.wait(lock, [&] {
+        return stop_.load() ||
+               send_completions_.load() > baseline ||
+               post_errors_.load() != 0 ||
+               cq_errors_.load() != 0;
+    });
+    return !stop_.load() && send_completions_.load() > baseline;
 }
 
 void QPWorker::cq_loop() {
@@ -152,6 +268,7 @@ void QPWorker::cq_loop() {
                         }
                     } else {
                         send_completions_.fetch_add(1);
+                        completion_cv_.notify_all();
                     }
                 } else {
                     if (is_marker_immediate(c.imm_data)) {
@@ -186,6 +303,7 @@ void QPWorker::cq_loop() {
             }
             RDMA_PROXY_LOG_ERROR("CQ worker peer=", qp_.peer_rank(), " qp=", qp_.qp_index(), " failed: ", e.what());
             stop_.store(true);
+            completion_cv_.notify_all();
         }
     }
 }
