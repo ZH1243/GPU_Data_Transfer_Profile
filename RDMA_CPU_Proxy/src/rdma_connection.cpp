@@ -323,14 +323,14 @@ void RdmaQueuePair::connect(const QPInfo& remote) {
                         " local_gid=", gid_to_string(impl_->local_info.gid),
                         " remote_gid=", gid_to_string(remote.gid),
                         " mtu=4096",
-                        " sl=", rtr.ah_attr.sl,
-                        " src_path_bits=", rtr.ah_attr.src_path_bits,
+                        " sl=", static_cast<int>(rtr.ah_attr.sl),
+                        " src_path_bits=", static_cast<int>(rtr.ah_attr.src_path_bits),
                         " gid_index=", config_.gid_index,
                         " rdma_port=", static_cast<int>(config_.rdma_port),
-                        " timeout=", rts.timeout,
-                        " retry_cnt=", rts.retry_cnt,
-                        " rnr_retry=", rts.rnr_retry,
-                        " min_rnr_timer=", rtr.min_rnr_timer);
+                        " timeout=", static_cast<int>(rts.timeout),
+                        " retry_cnt=", static_cast<int>(rts.retry_cnt),
+                        " rnr_retry=", static_cast<int>(rts.rnr_retry),
+                        " min_rnr_timer=", static_cast<int>(rtr.min_rnr_timer));
 #endif
 }
 
