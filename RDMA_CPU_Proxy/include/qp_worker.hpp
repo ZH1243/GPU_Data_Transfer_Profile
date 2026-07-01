@@ -21,6 +21,7 @@ struct SendTask {
     uint32_t local_lkey{0};
     uintptr_t remote_base{0};
     uint32_t remote_rkey{0};
+    bool signaled{true};
     bool marker{false};
 };
 

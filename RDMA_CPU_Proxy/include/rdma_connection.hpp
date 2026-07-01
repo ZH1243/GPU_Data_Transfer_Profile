@@ -43,7 +43,8 @@ public:
         uintptr_t remote_addr,
         uint32_t remote_rkey,
         std::size_t length,
-        uint32_t imm_data);
+        uint32_t imm_data,
+        bool signaled);
     void post_send_with_immediate(uint64_t wr_id, uint32_t imm_data);
     int poll(std::vector<Completion>& completions, int max_entries);
 

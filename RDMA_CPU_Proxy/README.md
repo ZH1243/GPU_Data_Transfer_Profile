@@ -84,15 +84,22 @@ chunk 10 -> QP 0
 
 The immediate value currently encodes the chunk index as a 32-bit unsigned value. Extend `protocol.hpp` if you need flags, stream IDs, or sequence numbers.
 
+Data RDMA Write-with-Immediate WRs can be signaled at a reduced cadence with `data_signal_interval`:
+
+- `1` signals every data WR and matches the original behavior.
+- `N > 1` signals every Nth data WR per QP.
+- `0` leaves all data WRs unsignaled.
+
+The final per-QP `SEND_WITH_IMM` marker is always signaled, so each iteration still has a local send-side completion that proves earlier WRs on that QP have drained.
+
 ## Measured Iterations
 
 The executable runs `num_iterations` measured iterations. Each iteration:
 
 - fills per-peer send buffers with deterministic test data when `fill_test_data=true`
 - captures completion counter baselines, then exchanges a TCP iteration-start barrier so no peer can post measured RDMA writes before the receiver has captured its baseline
-- enqueues every chunk across the peer QPs
-- waits for all local data send completions and one receive-side drain marker per QP
-- sends one zero-payload immediate marker per QP after the data chunks
+- enqueues every chunk across the peer QPs, followed by one zero-payload immediate marker per QP
+- waits for the configured local data send completions and one receive-side drain marker per QP
 - reports whether every expected data immediate was observed on the expected QP
 - validates received bytes when `validate_data=true`
 - reports elapsed time, aggregate bandwidth, completion counters, and error counters per QP
@@ -180,6 +187,7 @@ Required parameters are represented in `config/example_config.json`:
 - `listen_port`, `connection_manager_port`
 - `peers`
 - `completion_poll_batch_size`
+- `data_signal_interval`
 - `send_queue_depth`, `recv_queue_depth`, `cq_depth`
 - `num_iterations`, `completion_timeout_ms`
 - `dtype`

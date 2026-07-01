@@ -14,6 +14,7 @@
   "listen_port": 18515,
   "connection_manager_port": 18515,
   "completion_poll_batch_size": 16,
+  "data_signal_interval": 16,
   "send_queue_depth": 256,
   "recv_queue_depth": 256,
   "cq_depth": 512,

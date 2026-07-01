@@ -105,7 +105,8 @@ void QPWorker::send_loop() {
                     task.remote_base + task.chunk.dst_offset_bytes,
                     task.remote_rkey,
                     task.chunk.length_bytes,
-                    task.chunk.imm_data);
+                    task.chunk.imm_data,
+                    task.signaled);
             }
         } catch (const std::exception& e) {
             post_errors_.fetch_add(1);

@@ -16,6 +16,7 @@ int main(int argc, char** argv) {
     assert(config.token_dimension == 128);
     assert(config.tokens_per_chunk == 32);
     assert(config.num_qps_per_peer == 10);
+    assert(config.data_signal_interval == 16);
     assert(config.num_iterations == 1);
     assert(config.completion_timeout_ms == 30000);
     assert(config.dtype == rdma_proxy::DataType::kBF16);
@@ -58,6 +59,7 @@ int main(int argc, char** argv) {
   "listen_port": 18515,
   "connection_manager_port": 18515,
   "completion_poll_batch_size": 16,
+  "data_signal_interval": 0,
   "send_queue_depth": 256,
   "recv_queue_depth": 256,
   "cq_depth": 512,
@@ -105,6 +107,15 @@ int main(int argc, char** argv) {
     assert(peer_port_config.completion_timeout_ms == 1000);
     assert(!peer_port_config.validate_data);
     assert(peer_port_config.cpu_affinity == "0-95,192-287");
+
+    const char* signal_interval_args[] = {
+        "test_config",
+        "--config",
+        argv[1],
+        "--data_signal_interval=0",
+    };
+    const auto signal_interval_config = rdma_proxy::load_config(4, const_cast<char**>(signal_interval_args));
+    assert(signal_interval_config.data_signal_interval == 0);
 
     std::cout << rdma_proxy::config_summary(config) << '\n';
     std::cout << "test_config passed\n";

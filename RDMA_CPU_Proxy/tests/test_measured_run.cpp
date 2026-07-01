@@ -18,6 +18,7 @@ int main() {
     config.tokens_per_chunk = 7;
     config.num_qps_per_peer = 3;
     config.completion_poll_batch_size = 8;
+    config.data_signal_interval = 0;
     config.send_queue_depth = 64;
     config.recv_queue_depth = 64;
     config.cq_depth = 128;

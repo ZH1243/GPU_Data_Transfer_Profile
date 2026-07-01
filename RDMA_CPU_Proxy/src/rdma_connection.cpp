@@ -285,11 +285,14 @@ void RdmaQueuePair::post_write_with_immediate(
     uintptr_t remote_addr,
     uint32_t remote_rkey,
     std::size_t length,
-    uint32_t imm_data) {
+    uint32_t imm_data,
+    bool signaled) {
     if (config_.mock_mode) {
         std::memcpy(reinterpret_cast<void*>(remote_addr), reinterpret_cast<const void*>(local_addr), length);
         std::lock_guard<std::mutex> lock(impl_->mock_mutex);
-        impl_->mock_completions.push_back(Completion{CompletionKind::kSend, wr_id, imm_data, length});
+        if (signaled) {
+            impl_->mock_completions.push_back(Completion{CompletionKind::kSend, wr_id, imm_data, length});
+        }
         impl_->mock_completions.push_back(Completion{CompletionKind::kRecvWithImmediate, wr_id, imm_data, length});
         return;
     }
@@ -305,7 +308,7 @@ void RdmaQueuePair::post_write_with_immediate(
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
     wr.imm_data = htonl(imm_data);
     wr.wr.rdma.remote_addr = remote_addr;
     wr.wr.rdma.rkey = remote_rkey;
