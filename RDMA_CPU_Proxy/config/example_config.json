@@ -23,6 +23,7 @@
   "mock_mode": true,
   "fill_test_data": true,
   "validate_data": true,
+  "cpu_affinity": "auto",
   "log_level": "info",
   "peers": [
     {

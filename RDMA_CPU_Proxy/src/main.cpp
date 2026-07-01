@@ -1,4 +1,5 @@
 #include "config.hpp"
+#include "cpu_affinity.hpp"
 #include "logging.hpp"
 #include "proxy.hpp"
 
@@ -9,6 +10,7 @@ int main(int argc, char** argv) {
     try {
         auto config = rdma_proxy::load_config(argc, argv);
         rdma_proxy::Logger::instance().set_level(rdma_proxy::log_level_from_string(config.log_level));
+        rdma_proxy::apply_cpu_affinity(config);
 
         rdma_proxy::Proxy proxy(config);
         proxy.initialize();

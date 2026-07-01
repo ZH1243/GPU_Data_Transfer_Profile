@@ -266,6 +266,7 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "mock_mode") config.mock_mode = (value == "1" || value == "true" || value == "yes");
     else if (key == "fill_test_data") config.fill_test_data = (value == "1" || value == "true" || value == "yes");
     else if (key == "validate_data") config.validate_data = (value == "1" || value == "true" || value == "yes");
+    else if (key == "cpu_affinity") config.cpu_affinity = value;
     else if (key == "log_level") config.log_level = value;
 }
 
@@ -338,6 +339,7 @@ ProxyConfig load_config_file(const std::string& path) {
     config.mock_mode = get_bool(object, "mock_mode", config.mock_mode);
     config.fill_test_data = get_bool(object, "fill_test_data", config.fill_test_data);
     config.validate_data = get_bool(object, "validate_data", config.validate_data);
+    config.cpu_affinity = get_string(object, "cpu_affinity", config.cpu_affinity);
     config.log_level = get_string(object, "log_level", config.log_level);
 
     if (has(object, "peers")) {
@@ -415,6 +417,7 @@ std::string config_summary(const ProxyConfig& config) {
         << " qps_per_peer=" << config.num_qps_per_peer
         << " iterations=" << config.num_iterations
         << " dtype=" << to_string(config.dtype)
+        << " cpu_affinity=" << (config.cpu_affinity.empty() ? "none" : config.cpu_affinity)
         << " mock_mode=" << (config.mock_mode ? "true" : "false");
     return out.str();
 }

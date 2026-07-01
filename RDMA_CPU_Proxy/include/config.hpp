@@ -47,6 +47,7 @@ struct ProxyConfig {
     bool mock_mode{false};
     bool fill_test_data{true};
     bool validate_data{true};
+    std::string cpu_affinity;
     std::string log_level{"info"};
     std::vector<PeerAddress> peers;
 };

@@ -32,6 +32,7 @@ endif()
 
 set(RDMA_PROXY_SOURCES
   src/config.cpp
+  src/cpu_affinity.cpp
   src/cuda_buffers.cpp
   src/logging.cpp
   src/protocol.cpp

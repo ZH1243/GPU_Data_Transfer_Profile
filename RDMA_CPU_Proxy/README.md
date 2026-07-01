@@ -139,11 +139,19 @@ Node A, GPU 0:
   --node_rank=0 \
   --local_gpu_index=0 \
   --cuda_device_id=0 \
+  --cpu_affinity=auto \
   --listen_port=18515 \
   --mock_mode=false
 ```
 
 Node B, GPU 0 would use `--node_rank=1`, `--cuda_device_id=0`, and a peer list containing Node A/C/D GPU-0 proxy addresses.
+
+`--cpu_affinity=auto` runs `nvidia-smi topo -m`, reads the `CPU Affinity` column for `cuda_device_id`, and binds the proxy process before CUDA/RDMA initialization and before QP worker threads are created. Worker threads inherit that CPU mask. You can also pass an explicit Linux CPU list such as `--cpu_affinity=0-95,192-287`, or disable binding with `--cpu_affinity=none`.
+
+For the topology shown in the prompt:
+
+- GPUs 0-3 bind to NUMA 0 CPUs: `0-95,192-287`
+- GPUs 4-7 bind to NUMA 1 CPUs: `96-191,288-383`
 
 For 8 GPUs per node, run 8 processes per node, usually with different ports per GPU:
 
@@ -153,6 +161,7 @@ for gpu in 0 1 2 3 4 5 6 7; do
     --config RDMA_CPU_Proxy/config/example_config.json \
     --local_gpu_index=${gpu} \
     --cuda_device_id=${gpu} \
+    --cpu_affinity=auto \
     --listen_port=$((18515 + gpu)) &
 done
 wait
@@ -176,6 +185,7 @@ Required parameters are represented in `config/example_config.json`:
 - `dtype`
 - `mock_mode`
 - `fill_test_data`, `validate_data`
+- `cpu_affinity`
 
 Command-line overrides use `--key=value`. `--listen_port=value` also updates every `peers[].port`, matching the common launch convention where GPU `k` uses the same metadata port on every node. You can also use `--peer_port=value` to update every peer port explicitly. `--peer_host=value` is supported only when the config has exactly one peer.
 
