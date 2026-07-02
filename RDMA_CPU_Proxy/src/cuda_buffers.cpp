@@ -321,13 +321,14 @@ void launch_cuda_forward_copy_batch_async(
 #if RDMA_PROXY_HAVE_CUDA
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     if (use_batch_api) {
-        const void* dsts[] = {copy.dst};
-        const void* srcs[] = {copy.src};
-        const std::size_t sizes[] = {copy.bytes};
+        void* dsts[] = {copy.dst};
+        void* srcs[] = {const_cast<void*>(copy.src)};
+        std::size_t sizes[] = {copy.bytes};
         cudaMemcpyAttributes attrs{};
         attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
         std::size_t attrs_idxs[] = {0};
-        check_cuda(cudaMemcpyBatchAsync(dsts, srcs, sizes, 1, &attrs, attrs_idxs, 1, cuda_stream),
+        std::size_t fail_idx = 0;
+        check_cuda(cudaMemcpyBatchAsync(dsts, srcs, sizes, 1, &attrs, attrs_idxs, 1, &fail_idx, cuda_stream),
                    "cudaMemcpyBatchAsync");
     } else {
         check_cuda(cudaMemcpyAsync(copy.dst, copy.src, copy.bytes, cudaMemcpyDeviceToDevice, cuda_stream),
