@@ -759,19 +759,21 @@ void Proxy::issue_forwarding_batch(
         copy.dst = static_cast<char*>(dst_it->ptr) + destination_byte_offset;
         copy.bytes = bytes;
 
-        RDMA_PROXY_LOG_INFO("nvlink_forward iteration=", iteration,
-                            " local_rank=", config_.node_rank,
-                            " src_gpu=", config_.local_gpu_index,
-                            " dst_gpu=", dst_gpu,
-                            " peer_rank=", peer.peer_rank,
-                            " batch=", batch_index_in_iteration,
-                            " chunk=", chunk_index,
-                            " token_offset=", token_offset,
-                            " token_count=", config_.nvlink_forward_chunk_tokens,
-                            " peer_slot_offset=", peer_slot_offset,
-                            " bytes=", bytes,
-                            " src_addr=", reinterpret_cast<uintptr_t>(copy.src),
-                            " dst_addr=", reinterpret_cast<uintptr_t>(copy.dst));
+        if (config_.nvlink_forward_log_batches) {
+            RDMA_PROXY_LOG_INFO("nvlink_forward iteration=", iteration,
+                                " local_rank=", config_.node_rank,
+                                " src_gpu=", config_.local_gpu_index,
+                                " dst_gpu=", dst_gpu,
+                                " peer_rank=", peer.peer_rank,
+                                " batch=", batch_index_in_iteration,
+                                " chunk=", chunk_index,
+                                " token_offset=", token_offset,
+                                " token_count=", config_.nvlink_forward_chunk_tokens,
+                                " peer_slot_offset=", peer_slot_offset,
+                                " bytes=", bytes,
+                                " src_addr=", reinterpret_cast<uintptr_t>(copy.src),
+                                " dst_addr=", reinterpret_cast<uintptr_t>(copy.dst));
+        }
         launch_cuda_forward_copy_batch_async(
             copy,
             forwarding_stream_,
@@ -820,13 +822,15 @@ void Proxy::forwarding_loop() {
                     continue;
                 }
 
-                RDMA_PROXY_LOG_INFO("nvlink_forward_batch_ready iteration=", iteration,
-                                    " local_rank=", config_.node_rank,
-                                    " local_gpu=", config_.local_gpu_index,
-                                    " peer_rank=", peer.peer_rank,
-                                    " batch=", batch_in_iteration,
-                                    " batch_start_token=", batch_start_token,
-                                    " batch_tokens=", config_.nvlink_forward_threshold_tokens);
+                if (config_.nvlink_forward_log_batches) {
+                    RDMA_PROXY_LOG_INFO("nvlink_forward_batch_ready iteration=", iteration,
+                                        " local_rank=", config_.node_rank,
+                                        " local_gpu=", config_.local_gpu_index,
+                                        " peer_rank=", peer.peer_rank,
+                                        " batch=", batch_in_iteration,
+                                        " batch_start_token=", batch_start_token,
+                                        " batch_tokens=", config_.nvlink_forward_threshold_tokens);
+                }
                 issue_forwarding_batch(
                     peer,
                     cuda_buffers_.peer_buffers()[peer_index],
