@@ -33,6 +33,7 @@
   "nvlink_forward_stream_nonblocking": true,
   "nvlink_forward_synchronize_batches": false,
   "nvlink_forward_synchronize_iteration": true,
+  "nvlink_forward_log_batches": false,
   "nvlink_forward_exchange_dir": "/tmp/rdma_cpu_proxy_nvlink",
   "nvlink_forward_destinations": [
   ],

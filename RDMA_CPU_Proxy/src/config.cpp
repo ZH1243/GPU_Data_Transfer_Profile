@@ -320,6 +320,9 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "nvlink_forward_synchronize_iteration") {
         config.nvlink_forward_synchronize_iteration = (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "nvlink_forward_log_batches") {
+        config.nvlink_forward_log_batches = (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "nvlink_forward_exchange_dir") config.nvlink_forward_exchange_dir = value;
     else if (key == "cpu_affinity") config.cpu_affinity = value;
     else if (key == "log_level") config.log_level = value;
@@ -413,6 +416,8 @@ ProxyConfig load_config_file(const std::string& path) {
         object, "nvlink_forward_synchronize_batches", config.nvlink_forward_synchronize_batches);
     config.nvlink_forward_synchronize_iteration = get_bool(
         object, "nvlink_forward_synchronize_iteration", config.nvlink_forward_synchronize_iteration);
+    config.nvlink_forward_log_batches = get_bool(
+        object, "nvlink_forward_log_batches", config.nvlink_forward_log_batches);
     config.nvlink_forward_exchange_dir = get_string(
         object, "nvlink_forward_exchange_dir", config.nvlink_forward_exchange_dir);
     config.cpu_affinity = get_string(object, "cpu_affinity", config.cpu_affinity);
@@ -574,6 +579,7 @@ std::string config_summary(const ProxyConfig& config) {
         << " nvlink_forward_threshold_tokens=" << config.nvlink_forward_threshold_tokens
         << " nvlink_forward_chunk_tokens=" << config.nvlink_forward_chunk_tokens
         << " nvlink_forward_use_batch_api=" << (config.nvlink_forward_use_batch_api ? "true" : "false")
+        << " nvlink_forward_log_batches=" << (config.nvlink_forward_log_batches ? "true" : "false")
         << " nvlink_forward_exchange_dir=" << config.nvlink_forward_exchange_dir
         << " cpu_affinity=" << (config.cpu_affinity.empty() ? "none" : config.cpu_affinity)
         << " mock_mode=" << (config.mock_mode ? "true" : "false");

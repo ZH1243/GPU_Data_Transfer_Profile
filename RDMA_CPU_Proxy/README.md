@@ -71,7 +71,7 @@ The source token offset is copied into the destination buffer slot for the curre
 
 The forwarding thread assumes the sequential peer-transfer order for this path and uses descending ring order. On `node_rank=0` with four nodes, receive buffers are processed as peer rank 3, then 2, then 1.
 
-Forwarding logs include `iteration`, `src_gpu`, `dst_gpu`, `peer_rank`, `batch`, `chunk`, `token_offset`, `token_count`, byte count, and source/destination addresses.
+Set `nvlink_forward_log_batches=true` to emit per-batch/per-copy forwarding traces. Those trace logs include `iteration`, `src_gpu`, `dst_gpu`, `peer_rank`, `batch`, `chunk`, `token_offset`, `token_count`, byte count, and source/destination addresses. The option is disabled by default because large runs can produce many forwarding batches.
 
 ## RDMA and GPUDirect RDMA
 
@@ -223,6 +223,7 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_stream_nonblocking`
 - `nvlink_forward_synchronize_batches`
 - `nvlink_forward_synchronize_iteration`
+- `nvlink_forward_log_batches`
 - `nvlink_forward_exchange_dir`
 - `nvlink_forward_destinations`
 - `cpu_affinity`

@@ -32,6 +32,7 @@ int main(int argc, char** argv) {
     assert(config.nvlink_forward_stream_nonblocking);
     assert(!config.nvlink_forward_synchronize_batches);
     assert(config.nvlink_forward_synchronize_iteration);
+    assert(!config.nvlink_forward_log_batches);
     assert(config.nvlink_forward_exchange_dir == "/tmp/rdma_cpu_proxy_nvlink");
     assert(config.nvlink_forward_destinations.empty());
     assert(config.cpu_affinity == "auto");
@@ -164,6 +165,7 @@ int main(int argc, char** argv) {
   "nvlink_forward_stream_nonblocking": true,
   "nvlink_forward_synchronize_batches": false,
   "nvlink_forward_synchronize_iteration": true,
+  "nvlink_forward_log_batches": true,
   "nvlink_forward_destinations": [
     {"gpu_index": 1, "cuda_device_id": 1, "buffer_addr": "0x100000", "buffer_bytes": 9600},
     {"gpu_index": 2, "cuda_device_id": 2, "buffer_addr": "0x200000", "buffer_bytes": 9600},
@@ -180,6 +182,7 @@ int main(int argc, char** argv) {
     }
     const auto nvlink_config = rdma_proxy::load_config_file(nvlink_config_path);
     assert(nvlink_config.nvlink_forwarding_enabled);
+    assert(nvlink_config.nvlink_forward_log_batches);
     assert(nvlink_config.nvlink_forward_destinations.size() == 3);
     assert(nvlink_config.nvlink_forward_destinations[0].buffer_addr == 0x100000ULL);
 
