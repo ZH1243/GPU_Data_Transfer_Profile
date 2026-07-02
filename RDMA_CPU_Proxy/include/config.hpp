@@ -19,6 +19,13 @@ struct PeerAddress {
     uint16_t port{0};
 };
 
+struct NvlinkForwardDestination {
+    int gpu_index{-1};
+    int cuda_device_id{-1};
+    uint64_t buffer_addr{0};
+    std::size_t buffer_bytes{0};
+};
+
 struct ProxyConfig {
     int node_rank{0};
     int num_nodes{1};
@@ -50,9 +57,18 @@ struct ProxyConfig {
     bool fill_test_data{true};
     bool validate_data{true};
     bool sequential_peer_transfers{false};
+    bool nvlink_forwarding_enabled{false};
+    std::size_t nvlink_forward_threshold_tokens{0};
+    std::size_t nvlink_forward_chunk_tokens{0};
+    bool nvlink_forward_use_batch_api{true};
+    bool nvlink_forward_stream_nonblocking{true};
+    bool nvlink_forward_synchronize_batches{false};
+    bool nvlink_forward_synchronize_iteration{true};
+    std::string nvlink_forward_exchange_dir{"/tmp/rdma_cpu_proxy_nvlink"};
     std::string cpu_affinity;
     std::string log_level{"info"};
     std::vector<PeerAddress> peers;
+    std::vector<NvlinkForwardDestination> nvlink_forward_destinations;
 };
 
 std::size_t dtype_size(DataType dtype);

@@ -1,7 +1,10 @@
 #include "logging.hpp"
 #include "proxy.hpp"
 
+#include <algorithm>
+#include <cstdint>
 #include <iostream>
+#include <vector>
 
 int main() {
     using namespace rdma_proxy;
@@ -60,6 +63,35 @@ int main() {
         proxy.initialize();
         proxy.run();
         proxy.shutdown();
+    }
+
+    {
+        auto config = make_config();
+        config.num_gpus_per_node = 2;
+        config.num_iterations = 1;
+        config.nvlink_forwarding_enabled = true;
+        config.nvlink_forward_threshold_tokens = config.num_tokens;
+        config.nvlink_forward_chunk_tokens = config.num_tokens;
+        const auto destination_bytes = config.num_tokens * config.token_dimension * dtype_size(config.dtype);
+        std::vector<uint8_t> destination(destination_bytes, 0);
+        config.nvlink_forward_destinations.push_back(
+            NvlinkForwardDestination{
+                1,
+                1,
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(destination.data())),
+                destination.size()});
+        validate_config(config);
+
+        Proxy proxy(config);
+        proxy.initialize();
+        proxy.run();
+        proxy.shutdown();
+
+        const bool copied = std::any_of(destination.begin(), destination.end(), [](uint8_t v) { return v != 0; });
+        if (!copied) {
+            std::cerr << "NVLink mock forwarding destination remained empty\n";
+            return 1;
+        }
     }
 
     std::cout << "test_measured_run passed\n";

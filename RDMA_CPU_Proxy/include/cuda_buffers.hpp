@@ -22,6 +22,17 @@ struct PeerGpuBuffers {
     GpuBuffer recv;
 };
 
+struct NvlinkReceiveBuffer {
+    int source_gpu_index{-1};
+    GpuBuffer recv;
+};
+
+struct CudaForwardCopy {
+    void* dst{nullptr};
+    const void* src{nullptr};
+    std::size_t bytes{0};
+};
+
 class CudaBuffers {
 public:
     explicit CudaBuffers(ProxyConfig config);
@@ -42,10 +53,13 @@ public:
 
     const std::vector<PeerGpuBuffers>& peer_buffers() const { return buffers_; }
     std::vector<PeerGpuBuffers>& peer_buffers() { return buffers_; }
+    const std::vector<NvlinkReceiveBuffer>& nvlink_receive_buffers() const { return nvlink_recv_buffers_; }
     PeerGpuBuffers& buffers_for_peer(int peer_rank);
     const PeerGpuBuffers& buffers_for_peer(int peer_rank) const;
+    const NvlinkReceiveBuffer& nvlink_receive_buffer_for_source(int source_gpu_index) const;
 
     std::size_t token_buffer_bytes() const;
+    std::size_t nvlink_receive_buffer_bytes() const;
 
 private:
     void allocate_buffer(GpuBuffer& buffer, std::size_t bytes);
@@ -53,8 +67,21 @@ private:
 
     ProxyConfig config_;
     std::vector<PeerGpuBuffers> buffers_;
+    std::vector<NvlinkReceiveBuffer> nvlink_recv_buffers_;
 };
 
 void launch_copy_tokens(void* dst, const void* src, std::size_t bytes, bool mock_mode);
+void* create_cuda_stream(int cuda_device_id, bool nonblocking, bool mock_mode);
+void destroy_cuda_stream(void* stream, bool mock_mode);
+void synchronize_cuda_stream(void* stream, bool mock_mode);
+void enable_cuda_peer_access(int cuda_device_id, int peer_cuda_device_id, bool mock_mode);
+void launch_cuda_forward_copy_batch_async(
+    const CudaForwardCopy& copy,
+    void* stream,
+    bool use_batch_api,
+    bool mock_mode);
+std::string export_cuda_ipc_memory_handle(void* ptr, bool mock_mode);
+void* open_cuda_ipc_memory_handle(const std::string& handle_hex, uint64_t mock_addr, bool mock_mode);
+void close_cuda_ipc_memory_handle(void* ptr, bool mock_mode);
 
 }  // namespace rdma_proxy

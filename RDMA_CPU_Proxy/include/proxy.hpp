@@ -7,8 +7,12 @@
 #include "rdma_connection.hpp"
 #include "rdma_context.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <vector>
 
 namespace rdma_proxy {
@@ -48,6 +52,14 @@ private:
         std::vector<uint64_t> immediate_counts;
     };
 
+    struct ForwardDestinationState {
+        int gpu_index{-1};
+        int cuda_device_id{-1};
+        void* ptr{nullptr};
+        std::size_t bytes{0};
+        bool imported_cuda_ipc{false};
+    };
+
     PeerConnectionInfo make_local_peer_info(const PeerState& peer) const;
     void setup_peer(PeerGpuBuffers& buffers);
     void synchronize_peer_ready(const PeerAddress& peer_addr, const PeerState& peer) const;
@@ -72,6 +84,29 @@ private:
         const PeerState& peer,
         const std::vector<QPCompletionBaseline>& baselines,
         const std::shared_ptr<DynamicChunkDistributor>& distributor) const;
+    void start_forwarding_thread();
+    void stop_forwarding_thread();
+    void prepare_forwarding_destinations();
+    void publish_local_nvlink_receive_buffers() const;
+    ForwardDestinationState load_forward_destination(int dst_gpu) const;
+    std::string nvlink_exchange_file(int gpu_index) const;
+    void forwarding_loop();
+    std::vector<std::size_t> nvlink_forward_peer_order() const;
+    bool forwarding_batch_available(
+        const PeerState& peer,
+        const std::vector<ChunkDescriptor>& chunks,
+        std::size_t batch_start_token,
+        std::size_t batch_tokens,
+        uint64_t required_count) const;
+    void issue_forwarding_batch(
+        const PeerState& peer,
+        const PeerGpuBuffers& buffers,
+        uint64_t iteration,
+        std::size_t batch_index_in_iteration,
+        std::size_t batch_start_token);
+    void wait_for_forwarding_iteration(uint64_t iteration);
+    void set_forwarding_error(const std::string& error);
+    void check_forwarding_error() const;
     std::size_t verify_immediates(
         const PeerState& peer,
         const std::vector<ChunkDescriptor>& chunks,
@@ -94,6 +129,13 @@ private:
     RdmaContext rdma_context_;
     ConnectionManager connection_manager_;
     std::vector<PeerState> peers_;
+    std::atomic<bool> forwarding_stop_{false};
+    std::thread forwarding_thread_;
+    void* forwarding_stream_{nullptr};
+    mutable std::mutex forwarding_mutex_;
+    std::vector<std::size_t> forwarding_next_batch_by_peer_;
+    std::vector<ForwardDestinationState> forwarding_destinations_;
+    std::string forwarding_error_;
     bool initialized_{false};
 };
 

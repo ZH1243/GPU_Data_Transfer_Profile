@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <stdexcept>
@@ -219,6 +221,32 @@ bool get_bool(const Json::Object& object, const std::string& key, bool fallback 
     return std::get<bool>(json.value);
 }
 
+uint64_t parse_u64(const std::string& value, const std::string& key) {
+    std::size_t consumed = 0;
+    const int base = value.rfind("0x", 0) == 0 || value.rfind("0X", 0) == 0 ? 16 : 10;
+    const auto parsed = std::stoull(value, &consumed, base);
+    if (consumed != value.size()) {
+        throw std::runtime_error(key + " must be an unsigned integer string");
+    }
+    return static_cast<uint64_t>(parsed);
+}
+
+uint64_t get_u64_string_or_number(const Json::Object& object, const std::string& key, uint64_t fallback = 0) {
+    if (!has(object, key)) return fallback;
+    const auto& json = get_required(object, key);
+    if (std::holds_alternative<std::string>(json.value)) {
+        return parse_u64(std::get<std::string>(json.value), key);
+    }
+    if (std::holds_alternative<double>(json.value)) {
+        const double value = std::get<double>(json.value);
+        if (value < 0 || value > static_cast<double>(std::numeric_limits<uint64_t>::max())) {
+            throw std::runtime_error(key + " out of uint64 range");
+        }
+        return static_cast<uint64_t>(value);
+    }
+    throw std::runtime_error(key + " must be a string or number");
+}
+
 template <typename T>
 T number_as(const Json::Object& object, const std::string& key, T fallback = {}) {
     return static_cast<T>(get_number(object, key, static_cast<double>(fallback)));
@@ -271,6 +299,28 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "sequential_peer_transfers") {
         config.sequential_peer_transfers = (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "nvlink_forwarding_enabled") {
+        config.nvlink_forwarding_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_threshold_tokens") {
+        config.nvlink_forward_threshold_tokens = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "nvlink_forward_chunk_tokens") {
+        config.nvlink_forward_chunk_tokens = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "nvlink_forward_use_batch_api") {
+        config.nvlink_forward_use_batch_api = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_stream_nonblocking") {
+        config.nvlink_forward_stream_nonblocking = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_synchronize_batches") {
+        config.nvlink_forward_synchronize_batches = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_synchronize_iteration") {
+        config.nvlink_forward_synchronize_iteration = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_exchange_dir") config.nvlink_forward_exchange_dir = value;
     else if (key == "cpu_affinity") config.cpu_affinity = value;
     else if (key == "log_level") config.log_level = value;
 }
@@ -349,6 +399,22 @@ ProxyConfig load_config_file(const std::string& path) {
     config.validate_data = get_bool(object, "validate_data", config.validate_data);
     config.sequential_peer_transfers = get_bool(
         object, "sequential_peer_transfers", config.sequential_peer_transfers);
+    config.nvlink_forwarding_enabled = get_bool(
+        object, "nvlink_forwarding_enabled", config.nvlink_forwarding_enabled);
+    config.nvlink_forward_threshold_tokens = number_as<std::size_t>(
+        object, "nvlink_forward_threshold_tokens", config.nvlink_forward_threshold_tokens);
+    config.nvlink_forward_chunk_tokens = number_as<std::size_t>(
+        object, "nvlink_forward_chunk_tokens", config.nvlink_forward_chunk_tokens);
+    config.nvlink_forward_use_batch_api = get_bool(
+        object, "nvlink_forward_use_batch_api", config.nvlink_forward_use_batch_api);
+    config.nvlink_forward_stream_nonblocking = get_bool(
+        object, "nvlink_forward_stream_nonblocking", config.nvlink_forward_stream_nonblocking);
+    config.nvlink_forward_synchronize_batches = get_bool(
+        object, "nvlink_forward_synchronize_batches", config.nvlink_forward_synchronize_batches);
+    config.nvlink_forward_synchronize_iteration = get_bool(
+        object, "nvlink_forward_synchronize_iteration", config.nvlink_forward_synchronize_iteration);
+    config.nvlink_forward_exchange_dir = get_string(
+        object, "nvlink_forward_exchange_dir", config.nvlink_forward_exchange_dir);
     config.cpu_affinity = get_string(object, "cpu_affinity", config.cpu_affinity);
     config.log_level = get_string(object, "log_level", config.log_level);
 
@@ -360,6 +426,18 @@ ProxyConfig load_config_file(const std::string& path) {
             peer.host = get_string(peer_obj, "host");
             peer.port = number_as<uint16_t>(peer_obj, "port", config.connection_manager_port);
             config.peers.push_back(peer);
+        }
+    }
+    if (has(object, "nvlink_forward_destinations")) {
+        for (const auto& entry : as_array(
+                 get_required(object, "nvlink_forward_destinations"), "nvlink_forward_destinations")) {
+            const auto& dst_obj = as_object(entry, "nvlink_forward_destination");
+            NvlinkForwardDestination dst;
+            dst.gpu_index = number_as<int>(dst_obj, "gpu_index", -1);
+            dst.cuda_device_id = number_as<int>(dst_obj, "cuda_device_id", dst.gpu_index);
+            dst.buffer_addr = get_u64_string_or_number(dst_obj, "buffer_addr", 0);
+            dst.buffer_bytes = number_as<std::size_t>(dst_obj, "buffer_bytes", 0);
+            config.nvlink_forward_destinations.push_back(dst);
         }
     }
 
@@ -422,6 +500,61 @@ void validate_config(const ProxyConfig& config) {
     if (config.num_nodes > 1 && static_cast<int>(config.peers.size()) != config.num_nodes - 1) {
         throw std::runtime_error("peers must contain exactly num_nodes - 1 entries");
     }
+    if (config.nvlink_forwarding_enabled) {
+        if (config.num_gpus_per_node <= 1) {
+            throw std::runtime_error("nvlink_forwarding_enabled requires num_gpus_per_node > 1");
+        }
+        if (config.nvlink_forward_threshold_tokens == 0) {
+            throw std::runtime_error("nvlink_forward_threshold_tokens must be > 0 when NVLink forwarding is enabled");
+        }
+        if (config.nvlink_forward_chunk_tokens == 0) {
+            throw std::runtime_error("nvlink_forward_chunk_tokens must be > 0 when NVLink forwarding is enabled");
+        }
+        const auto expected_threshold =
+            config.nvlink_forward_chunk_tokens * static_cast<std::size_t>(config.num_gpus_per_node - 1);
+        if (config.nvlink_forward_threshold_tokens != expected_threshold) {
+            throw std::runtime_error(
+                "unsupported NVLink forwarding configuration: nvlink_forward_threshold_tokens must equal "
+                "nvlink_forward_chunk_tokens * (num_gpus_per_node - 1)");
+        }
+        if (config.num_tokens % config.nvlink_forward_threshold_tokens != 0) {
+            throw std::runtime_error(
+                "unsupported NVLink forwarding configuration: num_tokens must be an exact multiple of "
+                "nvlink_forward_threshold_tokens");
+        }
+        if (config.nvlink_forward_exchange_dir.empty()) {
+            throw std::runtime_error("nvlink_forward_exchange_dir must be non-empty when NVLink forwarding is enabled");
+        }
+        if (!config.nvlink_forward_destinations.empty() &&
+            config.nvlink_forward_destinations.size() != static_cast<std::size_t>(config.num_gpus_per_node - 1)) {
+            throw std::runtime_error(
+                "manual nvlink_forward_destinations must contain exactly one entry for each non-source local GPU");
+        }
+        std::vector<bool> seen(static_cast<std::size_t>(config.num_gpus_per_node), false);
+        const auto required_bytes =
+            config.num_tokens * config.token_dimension * dtype_size(config.dtype) * config.peers.size();
+        for (const auto& dst : config.nvlink_forward_destinations) {
+            if (dst.gpu_index < 0 || dst.gpu_index >= config.num_gpus_per_node) {
+                throw std::runtime_error("NVLink forwarding destination gpu_index out of range");
+            }
+            if (dst.gpu_index == config.local_gpu_index) {
+                throw std::runtime_error("NVLink forwarding destinations must not include the source GPU");
+            }
+            if (seen[static_cast<std::size_t>(dst.gpu_index)]) {
+                throw std::runtime_error("duplicate NVLink forwarding destination gpu_index");
+            }
+            seen[static_cast<std::size_t>(dst.gpu_index)] = true;
+            if (dst.cuda_device_id < 0) {
+                throw std::runtime_error("NVLink forwarding destination cuda_device_id must be >= 0");
+            }
+            if (dst.buffer_addr == 0) {
+                throw std::runtime_error("NVLink forwarding destination buffer_addr must be non-zero");
+            }
+            if (dst.buffer_bytes < required_bytes) {
+                throw std::runtime_error("NVLink forwarding destination buffer_bytes is smaller than forwarding buffer");
+            }
+        }
+    }
 }
 
 std::string config_summary(const ProxyConfig& config) {
@@ -437,6 +570,11 @@ std::string config_summary(const ProxyConfig& config) {
         << " iterations=" << config.num_iterations
         << " dtype=" << to_string(config.dtype)
         << " sequential_peer_transfers=" << (config.sequential_peer_transfers ? "true" : "false")
+        << " nvlink_forwarding_enabled=" << (config.nvlink_forwarding_enabled ? "true" : "false")
+        << " nvlink_forward_threshold_tokens=" << config.nvlink_forward_threshold_tokens
+        << " nvlink_forward_chunk_tokens=" << config.nvlink_forward_chunk_tokens
+        << " nvlink_forward_use_batch_api=" << (config.nvlink_forward_use_batch_api ? "true" : "false")
+        << " nvlink_forward_exchange_dir=" << config.nvlink_forward_exchange_dir
         << " cpu_affinity=" << (config.cpu_affinity.empty() ? "none" : config.cpu_affinity)
         << " mock_mode=" << (config.mock_mode ? "true" : "false");
     return out.str();

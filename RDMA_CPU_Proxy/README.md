@@ -23,6 +23,8 @@ The CQ worker reposts receive WRs after receive/immediate completions so the res
 The measured run waits until every chunk has produced both a send completion and a receive-with-immediate completion on the local QPs before reporting an iteration complete.
 Before the first measured send, peers also exchange a TCP ready barrier after QPs are connected and receive WQEs are posted.
 
+When `nvlink_forwarding_enabled=true`, each proxy also starts one forwarding thread for its local GPU. The QP CQ workers still own CQ polling and immediate decoding; the forwarding thread monitors their per-chunk immediate counters, processes peer-node receive buffers in deterministic descending ring order, and issues intra-node GPU-to-GPU copies after a complete forwarding batch has arrived.
+
 ## GPU Buffer Layout
 
 Each token buffer is contiguous row-major memory with shape:
@@ -43,6 +45,33 @@ num_tokens * token_dimension * sizeof(dtype)
 ```
 
 The CUDA path uses `cudaMalloc` and host-to-device copies for generated test payloads. In mock mode, host memory is allocated instead. When `fill_test_data` is enabled, every iteration fills each peer send buffer with deterministic byte data keyed by source rank, destination rank, GPU index, iteration, and byte offset. When `validate_data` is enabled, the receive buffer is copied back and checked after all expected immediate completions arrive.
+
+## Intra-Node NVLink Forwarding
+
+NVLink forwarding is disabled by default and does not change RDMA-only behavior. When enabled, each proxy allocates one inbound NVLink receive buffer on its local GPU for every other local source GPU. With 8 GPUs per node, each proxy allocates 7 such buffers. Each buffer is sized for all remote-node streams, so with 4 nodes it has 3 peer-node slots.
+
+The proxy publishes these local inbound buffers through `nvlink_forward_exchange_dir` using CUDA IPC handles. Other local GPU proxies import the specific buffer assigned to their source GPU and forward from their per-peer RDMA receive buffer to that imported destination buffer using the CUDA copy engine. Each forwarding copy is submitted as a one-entry `cudaMemcpyBatchAsync` call by default, and all copies for one forwarding batch are enqueued sequentially into the same CUDA stream.
+
+The current implementation supports the common full-fanout layout only:
+
+```text
+nvlink_forward_threshold_tokens == nvlink_forward_chunk_tokens * (num_gpus_per_node - 1)
+num_tokens must be a multiple of nvlink_forward_threshold_tokens
+```
+
+For source GPU `g`, chunk `i` in a forwarding batch goes to:
+
+```text
+dst_gpu = (g + 1 + i) % num_gpus_per_node
+```
+
+The source token offset is copied into the destination buffer slot for the current peer-node RDMA receive buffer. For example, with GPU 0, threshold 700, chunk size 100, and 8 local GPUs, tokens `[0,100)` go to GPU 1, `[100,200)` to GPU 2, and so on through GPU 7. GPU 1 starts at GPU 2 and wraps around to GPU 0.
+
+`nvlink_forward_destinations` remains as a manual-address override for experiments. When it is empty, the normal path is to allocate local buffers and exchange CUDA IPC metadata automatically through `nvlink_forward_exchange_dir`. Use a unique exchange directory per run to avoid stale metadata files from an earlier launch.
+
+The forwarding thread assumes the sequential peer-transfer order for this path and uses descending ring order. On `node_rank=0` with four nodes, receive buffers are processed as peer rank 3, then 2, then 1.
+
+Forwarding logs include `iteration`, `src_gpu`, `dst_gpu`, `peer_rank`, `batch`, `chunk`, `token_offset`, `token_count`, byte count, and source/destination addresses.
 
 ## RDMA and GPUDirect RDMA
 
@@ -187,6 +216,15 @@ Required parameters are represented in `config/example_config.json`:
 - `dtype`
 - `mock_mode`
 - `fill_test_data`, `validate_data`
+- `nvlink_forwarding_enabled`
+- `nvlink_forward_threshold_tokens`
+- `nvlink_forward_chunk_tokens`
+- `nvlink_forward_use_batch_api`
+- `nvlink_forward_stream_nonblocking`
+- `nvlink_forward_synchronize_batches`
+- `nvlink_forward_synchronize_iteration`
+- `nvlink_forward_exchange_dir`
+- `nvlink_forward_destinations`
 - `cpu_affinity`
 
 Command-line overrides use `--key=value`. `--listen_port=value` also updates every `peers[].port`, matching the common launch convention where GPU `k` uses the same metadata port on every node. You can also use `--peer_port=value` to update every peer port explicitly. `--peer_host=value` is supported only when the config has exactly one peer.

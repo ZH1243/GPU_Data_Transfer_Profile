@@ -165,6 +165,11 @@ uint64_t QPWorker::received_immediate_count(std::size_t chunk_index) const {
     return immediate_counts_[chunk_index];
 }
 
+std::vector<uint64_t> QPWorker::received_immediate_counts() const {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    return immediate_counts_;
+}
+
 std::chrono::steady_clock::time_point QPWorker::latest_send_marker_time() const {
     std::lock_guard<std::mutex> lock(stats_mutex_);
     return latest_send_marker_time_;

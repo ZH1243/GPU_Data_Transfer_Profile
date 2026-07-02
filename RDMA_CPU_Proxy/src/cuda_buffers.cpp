@@ -4,11 +4,14 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 
 #if RDMA_PROXY_HAVE_CUDA
 #include <cuda_runtime.h>
+#include <dlfcn.h>
 #endif
 
 namespace rdma_proxy {
@@ -19,6 +22,25 @@ void check_cuda(cudaError_t status, const char* what) {
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
     }
+}
+
+using CudaMemcpyBatchAsyncFn = cudaError_t (*)(
+    void**,
+    void**,
+    std::size_t*,
+    std::size_t,
+    void*,
+    std::size_t*,
+    std::size_t,
+    cudaStream_t);
+
+CudaMemcpyBatchAsyncFn cuda_memcpy_batch_async() {
+    static std::once_flag once;
+    static CudaMemcpyBatchAsyncFn fn = nullptr;
+    std::call_once(once, [] {
+        fn = reinterpret_cast<CudaMemcpyBatchAsyncFn>(dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync"));
+    });
+    return fn;
 }
 #endif
 
@@ -60,6 +82,9 @@ CudaBuffers::~CudaBuffers() {
         free_buffer(entry.send);
         free_buffer(entry.recv);
     }
+    for (auto& entry : nvlink_recv_buffers_) {
+        free_buffer(entry.recv);
+    }
 }
 
 void CudaBuffers::initialize() {
@@ -84,6 +109,22 @@ void CudaBuffers::initialize() {
         allocate_buffer(entry.recv, bytes);
         buffers_.push_back(entry);
         RDMA_PROXY_LOG_INFO("allocated GPU buffers for peer ", peer.node_rank, " bytes=", bytes);
+    }
+
+    nvlink_recv_buffers_.clear();
+    if (config_.nvlink_forwarding_enabled) {
+        const auto forwarding_bytes = nvlink_receive_buffer_bytes();
+        nvlink_recv_buffers_.reserve(static_cast<std::size_t>(config_.num_gpus_per_node - 1));
+        for (int source_gpu = 0; source_gpu < config_.num_gpus_per_node; ++source_gpu) {
+            if (source_gpu == config_.local_gpu_index) continue;
+            NvlinkReceiveBuffer entry;
+            entry.source_gpu_index = source_gpu;
+            allocate_buffer(entry.recv, forwarding_bytes);
+            nvlink_recv_buffers_.push_back(entry);
+            RDMA_PROXY_LOG_INFO("allocated NVLink receive buffer local_gpu=", config_.local_gpu_index,
+                                " source_gpu=", source_gpu,
+                                " bytes=", forwarding_bytes);
+        }
     }
 }
 
@@ -162,8 +203,20 @@ const PeerGpuBuffers& CudaBuffers::buffers_for_peer(int peer_rank) const {
     return *it;
 }
 
+const NvlinkReceiveBuffer& CudaBuffers::nvlink_receive_buffer_for_source(int source_gpu_index) const {
+    auto it = std::find_if(nvlink_recv_buffers_.begin(), nvlink_recv_buffers_.end(), [&](const auto& entry) {
+        return entry.source_gpu_index == source_gpu_index;
+    });
+    if (it == nvlink_recv_buffers_.end()) throw std::runtime_error("unknown NVLink source GPU");
+    return *it;
+}
+
 std::size_t CudaBuffers::token_buffer_bytes() const {
     return config_.num_tokens * config_.token_dimension * dtype_size(config_.dtype);
+}
+
+std::size_t CudaBuffers::nvlink_receive_buffer_bytes() const {
+    return token_buffer_bytes() * config_.peers.size();
 }
 
 void CudaBuffers::allocate_buffer(GpuBuffer& buffer, std::size_t bytes) {
@@ -210,6 +263,160 @@ void launch_copy_tokens(void* dst, const void* src, std::size_t bytes, bool mock
     (void)src;
     (void)bytes;
     throw std::runtime_error("CUDA copy requested but CUDA support was not built");
+#endif
+}
+
+void* create_cuda_stream(int cuda_device_id, bool nonblocking, bool mock_mode) {
+    if (mock_mode) return nullptr;
+#if RDMA_PROXY_HAVE_CUDA
+    check_cuda(cudaSetDevice(cuda_device_id), "cudaSetDevice before stream create");
+    cudaStream_t stream = nullptr;
+    const unsigned flags = nonblocking ? cudaStreamNonBlocking : cudaStreamDefault;
+    check_cuda(cudaStreamCreateWithFlags(&stream, flags), "cudaStreamCreateWithFlags");
+    return reinterpret_cast<void*>(stream);
+#else
+    (void)cuda_device_id;
+    (void)nonblocking;
+    throw std::runtime_error("CUDA stream requested but CUDA support was not built");
+#endif
+}
+
+void destroy_cuda_stream(void* stream, bool mock_mode) {
+    if (mock_mode || !stream) return;
+#if RDMA_PROXY_HAVE_CUDA
+    const auto status = cudaStreamDestroy(reinterpret_cast<cudaStream_t>(stream));
+    if (status != cudaSuccess) {
+        RDMA_PROXY_LOG_WARN("cudaStreamDestroy failed during cleanup: ", cudaGetErrorString(status));
+    }
+#else
+    (void)stream;
+#endif
+}
+
+void synchronize_cuda_stream(void* stream, bool mock_mode) {
+    if (mock_mode) return;
+#if RDMA_PROXY_HAVE_CUDA
+    check_cuda(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream)), "cudaStreamSynchronize");
+#else
+    (void)stream;
+    throw std::runtime_error("CUDA stream synchronization requested but CUDA support was not built");
+#endif
+}
+
+void enable_cuda_peer_access(int cuda_device_id, int peer_cuda_device_id, bool mock_mode) {
+    if (mock_mode || cuda_device_id == peer_cuda_device_id) return;
+#if RDMA_PROXY_HAVE_CUDA
+    check_cuda(cudaSetDevice(cuda_device_id), "cudaSetDevice before peer access enable");
+    int can_access = 0;
+    check_cuda(cudaDeviceCanAccessPeer(&can_access, cuda_device_id, peer_cuda_device_id), "cudaDeviceCanAccessPeer");
+    if (!can_access) {
+        throw std::runtime_error("CUDA device " + std::to_string(cuda_device_id) +
+                                 " cannot access peer CUDA device " + std::to_string(peer_cuda_device_id));
+    }
+    const auto status = cudaDeviceEnablePeerAccess(peer_cuda_device_id, 0);
+    if (status != cudaSuccess && status != cudaErrorPeerAccessAlreadyEnabled) {
+        throw std::runtime_error(std::string("cudaDeviceEnablePeerAccess: ") + cudaGetErrorString(status));
+    }
+    if (status == cudaErrorPeerAccessAlreadyEnabled) {
+        (void)cudaGetLastError();
+    }
+#else
+    (void)cuda_device_id;
+    (void)peer_cuda_device_id;
+    throw std::runtime_error("CUDA peer access requested but CUDA support was not built");
+#endif
+}
+
+void launch_cuda_forward_copy_batch_async(
+    const CudaForwardCopy& copy,
+    void* stream,
+    bool use_batch_api,
+    bool mock_mode) {
+    if (!copy.dst || !copy.src) throw std::runtime_error("NVLink forwarding copy has null pointer");
+    if (copy.bytes == 0) throw std::runtime_error("NVLink forwarding copy has zero size");
+    if (mock_mode) {
+        std::memcpy(copy.dst, copy.src, copy.bytes);
+        return;
+    }
+#if RDMA_PROXY_HAVE_CUDA
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    if (use_batch_api) {
+        auto fn = cuda_memcpy_batch_async();
+        if (!fn) {
+            throw std::runtime_error(
+                "cudaMemcpyBatchAsync is unavailable in the loaded CUDA runtime; disable "
+                "nvlink_forward_use_batch_api or use a CUDA runtime that provides it");
+        }
+        void* dsts[] = {copy.dst};
+        void* srcs[] = {const_cast<void*>(copy.src)};
+        std::size_t sizes[] = {copy.bytes};
+        check_cuda(fn(dsts, srcs, sizes, 1, nullptr, nullptr, 0, cuda_stream), "cudaMemcpyBatchAsync");
+    } else {
+        check_cuda(cudaMemcpyAsync(copy.dst, copy.src, copy.bytes, cudaMemcpyDeviceToDevice, cuda_stream),
+                   "cudaMemcpyAsync D2D forwarding");
+    }
+#else
+    (void)copy;
+    (void)stream;
+    (void)use_batch_api;
+    throw std::runtime_error("CUDA forwarding copy requested but CUDA support was not built");
+#endif
+}
+
+std::string export_cuda_ipc_memory_handle(void* ptr, bool mock_mode) {
+    if (!ptr) throw std::runtime_error("cannot export null CUDA IPC pointer");
+    std::ostringstream out;
+    out << std::hex << std::setfill('0');
+    if (mock_mode) {
+        out << std::setw(sizeof(uintptr_t) * 2) << reinterpret_cast<uintptr_t>(ptr);
+        return out.str();
+    }
+#if RDMA_PROXY_HAVE_CUDA
+    cudaIpcMemHandle_t handle{};
+    check_cuda(cudaIpcGetMemHandle(&handle, ptr), "cudaIpcGetMemHandle");
+    const auto* bytes = reinterpret_cast<const unsigned char*>(&handle);
+    for (std::size_t i = 0; i < sizeof(handle); ++i) {
+        out << std::setw(2) << static_cast<unsigned>(bytes[i]);
+    }
+    return out.str();
+#else
+    throw std::runtime_error("CUDA IPC export requested but CUDA support was not built");
+#endif
+}
+
+void* open_cuda_ipc_memory_handle(const std::string& handle_hex, uint64_t mock_addr, bool mock_mode) {
+    if (mock_mode) {
+        return reinterpret_cast<void*>(static_cast<uintptr_t>(mock_addr));
+    }
+#if RDMA_PROXY_HAVE_CUDA
+    cudaIpcMemHandle_t handle{};
+    if (handle_hex.size() != sizeof(handle) * 2) {
+        throw std::runtime_error("invalid CUDA IPC handle length");
+    }
+    auto* bytes = reinterpret_cast<unsigned char*>(&handle);
+    for (std::size_t i = 0; i < sizeof(handle); ++i) {
+        const auto byte_text = handle_hex.substr(i * 2, 2);
+        bytes[i] = static_cast<unsigned char>(std::stoul(byte_text, nullptr, 16));
+    }
+    void* ptr = nullptr;
+    check_cuda(cudaIpcOpenMemHandle(&ptr, handle, cudaIpcMemLazyEnablePeerAccess), "cudaIpcOpenMemHandle");
+    return ptr;
+#else
+    (void)handle_hex;
+    (void)mock_addr;
+    throw std::runtime_error("CUDA IPC open requested but CUDA support was not built");
+#endif
+}
+
+void close_cuda_ipc_memory_handle(void* ptr, bool mock_mode) {
+    if (mock_mode || !ptr) return;
+#if RDMA_PROXY_HAVE_CUDA
+    const auto status = cudaIpcCloseMemHandle(ptr);
+    if (status != cudaSuccess) {
+        RDMA_PROXY_LOG_WARN("cudaIpcCloseMemHandle failed during cleanup: ", cudaGetErrorString(status));
+    }
+#else
+    (void)ptr;
 #endif
 }
 

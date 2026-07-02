@@ -61,7 +61,7 @@ endif()
 
 if(RDMA_PROXY_HAVE_CUDA)
   set_target_properties(rdma_cpu_proxy_lib PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
-  target_link_libraries(rdma_cpu_proxy_lib PRIVATE CUDA::cudart)
+  target_link_libraries(rdma_cpu_proxy_lib PRIVATE CUDA::cudart ${CMAKE_DL_LIBS})
 endif()
 
 find_package(Threads REQUIRED)

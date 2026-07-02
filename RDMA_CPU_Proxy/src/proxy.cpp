@@ -4,7 +4,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -31,6 +35,7 @@ void Proxy::initialize() {
     for (auto& peer_buffers : cuda_buffers_.peer_buffers()) {
         setup_peer(peer_buffers);
     }
+    start_forwarding_thread();
     initialized_ = true;
 }
 
@@ -51,6 +56,7 @@ void Proxy::run() {
 }
 
 void Proxy::shutdown() {
+    stop_forwarding_thread();
     for (auto& peer : peers_) {
         for (auto& worker : peer.workers) {
             if (worker) worker->stop();
@@ -173,6 +179,8 @@ void Proxy::run_iteration(uint64_t iteration) {
             wait_for_iteration(peers_[i], baselines[i], dispatchers[i]);
         }
     }
+
+    wait_for_forwarding_iteration(iteration);
     const auto end = std::chrono::steady_clock::now();
     const auto seconds = std::chrono::duration<double>(end - start).count();
 
@@ -440,6 +448,409 @@ void Proxy::wait_for_outgoing_transfer(
             throw std::runtime_error(out.str());
         }
         std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+}
+
+void Proxy::start_forwarding_thread() {
+    if (!config_.nvlink_forwarding_enabled) return;
+    if (forwarding_thread_.joinable()) return;
+
+    forwarding_stream_ = create_cuda_stream(
+        config_.cuda_device_id,
+        config_.nvlink_forward_stream_nonblocking,
+        config_.mock_mode);
+    publish_local_nvlink_receive_buffers();
+    prepare_forwarding_destinations();
+    for (const auto& dst : forwarding_destinations_) {
+        enable_cuda_peer_access(config_.cuda_device_id, dst.cuda_device_id, config_.mock_mode);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(forwarding_mutex_);
+        forwarding_next_batch_by_peer_.assign(peers_.size(), 0);
+        forwarding_error_.clear();
+    }
+    forwarding_stop_.store(false);
+    forwarding_thread_ = std::thread(&Proxy::forwarding_loop, this);
+    RDMA_PROXY_LOG_INFO("NVLink forwarding thread started local_rank=", config_.node_rank,
+                        " local_gpu=", config_.local_gpu_index,
+                        " threshold_tokens=", config_.nvlink_forward_threshold_tokens,
+                        " chunk_tokens=", config_.nvlink_forward_chunk_tokens,
+                        " use_batch_api=", config_.nvlink_forward_use_batch_api ? "true" : "false");
+}
+
+void Proxy::stop_forwarding_thread() {
+    forwarding_stop_.store(true);
+    if (forwarding_thread_.joinable()) forwarding_thread_.join();
+    for (auto& dst : forwarding_destinations_) {
+        if (dst.imported_cuda_ipc) {
+            close_cuda_ipc_memory_handle(dst.ptr, config_.mock_mode);
+        }
+        dst.ptr = nullptr;
+        dst.imported_cuda_ipc = false;
+    }
+    forwarding_destinations_.clear();
+    destroy_cuda_stream(forwarding_stream_, config_.mock_mode);
+    forwarding_stream_ = nullptr;
+}
+
+std::string Proxy::nvlink_exchange_file(int gpu_index) const {
+    std::filesystem::path path(config_.nvlink_forward_exchange_dir);
+    path /= "node_" + std::to_string(config_.node_rank) + "_gpu_" + std::to_string(gpu_index) + ".txt";
+    return path.string();
+}
+
+void Proxy::publish_local_nvlink_receive_buffers() const {
+    if (!config_.nvlink_forward_destinations.empty()) return;
+
+    std::filesystem::create_directories(config_.nvlink_forward_exchange_dir);
+    const auto path = nvlink_exchange_file(config_.local_gpu_index);
+    std::ofstream out(path, std::ios::trunc);
+    if (!out) throw std::runtime_error("failed to write NVLink exchange file: " + path);
+    out << "node_rank " << config_.node_rank << '\n'
+        << "gpu_index " << config_.local_gpu_index << '\n'
+        << "cuda_device_id " << config_.cuda_device_id << '\n'
+        << "buffer_bytes " << cuda_buffers_.nvlink_receive_buffer_bytes() << '\n';
+    for (const auto& entry : cuda_buffers_.nvlink_receive_buffers()) {
+        out << "source_gpu " << entry.source_gpu_index
+            << " mock_addr " << reinterpret_cast<uintptr_t>(entry.recv.ptr)
+            << " ipc_handle " << export_cuda_ipc_memory_handle(entry.recv.ptr, config_.mock_mode)
+            << '\n';
+    }
+    RDMA_PROXY_LOG_INFO("published NVLink receive buffers local_rank=", config_.node_rank,
+                        " local_gpu=", config_.local_gpu_index,
+                        " path=", path,
+                        " buffers=", cuda_buffers_.nvlink_receive_buffers().size(),
+                        " bytes_per_buffer=", cuda_buffers_.nvlink_receive_buffer_bytes());
+}
+
+Proxy::ForwardDestinationState Proxy::load_forward_destination(int dst_gpu) const {
+    if (!config_.nvlink_forward_destinations.empty()) {
+        const auto it = std::find_if(
+            config_.nvlink_forward_destinations.begin(),
+            config_.nvlink_forward_destinations.end(),
+            [&](const NvlinkForwardDestination& dst) { return dst.gpu_index == dst_gpu; });
+        if (it == config_.nvlink_forward_destinations.end()) {
+            throw std::runtime_error("missing manual NVLink forwarding destination for GPU " + std::to_string(dst_gpu));
+        }
+        return ForwardDestinationState{
+            it->gpu_index,
+            it->cuda_device_id,
+            reinterpret_cast<void*>(static_cast<uintptr_t>(it->buffer_addr)),
+            it->buffer_bytes,
+            false};
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(config_.completion_timeout_ms);
+    const auto path = nvlink_exchange_file(dst_gpu);
+    while (!std::filesystem::exists(path)) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw std::runtime_error("timed out waiting for NVLink exchange file: " + path);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("failed to read NVLink exchange file: " + path);
+
+    int node_rank = -1;
+    int gpu_index = -1;
+    int cuda_device_id = -1;
+    std::size_t buffer_bytes = 0;
+    uint64_t mock_addr = 0;
+    std::string ipc_handle;
+    std::string key;
+    bool found_source_buffer = false;
+    while (in >> key) {
+        if (key == "node_rank") {
+            in >> node_rank;
+        } else if (key == "gpu_index") {
+            in >> gpu_index;
+        } else if (key == "cuda_device_id") {
+            in >> cuda_device_id;
+        } else if (key == "buffer_bytes") {
+            in >> buffer_bytes;
+        } else if (key == "source_gpu") {
+            int source_gpu = -1;
+            std::string mock_key;
+            std::string handle_key;
+            uint64_t entry_mock_addr = 0;
+            std::string entry_handle;
+            in >> source_gpu >> mock_key >> entry_mock_addr >> handle_key >> entry_handle;
+            if (!in || mock_key != "mock_addr" || handle_key != "ipc_handle") {
+                throw std::runtime_error("malformed NVLink source buffer entry in " + path);
+            }
+            if (source_gpu == config_.local_gpu_index) {
+                mock_addr = entry_mock_addr;
+                ipc_handle = entry_handle;
+                found_source_buffer = true;
+            }
+        } else {
+            throw std::runtime_error("unknown key in NVLink exchange file " + path + ": " + key);
+        }
+    }
+    if (node_rank != config_.node_rank || gpu_index != dst_gpu || cuda_device_id < 0 ||
+        buffer_bytes == 0 || !found_source_buffer) {
+        throw std::runtime_error("incomplete or mismatched NVLink exchange file: " + path);
+    }
+
+    void* ptr = open_cuda_ipc_memory_handle(ipc_handle, mock_addr, config_.mock_mode);
+    RDMA_PROXY_LOG_INFO("imported NVLink receive buffer local_rank=", config_.node_rank,
+                        " src_gpu=", config_.local_gpu_index,
+                        " dst_gpu=", dst_gpu,
+                        " cuda_device_id=", cuda_device_id,
+                        " bytes=", buffer_bytes,
+                        " ptr=", reinterpret_cast<uintptr_t>(ptr),
+                        " path=", path);
+    return ForwardDestinationState{dst_gpu, cuda_device_id, ptr, buffer_bytes, true};
+}
+
+void Proxy::prepare_forwarding_destinations() {
+    forwarding_destinations_.clear();
+    forwarding_destinations_.reserve(static_cast<std::size_t>(config_.num_gpus_per_node - 1));
+    for (std::size_t chunk_index = 0;
+         chunk_index < static_cast<std::size_t>(config_.num_gpus_per_node - 1);
+         ++chunk_index) {
+        const int dst_gpu =
+            (config_.local_gpu_index + 1 + static_cast<int>(chunk_index)) % config_.num_gpus_per_node;
+        forwarding_destinations_.push_back(load_forward_destination(dst_gpu));
+    }
+}
+
+std::vector<std::size_t> Proxy::nvlink_forward_peer_order() const {
+    std::vector<std::size_t> order;
+    order.reserve(peers_.size());
+    for (int offset = config_.num_nodes - 1; offset >= 1; --offset) {
+        const int target_rank = (config_.node_rank + offset) % config_.num_nodes;
+        const auto it = std::find_if(peers_.begin(), peers_.end(), [&](const PeerState& peer) {
+            return peer.peer_rank == target_rank;
+        });
+        if (it == peers_.end()) {
+            throw std::runtime_error(
+                "NVLink forwarding peer order cannot find peer rank " + std::to_string(target_rank));
+        }
+        order.push_back(static_cast<std::size_t>(std::distance(peers_.begin(), it)));
+    }
+    return order;
+}
+
+bool Proxy::forwarding_batch_available(
+    const PeerState& peer,
+    const std::vector<ChunkDescriptor>& chunks,
+    std::size_t batch_start_token,
+    std::size_t batch_tokens,
+    uint64_t required_count) const {
+    const auto batch_end_token = batch_start_token + batch_tokens;
+    std::vector<uint64_t> totals(chunks.size(), 0);
+    for (const auto& worker : peer.workers) {
+        const auto counts = worker->received_immediate_counts();
+        for (std::size_t i = 0; i < counts.size() && i < totals.size(); ++i) {
+            totals[i] += counts[i];
+        }
+    }
+
+    bool overlaps_any_chunk = false;
+    for (const auto& chunk : chunks) {
+        const auto chunk_end_token = chunk.start_token + chunk.num_tokens;
+        if (chunk.start_token >= batch_end_token || chunk_end_token <= batch_start_token) {
+            continue;
+        }
+        overlaps_any_chunk = true;
+        if (chunk.chunk_index >= totals.size() || totals[chunk.chunk_index] < required_count) {
+            return false;
+        }
+    }
+    return overlaps_any_chunk;
+}
+
+void Proxy::issue_forwarding_batch(
+    const PeerState& peer,
+    const PeerGpuBuffers& buffers,
+    uint64_t iteration,
+    std::size_t batch_index_in_iteration,
+    std::size_t batch_start_token) {
+    const auto token_bytes = config_.token_dimension * dtype_size(config_.dtype);
+    for (std::size_t chunk_index = 0;
+         chunk_index < static_cast<std::size_t>(config_.num_gpus_per_node - 1);
+         ++chunk_index) {
+        const int dst_gpu =
+            (config_.local_gpu_index + 1 + static_cast<int>(chunk_index)) % config_.num_gpus_per_node;
+        const auto dst_it = std::find_if(
+            forwarding_destinations_.begin(),
+            forwarding_destinations_.end(),
+            [&](const ForwardDestinationState& dst) { return dst.gpu_index == dst_gpu; });
+        if (dst_it == forwarding_destinations_.end()) {
+            throw std::runtime_error("missing NVLink forwarding destination for GPU " + std::to_string(dst_gpu));
+        }
+
+        const auto token_offset = batch_start_token + chunk_index * config_.nvlink_forward_chunk_tokens;
+        const auto peer_buffer_it = std::find_if(
+            cuda_buffers_.peer_buffers().cbegin(),
+            cuda_buffers_.peer_buffers().cend(),
+            [&](const PeerGpuBuffers& entry) { return &entry == &buffers; });
+        if (peer_buffer_it == cuda_buffers_.peer_buffers().cend()) {
+            throw std::runtime_error("cannot find NVLink forwarding peer buffer slot");
+        }
+        const auto peer_slot = static_cast<std::size_t>(
+            std::distance(cuda_buffers_.peer_buffers().cbegin(), peer_buffer_it));
+        const auto peer_slot_offset = cuda_buffers_.token_buffer_bytes() * peer_slot;
+        const auto source_byte_offset = token_offset * token_bytes;
+        const auto destination_byte_offset = peer_slot_offset + source_byte_offset;
+        const auto bytes = config_.nvlink_forward_chunk_tokens * token_bytes;
+        if (source_byte_offset + bytes > buffers.recv.bytes ||
+            destination_byte_offset + bytes > dst_it->bytes) {
+            throw std::runtime_error("NVLink forwarding copy exceeds source or destination buffer size");
+        }
+
+        CudaForwardCopy copy;
+        copy.src = static_cast<const char*>(buffers.recv.ptr) + source_byte_offset;
+        copy.dst = static_cast<char*>(dst_it->ptr) + destination_byte_offset;
+        copy.bytes = bytes;
+
+        RDMA_PROXY_LOG_INFO("nvlink_forward iteration=", iteration,
+                            " local_rank=", config_.node_rank,
+                            " src_gpu=", config_.local_gpu_index,
+                            " dst_gpu=", dst_gpu,
+                            " peer_rank=", peer.peer_rank,
+                            " batch=", batch_index_in_iteration,
+                            " chunk=", chunk_index,
+                            " token_offset=", token_offset,
+                            " token_count=", config_.nvlink_forward_chunk_tokens,
+                            " peer_slot_offset=", peer_slot_offset,
+                            " bytes=", bytes,
+                            " src_addr=", reinterpret_cast<uintptr_t>(copy.src),
+                            " dst_addr=", reinterpret_cast<uintptr_t>(copy.dst));
+        launch_cuda_forward_copy_batch_async(
+            copy,
+            forwarding_stream_,
+            config_.nvlink_forward_use_batch_api,
+            config_.mock_mode);
+    }
+    if (config_.nvlink_forward_synchronize_batches) {
+        synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
+    }
+}
+
+void Proxy::forwarding_loop() {
+    try {
+        const auto chunks = make_chunks();
+        const auto peer_order = nvlink_forward_peer_order();
+        const auto batches_per_iteration =
+            config_.num_tokens / config_.nvlink_forward_threshold_tokens;
+        const bool finite_iterations = config_.num_iterations != 0;
+        const auto total_batches = config_.num_iterations * batches_per_iteration;
+
+        while (!forwarding_stop_.load()) {
+            check_forwarding_error();
+            bool progressed = false;
+            for (const auto peer_index : peer_order) {
+                std::size_t next_batch = 0;
+                {
+                    std::lock_guard<std::mutex> lock(forwarding_mutex_);
+                    next_batch = forwarding_next_batch_by_peer_.at(peer_index);
+                }
+                if (finite_iterations && next_batch >= total_batches) {
+                    continue;
+                }
+
+                const uint64_t iteration = static_cast<uint64_t>(next_batch / batches_per_iteration);
+                const auto batch_in_iteration = next_batch % batches_per_iteration;
+                const auto batch_start_token =
+                    batch_in_iteration * config_.nvlink_forward_threshold_tokens;
+                const auto required_count = iteration + 1;
+                const auto& peer = peers_[peer_index];
+                if (!forwarding_batch_available(
+                        peer,
+                        chunks,
+                        batch_start_token,
+                        config_.nvlink_forward_threshold_tokens,
+                        required_count)) {
+                    continue;
+                }
+
+                RDMA_PROXY_LOG_INFO("nvlink_forward_batch_ready iteration=", iteration,
+                                    " local_rank=", config_.node_rank,
+                                    " local_gpu=", config_.local_gpu_index,
+                                    " peer_rank=", peer.peer_rank,
+                                    " batch=", batch_in_iteration,
+                                    " batch_start_token=", batch_start_token,
+                                    " batch_tokens=", config_.nvlink_forward_threshold_tokens);
+                issue_forwarding_batch(
+                    peer,
+                    cuda_buffers_.peer_buffers()[peer_index],
+                    iteration,
+                    batch_in_iteration,
+                    batch_start_token);
+                {
+                    std::lock_guard<std::mutex> lock(forwarding_mutex_);
+                    forwarding_next_batch_by_peer_.at(peer_index) = next_batch + 1;
+                }
+                progressed = true;
+            }
+            if (!progressed) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+        }
+    } catch (const std::exception& e) {
+        set_forwarding_error(e.what());
+    }
+}
+
+void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
+    if (!config_.nvlink_forwarding_enabled) return;
+    const auto batches_per_iteration = config_.num_tokens / config_.nvlink_forward_threshold_tokens;
+    const auto required_batches = static_cast<std::size_t>(iteration + 1) * batches_per_iteration;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(config_.completion_timeout_ms);
+    while (true) {
+        check_forwarding_error();
+        bool complete = true;
+        {
+            std::lock_guard<std::mutex> lock(forwarding_mutex_);
+            for (const auto next_batch : forwarding_next_batch_by_peer_) {
+                if (next_batch < required_batches) {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if (complete) {
+            if (config_.nvlink_forward_synchronize_iteration) {
+                synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
+            }
+            RDMA_PROXY_LOG_INFO("nvlink_forward_iteration_complete iteration=", iteration,
+                                " local_rank=", config_.node_rank,
+                                " local_gpu=", config_.local_gpu_index,
+                                " batches_per_peer=", batches_per_iteration);
+            return;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            std::ostringstream out;
+            out << "timed out waiting for NVLink forwarding iteration=" << iteration
+                << " local_rank=" << config_.node_rank
+                << " local_gpu=" << config_.local_gpu_index
+                << " required_batches_per_peer=" << required_batches;
+            std::lock_guard<std::mutex> lock(forwarding_mutex_);
+            for (std::size_t i = 0; i < forwarding_next_batch_by_peer_.size(); ++i) {
+                out << " peer" << peers_[i].peer_rank
+                    << "=" << forwarding_next_batch_by_peer_[i];
+            }
+            throw std::runtime_error(out.str());
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+}
+
+void Proxy::set_forwarding_error(const std::string& error) {
+    std::lock_guard<std::mutex> lock(forwarding_mutex_);
+    forwarding_error_ = error;
+}
+
+void Proxy::check_forwarding_error() const {
+    std::lock_guard<std::mutex> lock(forwarding_mutex_);
+    if (!forwarding_error_.empty()) {
+        throw std::runtime_error("NVLink forwarding failed: " + forwarding_error_);
     }
 }
 
