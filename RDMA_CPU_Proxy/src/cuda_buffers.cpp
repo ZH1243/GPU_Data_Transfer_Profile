@@ -5,13 +5,11 @@
 #include <algorithm>
 #include <cstring>
 #include <iomanip>
-#include <mutex>
 #include <sstream>
 #include <stdexcept>
 
 #if RDMA_PROXY_HAVE_CUDA
 #include <cuda_runtime.h>
-#include <dlfcn.h>
 #endif
 
 namespace rdma_proxy {
@@ -24,24 +22,6 @@ void check_cuda(cudaError_t status, const char* what) {
     }
 }
 
-using CudaMemcpyBatchAsyncFn = cudaError_t (*)(
-    void**,
-    void**,
-    std::size_t*,
-    std::size_t,
-    void*,
-    std::size_t*,
-    std::size_t,
-    cudaStream_t);
-
-CudaMemcpyBatchAsyncFn cuda_memcpy_batch_async() {
-    static std::once_flag once;
-    static CudaMemcpyBatchAsyncFn fn = nullptr;
-    std::call_once(once, [] {
-        fn = reinterpret_cast<CudaMemcpyBatchAsyncFn>(dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync"));
-    });
-    return fn;
-}
 #endif
 
 uint8_t test_pattern_byte(int source_rank, int destination_rank, int gpu_index, uint64_t iteration, std::size_t offset) {
@@ -341,16 +321,14 @@ void launch_cuda_forward_copy_batch_async(
 #if RDMA_PROXY_HAVE_CUDA
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     if (use_batch_api) {
-        auto fn = cuda_memcpy_batch_async();
-        if (!fn) {
-            throw std::runtime_error(
-                "cudaMemcpyBatchAsync is unavailable in the loaded CUDA runtime; disable "
-                "nvlink_forward_use_batch_api or use a CUDA runtime that provides it");
-        }
-        void* dsts[] = {copy.dst};
-        void* srcs[] = {const_cast<void*>(copy.src)};
-        std::size_t sizes[] = {copy.bytes};
-        check_cuda(fn(dsts, srcs, sizes, 1, nullptr, nullptr, 0, cuda_stream), "cudaMemcpyBatchAsync");
+        const void* dsts[] = {copy.dst};
+        const void* srcs[] = {copy.src};
+        const std::size_t sizes[] = {copy.bytes};
+        cudaMemcpyAttributes attrs{};
+        attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+        std::size_t attrs_idxs[] = {0};
+        check_cuda(cudaMemcpyBatchAsync(dsts, srcs, sizes, 1, &attrs, attrs_idxs, 1, cuda_stream),
+                   "cudaMemcpyBatchAsync");
     } else {
         check_cuda(cudaMemcpyAsync(copy.dst, copy.src, copy.bytes, cudaMemcpyDeviceToDevice, cuda_stream),
                    "cudaMemcpyAsync D2D forwarding");
