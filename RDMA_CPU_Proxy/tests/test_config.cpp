@@ -24,6 +24,7 @@ int main(int argc, char** argv) {
     assert(config.mock_mode);
     assert(config.fill_test_data);
     assert(config.validate_data);
+    assert(!config.sequential_peer_transfers);
     assert(config.cpu_affinity == "auto");
     assert(config.peers.size() == 3);
     assert(config.peers[0].node_rank == 1);
@@ -99,15 +100,17 @@ int main(int argc, char** argv) {
         "--num_iterations=3",
         "--completion_timeout_ms=1000",
         "--validate_data=false",
+        "--sequential_peer_transfers=true",
         "--cpu_affinity=0-95,192-287",
     };
-    const auto peer_port_config = rdma_proxy::load_config(8, const_cast<char**>(peer_port_args));
+    const auto peer_port_config = rdma_proxy::load_config(9, const_cast<char**>(peer_port_args));
     for (const auto& peer : peer_port_config.peers) {
         assert(peer.port == 18521);
     }
     assert(peer_port_config.num_iterations == 3);
     assert(peer_port_config.completion_timeout_ms == 1000);
     assert(!peer_port_config.validate_data);
+    assert(peer_port_config.sequential_peer_transfers);
     assert(peer_port_config.cpu_affinity == "0-95,192-287");
 
     const char* signal_interval_args[] = {

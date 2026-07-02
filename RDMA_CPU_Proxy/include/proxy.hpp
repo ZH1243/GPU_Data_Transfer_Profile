@@ -55,6 +55,7 @@ private:
     void synchronize_iteration_start(uint64_t iteration) const;
     void synchronize_iteration(uint64_t iteration) const;
     void fill_iteration_send_buffers(uint64_t iteration);
+    std::vector<std::size_t> sequential_peer_order() const;
     std::vector<ChunkDescriptor> make_chunks() const;
     std::vector<QPCompletionBaseline> capture_baselines(
         const PeerState& peer,
@@ -64,6 +65,10 @@ private:
         const PeerGpuBuffers& buffers,
         const std::vector<ChunkDescriptor>& chunks);
     void wait_for_iteration(
+        const PeerState& peer,
+        const std::vector<QPCompletionBaseline>& baselines,
+        const std::shared_ptr<DynamicChunkDistributor>& distributor) const;
+    void wait_for_outgoing_transfer(
         const PeerState& peer,
         const std::vector<QPCompletionBaseline>& baselines,
         const std::shared_ptr<DynamicChunkDistributor>& distributor) const;

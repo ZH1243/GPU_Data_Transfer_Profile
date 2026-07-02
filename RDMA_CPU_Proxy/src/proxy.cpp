@@ -154,13 +154,24 @@ void Proxy::run_iteration(uint64_t iteration) {
     synchronize_iteration_start(iteration);
 
     const auto start = std::chrono::steady_clock::now();
-    std::vector<std::shared_ptr<DynamicChunkDistributor>> dispatchers;
-    dispatchers.reserve(peers_.size());
-    for (std::size_t i = 0; i < peers_.size(); ++i) {
-        dispatchers.push_back(enqueue_chunks(peers_[i], cuda_buffers_.peer_buffers()[i], chunks));
-    }
-    for (std::size_t i = 0; i < peers_.size(); ++i) {
-        wait_for_iteration(peers_[i], baselines[i], dispatchers[i]);
+    std::vector<std::shared_ptr<DynamicChunkDistributor>> dispatchers(peers_.size());
+    if (config_.sequential_peer_transfers) {
+        const auto order = sequential_peer_order();
+        for (const auto peer_index : order) {
+            dispatchers[peer_index] = enqueue_chunks(
+                peers_[peer_index], cuda_buffers_.peer_buffers()[peer_index], chunks);
+            wait_for_outgoing_transfer(peers_[peer_index], baselines[peer_index], dispatchers[peer_index]);
+        }
+        for (std::size_t i = 0; i < peers_.size(); ++i) {
+            wait_for_iteration(peers_[i], baselines[i], dispatchers[i]);
+        }
+    } else {
+        for (std::size_t i = 0; i < peers_.size(); ++i) {
+            dispatchers[i] = enqueue_chunks(peers_[i], cuda_buffers_.peer_buffers()[i], chunks);
+        }
+        for (std::size_t i = 0; i < peers_.size(); ++i) {
+            wait_for_iteration(peers_[i], baselines[i], dispatchers[i]);
+        }
     }
     const auto end = std::chrono::steady_clock::now();
     const auto seconds = std::chrono::duration<double>(end - start).count();
@@ -268,6 +279,23 @@ std::vector<ChunkDescriptor> Proxy::make_chunks() const {
         config_.num_qps_per_peer);
 }
 
+std::vector<std::size_t> Proxy::sequential_peer_order() const {
+    std::vector<std::size_t> order;
+    order.reserve(peers_.size());
+    for (int offset = 1; offset < config_.num_nodes; ++offset) {
+        const int target_rank = (config_.node_rank + offset) % config_.num_nodes;
+        const auto it = std::find_if(peers_.begin(), peers_.end(), [&](const PeerState& peer) {
+            return peer.peer_rank == target_rank;
+        });
+        if (it == peers_.end()) {
+            throw std::runtime_error(
+                "sequential peer transfer order cannot find peer rank " + std::to_string(target_rank));
+        }
+        order.push_back(static_cast<std::size_t>(std::distance(peers_.begin(), it)));
+    }
+    return order;
+}
+
 std::vector<Proxy::QPCompletionBaseline> Proxy::capture_baselines(
     const PeerState& peer,
     const std::vector<ChunkDescriptor>& chunks) const {
@@ -357,6 +385,54 @@ void Proxy::wait_for_iteration(
                     << " send_marker=" << (peer.workers[q]->send_marker_completions() - baselines[q].send_markers)
                     << "/1"
                     << " recv_marker=" << (peer.workers[q]->recv_marker_completions() - baselines[q].recv_markers)
+                    << "/1";
+            }
+            out << " assigned_total=" << assignment.assigned_chunks()
+                << "/" << distributor->chunk_count();
+            throw std::runtime_error(out.str());
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+}
+
+void Proxy::wait_for_outgoing_transfer(
+    const PeerState& peer,
+    const std::vector<QPCompletionBaseline>& baselines,
+    const std::shared_ptr<DynamicChunkDistributor>& distributor) const {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(config_.completion_timeout_ms);
+    while (true) {
+        bool complete = true;
+        for (std::size_t q = 0; q < peer.workers.size(); ++q) {
+            const auto& worker = peer.workers[q];
+            if (worker->post_errors() != baselines[q].post_errors ||
+                worker->cq_errors() != baselines[q].cq_errors ||
+                worker->unexpected_immediate_completions() != baselines[q].unexpected_imms) {
+                const auto error = worker->last_error();
+                throw std::runtime_error("QP error local_rank=" + std::to_string(config_.node_rank) +
+                                         " local_gpu=" + std::to_string(config_.local_gpu_index) +
+                                         " remote_rank=" + std::to_string(peer.peer_rank) +
+                                         " remote_gpu=" + std::to_string(peer.remote_gpu_index) +
+                                         (error.empty() ? "" : " last_error=" + error));
+            }
+            if (worker->send_marker_completions() < baselines[q].send_markers + 1) {
+                complete = false;
+            }
+        }
+        if (complete) return;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            std::ostringstream out;
+            out << "timed out waiting for outgoing transfer local_rank=" << config_.node_rank
+                << " local_gpu=" << config_.local_gpu_index
+                << " remote_rank=" << peer.peer_rank
+                << " remote_gpu=" << peer.remote_gpu_index;
+            const auto assignment = distributor->assignment();
+            for (std::size_t q = 0; q < peer.workers.size(); ++q) {
+                out << " qp" << q
+                    << " send=" << (peer.workers[q]->send_completions() - baselines[q].sends)
+                    << "/" << assignment.expected_send_completions_by_qp[q]
+                    << " assigned_chunks=" << assignment.chunks_by_qp[q]
+                    << " send_marker=" << (peer.workers[q]->send_marker_completions() - baselines[q].send_markers)
                     << "/1";
             }
             out << " assigned_total=" << assignment.assigned_chunks()
