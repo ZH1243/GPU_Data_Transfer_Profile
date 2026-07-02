@@ -788,8 +788,9 @@ void Proxy::issue_forwarding_batch(
         synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
         const auto batch_timing_end = std::chrono::steady_clock::now();
         const auto batch_seconds = std::chrono::duration<double>(batch_timing_end - batch_timing_start).count();
-        const double batch_gbps = batch_seconds > 0.0 ?
+        const double batch_gbytes_per_sec = batch_seconds > 0.0 ?
             static_cast<double>(batch_bytes) / batch_seconds / 1.0e9 : 0.0;
+        const double batch_gbits_per_sec = batch_gbytes_per_sec * 8.0;
         {
             std::lock_guard<std::mutex> lock(forwarding_mutex_);
             if (forwarding_iteration_stats_.size() <= iteration) {
@@ -799,7 +800,8 @@ void Proxy::issue_forwarding_batch(
             ++stats.batch_count;
             stats.total_bytes += batch_bytes;
             stats.total_seconds += batch_seconds;
-            stats.sum_batch_bandwidth_gbps += batch_gbps;
+            stats.sum_batch_bandwidth_gbytes_per_sec += batch_gbytes_per_sec;
+            stats.sum_batch_bandwidth_gbits_per_sec += batch_gbits_per_sec;
         }
         if (config_.nvlink_forward_log_batches) {
             RDMA_PROXY_LOG_INFO("nvlink_forward_batch_complete iteration=", iteration,
@@ -809,7 +811,8 @@ void Proxy::issue_forwarding_batch(
                                 " batch=", batch_index_in_iteration,
                                 " bytes=", batch_bytes,
                                 " elapsed_us=", static_cast<uint64_t>(batch_seconds * 1.0e6),
-                                " bandwidth_gbps=", std::fixed, std::setprecision(3), batch_gbps);
+                                " bandwidth_GBps=", std::fixed, std::setprecision(3), batch_gbytes_per_sec,
+                                " bandwidth_gbps=", std::fixed, std::setprecision(3), batch_gbits_per_sec);
         }
     }
 }
@@ -910,10 +913,13 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
                     stats = forwarding_iteration_stats_[static_cast<std::size_t>(iteration)];
                 }
             }
-            const double avg_batch_gbps = stats.batch_count > 0 ?
-                stats.sum_batch_bandwidth_gbps / static_cast<double>(stats.batch_count) : 0.0;
-            const double aggregate_gbps = stats.total_seconds > 0.0 ?
+            const double avg_batch_gbytes_per_sec = stats.batch_count > 0 ?
+                stats.sum_batch_bandwidth_gbytes_per_sec / static_cast<double>(stats.batch_count) : 0.0;
+            const double avg_batch_gbits_per_sec = stats.batch_count > 0 ?
+                stats.sum_batch_bandwidth_gbits_per_sec / static_cast<double>(stats.batch_count) : 0.0;
+            const double aggregate_gbytes_per_sec = stats.total_seconds > 0.0 ?
                 static_cast<double>(stats.total_bytes) / stats.total_seconds / 1.0e9 : 0.0;
+            const double aggregate_gbits_per_sec = aggregate_gbytes_per_sec * 8.0;
             if (config_.nvlink_forward_synchronize_batches) {
                 RDMA_PROXY_LOG_INFO("nvlink_forward_iteration_complete iteration=", iteration,
                                     " local_rank=", config_.node_rank,
@@ -921,10 +927,14 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
                                     " batches_per_peer=", batches_per_iteration,
                                     " synchronized_batch_count=", stats.batch_count,
                                     " synchronized_batch_bytes=", stats.total_bytes,
+                                    " average_batch_bandwidth_GBps=", std::fixed, std::setprecision(3),
+                                        avg_batch_gbytes_per_sec,
                                     " average_batch_bandwidth_gbps=", std::fixed, std::setprecision(3),
-                                        avg_batch_gbps,
+                                        avg_batch_gbits_per_sec,
+                                    " aggregate_synchronized_bandwidth_GBps=", std::fixed, std::setprecision(3),
+                                        aggregate_gbytes_per_sec,
                                     " aggregate_synchronized_bandwidth_gbps=", std::fixed, std::setprecision(3),
-                                        aggregate_gbps);
+                                        aggregate_gbits_per_sec);
             } else {
                 RDMA_PROXY_LOG_INFO("nvlink_forward_iteration_complete iteration=", iteration,
                                     " local_rank=", config_.node_rank,

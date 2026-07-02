@@ -64,7 +64,8 @@ private:
         std::size_t batch_count{0};
         std::size_t total_bytes{0};
         double total_seconds{0.0};
-        double sum_batch_bandwidth_gbps{0.0};
+        double sum_batch_bandwidth_gbytes_per_sec{0.0};
+        double sum_batch_bandwidth_gbits_per_sec{0.0};
     };
 
     PeerConnectionInfo make_local_peer_info(const PeerState& peer) const;
