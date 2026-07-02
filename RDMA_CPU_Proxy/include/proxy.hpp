@@ -60,6 +60,13 @@ private:
         bool imported_cuda_ipc{false};
     };
 
+    struct ForwardingIterationStats {
+        std::size_t batch_count{0};
+        std::size_t total_bytes{0};
+        double total_seconds{0.0};
+        double sum_batch_bandwidth_gbps{0.0};
+    };
+
     PeerConnectionInfo make_local_peer_info(const PeerState& peer) const;
     void setup_peer(PeerGpuBuffers& buffers);
     void synchronize_peer_ready(const PeerAddress& peer_addr, const PeerState& peer) const;
@@ -135,6 +142,7 @@ private:
     mutable std::mutex forwarding_mutex_;
     std::vector<std::size_t> forwarding_next_batch_by_peer_;
     std::vector<ForwardDestinationState> forwarding_destinations_;
+    std::vector<ForwardingIterationStats> forwarding_iteration_stats_;
     std::string forwarding_error_;
     bool initialized_{false};
 };

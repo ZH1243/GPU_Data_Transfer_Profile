@@ -73,6 +73,8 @@ The forwarding thread assumes the sequential peer-transfer order for this path a
 
 Set `nvlink_forward_log_batches=true` to emit per-batch/per-copy forwarding traces. Those trace logs include `iteration`, `src_gpu`, `dst_gpu`, `peer_rank`, `batch`, `chunk`, `token_offset`, `token_count`, byte count, and source/destination addresses. The option is disabled by default because large runs can produce many forwarding batches.
 
+When `nvlink_forward_synchronize_batches=true`, each forwarding batch is timed from before its copy operations are enqueued until after `cudaStreamSynchronize()` returns. If `nvlink_forward_log_batches=true`, each synchronized batch also logs `elapsed_us` and `bandwidth_gbps`. At iteration completion, the proxy reports the arithmetic mean of synchronized batch bandwidths as `average_batch_bandwidth_gbps` and the aggregate `total_forwarded_bytes / total_synchronized_seconds` as `aggregate_synchronized_bandwidth_gbps`.
+
 ## RDMA and GPUDirect RDMA
 
 The real path uses libibverbs/rdma-core APIs:

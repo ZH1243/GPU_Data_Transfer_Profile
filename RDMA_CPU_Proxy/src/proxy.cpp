@@ -494,6 +494,7 @@ void Proxy::start_forwarding_thread() {
     {
         std::lock_guard<std::mutex> lock(forwarding_mutex_);
         forwarding_next_batch_by_peer_.assign(peers_.size(), 0);
+        forwarding_iteration_stats_.clear();
         forwarding_error_.clear();
     }
     forwarding_stop_.store(false);
@@ -722,6 +723,8 @@ void Proxy::issue_forwarding_batch(
     std::size_t batch_index_in_iteration,
     std::size_t batch_start_token) {
     const auto token_bytes = config_.token_dimension * dtype_size(config_.dtype);
+    const auto batch_timing_start = std::chrono::steady_clock::now();
+    std::size_t batch_bytes = 0;
     for (std::size_t chunk_index = 0;
          chunk_index < static_cast<std::size_t>(config_.num_gpus_per_node - 1);
          ++chunk_index) {
@@ -758,6 +761,7 @@ void Proxy::issue_forwarding_batch(
         copy.src = static_cast<const char*>(buffers.recv.ptr) + source_byte_offset;
         copy.dst = static_cast<char*>(dst_it->ptr) + destination_byte_offset;
         copy.bytes = bytes;
+        batch_bytes += bytes;
 
         if (config_.nvlink_forward_log_batches) {
             RDMA_PROXY_LOG_INFO("nvlink_forward iteration=", iteration,
@@ -782,6 +786,31 @@ void Proxy::issue_forwarding_batch(
     }
     if (config_.nvlink_forward_synchronize_batches) {
         synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
+        const auto batch_timing_end = std::chrono::steady_clock::now();
+        const auto batch_seconds = std::chrono::duration<double>(batch_timing_end - batch_timing_start).count();
+        const double batch_gbps = batch_seconds > 0.0 ?
+            static_cast<double>(batch_bytes) / batch_seconds / 1.0e9 : 0.0;
+        {
+            std::lock_guard<std::mutex> lock(forwarding_mutex_);
+            if (forwarding_iteration_stats_.size() <= iteration) {
+                forwarding_iteration_stats_.resize(static_cast<std::size_t>(iteration) + 1);
+            }
+            auto& stats = forwarding_iteration_stats_[static_cast<std::size_t>(iteration)];
+            ++stats.batch_count;
+            stats.total_bytes += batch_bytes;
+            stats.total_seconds += batch_seconds;
+            stats.sum_batch_bandwidth_gbps += batch_gbps;
+        }
+        if (config_.nvlink_forward_log_batches) {
+            RDMA_PROXY_LOG_INFO("nvlink_forward_batch_complete iteration=", iteration,
+                                " local_rank=", config_.node_rank,
+                                " local_gpu=", config_.local_gpu_index,
+                                " peer_rank=", peer.peer_rank,
+                                " batch=", batch_index_in_iteration,
+                                " bytes=", batch_bytes,
+                                " elapsed_us=", static_cast<uint64_t>(batch_seconds * 1.0e6),
+                                " bandwidth_gbps=", std::fixed, std::setprecision(3), batch_gbps);
+        }
     }
 }
 
@@ -874,10 +903,34 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
             if (config_.nvlink_forward_synchronize_iteration) {
                 synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
             }
-            RDMA_PROXY_LOG_INFO("nvlink_forward_iteration_complete iteration=", iteration,
-                                " local_rank=", config_.node_rank,
-                                " local_gpu=", config_.local_gpu_index,
-                                " batches_per_peer=", batches_per_iteration);
+            ForwardingIterationStats stats;
+            if (config_.nvlink_forward_synchronize_batches) {
+                std::lock_guard<std::mutex> lock(forwarding_mutex_);
+                if (forwarding_iteration_stats_.size() > iteration) {
+                    stats = forwarding_iteration_stats_[static_cast<std::size_t>(iteration)];
+                }
+            }
+            const double avg_batch_gbps = stats.batch_count > 0 ?
+                stats.sum_batch_bandwidth_gbps / static_cast<double>(stats.batch_count) : 0.0;
+            const double aggregate_gbps = stats.total_seconds > 0.0 ?
+                static_cast<double>(stats.total_bytes) / stats.total_seconds / 1.0e9 : 0.0;
+            if (config_.nvlink_forward_synchronize_batches) {
+                RDMA_PROXY_LOG_INFO("nvlink_forward_iteration_complete iteration=", iteration,
+                                    " local_rank=", config_.node_rank,
+                                    " local_gpu=", config_.local_gpu_index,
+                                    " batches_per_peer=", batches_per_iteration,
+                                    " synchronized_batch_count=", stats.batch_count,
+                                    " synchronized_batch_bytes=", stats.total_bytes,
+                                    " average_batch_bandwidth_gbps=", std::fixed, std::setprecision(3),
+                                        avg_batch_gbps,
+                                    " aggregate_synchronized_bandwidth_gbps=", std::fixed, std::setprecision(3),
+                                        aggregate_gbps);
+            } else {
+                RDMA_PROXY_LOG_INFO("nvlink_forward_iteration_complete iteration=", iteration,
+                                    " local_rank=", config_.node_rank,
+                                    " local_gpu=", config_.local_gpu_index,
+                                    " batches_per_peer=", batches_per_iteration);
+            }
             return;
         }
         if (std::chrono::steady_clock::now() >= deadline) {
