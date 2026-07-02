@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -13,7 +15,31 @@
 #include <stdexcept>
 #include <thread>
 
+#if defined(__unix__) || defined(__APPLE__)
+#include <unistd.h>
+#endif
+
 namespace rdma_proxy {
+namespace {
+
+int current_process_id() {
+#if defined(__unix__) || defined(__APPLE__)
+    return static_cast<int>(getpid());
+#else
+    return 0;
+#endif
+}
+
+bool process_is_alive(int pid) {
+    if (pid <= 0) return false;
+#if defined(__unix__) || defined(__APPLE__)
+    return kill(static_cast<pid_t>(pid), 0) == 0 || errno == EPERM;
+#else
+    return true;
+#endif
+}
+
+}  // namespace
 
 Proxy::Proxy(ProxyConfig config)
     : config_(std::move(config)),
@@ -505,10 +531,12 @@ void Proxy::publish_local_nvlink_receive_buffers() const {
 
     std::filesystem::create_directories(config_.nvlink_forward_exchange_dir);
     const auto path = nvlink_exchange_file(config_.local_gpu_index);
-    std::ofstream out(path, std::ios::trunc);
-    if (!out) throw std::runtime_error("failed to write NVLink exchange file: " + path);
+    const auto tmp_path = path + ".tmp." + std::to_string(current_process_id());
+    std::ofstream out(tmp_path, std::ios::trunc);
+    if (!out) throw std::runtime_error("failed to write NVLink exchange file: " + tmp_path);
     out << "node_rank " << config_.node_rank << '\n'
         << "gpu_index " << config_.local_gpu_index << '\n'
+        << "exporter_pid " << current_process_id() << '\n'
         << "cuda_device_id " << config_.cuda_device_id << '\n'
         << "buffer_bytes " << cuda_buffers_.nvlink_receive_buffer_bytes() << '\n';
     for (const auto& entry : cuda_buffers_.nvlink_receive_buffers()) {
@@ -517,6 +545,9 @@ void Proxy::publish_local_nvlink_receive_buffers() const {
             << " ipc_handle " << export_cuda_ipc_memory_handle(entry.recv.ptr, config_.mock_mode)
             << '\n';
     }
+    out.close();
+    if (!out) throw std::runtime_error("failed to flush NVLink exchange file: " + tmp_path);
+    std::filesystem::rename(tmp_path, path);
     RDMA_PROXY_LOG_INFO("published NVLink receive buffers local_rank=", config_.node_rank,
                         " local_gpu=", config_.local_gpu_index,
                         " path=", path,
@@ -541,69 +572,89 @@ Proxy::ForwardDestinationState Proxy::load_forward_destination(int dst_gpu) cons
             false};
     }
 
+    const auto path = nvlink_exchange_file(dst_gpu);
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(config_.completion_timeout_ms);
-    const auto path = nvlink_exchange_file(dst_gpu);
-    while (!std::filesystem::exists(path)) {
-        if (std::chrono::steady_clock::now() >= deadline) {
-            throw std::runtime_error("timed out waiting for NVLink exchange file: " + path);
+    std::string last_wait_reason = "file not present";
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!std::filesystem::exists(path)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
 
-    std::ifstream in(path);
-    if (!in) throw std::runtime_error("failed to read NVLink exchange file: " + path);
-
-    int node_rank = -1;
-    int gpu_index = -1;
-    int cuda_device_id = -1;
-    std::size_t buffer_bytes = 0;
-    uint64_t mock_addr = 0;
-    std::string ipc_handle;
-    std::string key;
-    bool found_source_buffer = false;
-    while (in >> key) {
-        if (key == "node_rank") {
-            in >> node_rank;
-        } else if (key == "gpu_index") {
-            in >> gpu_index;
-        } else if (key == "cuda_device_id") {
-            in >> cuda_device_id;
-        } else if (key == "buffer_bytes") {
-            in >> buffer_bytes;
-        } else if (key == "source_gpu") {
-            int source_gpu = -1;
-            std::string mock_key;
-            std::string handle_key;
-            uint64_t entry_mock_addr = 0;
-            std::string entry_handle;
-            in >> source_gpu >> mock_key >> entry_mock_addr >> handle_key >> entry_handle;
-            if (!in || mock_key != "mock_addr" || handle_key != "ipc_handle") {
-                throw std::runtime_error("malformed NVLink source buffer entry in " + path);
-            }
-            if (source_gpu == config_.local_gpu_index) {
-                mock_addr = entry_mock_addr;
-                ipc_handle = entry_handle;
-                found_source_buffer = true;
-            }
-        } else {
-            throw std::runtime_error("unknown key in NVLink exchange file " + path + ": " + key);
+        std::ifstream in(path);
+        if (!in) {
+            last_wait_reason = "file not readable";
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
         }
-    }
-    if (node_rank != config_.node_rank || gpu_index != dst_gpu || cuda_device_id < 0 ||
-        buffer_bytes == 0 || !found_source_buffer) {
-        throw std::runtime_error("incomplete or mismatched NVLink exchange file: " + path);
+
+        int node_rank = -1;
+        int gpu_index = -1;
+        int exporter_pid = -1;
+        int cuda_device_id = -1;
+        std::size_t buffer_bytes = 0;
+        uint64_t mock_addr = 0;
+        std::string ipc_handle;
+        std::string key;
+        bool found_source_buffer = false;
+        while (in >> key) {
+            if (key == "node_rank") {
+                in >> node_rank;
+            } else if (key == "gpu_index") {
+                in >> gpu_index;
+            } else if (key == "exporter_pid") {
+                in >> exporter_pid;
+            } else if (key == "cuda_device_id") {
+                in >> cuda_device_id;
+            } else if (key == "buffer_bytes") {
+                in >> buffer_bytes;
+            } else if (key == "source_gpu") {
+                int source_gpu = -1;
+                std::string mock_key;
+                std::string handle_key;
+                uint64_t entry_mock_addr = 0;
+                std::string entry_handle;
+                in >> source_gpu >> mock_key >> entry_mock_addr >> handle_key >> entry_handle;
+                if (!in || mock_key != "mock_addr" || handle_key != "ipc_handle") {
+                    throw std::runtime_error("malformed NVLink source buffer entry in " + path);
+                }
+                if (source_gpu == config_.local_gpu_index) {
+                    mock_addr = entry_mock_addr;
+                    ipc_handle = entry_handle;
+                    found_source_buffer = true;
+                }
+            } else {
+                throw std::runtime_error("unknown key in NVLink exchange file " + path + ": " + key);
+            }
+        }
+
+        if (!process_is_alive(exporter_pid)) {
+            last_wait_reason = "exporter PID is not alive";
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        if (node_rank != config_.node_rank || gpu_index != dst_gpu || cuda_device_id < 0 ||
+            buffer_bytes == 0 || !found_source_buffer) {
+            last_wait_reason = "metadata incomplete or mismatched";
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        void* ptr = open_cuda_ipc_memory_handle(ipc_handle, mock_addr, config_.mock_mode);
+        RDMA_PROXY_LOG_INFO("imported NVLink receive buffer local_rank=", config_.node_rank,
+                            " src_gpu=", config_.local_gpu_index,
+                            " dst_gpu=", dst_gpu,
+                            " exporter_pid=", exporter_pid,
+                            " cuda_device_id=", cuda_device_id,
+                            " bytes=", buffer_bytes,
+                            " ptr=", reinterpret_cast<uintptr_t>(ptr),
+                            " path=", path);
+        return ForwardDestinationState{dst_gpu, cuda_device_id, ptr, buffer_bytes, true};
     }
 
-    void* ptr = open_cuda_ipc_memory_handle(ipc_handle, mock_addr, config_.mock_mode);
-    RDMA_PROXY_LOG_INFO("imported NVLink receive buffer local_rank=", config_.node_rank,
-                        " src_gpu=", config_.local_gpu_index,
-                        " dst_gpu=", dst_gpu,
-                        " cuda_device_id=", cuda_device_id,
-                        " bytes=", buffer_bytes,
-                        " ptr=", reinterpret_cast<uintptr_t>(ptr),
-                        " path=", path);
-    return ForwardDestinationState{dst_gpu, cuda_device_id, ptr, buffer_bytes, true};
+    throw std::runtime_error("timed out waiting for live NVLink exchange file: " + path +
+                             " reason=" + last_wait_reason);
 }
 
 void Proxy::prepare_forwarding_destinations() {
