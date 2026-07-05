@@ -342,6 +342,65 @@ void launch_cuda_forward_copy_batch_async(
 #endif
 }
 
+void launch_cuda_forward_copy_batch_async(
+    const std::vector<CudaForwardCopy>& copies,
+    void* stream,
+    bool use_batch_api,
+    bool mock_mode) {
+    if (copies.empty()) return;
+    for (const auto& copy : copies) {
+        if (!copy.dst || !copy.src) throw std::runtime_error("NVLink forwarding copy has null pointer");
+        if (copy.bytes == 0) throw std::runtime_error("NVLink forwarding copy has zero size");
+    }
+    if (mock_mode) {
+        for (const auto& copy : copies) {
+            std::memcpy(copy.dst, copy.src, copy.bytes);
+        }
+        return;
+    }
+#if RDMA_PROXY_HAVE_CUDA
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    if (use_batch_api) {
+        std::vector<void*> dsts;
+        std::vector<void*> srcs;
+        std::vector<std::size_t> sizes;
+        dsts.reserve(copies.size());
+        srcs.reserve(copies.size());
+        sizes.reserve(copies.size());
+        for (const auto& copy : copies) {
+            dsts.push_back(copy.dst);
+            srcs.push_back(const_cast<void*>(copy.src));
+            sizes.push_back(copy.bytes);
+        }
+        cudaMemcpyAttributes attrs{};
+        attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+        std::vector<std::size_t> attrs_idxs(copies.size(), 0);
+        std::size_t fail_idx = 0;
+        check_cuda(cudaMemcpyBatchAsync(
+                       dsts.data(),
+                       srcs.data(),
+                       sizes.data(),
+                       copies.size(),
+                       &attrs,
+                       attrs_idxs.data(),
+                       1,
+                       &fail_idx,
+                       cuda_stream),
+                   "cudaMemcpyBatchAsync");
+    } else {
+        for (const auto& copy : copies) {
+            check_cuda(cudaMemcpyAsync(copy.dst, copy.src, copy.bytes, cudaMemcpyDeviceToDevice, cuda_stream),
+                       "cudaMemcpyAsync D2D forwarding");
+        }
+    }
+#else
+    (void)copies;
+    (void)stream;
+    (void)use_batch_api;
+    throw std::runtime_error("CUDA forwarding copy requested but CUDA support was not built");
+#endif
+}
+
 std::string export_cuda_ipc_memory_handle(void* ptr, bool mock_mode) {
     if (!ptr) throw std::runtime_error("cannot export null CUDA IPC pointer");
     std::ostringstream out;

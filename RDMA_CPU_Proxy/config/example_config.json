@@ -34,6 +34,8 @@
   "nvlink_forward_synchronize_batches": false,
   "nvlink_forward_synchronize_iteration": true,
   "nvlink_forward_log_batches": false,
+  "nvlink_routing_probability": 0.5,
+  "nvlink_routing_seed": 1,
   "nvlink_forward_exchange_dir": "/tmp/rdma_cpu_proxy_nvlink",
   "nvlink_forward_destinations": [
   ],

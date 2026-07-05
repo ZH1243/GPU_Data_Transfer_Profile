@@ -72,6 +72,7 @@ int main() {
         config.nvlink_forwarding_enabled = true;
         config.nvlink_forward_threshold_tokens = config.num_tokens;
         config.nvlink_forward_chunk_tokens = config.num_tokens;
+        config.nvlink_routing_probability = 1.0;
         const auto destination_bytes = config.num_tokens * config.token_dimension * dtype_size(config.dtype);
         std::vector<uint8_t> destination(destination_bytes, 0);
         config.nvlink_forward_destinations.push_back(

@@ -94,6 +94,7 @@ private:
         const std::shared_ptr<DynamicChunkDistributor>& distributor) const;
     void start_forwarding_thread();
     void stop_forwarding_thread();
+    void prepare_forwarding_routing_tables();
     void prepare_forwarding_destinations();
     void publish_local_nvlink_receive_buffers() const;
     ForwardDestinationState load_forward_destination(int dst_gpu) const;
@@ -142,6 +143,7 @@ private:
     void* forwarding_stream_{nullptr};
     mutable std::mutex forwarding_mutex_;
     std::vector<std::size_t> forwarding_next_batch_by_peer_;
+    std::vector<std::vector<uint8_t>> forwarding_routing_tables_by_peer_;
     std::vector<ForwardDestinationState> forwarding_destinations_;
     std::vector<ForwardingIterationStats> forwarding_iteration_stats_;
     std::string forwarding_error_;

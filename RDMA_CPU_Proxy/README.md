@@ -50,28 +50,30 @@ The CUDA path uses `cudaMalloc` and host-to-device copies for generated test pay
 
 NVLink forwarding is disabled by default and does not change RDMA-only behavior. When enabled, each proxy allocates one inbound NVLink receive buffer on its local GPU for every other local source GPU. With 8 GPUs per node, each proxy allocates 7 such buffers. Each buffer is sized for all remote-node streams, so with 4 nodes it has 3 peer-node slots.
 
-The proxy publishes these local inbound buffers through `nvlink_forward_exchange_dir` using CUDA IPC handles. Other local GPU proxies import the specific buffer assigned to their source GPU and forward from their per-peer RDMA receive buffer to that imported destination buffer using the CUDA copy engine. Each forwarding copy is submitted as a one-entry `cudaMemcpyBatchAsync` call by default, and all copies for one forwarding batch are enqueued sequentially into the same CUDA stream.
+The proxy publishes these local inbound buffers through `nvlink_forward_exchange_dir` using CUDA IPC handles. Other local GPU proxies import the specific buffer assigned to their source GPU and forward from their per-peer RDMA receive buffer to that imported destination buffer using the CUDA copy engine. Each destination GPU receives at most one `cudaMemcpyBatchAsync` call per forwarding batch, and all destination calls for one batch are enqueued sequentially into the same CUDA stream.
 
-The current implementation supports the common full-fanout layout only:
+Each peer-node RDMA receive buffer has a CPU-side routing table with one `uint8_t` row per token. The eight bits represent routing columns 0 through 7; column `j` maps to local GPU:
 
 ```text
-nvlink_forward_threshold_tokens == nvlink_forward_chunk_tokens * (num_gpus_per_node - 1)
+(local_gpu_index + 1 + j) % num_gpus_per_node
+```
+
+Column 7 is stored as the least significant bit. In the standard 8-GPU layout it maps back to the source GPU, so it is generated and included in sorting, but ignored when issuing NVLink copies. Routing rows are generated randomly on the CPU using `nvlink_routing_probability`, sorted in descending unsigned-byte order, and then interpreted as matching the token order in the RDMA receive buffer.
+
+For a forwarding batch, each destination scans the routing rows for that batch, gathers the matching token source addresses, and copies them into a continuous destination span with one batched copy call. Because tokens may route to multiple destinations, the total forwarded byte count can exceed the batch's source byte count.
+
+The routing-table implementation requires:
+
+```text
+num_gpus_per_node <= 8
 num_tokens must be a multiple of nvlink_forward_threshold_tokens
 ```
-
-For source GPU `g`, chunk `i` in a forwarding batch goes to:
-
-```text
-dst_gpu = (g + 1 + i) % num_gpus_per_node
-```
-
-The source token offset is copied into the destination buffer slot for the current peer-node RDMA receive buffer. For example, with GPU 0, threshold 700, chunk size 100, and 8 local GPUs, tokens `[0,100)` go to GPU 1, `[100,200)` to GPU 2, and so on through GPU 7. GPU 1 starts at GPU 2 and wraps around to GPU 0.
 
 `nvlink_forward_destinations` remains as a manual-address override for experiments. When it is empty, the normal path is to allocate local buffers and exchange CUDA IPC metadata automatically through `nvlink_forward_exchange_dir`. Use a unique exchange directory per run to avoid stale metadata files from an earlier launch.
 
 The forwarding thread assumes the sequential peer-transfer order for this path and uses descending ring order. On `node_rank=0` with four nodes, receive buffers are processed as peer rank 3, then 2, then 1.
 
-Set `nvlink_forward_log_batches=true` to emit per-batch/per-copy forwarding traces. Those trace logs include `iteration`, `src_gpu`, `dst_gpu`, `peer_rank`, `batch`, `chunk`, `token_offset`, `token_count`, byte count, and source/destination addresses. The option is disabled by default because large runs can produce many forwarding batches.
+Set `nvlink_forward_log_batches=true` to emit per-batch/per-copy forwarding traces. Those trace logs include `iteration`, `src_gpu`, `dst_gpu`, `peer_rank`, `batch`, `route_column`, `batch_start_token`, routed token count, byte count, and first source/destination addresses. The option is disabled by default because large runs can produce many forwarding batches.
 
 When `nvlink_forward_synchronize_batches=true`, each forwarding batch is timed from before its copy operations are enqueued until after `cudaStreamSynchronize()` returns. If `nvlink_forward_log_batches=true`, each synchronized batch also logs `elapsed_us`, `bandwidth_GBps`, and `bandwidth_gbps`. At iteration completion, the proxy reports the arithmetic mean of synchronized batch bandwidths as `average_batch_bandwidth_GBps` / `average_batch_bandwidth_gbps` and the aggregate `total_forwarded_bytes / total_synchronized_seconds` as `aggregate_synchronized_bandwidth_GBps` / `aggregate_synchronized_bandwidth_gbps`.
 
@@ -226,6 +228,8 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_synchronize_batches`
 - `nvlink_forward_synchronize_iteration`
 - `nvlink_forward_log_batches`
+- `nvlink_routing_probability`
+- `nvlink_routing_seed`
 - `nvlink_forward_exchange_dir`
 - `nvlink_forward_destinations`
 - `cpu_affinity`

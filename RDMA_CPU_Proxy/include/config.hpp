@@ -65,6 +65,8 @@ struct ProxyConfig {
     bool nvlink_forward_synchronize_batches{false};
     bool nvlink_forward_synchronize_iteration{true};
     bool nvlink_forward_log_batches{false};
+    double nvlink_routing_probability{0.5};
+    uint64_t nvlink_routing_seed{1};
     std::string nvlink_forward_exchange_dir{"/tmp/rdma_cpu_proxy_nvlink"};
     std::string cpu_affinity;
     std::string log_level{"info"};

@@ -80,6 +80,11 @@ void launch_cuda_forward_copy_batch_async(
     void* stream,
     bool use_batch_api,
     bool mock_mode);
+void launch_cuda_forward_copy_batch_async(
+    const std::vector<CudaForwardCopy>& copies,
+    void* stream,
+    bool use_batch_api,
+    bool mock_mode);
 std::string export_cuda_ipc_memory_handle(void* ptr, bool mock_mode);
 void* open_cuda_ipc_memory_handle(const std::string& handle_hex, uint64_t mock_addr, bool mock_mode);
 void close_cuda_ipc_memory_handle(void* ptr, bool mock_mode);
