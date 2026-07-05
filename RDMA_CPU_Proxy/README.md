@@ -54,13 +54,13 @@ The proxy publishes these local inbound buffers through `nvlink_forward_exchange
 
 By default forwarding uses per-buffer routing tables. Set `nvlink_forward_use_round_robin=true` to use the older fixed round-robin layout instead.
 
-Each peer-node RDMA receive buffer has a CPU-side routing table with one `uint8_t` row per token. The eight bits represent routing columns 0 through 7; column `j` maps to local GPU:
+Each peer-node RDMA receive buffer has a CPU-side routing table with one `uint8_t` row per token. The eight bits represent routing columns 0 through 7. For a node with `num_gpus_per_node=N`, only columns `0..N-2` are active forwarding columns; columns `N-1..7` are generated and included in sorting, but ignored when issuing NVLink copies. Active column `j` maps to local GPU:
 
 ```text
 (local_gpu_index + 1 + j) % num_gpus_per_node
 ```
 
-Column 7 is stored as the least significant bit. In the standard 8-GPU layout it maps back to the source GPU, so it is generated and included in sorting, but ignored when issuing NVLink copies. Routing rows are generated randomly on the CPU using `nvlink_routing_probability`, sorted in descending unsigned-byte order, and then interpreted as matching the token order in the RDMA receive buffer.
+Column 7 is stored as the least significant bit. In an 8-GPU layout, columns 0 through 6 cover the seven peer GPUs and column 7 is ignored. In a 4-GPU layout, columns 0 through 2 cover the three peer GPUs and columns 3 through 7 are ignored. Routing rows are generated randomly on the CPU using `nvlink_routing_probability`, sorted in descending unsigned-byte order, and then interpreted as matching the token order in the RDMA receive buffer.
 
 For a forwarding batch, each destination scans the routing rows for that batch, gathers the matching token source addresses, and copies them into a continuous destination span with one batched copy call. Because tokens may route to multiple destinations, the total forwarded byte count can exceed the batch's source byte count.
 

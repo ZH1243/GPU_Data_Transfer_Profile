@@ -524,14 +524,14 @@ void validate_config(const ProxyConfig& config) {
         if (config.num_gpus_per_node <= 1) {
             throw std::runtime_error("nvlink_forwarding_enabled requires num_gpus_per_node > 1");
         }
+        if (config.num_gpus_per_node > 8) {
+            throw std::runtime_error("nvlink_forwarding_enabled supports at most 8 local GPUs");
+        }
         if (config.nvlink_forward_threshold_tokens == 0) {
             throw std::runtime_error("nvlink_forward_threshold_tokens must be > 0 when NVLink forwarding is enabled");
         }
         if (config.nvlink_forward_chunk_tokens == 0) {
             throw std::runtime_error("nvlink_forward_chunk_tokens must be > 0 when NVLink forwarding is enabled");
-        }
-        if (!config.nvlink_forward_use_round_robin && config.num_gpus_per_node > 8) {
-            throw std::runtime_error("routing-table NVLink forwarding supports at most 8 local GPUs");
         }
         if (config.nvlink_forward_use_round_robin) {
             const auto expected_threshold =

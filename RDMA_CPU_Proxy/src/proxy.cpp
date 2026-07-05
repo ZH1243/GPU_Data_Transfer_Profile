@@ -45,6 +45,24 @@ uint8_t routing_column_mask(std::size_t column) {
     return static_cast<uint8_t>(1U << (7U - column));
 }
 
+std::size_t active_routing_columns(int num_gpus_per_node) {
+    return static_cast<std::size_t>(num_gpus_per_node - 1);
+}
+
+int routing_column_to_gpu(int local_gpu, std::size_t column, int num_gpus_per_node) {
+    if (column >= active_routing_columns(num_gpus_per_node)) return -1;
+    return (local_gpu + 1 + static_cast<int>(column)) % num_gpus_per_node;
+}
+
+std::size_t routing_column_for_gpu(int local_gpu, int dst_gpu, int num_gpus_per_node) {
+    const auto column = static_cast<std::size_t>(
+        (dst_gpu - local_gpu - 1 + num_gpus_per_node) % num_gpus_per_node);
+    if (column >= active_routing_columns(num_gpus_per_node)) {
+        throw std::runtime_error("NVLink routing destination maps outside active routing columns");
+    }
+    return column;
+}
+
 }  // namespace
 
 Proxy::Proxy(ProxyConfig config)
@@ -551,6 +569,8 @@ void Proxy::prepare_forwarding_routing_tables() {
         forwarding_routing_tables_by_peer_.push_back(std::move(table));
         RDMA_PROXY_LOG_INFO("generated NVLink routing table peer_rank=", peer.peer_rank,
                             " rows=", config_.num_tokens,
+                            " active_columns=", active_routing_columns(config_.num_gpus_per_node),
+                            " ignored_columns=", 8 - active_routing_columns(config_.num_gpus_per_node),
                             " probability=", config_.nvlink_routing_probability,
                             " seed=", config_.nvlink_routing_seed);
     }
@@ -833,18 +853,19 @@ void Proxy::issue_forwarding_batch(
 
         const auto& routing_table = forwarding_routing_tables_by_peer_[peer_slot];
 
-        // Each routing row is one uint8_t for one received token. Column j maps to
-        // GPU (local_gpu + 1 + j) % num_gpus_per_node; column 7 is stored in the
-        // least significant bit, so it participates in sorting but maps back to the
-        // source GPU in the 8-GPU layout and is ignored for forwarding today.
+        // Each routing row is one uint8_t for one received token. Columns
+        // 0..num_gpus_per_node-2 map to local destination GPUs via
+        // (local_gpu + 1 + column) % num_gpus_per_node. The remaining columns
+        // are still generated and included in sorting, but are ignored for
+        // forwarding because they do not represent unique peer GPUs.
         for (const auto& dst : forwarding_destinations_) {
-            const auto route_column = static_cast<std::size_t>(
-                (dst.gpu_index - config_.local_gpu_index - 1 + config_.num_gpus_per_node) %
-                config_.num_gpus_per_node);
-            if (route_column >= 8) continue;
+            const auto route_column =
+                routing_column_for_gpu(config_.local_gpu_index, dst.gpu_index, config_.num_gpus_per_node);
             const int mapped_gpu =
-                (config_.local_gpu_index + 1 + static_cast<int>(route_column)) % config_.num_gpus_per_node;
-            if (mapped_gpu == config_.local_gpu_index) continue;
+                routing_column_to_gpu(config_.local_gpu_index, route_column, config_.num_gpus_per_node);
+            if (mapped_gpu != dst.gpu_index) {
+                throw std::runtime_error("NVLink routing destination mapping mismatch");
+            }
 
             std::vector<CudaForwardCopy> copies;
             copies.reserve(batch_tokens);
