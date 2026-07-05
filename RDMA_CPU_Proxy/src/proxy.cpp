@@ -959,9 +959,12 @@ void Proxy::issue_forwarding_batch(
             auto& stats = forwarding_iteration_stats_[static_cast<std::size_t>(iteration)];
             ++stats.batch_count;
             stats.total_bytes += batch_bytes;
-            stats.total_seconds += batch_seconds;
-            stats.sum_batch_bandwidth_gbytes_per_sec += batch_gbytes_per_sec;
-            stats.sum_batch_bandwidth_gbits_per_sec += batch_gbits_per_sec;
+            if (batch_bytes > 0) {
+                ++stats.bandwidth_sample_count;
+                stats.total_seconds += batch_seconds;
+                stats.sum_batch_bandwidth_gbytes_per_sec += batch_gbytes_per_sec;
+                stats.sum_batch_bandwidth_gbits_per_sec += batch_gbits_per_sec;
+            }
         }
         if (config_.nvlink_forward_log_batches) {
             RDMA_PROXY_LOG_INFO("nvlink_forward_batch_complete iteration=", iteration,
@@ -1073,10 +1076,12 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
                     stats = forwarding_iteration_stats_[static_cast<std::size_t>(iteration)];
                 }
             }
-            const double avg_batch_gbytes_per_sec = stats.batch_count > 0 ?
-                stats.sum_batch_bandwidth_gbytes_per_sec / static_cast<double>(stats.batch_count) : 0.0;
-            const double avg_batch_gbits_per_sec = stats.batch_count > 0 ?
-                stats.sum_batch_bandwidth_gbits_per_sec / static_cast<double>(stats.batch_count) : 0.0;
+            const double avg_batch_gbytes_per_sec = stats.bandwidth_sample_count > 0 ?
+                stats.sum_batch_bandwidth_gbytes_per_sec /
+                    static_cast<double>(stats.bandwidth_sample_count) : 0.0;
+            const double avg_batch_gbits_per_sec = stats.bandwidth_sample_count > 0 ?
+                stats.sum_batch_bandwidth_gbits_per_sec /
+                    static_cast<double>(stats.bandwidth_sample_count) : 0.0;
             const double aggregate_gbytes_per_sec = stats.total_seconds > 0.0 ?
                 static_cast<double>(stats.total_bytes) / stats.total_seconds / 1.0e9 : 0.0;
             const double aggregate_gbits_per_sec = aggregate_gbytes_per_sec * 8.0;
@@ -1086,6 +1091,9 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
                                     " local_gpu=", config_.local_gpu_index,
                                     " batches_per_peer=", batches_per_iteration,
                                     " synchronized_batch_count=", stats.batch_count,
+                                    " bandwidth_sample_count=", stats.bandwidth_sample_count,
+                                    " empty_bandwidth_sample_count=",
+                                        stats.batch_count - stats.bandwidth_sample_count,
                                     " synchronized_batch_bytes=", stats.total_bytes,
                                     " average_batch_bandwidth_GBps=", std::fixed, std::setprecision(3),
                                         avg_batch_gbytes_per_sec,
