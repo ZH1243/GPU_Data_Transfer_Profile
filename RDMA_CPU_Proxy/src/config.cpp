@@ -323,6 +323,9 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "nvlink_forward_log_batches") {
         config.nvlink_forward_log_batches = (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "nvlink_forward_use_round_robin") {
+        config.nvlink_forward_use_round_robin = (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "nvlink_routing_probability") {
         config.nvlink_routing_probability = std::stod(value);
     }
@@ -424,6 +427,8 @@ ProxyConfig load_config_file(const std::string& path) {
         object, "nvlink_forward_synchronize_iteration", config.nvlink_forward_synchronize_iteration);
     config.nvlink_forward_log_batches = get_bool(
         object, "nvlink_forward_log_batches", config.nvlink_forward_log_batches);
+    config.nvlink_forward_use_round_robin = get_bool(
+        object, "nvlink_forward_use_round_robin", config.nvlink_forward_use_round_robin);
     config.nvlink_routing_probability = get_number(
         object, "nvlink_routing_probability", config.nvlink_routing_probability);
     config.nvlink_routing_seed = number_as<uint64_t>(
@@ -525,8 +530,17 @@ void validate_config(const ProxyConfig& config) {
         if (config.nvlink_forward_chunk_tokens == 0) {
             throw std::runtime_error("nvlink_forward_chunk_tokens must be > 0 when NVLink forwarding is enabled");
         }
-        if (config.num_gpus_per_node > 8) {
+        if (!config.nvlink_forward_use_round_robin && config.num_gpus_per_node > 8) {
             throw std::runtime_error("routing-table NVLink forwarding supports at most 8 local GPUs");
+        }
+        if (config.nvlink_forward_use_round_robin) {
+            const auto expected_threshold =
+                config.nvlink_forward_chunk_tokens * static_cast<std::size_t>(config.num_gpus_per_node - 1);
+            if (config.nvlink_forward_threshold_tokens != expected_threshold) {
+                throw std::runtime_error(
+                    "round-robin NVLink forwarding requires nvlink_forward_threshold_tokens to equal "
+                    "nvlink_forward_chunk_tokens * (num_gpus_per_node - 1)");
+            }
         }
         if (config.nvlink_forward_threshold_tokens > config.num_tokens) {
             throw std::runtime_error(
@@ -593,6 +607,7 @@ std::string config_summary(const ProxyConfig& config) {
         << " nvlink_forward_chunk_tokens=" << config.nvlink_forward_chunk_tokens
         << " nvlink_forward_use_batch_api=" << (config.nvlink_forward_use_batch_api ? "true" : "false")
         << " nvlink_forward_log_batches=" << (config.nvlink_forward_log_batches ? "true" : "false")
+        << " nvlink_forward_use_round_robin=" << (config.nvlink_forward_use_round_robin ? "true" : "false")
         << " nvlink_routing_probability=" << config.nvlink_routing_probability
         << " nvlink_routing_seed=" << config.nvlink_routing_seed
         << " nvlink_forward_exchange_dir=" << config.nvlink_forward_exchange_dir

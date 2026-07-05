@@ -52,6 +52,8 @@ NVLink forwarding is disabled by default and does not change RDMA-only behavior.
 
 The proxy publishes these local inbound buffers through `nvlink_forward_exchange_dir` using CUDA IPC handles. Other local GPU proxies import the specific buffer assigned to their source GPU and forward from their per-peer RDMA receive buffer to that imported destination buffer using the CUDA copy engine. Each destination GPU receives at most one `cudaMemcpyBatchAsync` call per forwarding batch, and all destination calls for one batch are enqueued sequentially into the same CUDA stream.
 
+By default forwarding uses per-buffer routing tables. Set `nvlink_forward_use_round_robin=true` to use the older fixed round-robin layout instead.
+
 Each peer-node RDMA receive buffer has a CPU-side routing table with one `uint8_t` row per token. The eight bits represent routing columns 0 through 7; column `j` maps to local GPU:
 
 ```text
@@ -68,6 +70,14 @@ The routing-table implementation requires:
 num_gpus_per_node <= 8
 num_tokens must be a multiple of nvlink_forward_threshold_tokens
 ```
+
+In round-robin mode, the previous full-fanout rule is restored:
+
+```text
+nvlink_forward_threshold_tokens == nvlink_forward_chunk_tokens * (num_gpus_per_node - 1)
+```
+
+For source GPU `g`, chunk `i` in a forwarding batch goes to `(g + 1 + i) % num_gpus_per_node`.
 
 `nvlink_forward_destinations` remains as a manual-address override for experiments. When it is empty, the normal path is to allocate local buffers and exchange CUDA IPC metadata automatically through `nvlink_forward_exchange_dir`. Use a unique exchange directory per run to avoid stale metadata files from an earlier launch.
 
@@ -228,6 +238,7 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_synchronize_batches`
 - `nvlink_forward_synchronize_iteration`
 - `nvlink_forward_log_batches`
+- `nvlink_forward_use_round_robin`
 - `nvlink_routing_probability`
 - `nvlink_routing_seed`
 - `nvlink_forward_exchange_dir`

@@ -493,7 +493,9 @@ void Proxy::start_forwarding_thread() {
         config_.mock_mode);
     publish_local_nvlink_receive_buffers();
     prepare_forwarding_destinations();
-    prepare_forwarding_routing_tables();
+    if (!config_.nvlink_forward_use_round_robin) {
+        prepare_forwarding_routing_tables();
+    }
     for (const auto& dst : forwarding_destinations_) {
         enable_cuda_peer_access(config_.cuda_device_id, dst.cuda_device_id, config_.mock_mode);
     }
@@ -760,7 +762,7 @@ void Proxy::issue_forwarding_batch(
     std::size_t batch_bytes = 0;
     const auto batch_tokens = config_.nvlink_forward_threshold_tokens;
     if (batch_start_token + batch_tokens > config_.num_tokens) {
-        throw std::runtime_error("NVLink forwarding batch exceeds routing table rows");
+        throw std::runtime_error("NVLink forwarding batch exceeds token range");
     }
 
     const auto peer_buffer_it = std::find_if(
@@ -772,84 +774,137 @@ void Proxy::issue_forwarding_batch(
     }
     const auto peer_slot = static_cast<std::size_t>(
         std::distance(cuda_buffers_.peer_buffers().cbegin(), peer_buffer_it));
-    if (peer_slot >= forwarding_routing_tables_by_peer_.size()) {
-        throw std::runtime_error("missing NVLink routing table for peer buffer slot");
-    }
-
-    const auto& routing_table = forwarding_routing_tables_by_peer_[peer_slot];
     const auto peer_slot_offset = cuda_buffers_.token_buffer_bytes() * peer_slot;
 
-    // Each routing row is one uint8_t for one received token. Column j maps to
-    // GPU (local_gpu + 1 + j) % num_gpus_per_node; column 7 is stored in the
-    // least significant bit, so it participates in sorting but maps back to the
-    // source GPU in the 8-GPU layout and is ignored for forwarding today.
-    for (const auto& dst : forwarding_destinations_) {
-        const auto route_column = static_cast<std::size_t>(
-            (dst.gpu_index - config_.local_gpu_index - 1 + config_.num_gpus_per_node) %
-            config_.num_gpus_per_node);
-        if (route_column >= 8) continue;
-        const int mapped_gpu =
-            (config_.local_gpu_index + 1 + static_cast<int>(route_column)) % config_.num_gpus_per_node;
-        if (mapped_gpu == config_.local_gpu_index) continue;
-
-        std::vector<CudaForwardCopy> copies;
-        copies.reserve(batch_tokens);
-        const auto destination_base_offset = peer_slot_offset + batch_start_token * token_bytes;
-        for (std::size_t token = 0; token < batch_tokens; ++token) {
-            const auto token_index = batch_start_token + token;
-            if ((routing_table[token_index] & routing_column_mask(route_column)) == 0) {
-                continue;
+    if (config_.nvlink_forward_use_round_robin) {
+        for (std::size_t chunk_index = 0;
+             chunk_index < static_cast<std::size_t>(config_.num_gpus_per_node - 1);
+             ++chunk_index) {
+            const int dst_gpu =
+                (config_.local_gpu_index + 1 + static_cast<int>(chunk_index)) % config_.num_gpus_per_node;
+            const auto dst_it = std::find_if(
+                forwarding_destinations_.begin(),
+                forwarding_destinations_.end(),
+                [&](const ForwardDestinationState& dst) { return dst.gpu_index == dst_gpu; });
+            if (dst_it == forwarding_destinations_.end()) {
+                throw std::runtime_error("missing NVLink forwarding destination for GPU " + std::to_string(dst_gpu));
             }
 
-            const auto source_byte_offset = token_index * token_bytes;
-            const auto destination_byte_offset = destination_base_offset + copies.size() * token_bytes;
-            if (source_byte_offset + token_bytes > buffers.recv.bytes ||
-                destination_byte_offset + token_bytes > dst.bytes) {
+            const auto token_offset = batch_start_token + chunk_index * config_.nvlink_forward_chunk_tokens;
+            const auto source_byte_offset = token_offset * token_bytes;
+            const auto destination_byte_offset = peer_slot_offset + source_byte_offset;
+            const auto bytes = config_.nvlink_forward_chunk_tokens * token_bytes;
+            if (source_byte_offset + bytes > buffers.recv.bytes ||
+                destination_byte_offset + bytes > dst_it->bytes) {
                 throw std::runtime_error("NVLink forwarding copy exceeds source or destination buffer size");
             }
 
             CudaForwardCopy copy;
             copy.src = static_cast<const char*>(buffers.recv.ptr) + source_byte_offset;
-            copy.dst = static_cast<char*>(dst.ptr) + destination_byte_offset;
-            copy.bytes = token_bytes;
-            copies.push_back(copy);
+            copy.dst = static_cast<char*>(dst_it->ptr) + destination_byte_offset;
+            copy.bytes = bytes;
+            batch_bytes += bytes;
+
+            if (config_.nvlink_forward_log_batches) {
+                RDMA_PROXY_LOG_INFO("nvlink_forward_round_robin iteration=", iteration,
+                                    " local_rank=", config_.node_rank,
+                                    " src_gpu=", config_.local_gpu_index,
+                                    " dst_gpu=", dst_gpu,
+                                    " peer_rank=", peer.peer_rank,
+                                    " batch=", batch_index_in_iteration,
+                                    " chunk=", chunk_index,
+                                    " token_offset=", token_offset,
+                                    " token_count=", config_.nvlink_forward_chunk_tokens,
+                                    " peer_slot_offset=", peer_slot_offset,
+                                    " bytes=", bytes,
+                                    " src_addr=", reinterpret_cast<uintptr_t>(copy.src),
+                                    " dst_addr=", reinterpret_cast<uintptr_t>(copy.dst));
+            }
+            launch_cuda_forward_copy_batch_async(
+                copy,
+                forwarding_stream_,
+                config_.nvlink_forward_use_batch_api,
+                config_.mock_mode);
+        }
+    } else {
+        if (peer_slot >= forwarding_routing_tables_by_peer_.size()) {
+            throw std::runtime_error("missing NVLink routing table for peer buffer slot");
         }
 
-        if (copies.empty()) {
+        const auto& routing_table = forwarding_routing_tables_by_peer_[peer_slot];
+
+        // Each routing row is one uint8_t for one received token. Column j maps to
+        // GPU (local_gpu + 1 + j) % num_gpus_per_node; column 7 is stored in the
+        // least significant bit, so it participates in sorting but maps back to the
+        // source GPU in the 8-GPU layout and is ignored for forwarding today.
+        for (const auto& dst : forwarding_destinations_) {
+            const auto route_column = static_cast<std::size_t>(
+                (dst.gpu_index - config_.local_gpu_index - 1 + config_.num_gpus_per_node) %
+                config_.num_gpus_per_node);
+            if (route_column >= 8) continue;
+            const int mapped_gpu =
+                (config_.local_gpu_index + 1 + static_cast<int>(route_column)) % config_.num_gpus_per_node;
+            if (mapped_gpu == config_.local_gpu_index) continue;
+
+            std::vector<CudaForwardCopy> copies;
+            copies.reserve(batch_tokens);
+            const auto destination_base_offset = peer_slot_offset + batch_start_token * token_bytes;
+            for (std::size_t token = 0; token < batch_tokens; ++token) {
+                const auto token_index = batch_start_token + token;
+                if ((routing_table[token_index] & routing_column_mask(route_column)) == 0) {
+                    continue;
+                }
+
+                const auto source_byte_offset = token_index * token_bytes;
+                const auto destination_byte_offset = destination_base_offset + copies.size() * token_bytes;
+                if (source_byte_offset + token_bytes > buffers.recv.bytes ||
+                    destination_byte_offset + token_bytes > dst.bytes) {
+                    throw std::runtime_error("NVLink forwarding copy exceeds source or destination buffer size");
+                }
+
+                CudaForwardCopy copy;
+                copy.src = static_cast<const char*>(buffers.recv.ptr) + source_byte_offset;
+                copy.dst = static_cast<char*>(dst.ptr) + destination_byte_offset;
+                copy.bytes = token_bytes;
+                copies.push_back(copy);
+            }
+
+            if (copies.empty()) {
+                if (config_.nvlink_forward_log_batches) {
+                    RDMA_PROXY_LOG_INFO("nvlink_forward_route_empty iteration=", iteration,
+                                        " local_rank=", config_.node_rank,
+                                        " src_gpu=", config_.local_gpu_index,
+                                        " dst_gpu=", dst.gpu_index,
+                                        " peer_rank=", peer.peer_rank,
+                                        " batch=", batch_index_in_iteration,
+                                        " route_column=", route_column);
+                }
+                continue;
+            }
+
+            const auto bytes = copies.size() * token_bytes;
+            batch_bytes += bytes;
             if (config_.nvlink_forward_log_batches) {
-                RDMA_PROXY_LOG_INFO("nvlink_forward_route_empty iteration=", iteration,
+                RDMA_PROXY_LOG_INFO("nvlink_forward iteration=", iteration,
                                     " local_rank=", config_.node_rank,
                                     " src_gpu=", config_.local_gpu_index,
                                     " dst_gpu=", dst.gpu_index,
                                     " peer_rank=", peer.peer_rank,
                                     " batch=", batch_index_in_iteration,
-                                    " route_column=", route_column);
+                                    " route_column=", route_column,
+                                    " batch_start_token=", batch_start_token,
+                                    " routed_tokens=", copies.size(),
+                                    " peer_slot_offset=", peer_slot_offset,
+                                    " bytes=", bytes,
+                                    " first_src_addr=", reinterpret_cast<uintptr_t>(copies.front().src),
+                                    " first_dst_addr=", reinterpret_cast<uintptr_t>(copies.front().dst));
             }
-            continue;
+            launch_cuda_forward_copy_batch_async(
+                copies,
+                forwarding_stream_,
+                config_.nvlink_forward_use_batch_api,
+                config_.mock_mode);
         }
-
-        const auto bytes = copies.size() * token_bytes;
-        batch_bytes += bytes;
-        if (config_.nvlink_forward_log_batches) {
-            RDMA_PROXY_LOG_INFO("nvlink_forward iteration=", iteration,
-                                " local_rank=", config_.node_rank,
-                                " src_gpu=", config_.local_gpu_index,
-                                " dst_gpu=", dst.gpu_index,
-                                " peer_rank=", peer.peer_rank,
-                                " batch=", batch_index_in_iteration,
-                                " route_column=", route_column,
-                                " batch_start_token=", batch_start_token,
-                                " routed_tokens=", copies.size(),
-                                " peer_slot_offset=", peer_slot_offset,
-                                " bytes=", bytes,
-                                " first_src_addr=", reinterpret_cast<uintptr_t>(copies.front().src),
-                                " first_dst_addr=", reinterpret_cast<uintptr_t>(copies.front().dst));
-        }
-        launch_cuda_forward_copy_batch_async(
-            copies,
-            forwarding_stream_,
-            config_.nvlink_forward_use_batch_api,
-            config_.mock_mode);
     }
     if (config_.nvlink_forward_synchronize_batches) {
         synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
