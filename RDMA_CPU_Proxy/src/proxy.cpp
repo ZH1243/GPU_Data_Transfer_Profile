@@ -849,25 +849,41 @@ void Proxy::issue_forwarding_batch(
             std::vector<CudaForwardCopy> copies;
             copies.reserve(batch_tokens);
             const auto destination_base_offset = peer_slot_offset + batch_start_token * token_bytes;
-            for (std::size_t token = 0; token < batch_tokens; ++token) {
-                const auto token_index = batch_start_token + token;
-                if ((routing_table[token_index] & routing_column_mask(route_column)) == 0) {
-                    continue;
-                }
-
-                const auto source_byte_offset = token_index * token_bytes;
-                const auto destination_byte_offset = destination_base_offset + copies.size() * token_bytes;
-                if (source_byte_offset + token_bytes > buffers.recv.bytes ||
-                    destination_byte_offset + token_bytes > dst.bytes) {
+            std::size_t routed_tokens = 0;
+            std::size_t run_start_token = 0;
+            std::size_t run_tokens = 0;
+            auto flush_run = [&]() {
+                if (run_tokens == 0) return;
+                const auto source_byte_offset = run_start_token * token_bytes;
+                const auto destination_byte_offset = destination_base_offset + routed_tokens * token_bytes;
+                const auto bytes = run_tokens * token_bytes;
+                if (source_byte_offset + bytes > buffers.recv.bytes ||
+                    destination_byte_offset + bytes > dst.bytes) {
                     throw std::runtime_error("NVLink forwarding copy exceeds source or destination buffer size");
                 }
 
                 CudaForwardCopy copy;
                 copy.src = static_cast<const char*>(buffers.recv.ptr) + source_byte_offset;
                 copy.dst = static_cast<char*>(dst.ptr) + destination_byte_offset;
-                copy.bytes = token_bytes;
+                copy.bytes = bytes;
                 copies.push_back(copy);
+                routed_tokens += run_tokens;
+                run_tokens = 0;
+            };
+
+            for (std::size_t token = 0; token < batch_tokens; ++token) {
+                const auto token_index = batch_start_token + token;
+                if ((routing_table[token_index] & routing_column_mask(route_column)) == 0) {
+                    flush_run();
+                    continue;
+                }
+
+                if (run_tokens == 0) {
+                    run_start_token = token_index;
+                }
+                ++run_tokens;
             }
+            flush_run();
 
             if (copies.empty()) {
                 if (config_.nvlink_forward_log_batches) {
@@ -882,7 +898,7 @@ void Proxy::issue_forwarding_batch(
                 continue;
             }
 
-            const auto bytes = copies.size() * token_bytes;
+            const auto bytes = routed_tokens * token_bytes;
             batch_bytes += bytes;
             if (config_.nvlink_forward_log_batches) {
                 RDMA_PROXY_LOG_INFO("nvlink_forward iteration=", iteration,
@@ -893,7 +909,8 @@ void Proxy::issue_forwarding_batch(
                                     " batch=", batch_index_in_iteration,
                                     " route_column=", route_column,
                                     " batch_start_token=", batch_start_token,
-                                    " routed_tokens=", copies.size(),
+                                    " routed_tokens=", routed_tokens,
+                                    " batch_entries=", copies.size(),
                                     " peer_slot_offset=", peer_slot_offset,
                                     " bytes=", bytes,
                                     " first_src_addr=", reinterpret_cast<uintptr_t>(copies.front().src),
