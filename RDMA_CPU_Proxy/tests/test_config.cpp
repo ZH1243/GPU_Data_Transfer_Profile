@@ -33,6 +33,7 @@ int main(int argc, char** argv) {
     assert(!config.nvlink_forward_synchronize_batches);
     assert(config.nvlink_forward_synchronize_iteration);
     assert(!config.nvlink_forward_log_batches);
+    assert(!config.log_qp_reports);
     assert(!config.nvlink_forward_use_round_robin);
     assert(config.nvlink_routing_probability == 0.5);
     assert(config.nvlink_routing_seed == 1);
@@ -114,9 +115,10 @@ int main(int argc, char** argv) {
         "--completion_timeout_ms=1000",
         "--validate_data=false",
         "--sequential_peer_transfers=true",
+        "--log_qp_reports=true",
         "--cpu_affinity=0-95,192-287",
     };
-    const auto peer_port_config = rdma_proxy::load_config(9, const_cast<char**>(peer_port_args));
+    const auto peer_port_config = rdma_proxy::load_config(10, const_cast<char**>(peer_port_args));
     for (const auto& peer : peer_port_config.peers) {
         assert(peer.port == 18521);
     }
@@ -124,6 +126,7 @@ int main(int argc, char** argv) {
     assert(peer_port_config.completion_timeout_ms == 1000);
     assert(!peer_port_config.validate_data);
     assert(peer_port_config.sequential_peer_transfers);
+    assert(peer_port_config.log_qp_reports);
     assert(peer_port_config.cpu_affinity == "0-95,192-287");
 
     const char* signal_interval_args[] = {
@@ -169,6 +172,7 @@ int main(int argc, char** argv) {
   "nvlink_forward_synchronize_batches": false,
   "nvlink_forward_synchronize_iteration": true,
   "nvlink_forward_log_batches": true,
+  "log_qp_reports": true,
   "nvlink_forward_use_round_robin": true,
   "nvlink_routing_probability": 0.25,
   "nvlink_routing_seed": 1234,
@@ -189,6 +193,7 @@ int main(int argc, char** argv) {
     const auto nvlink_config = rdma_proxy::load_config_file(nvlink_config_path);
     assert(nvlink_config.nvlink_forwarding_enabled);
     assert(nvlink_config.nvlink_forward_log_batches);
+    assert(nvlink_config.log_qp_reports);
     assert(nvlink_config.nvlink_forward_use_round_robin);
     assert(nvlink_config.nvlink_routing_probability == 0.25);
     assert(nvlink_config.nvlink_routing_seed == 1234);

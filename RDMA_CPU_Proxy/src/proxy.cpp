@@ -1208,69 +1208,71 @@ void Proxy::report_iteration(
                         " immediate_mismatches=", verification_errors,
                         " validation_errors=", validation_errors);
 
-    for (std::size_t peer_index = 0; peer_index < peers_.size(); ++peer_index) {
-        const auto& peer = peers_[peer_index];
-        const auto& assignment = assignments[peer_index];
-        for (std::size_t q = 0; q < peer.workers.size(); ++q) {
-            const auto& worker = peer.workers[q];
-            const auto local_qp = peer.qps[q]->local_info();
-            const auto remote_qp = peer.qps[q]->remote_info();
-            const auto send_marker_time = worker->latest_send_marker_time();
-            const auto recv_marker_time = worker->latest_recv_marker_time();
-            const auto empty_time = std::chrono::steady_clock::time_point{};
-            const auto send_marker_elapsed_us = send_marker_time == empty_time ? -1 :
-                static_cast<int64_t>(
-                    std::chrono::duration_cast<std::chrono::microseconds>(send_marker_time - start).count());
-            const auto recv_marker_elapsed_us = recv_marker_time == empty_time ? -1 :
-                static_cast<int64_t>(
-                    std::chrono::duration_cast<std::chrono::microseconds>(recv_marker_time - start).count());
-            const auto marker_gap_us =
-                send_marker_elapsed_us >= 0 && recv_marker_elapsed_us >= 0 ?
-                    recv_marker_elapsed_us - send_marker_elapsed_us :
-                    0;
-            const auto send_delta = worker->send_completions() - baselines[peer_index][q].sends;
-            const auto recv_delta = worker->recv_completions() - baselines[peer_index][q].recvs;
-            const auto send_marker_delta =
-                worker->send_marker_completions() - baselines[peer_index][q].send_markers;
-            const auto recv_marker_delta =
-                worker->recv_marker_completions() - baselines[peer_index][q].recv_markers;
-            const auto post_error_delta = worker->post_errors() - baselines[peer_index][q].post_errors;
-            const auto cq_error_delta = worker->cq_errors() - baselines[peer_index][q].cq_errors;
-            const auto unexpected_delta =
-                worker->unexpected_immediate_completions() - baselines[peer_index][q].unexpected_imms;
-            const auto errors = post_error_delta + cq_error_delta + unexpected_delta;
-            const double qp_gbps = seconds > 0.0 ?
-                (static_cast<double>(assignment.bytes_by_qp[q]) * 8.0 / seconds / 1.0e9) : 0.0;
-            RDMA_PROXY_LOG_INFO("qp_report iteration=", iteration,
-                                " local_rank=", config_.node_rank,
-                                " local_gpu=", config_.local_gpu_index,
-                                " peer=", peer.peer_rank,
-                                " remote_rank=", peer.peer_rank,
-                                " remote_gpu=", peer.remote_gpu_index,
-                                " qp=", q,
-                                " local_qpn=", local_qp.qp_num,
-                                " remote_qpn=", remote_qp.qp_num,
-                                " local_lid=", local_qp.lid,
-                                " remote_lid=", remote_qp.lid,
-                                " local_psn=", local_qp.psn,
-                                " remote_psn=", remote_qp.psn,
-                                " bytes=", assignment.bytes_by_qp[q],
-                                " assigned_chunks=", assignment.chunks_by_qp[q],
-                                " elapsed_us=", static_cast<uint64_t>(latency_us),
-                                " send_marker_elapsed_us=", send_marker_elapsed_us,
-                                " recv_marker_elapsed_us=", recv_marker_elapsed_us,
-                                " marker_gap_us=", marker_gap_us,
-                                " bandwidth_gbps=", std::fixed, std::setprecision(3), qp_gbps,
-                                " send_completions=", send_delta,
-                                " expected_data_send_completions=",
-                                    assignment.expected_send_completions_by_qp[q],
-                                " recv_immediate_completions=", recv_delta,
-                                " send_marker_completions=", send_marker_delta,
-                                " recv_marker_completions=", recv_marker_delta,
-                                " post_errors=", post_error_delta,
-                                " cq_errors=", cq_error_delta,
-                                " unexpected_immediates=", unexpected_delta,
-                                " errors=", errors);
+    if (config_.log_qp_reports) {
+        for (std::size_t peer_index = 0; peer_index < peers_.size(); ++peer_index) {
+            const auto& peer = peers_[peer_index];
+            const auto& assignment = assignments[peer_index];
+            for (std::size_t q = 0; q < peer.workers.size(); ++q) {
+                const auto& worker = peer.workers[q];
+                const auto local_qp = peer.qps[q]->local_info();
+                const auto remote_qp = peer.qps[q]->remote_info();
+                const auto send_marker_time = worker->latest_send_marker_time();
+                const auto recv_marker_time = worker->latest_recv_marker_time();
+                const auto empty_time = std::chrono::steady_clock::time_point{};
+                const auto send_marker_elapsed_us = send_marker_time == empty_time ? -1 :
+                    static_cast<int64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(send_marker_time - start).count());
+                const auto recv_marker_elapsed_us = recv_marker_time == empty_time ? -1 :
+                    static_cast<int64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(recv_marker_time - start).count());
+                const auto marker_gap_us =
+                    send_marker_elapsed_us >= 0 && recv_marker_elapsed_us >= 0 ?
+                        recv_marker_elapsed_us - send_marker_elapsed_us :
+                        0;
+                const auto send_delta = worker->send_completions() - baselines[peer_index][q].sends;
+                const auto recv_delta = worker->recv_completions() - baselines[peer_index][q].recvs;
+                const auto send_marker_delta =
+                    worker->send_marker_completions() - baselines[peer_index][q].send_markers;
+                const auto recv_marker_delta =
+                    worker->recv_marker_completions() - baselines[peer_index][q].recv_markers;
+                const auto post_error_delta = worker->post_errors() - baselines[peer_index][q].post_errors;
+                const auto cq_error_delta = worker->cq_errors() - baselines[peer_index][q].cq_errors;
+                const auto unexpected_delta =
+                    worker->unexpected_immediate_completions() - baselines[peer_index][q].unexpected_imms;
+                const auto errors = post_error_delta + cq_error_delta + unexpected_delta;
+                const double qp_gbps = seconds > 0.0 ?
+                    (static_cast<double>(assignment.bytes_by_qp[q]) * 8.0 / seconds / 1.0e9) : 0.0;
+                RDMA_PROXY_LOG_INFO("qp_report iteration=", iteration,
+                                    " local_rank=", config_.node_rank,
+                                    " local_gpu=", config_.local_gpu_index,
+                                    " peer=", peer.peer_rank,
+                                    " remote_rank=", peer.peer_rank,
+                                    " remote_gpu=", peer.remote_gpu_index,
+                                    " qp=", q,
+                                    " local_qpn=", local_qp.qp_num,
+                                    " remote_qpn=", remote_qp.qp_num,
+                                    " local_lid=", local_qp.lid,
+                                    " remote_lid=", remote_qp.lid,
+                                    " local_psn=", local_qp.psn,
+                                    " remote_psn=", remote_qp.psn,
+                                    " bytes=", assignment.bytes_by_qp[q],
+                                    " assigned_chunks=", assignment.chunks_by_qp[q],
+                                    " elapsed_us=", static_cast<uint64_t>(latency_us),
+                                    " send_marker_elapsed_us=", send_marker_elapsed_us,
+                                    " recv_marker_elapsed_us=", recv_marker_elapsed_us,
+                                    " marker_gap_us=", marker_gap_us,
+                                    " bandwidth_gbps=", std::fixed, std::setprecision(3), qp_gbps,
+                                    " send_completions=", send_delta,
+                                    " expected_data_send_completions=",
+                                        assignment.expected_send_completions_by_qp[q],
+                                    " recv_immediate_completions=", recv_delta,
+                                    " send_marker_completions=", send_marker_delta,
+                                    " recv_marker_completions=", recv_marker_delta,
+                                    " post_errors=", post_error_delta,
+                                    " cq_errors=", cq_error_delta,
+                                    " unexpected_immediates=", unexpected_delta,
+                                    " errors=", errors);
+            }
         }
     }
 }

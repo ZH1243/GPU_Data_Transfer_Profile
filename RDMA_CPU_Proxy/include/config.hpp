@@ -65,6 +65,7 @@ struct ProxyConfig {
     bool nvlink_forward_synchronize_batches{false};
     bool nvlink_forward_synchronize_iteration{true};
     bool nvlink_forward_log_batches{false};
+    bool log_qp_reports{false};
     bool nvlink_forward_use_round_robin{false};
     double nvlink_routing_probability{0.5};
     uint64_t nvlink_routing_seed{1};

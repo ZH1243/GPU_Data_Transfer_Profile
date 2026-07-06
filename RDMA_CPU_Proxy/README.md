@@ -138,7 +138,7 @@ The executable runs `num_iterations` measured iterations. Each iteration:
 - waits for one local send-side drain marker and one receive-side drain marker per QP
 - reports whether every expected data immediate was observed across the peer QPs
 - validates received bytes when `validate_data=true`
-- reports elapsed time, aggregate bandwidth, completion counters, and error counters per QP
+- reports elapsed time and aggregate bandwidth; when `log_qp_reports=true`, also reports completion counters and error counters per QP
 - exchanges a TCP iteration-done barrier with every peer before starting the next iteration or tearing down RDMA resources
 
 Set `num_iterations` to `0` for an indefinite loop. `completion_timeout_ms` bounds how long an iteration waits for completions before failing with per-QP progress details.
@@ -238,6 +238,7 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_synchronize_batches`
 - `nvlink_forward_synchronize_iteration`
 - `nvlink_forward_log_batches`
+- `log_qp_reports`
 - `nvlink_forward_use_round_robin`
 - `nvlink_routing_probability`
 - `nvlink_routing_seed`
