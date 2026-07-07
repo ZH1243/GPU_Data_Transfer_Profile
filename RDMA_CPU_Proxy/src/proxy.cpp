@@ -69,6 +69,26 @@ int routing_column_to_gpu(int local_gpu, std::size_t column, int num_gpus_per_no
     return (local_gpu + 1 + static_cast<int>(column)) % num_gpus_per_node;
 }
 
+int64_t elapsed_us_since(
+    std::chrono::steady_clock::time_point time,
+    std::chrono::steady_clock::time_point start) {
+    if (time == std::chrono::steady_clock::time_point{}) return -1;
+    return static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(time - start).count());
+}
+
+int64_t nonnegative_delta_us(
+    std::chrono::steady_clock::time_point start,
+    std::chrono::steady_clock::time_point end) {
+    if (start == std::chrono::steady_clock::time_point{} ||
+        end == std::chrono::steady_clock::time_point{}) {
+        return -1;
+    }
+    const auto delta = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+    return std::max<int64_t>(0, delta);
+}
+
 std::size_t routing_column_for_gpu(int local_gpu, int dst_gpu, int num_gpus_per_node) {
     const auto column = static_cast<std::size_t>(
         (dst_gpu - local_gpu - 1 + num_gpus_per_node) % num_gpus_per_node);
@@ -1364,6 +1384,63 @@ void Proxy::report_iteration(
                         " immediate_mismatches=", verification_errors,
                         " validation_errors=", validation_errors);
 
+    for (std::size_t peer_index = 0; peer_index < peers_.size(); ++peer_index) {
+        const auto& peer = peers_[peer_index];
+        const auto& assignment = assignments[peer_index];
+        auto send_payload_done_time = std::chrono::steady_clock::time_point{};
+        auto recv_payload_done_time = std::chrono::steady_clock::time_point{};
+        auto send_marker_done_time = std::chrono::steady_clock::time_point{};
+        auto recv_marker_done_time = std::chrono::steady_clock::time_point{};
+        std::size_t send_payload_completions = 0;
+        std::size_t recv_payload_completions = 0;
+
+        for (std::size_t q = 0; q < peer.workers.size(); ++q) {
+            const auto& worker = peer.workers[q];
+            const auto send_delta = worker->send_completions() - baselines[peer_index][q].sends;
+            const auto recv_delta = worker->recv_completions() - baselines[peer_index][q].recvs;
+            send_payload_completions += static_cast<std::size_t>(send_delta);
+            recv_payload_completions += static_cast<std::size_t>(recv_delta);
+
+            if (assignment.expected_send_completions_by_qp[q] > 0) {
+                send_payload_done_time = std::max(
+                    send_payload_done_time, worker->latest_send_completion_time());
+            }
+            if (recv_delta > 0) {
+                recv_payload_done_time = std::max(
+                    recv_payload_done_time, worker->latest_recv_completion_time());
+            }
+            if (worker->send_marker_completions() > baselines[peer_index][q].send_markers) {
+                send_marker_done_time = std::max(
+                    send_marker_done_time, worker->latest_send_marker_time());
+            }
+            if (worker->recv_marker_completions() > baselines[peer_index][q].recv_markers) {
+                recv_marker_done_time = std::max(
+                    recv_marker_done_time, worker->latest_recv_marker_time());
+            }
+        }
+
+        RDMA_PROXY_LOG_INFO("marker_wait_report iteration=", iteration,
+                            " local_rank=", config_.node_rank,
+                            " local_gpu=", config_.local_gpu_index,
+                            " peer=", peer.peer_rank,
+                            " remote_rank=", peer.peer_rank,
+                            " remote_gpu=", peer.remote_gpu_index,
+                            " send_payload_completions=", send_payload_completions,
+                            " recv_payload_completions=", recv_payload_completions,
+                            " send_payload_done_elapsed_us=",
+                                elapsed_us_since(send_payload_done_time, start),
+                            " send_marker_done_elapsed_us=",
+                                elapsed_us_since(send_marker_done_time, start),
+                            " send_marker_wait_after_payload_us=",
+                                nonnegative_delta_us(send_payload_done_time, send_marker_done_time),
+                            " recv_payload_done_elapsed_us=",
+                                elapsed_us_since(recv_payload_done_time, start),
+                            " recv_marker_done_elapsed_us=",
+                                elapsed_us_since(recv_marker_done_time, start),
+                            " recv_marker_wait_after_payload_us=",
+                                nonnegative_delta_us(recv_payload_done_time, recv_marker_done_time));
+    }
+
     if (config_.log_qp_reports) {
         for (std::size_t peer_index = 0; peer_index < peers_.size(); ++peer_index) {
             const auto& peer = peers_[peer_index];
@@ -1372,21 +1449,24 @@ void Proxy::report_iteration(
                 const auto& worker = peer.workers[q];
                 const auto local_qp = peer.qps[q]->local_info();
                 const auto remote_qp = peer.qps[q]->remote_info();
+                const auto send_payload_time =
+                    assignment.expected_send_completions_by_qp[q] > 0 ?
+                        worker->latest_send_completion_time() : std::chrono::steady_clock::time_point{};
+                const auto recv_delta = worker->recv_completions() - baselines[peer_index][q].recvs;
+                const auto recv_payload_time =
+                    recv_delta > 0 ?
+                        worker->latest_recv_completion_time() : std::chrono::steady_clock::time_point{};
                 const auto send_marker_time = worker->latest_send_marker_time();
                 const auto recv_marker_time = worker->latest_recv_marker_time();
-                const auto empty_time = std::chrono::steady_clock::time_point{};
-                const auto send_marker_elapsed_us = send_marker_time == empty_time ? -1 :
-                    static_cast<int64_t>(
-                        std::chrono::duration_cast<std::chrono::microseconds>(send_marker_time - start).count());
-                const auto recv_marker_elapsed_us = recv_marker_time == empty_time ? -1 :
-                    static_cast<int64_t>(
-                        std::chrono::duration_cast<std::chrono::microseconds>(recv_marker_time - start).count());
+                const auto send_payload_elapsed_us = elapsed_us_since(send_payload_time, start);
+                const auto recv_payload_elapsed_us = elapsed_us_since(recv_payload_time, start);
+                const auto send_marker_elapsed_us = elapsed_us_since(send_marker_time, start);
+                const auto recv_marker_elapsed_us = elapsed_us_since(recv_marker_time, start);
                 const auto marker_gap_us =
                     send_marker_elapsed_us >= 0 && recv_marker_elapsed_us >= 0 ?
                         recv_marker_elapsed_us - send_marker_elapsed_us :
                         0;
                 const auto send_delta = worker->send_completions() - baselines[peer_index][q].sends;
-                const auto recv_delta = worker->recv_completions() - baselines[peer_index][q].recvs;
                 const auto send_marker_delta =
                     worker->send_marker_completions() - baselines[peer_index][q].send_markers;
                 const auto recv_marker_delta =
@@ -1414,8 +1494,14 @@ void Proxy::report_iteration(
                                     " bytes=", assignment.bytes_by_qp[q],
                                     " assigned_chunks=", assignment.chunks_by_qp[q],
                                     " elapsed_us=", static_cast<uint64_t>(latency_us),
+                                    " send_payload_done_elapsed_us=", send_payload_elapsed_us,
                                     " send_marker_elapsed_us=", send_marker_elapsed_us,
+                                    " send_marker_wait_after_payload_us=",
+                                        nonnegative_delta_us(send_payload_time, send_marker_time),
+                                    " recv_payload_done_elapsed_us=", recv_payload_elapsed_us,
                                     " recv_marker_elapsed_us=", recv_marker_elapsed_us,
+                                    " recv_marker_wait_after_payload_us=",
+                                        nonnegative_delta_us(recv_payload_time, recv_marker_time),
                                     " marker_gap_us=", marker_gap_us,
                                     " bandwidth_gbps=", std::fixed, std::setprecision(3), qp_gbps,
                                     " send_completions=", send_delta,

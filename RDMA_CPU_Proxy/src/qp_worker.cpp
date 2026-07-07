@@ -177,6 +177,16 @@ std::vector<uint64_t> QPWorker::received_immediate_counts() const {
     return immediate_counts_;
 }
 
+std::chrono::steady_clock::time_point QPWorker::latest_send_completion_time() const {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    return latest_send_completion_time_;
+}
+
+std::chrono::steady_clock::time_point QPWorker::latest_recv_completion_time() const {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    return latest_recv_completion_time_;
+}
+
 std::chrono::steady_clock::time_point QPWorker::latest_send_marker_time() const {
     std::lock_guard<std::mutex> lock(stats_mutex_);
     return latest_send_marker_time_;
@@ -312,6 +322,10 @@ void QPWorker::cq_loop() {
                         completion_cv_.notify_all();
                     } else {
                         send_completions_.fetch_add(1);
+                        {
+                            std::lock_guard<std::mutex> lock(stats_mutex_);
+                            latest_send_completion_time_ = std::chrono::steady_clock::now();
+                        }
                         completion_cv_.notify_all();
                     }
                 } else {
@@ -327,6 +341,7 @@ void QPWorker::cq_loop() {
                         const auto chunk_index = decode_immediate(c.imm_data);
                         {
                             std::lock_guard<std::mutex> lock(stats_mutex_);
+                            latest_recv_completion_time_ = std::chrono::steady_clock::now();
                             if (chunk_index < immediate_counts_.size()) {
                                 ++immediate_counts_[chunk_index];
                             } else {
