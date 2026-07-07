@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <exception>
 #include <iostream>
+#include <thread>
 #include <vector>
 
 int main() {
@@ -123,6 +125,54 @@ int main() {
             std::cerr << "NVLink mock round-robin forwarding destination remained empty\n";
             return 1;
         }
+    }
+
+    {
+        auto config0 = make_config();
+        config0.node_rank = 0;
+        config0.num_nodes = 1;
+        config0.local_gpu_index = 0;
+        config0.cuda_device_id = 0;
+        config0.num_gpus_per_node = 2;
+        config0.num_iterations = 2;
+        config0.local_iteration_sync_enabled = true;
+        config0.local_iteration_sync_dir = "/tmp/rdma_cpu_proxy_test_local_iteration_sync";
+        config0.local_iteration_sync_run_id = "test_measured_run";
+        config0.peers.clear();
+
+        auto config1 = config0;
+        config1.local_gpu_index = 1;
+        config1.cuda_device_id = 1;
+
+        validate_config(config0);
+        validate_config(config1);
+
+        std::exception_ptr error0;
+        std::exception_ptr error1;
+        std::thread gpu0([&] {
+            try {
+                Proxy proxy(config0);
+                proxy.initialize();
+                proxy.run();
+                proxy.shutdown();
+            } catch (...) {
+                error0 = std::current_exception();
+            }
+        });
+        std::thread gpu1([&] {
+            try {
+                Proxy proxy(config1);
+                proxy.initialize();
+                proxy.run();
+                proxy.shutdown();
+            } catch (...) {
+                error1 = std::current_exception();
+            }
+        });
+        gpu0.join();
+        gpu1.join();
+        if (error0) std::rethrow_exception(error0);
+        if (error1) std::rethrow_exception(error1);
     }
 
     std::cout << "test_measured_run passed\n";

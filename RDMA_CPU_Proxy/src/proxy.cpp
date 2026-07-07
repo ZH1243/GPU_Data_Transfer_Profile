@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <csignal>
 #include <cstdint>
 #include <cerrno>
@@ -39,6 +40,20 @@ bool process_is_alive(int pid) {
 #else
     return true;
 #endif
+}
+
+std::string sanitize_path_component(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    for (const char c : value) {
+        const auto uc = static_cast<unsigned char>(c);
+        if (std::isalnum(uc) || c == '.' || c == '_' || c == '-') {
+            out.push_back(c);
+        } else {
+            out.push_back('_');
+        }
+    }
+    return out.empty() ? "default" : out;
 }
 
 uint8_t routing_column_mask(std::size_t column) {
@@ -269,63 +284,204 @@ void Proxy::fill_iteration_send_buffers(uint64_t iteration) {
 }
 
 void Proxy::synchronize_iteration_start(uint64_t iteration) const {
-    if (peers_.empty()) return;
+    if (!peers_.empty()) {
+        std::ostringstream local;
+        local << "iteration_start"
+              << " rank=" << config_.node_rank
+              << " gpu=" << config_.local_gpu_index
+              << " iteration=" << iteration;
+        const auto expected_phase = "iteration_start";
+        const auto expected_iteration = "iteration=" + std::to_string(iteration);
 
-    std::ostringstream local;
-    local << "iteration_start"
-          << " rank=" << config_.node_rank
-          << " gpu=" << config_.local_gpu_index
-          << " iteration=" << iteration;
-    const auto expected_phase = "iteration_start";
-    const auto expected_iteration = "iteration=" + std::to_string(iteration);
+        RDMA_PROXY_LOG_INFO("iteration=", iteration, " waiting for ", peers_.size(), " peer start barrier(s)");
+        for (const auto& peer : peers_) {
+            const auto it = std::find_if(config_.peers.begin(), config_.peers.end(), [&](const PeerAddress& p) {
+                return p.node_rank == peer.peer_rank;
+            });
+            if (it == config_.peers.end()) {
+                throw std::runtime_error("cannot synchronize unknown peer rank " + std::to_string(peer.peer_rank));
+            }
 
-    RDMA_PROXY_LOG_INFO("iteration=", iteration, " waiting for ", peers_.size(), " peer start barrier(s)");
-    for (const auto& peer : peers_) {
-        const auto it = std::find_if(config_.peers.begin(), config_.peers.end(), [&](const PeerAddress& p) {
-            return p.node_rank == peer.peer_rank;
-        });
-        if (it == config_.peers.end()) {
-            throw std::runtime_error("cannot synchronize unknown peer rank " + std::to_string(peer.peer_rank));
+            const auto remote = connection_manager_.exchange_control_message(
+                *it, local.str(), config_.completion_timeout_ms);
+            if (remote.find(expected_phase) == std::string::npos ||
+                remote.find(expected_iteration) == std::string::npos) {
+                throw std::runtime_error("peer start synchronization mismatch: " + remote);
+            }
+            RDMA_PROXY_LOG_DEBUG("iteration=", iteration, " start synchronized with peer=", peer.peer_rank);
         }
-
-        const auto remote = connection_manager_.exchange_control_message(
-            *it, local.str(), config_.completion_timeout_ms);
-        if (remote.find(expected_phase) == std::string::npos ||
-            remote.find(expected_iteration) == std::string::npos) {
-            throw std::runtime_error("peer start synchronization mismatch: " + remote);
-        }
-        RDMA_PROXY_LOG_DEBUG("iteration=", iteration, " start synchronized with peer=", peer.peer_rank);
+        RDMA_PROXY_LOG_INFO("iteration=", iteration, " peer start barrier complete");
     }
-    RDMA_PROXY_LOG_INFO("iteration=", iteration, " peer start barrier complete");
+    synchronize_local_iteration_phase("iteration_start", iteration);
 }
 
 void Proxy::synchronize_iteration(uint64_t iteration) const {
-    if (peers_.empty()) return;
+    if (!peers_.empty()) {
+        std::ostringstream local;
+        local << "iteration_done"
+              << " rank=" << config_.node_rank
+              << " gpu=" << config_.local_gpu_index
+              << " iteration=" << iteration;
+        const auto expected_iteration = "iteration=" + std::to_string(iteration);
 
-    std::ostringstream local;
-    local << "iteration_done"
-          << " rank=" << config_.node_rank
-          << " gpu=" << config_.local_gpu_index
-          << " iteration=" << iteration;
-    const auto expected_iteration = "iteration=" + std::to_string(iteration);
+        RDMA_PROXY_LOG_INFO("iteration=", iteration, " waiting for ", peers_.size(), " peer synchronization barrier(s)");
+        for (const auto& peer : peers_) {
+            const auto it = std::find_if(config_.peers.begin(), config_.peers.end(), [&](const PeerAddress& p) {
+                return p.node_rank == peer.peer_rank;
+            });
+            if (it == config_.peers.end()) {
+                throw std::runtime_error("cannot synchronize unknown peer rank " + std::to_string(peer.peer_rank));
+            }
 
-    RDMA_PROXY_LOG_INFO("iteration=", iteration, " waiting for ", peers_.size(), " peer synchronization barrier(s)");
-    for (const auto& peer : peers_) {
-        const auto it = std::find_if(config_.peers.begin(), config_.peers.end(), [&](const PeerAddress& p) {
-            return p.node_rank == peer.peer_rank;
-        });
-        if (it == config_.peers.end()) {
-            throw std::runtime_error("cannot synchronize unknown peer rank " + std::to_string(peer.peer_rank));
+            const auto remote = connection_manager_.exchange_control_message(
+                *it, local.str(), config_.completion_timeout_ms);
+            if (remote.find(expected_iteration) == std::string::npos) {
+                throw std::runtime_error("peer synchronization iteration mismatch: " + remote);
+            }
+            RDMA_PROXY_LOG_DEBUG("iteration=", iteration, " synchronized with peer=", peer.peer_rank);
         }
-
-        const auto remote = connection_manager_.exchange_control_message(
-            *it, local.str(), config_.completion_timeout_ms);
-        if (remote.find(expected_iteration) == std::string::npos) {
-            throw std::runtime_error("peer synchronization iteration mismatch: " + remote);
-        }
-        RDMA_PROXY_LOG_DEBUG("iteration=", iteration, " synchronized with peer=", peer.peer_rank);
+        RDMA_PROXY_LOG_INFO("iteration=", iteration, " peer synchronization complete");
     }
-    RDMA_PROXY_LOG_INFO("iteration=", iteration, " peer synchronization complete");
+    synchronize_local_iteration_phase("iteration_done", iteration);
+}
+
+std::string Proxy::local_iteration_sync_file(
+    const std::string& phase,
+    uint64_t iteration,
+    int gpu_index) const {
+    std::filesystem::path path(config_.local_iteration_sync_dir);
+    std::ostringstream default_run_id;
+    default_run_id << "nodes_" << config_.num_nodes
+                   << "_gpus_" << config_.num_gpus_per_node;
+    path /= sanitize_path_component(
+        config_.local_iteration_sync_run_id.empty() ?
+            default_run_id.str() : config_.local_iteration_sync_run_id);
+    path /= "node_" + std::to_string(config_.node_rank);
+    path /= phase + "_iteration_" + std::to_string(iteration) +
+            "_gpu_" + std::to_string(gpu_index) + ".txt";
+    return path.string();
+}
+
+void Proxy::synchronize_local_iteration_phase(const std::string& phase, uint64_t iteration) const {
+    if (!config_.local_iteration_sync_enabled || config_.num_gpus_per_node <= 1) return;
+
+    const auto local_path = local_iteration_sync_file(phase, iteration, config_.local_gpu_index);
+    const auto tmp_path = local_path + ".tmp." + std::to_string(current_process_id());
+    std::filesystem::create_directories(std::filesystem::path(local_path).parent_path());
+
+    {
+        std::ofstream out(tmp_path, std::ios::trunc);
+        if (!out) throw std::runtime_error("failed to write local iteration sync file: " + tmp_path);
+        out << "phase " << phase << '\n'
+            << "node_rank " << config_.node_rank << '\n'
+            << "gpu_index " << config_.local_gpu_index << '\n'
+            << "iteration " << iteration << '\n'
+            << "num_gpus_per_node " << config_.num_gpus_per_node << '\n'
+            << "pid " << current_process_id() << '\n';
+        out.close();
+        if (!out) throw std::runtime_error("failed to flush local iteration sync file: " + tmp_path);
+    }
+    std::filesystem::rename(tmp_path, local_path);
+
+    RDMA_PROXY_LOG_INFO("iteration=", iteration,
+                        " waiting for local ", phase,
+                        " barrier local_rank=", config_.node_rank,
+                        " local_gpu=", config_.local_gpu_index,
+                        " gpus=", config_.num_gpus_per_node);
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(config_.completion_timeout_ms);
+    std::vector<std::string> waiting_reasons(static_cast<std::size_t>(config_.num_gpus_per_node));
+    auto file_matches = [&](int gpu_index, std::string& reason) {
+        const auto path = local_iteration_sync_file(phase, iteration, gpu_index);
+        if (!std::filesystem::exists(path)) {
+            reason = "missing";
+            return false;
+        }
+
+        std::ifstream in(path);
+        if (!in) {
+            reason = "not readable";
+            return false;
+        }
+
+        std::string file_phase;
+        int node_rank = -1;
+        int file_gpu_index = -1;
+        uint64_t file_iteration = 0;
+        int num_gpus_per_node = -1;
+        int pid = -1;
+        std::string key;
+        while (in >> key) {
+            if (key == "phase") {
+                in >> file_phase;
+            } else if (key == "node_rank") {
+                in >> node_rank;
+            } else if (key == "gpu_index") {
+                in >> file_gpu_index;
+            } else if (key == "iteration") {
+                in >> file_iteration;
+            } else if (key == "num_gpus_per_node") {
+                in >> num_gpus_per_node;
+            } else if (key == "pid") {
+                in >> pid;
+            } else {
+                reason = "unknown key " + key;
+                return false;
+            }
+        }
+
+        if (!in.eof()) {
+            reason = "malformed";
+            return false;
+        }
+        if (file_phase != phase ||
+            node_rank != config_.node_rank ||
+            file_gpu_index != gpu_index ||
+            file_iteration != iteration ||
+            num_gpus_per_node != config_.num_gpus_per_node) {
+            reason = "metadata mismatch";
+            return false;
+        }
+        if (!process_is_alive(pid)) {
+            reason = "process not alive";
+            return false;
+        }
+        reason.clear();
+        return true;
+    };
+
+    while (true) {
+        bool complete = true;
+        for (int gpu = 0; gpu < config_.num_gpus_per_node; ++gpu) {
+            std::string reason;
+            if (!file_matches(gpu, reason)) {
+                waiting_reasons[static_cast<std::size_t>(gpu)] = reason;
+                complete = false;
+            }
+        }
+        if (complete) {
+            RDMA_PROXY_LOG_INFO("iteration=", iteration,
+                                " local ", phase,
+                                " barrier complete local_rank=", config_.node_rank,
+                                " local_gpu=", config_.local_gpu_index);
+            return;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            std::ostringstream out;
+            out << "timed out waiting for local " << phase
+                << " barrier iteration=" << iteration
+                << " local_rank=" << config_.node_rank
+                << " local_gpu=" << config_.local_gpu_index
+                << " sync_dir=" << config_.local_iteration_sync_dir;
+            for (int gpu = 0; gpu < config_.num_gpus_per_node; ++gpu) {
+                const auto& reason = waiting_reasons[static_cast<std::size_t>(gpu)];
+                if (!reason.empty()) out << " gpu" << gpu << "=" << reason;
+            }
+            throw std::runtime_error(out.str());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
 }
 
 std::vector<ChunkDescriptor> Proxy::make_chunks() const {

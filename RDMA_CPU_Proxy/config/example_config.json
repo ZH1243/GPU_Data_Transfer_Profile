@@ -39,6 +39,9 @@
   "nvlink_routing_probability": 0.5,
   "nvlink_routing_seed": 1,
   "nvlink_forward_exchange_dir": "/tmp/rdma_cpu_proxy_nvlink",
+  "local_iteration_sync_enabled": false,
+  "local_iteration_sync_dir": "/tmp/rdma_cpu_proxy_local_iteration_sync",
+  "local_iteration_sync_run_id": "",
   "nvlink_forward_destinations": [
   ],
   "cpu_affinity": "auto",

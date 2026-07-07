@@ -141,6 +141,8 @@ The executable runs `num_iterations` measured iterations. Each iteration:
 - reports elapsed time and aggregate bandwidth; when `log_qp_reports=true`, also reports completion counters and error counters per QP
 - exchanges a TCP iteration-done barrier with every peer before starting the next iteration or tearing down RDMA resources
 
+Set `local_iteration_sync_enabled=true` to add a same-node GPU-proxy barrier at the iteration boundaries. With this enabled, the proxy first completes the existing same-GPU-index cross-node barrier, then writes a small arrival file under `local_iteration_sync_dir` and waits until every local GPU index on the node has arrived. The same local barrier is also applied after the existing cross-node iteration-done barrier. Use the same `local_iteration_sync_run_id` for every proxy in one launch, and prefer a unique value per launch when reusing a shared directory such as `/tmp`.
+
 Set `num_iterations` to `0` for an indefinite loop. `completion_timeout_ms` bounds how long an iteration waits for completions before failing with per-QP progress details.
 
 ## Why Receive WRs Are Required
@@ -238,6 +240,9 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_synchronize_batches`
 - `nvlink_forward_synchronize_iteration`
 - `nvlink_forward_log_batches`
+- `local_iteration_sync_enabled`
+- `local_iteration_sync_dir`
+- `local_iteration_sync_run_id`
 - `log_qp_reports`
 - `nvlink_forward_use_round_robin`
 - `nvlink_routing_probability`

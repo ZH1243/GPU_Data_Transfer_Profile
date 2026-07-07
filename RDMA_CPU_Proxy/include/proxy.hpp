@@ -75,6 +75,11 @@ private:
     void run_iteration(uint64_t iteration);
     void synchronize_iteration_start(uint64_t iteration) const;
     void synchronize_iteration(uint64_t iteration) const;
+    void synchronize_local_iteration_phase(const std::string& phase, uint64_t iteration) const;
+    std::string local_iteration_sync_file(
+        const std::string& phase,
+        uint64_t iteration,
+        int gpu_index) const;
     void fill_iteration_send_buffers(uint64_t iteration);
     std::vector<std::size_t> sequential_peer_order() const;
     std::vector<ChunkDescriptor> make_chunks() const;

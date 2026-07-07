@@ -70,6 +70,9 @@ struct ProxyConfig {
     double nvlink_routing_probability{0.5};
     uint64_t nvlink_routing_seed{1};
     std::string nvlink_forward_exchange_dir{"/tmp/rdma_cpu_proxy_nvlink"};
+    bool local_iteration_sync_enabled{false};
+    std::string local_iteration_sync_dir{"/tmp/rdma_cpu_proxy_local_iteration_sync"};
+    std::string local_iteration_sync_run_id;
     std::string cpu_affinity;
     std::string log_level{"info"};
     std::vector<PeerAddress> peers;

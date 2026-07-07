@@ -336,6 +336,11 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
         config.nvlink_routing_seed = static_cast<uint64_t>(std::stoull(value));
     }
     else if (key == "nvlink_forward_exchange_dir") config.nvlink_forward_exchange_dir = value;
+    else if (key == "local_iteration_sync_enabled") {
+        config.local_iteration_sync_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "local_iteration_sync_dir") config.local_iteration_sync_dir = value;
+    else if (key == "local_iteration_sync_run_id") config.local_iteration_sync_run_id = value;
     else if (key == "cpu_affinity") config.cpu_affinity = value;
     else if (key == "log_level") config.log_level = value;
 }
@@ -439,6 +444,12 @@ ProxyConfig load_config_file(const std::string& path) {
         object, "nvlink_routing_seed", config.nvlink_routing_seed);
     config.nvlink_forward_exchange_dir = get_string(
         object, "nvlink_forward_exchange_dir", config.nvlink_forward_exchange_dir);
+    config.local_iteration_sync_enabled = get_bool(
+        object, "local_iteration_sync_enabled", config.local_iteration_sync_enabled);
+    config.local_iteration_sync_dir = get_string(
+        object, "local_iteration_sync_dir", config.local_iteration_sync_dir);
+    config.local_iteration_sync_run_id = get_string(
+        object, "local_iteration_sync_run_id", config.local_iteration_sync_run_id);
     config.cpu_affinity = get_string(object, "cpu_affinity", config.cpu_affinity);
     config.log_level = get_string(object, "log_level", config.log_level);
 
@@ -523,6 +534,10 @@ void validate_config(const ProxyConfig& config) {
     if (config.completion_timeout_ms == 0) throw std::runtime_error("completion_timeout_ms must be > 0");
     if (config.num_nodes > 1 && static_cast<int>(config.peers.size()) != config.num_nodes - 1) {
         throw std::runtime_error("peers must contain exactly num_nodes - 1 entries");
+    }
+    if (config.local_iteration_sync_enabled && config.local_iteration_sync_dir.empty()) {
+        throw std::runtime_error(
+            "local_iteration_sync_dir must be non-empty when local iteration synchronization is enabled");
     }
     if (config.nvlink_forwarding_enabled) {
         if (config.num_gpus_per_node <= 1) {
@@ -616,6 +631,10 @@ std::string config_summary(const ProxyConfig& config) {
         << " nvlink_routing_probability=" << config.nvlink_routing_probability
         << " nvlink_routing_seed=" << config.nvlink_routing_seed
         << " nvlink_forward_exchange_dir=" << config.nvlink_forward_exchange_dir
+        << " local_iteration_sync_enabled=" << (config.local_iteration_sync_enabled ? "true" : "false")
+        << " local_iteration_sync_dir=" << config.local_iteration_sync_dir
+        << " local_iteration_sync_run_id="
+        << (config.local_iteration_sync_run_id.empty() ? "default" : config.local_iteration_sync_run_id)
         << " cpu_affinity=" << (config.cpu_affinity.empty() ? "none" : config.cpu_affinity)
         << " mock_mode=" << (config.mock_mode ? "true" : "false");
     return out.str();
