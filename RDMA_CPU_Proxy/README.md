@@ -244,6 +244,7 @@ Required parameters are represented in `config/example_config.json`:
 - `local_iteration_sync_dir`
 - `local_iteration_sync_run_id`
 - `log_qp_reports`
+- `log_marker_wait_reports`
 - `nvlink_forward_use_round_robin`
 - `nvlink_routing_probability`
 - `nvlink_routing_seed`

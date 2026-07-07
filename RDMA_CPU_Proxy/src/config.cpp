@@ -326,6 +326,9 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "log_qp_reports") {
         config.log_qp_reports = (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "log_marker_wait_reports") {
+        config.log_marker_wait_reports = (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "nvlink_forward_use_round_robin") {
         config.nvlink_forward_use_round_robin = (value == "1" || value == "true" || value == "yes");
     }
@@ -436,6 +439,8 @@ ProxyConfig load_config_file(const std::string& path) {
     config.nvlink_forward_log_batches = get_bool(
         object, "nvlink_forward_log_batches", config.nvlink_forward_log_batches);
     config.log_qp_reports = get_bool(object, "log_qp_reports", config.log_qp_reports);
+    config.log_marker_wait_reports = get_bool(
+        object, "log_marker_wait_reports", config.log_marker_wait_reports);
     config.nvlink_forward_use_round_robin = get_bool(
         object, "nvlink_forward_use_round_robin", config.nvlink_forward_use_round_robin);
     config.nvlink_routing_probability = get_number(
@@ -627,6 +632,7 @@ std::string config_summary(const ProxyConfig& config) {
         << " nvlink_forward_use_batch_api=" << (config.nvlink_forward_use_batch_api ? "true" : "false")
         << " nvlink_forward_log_batches=" << (config.nvlink_forward_log_batches ? "true" : "false")
         << " log_qp_reports=" << (config.log_qp_reports ? "true" : "false")
+        << " log_marker_wait_reports=" << (config.log_marker_wait_reports ? "true" : "false")
         << " nvlink_forward_use_round_robin=" << (config.nvlink_forward_use_round_robin ? "true" : "false")
         << " nvlink_routing_probability=" << config.nvlink_routing_probability
         << " nvlink_routing_seed=" << config.nvlink_routing_seed
