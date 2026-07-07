@@ -105,11 +105,18 @@ bool DynamicChunkDistributor::next(int qp_index, SendTask& task) {
     return true;
 }
 
-uint64_t DynamicChunkDistributor::marker_wr_id(int qp_index) const {
+void DynamicChunkDistributor::make_marker(int qp_index, SendTask& task) const {
     if (qp_index < 0) throw std::runtime_error("invalid QP index");
-    return (static_cast<uint64_t>(peer_rank_) << 48) |
-           (static_cast<uint64_t>(static_cast<std::size_t>(qp_index)) << 32) |
-           0xffffffffULL;
+    task = SendTask{};
+    task.marker = true;
+    task.wr_id = (static_cast<uint64_t>(peer_rank_) << 48) |
+                 (static_cast<uint64_t>(static_cast<std::size_t>(qp_index)) << 32) |
+                 0xffffffffULL;
+    task.local_base = local_base_;
+    task.local_lkey = local_lkey_;
+    task.remote_base = remote_base_;
+    task.remote_rkey = remote_rkey_;
+    task.signaled = true;
 }
 
 IterationAssignment DynamicChunkDistributor::assignment() const {
@@ -212,7 +219,15 @@ void QPWorker::send_loop() {
 
 void QPWorker::post_task(const SendTask& task) {
     if (task.marker) {
-        qp_.post_send_with_immediate(task.wr_id | kMarkerWrIdBit, encode_marker_immediate());
+        qp_.post_write_with_immediate(
+            task.wr_id | kMarkerWrIdBit,
+            task.local_base,
+            task.local_lkey,
+            task.remote_base,
+            task.remote_rkey,
+            0,
+            encode_marker_immediate(),
+            true);
     } else {
         qp_.post_write_with_immediate(
             task.wr_id,
@@ -259,9 +274,7 @@ void QPWorker::run_dynamic_iteration(const std::shared_ptr<DynamicChunkDistribut
     }
 
     SendTask marker;
-    marker.marker = true;
-    marker.wr_id = distributor->marker_wr_id(qp_.qp_index());
-    marker.signaled = true;
+    distributor->make_marker(qp_.qp_index(), marker);
     post_task(marker);
 }
 
@@ -296,6 +309,7 @@ void QPWorker::cq_loop() {
                             std::lock_guard<std::mutex> lock(stats_mutex_);
                             latest_send_marker_time_ = std::chrono::steady_clock::now();
                         }
+                        completion_cv_.notify_all();
                     } else {
                         send_completions_.fetch_add(1);
                         completion_cv_.notify_all();
@@ -307,6 +321,7 @@ void QPWorker::cq_loop() {
                             std::lock_guard<std::mutex> lock(stats_mutex_);
                             latest_recv_marker_time_ = std::chrono::steady_clock::now();
                         }
+                        completion_cv_.notify_all();
                     } else {
                         recv_completions_.fetch_add(1);
                         const auto chunk_index = decode_immediate(c.imm_data);

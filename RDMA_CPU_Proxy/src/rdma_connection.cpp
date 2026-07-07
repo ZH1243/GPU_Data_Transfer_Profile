@@ -369,14 +369,16 @@ void RdmaQueuePair::post_write_with_immediate(
 
 #if RDMA_PROXY_HAVE_VERBS
     ibv_sge sge{};
-    sge.addr = local_addr;
-    sge.length = static_cast<uint32_t>(length);
-    sge.lkey = local_lkey;
+    if (length > 0) {
+        sge.addr = local_addr;
+        sge.length = static_cast<uint32_t>(length);
+        sge.lkey = local_lkey;
+    }
 
     ibv_send_wr wr{};
     wr.wr_id = wr_id;
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
+    wr.sg_list = length > 0 ? &sge : nullptr;
+    wr.num_sge = length > 0 ? 1 : 0;
     wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
     wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
     wr.imm_data = htonl(imm_data);

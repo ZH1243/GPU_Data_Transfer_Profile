@@ -64,7 +64,7 @@ public:
         uint32_t remote_rkey);
 
     bool next(int qp_index, SendTask& task);
-    uint64_t marker_wr_id(int qp_index) const;
+    void make_marker(int qp_index, SendTask& task) const;
     IterationAssignment assignment() const;
     std::size_t chunk_count() const;
 
