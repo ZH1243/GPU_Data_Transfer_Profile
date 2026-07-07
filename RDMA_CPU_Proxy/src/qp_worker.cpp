@@ -229,15 +229,9 @@ void QPWorker::send_loop() {
 
 void QPWorker::post_task(const SendTask& task) {
     if (task.marker) {
-        qp_.post_write_with_immediate(
+        qp_.post_send_with_immediate(
             task.wr_id | kMarkerWrIdBit,
-            task.local_base,
-            task.local_lkey,
-            task.remote_base,
-            task.remote_rkey,
-            0,
-            encode_marker_immediate(),
-            true);
+            encode_marker_immediate());
     } else {
         qp_.post_write_with_immediate(
             task.wr_id,
