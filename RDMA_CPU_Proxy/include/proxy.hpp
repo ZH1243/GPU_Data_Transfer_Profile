@@ -132,6 +132,7 @@ private:
         const IterationAssignment& assignment,
         uint64_t iteration) const;
     std::size_t validate_received_data(uint64_t iteration) const;
+    void report_rdma_bandwidth_summary() const;
     void report_iteration(
         uint64_t iteration,
         std::chrono::steady_clock::time_point start,
@@ -140,7 +141,7 @@ private:
         const std::vector<std::vector<QPCompletionBaseline>>& baselines,
         const std::vector<IterationAssignment>& assignments,
         std::size_t verification_errors,
-        std::size_t validation_errors) const;
+        std::size_t validation_errors);
 
     ProxyConfig config_;
     CudaBuffers cuda_buffers_;
@@ -156,6 +157,7 @@ private:
     std::vector<ForwardDestinationState> forwarding_destinations_;
     std::vector<ForwardingIterationStats> forwarding_iteration_stats_;
     std::string forwarding_error_;
+    std::vector<double> rdma_iteration_bandwidth_gbps_;
     LocalIterationSyncHeader* local_iteration_sync_header_{nullptr};
     std::size_t local_iteration_sync_size_{0};
     int local_iteration_sync_fd_{-1};

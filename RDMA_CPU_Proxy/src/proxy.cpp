@@ -182,6 +182,7 @@ void Proxy::initialize() {
     if (initialized_) return;
     RDMA_PROXY_LOG_INFO("initializing proxy: ", config_summary(config_));
 
+    rdma_iteration_bandwidth_gbps_.clear();
     initialize_local_iteration_sync();
     cuda_buffers_.initialize();
     rdma_context_.initialize();
@@ -197,6 +198,7 @@ void Proxy::run_once() {
     if (!initialized_) throw std::runtime_error("proxy is not initialized");
     run_iteration(0);
     synchronize_iteration(0);
+    report_rdma_bandwidth_summary();
 }
 
 void Proxy::run() {
@@ -206,6 +208,9 @@ void Proxy::run() {
          ++iteration) {
         run_iteration(iteration);
         synchronize_iteration(iteration);
+    }
+    if (config_.num_iterations != 0) {
+        report_rdma_bandwidth_summary();
     }
 }
 
@@ -1533,6 +1538,39 @@ std::size_t Proxy::validate_received_data(uint64_t iteration) const {
     return errors;
 }
 
+void Proxy::report_rdma_bandwidth_summary() const {
+    if (rdma_iteration_bandwidth_gbps_.empty()) return;
+
+    double sum = 0.0;
+    for (const auto bandwidth : rdma_iteration_bandwidth_gbps_) {
+        sum += bandwidth;
+    }
+
+    const auto count = rdma_iteration_bandwidth_gbps_.size();
+    const double average = sum / static_cast<double>(count);
+    double variance = 0.0;
+    for (const auto bandwidth : rdma_iteration_bandwidth_gbps_) {
+        const auto delta = bandwidth - average;
+        variance += delta * delta;
+    }
+    variance /= static_cast<double>(count);
+
+    auto sorted = rdma_iteration_bandwidth_gbps_;
+    std::sort(sorted.begin(), sorted.end());
+    const double median = count % 2 == 0 ?
+        (sorted[count / 2 - 1] + sorted[count / 2]) * 0.5 :
+        sorted[count / 2];
+
+    RDMA_PROXY_LOG_INFO("rdma_bandwidth_summary local_rank=", config_.node_rank,
+                        " local_gpu=", config_.local_gpu_index,
+                        " iterations=", count,
+                        " average_bandwidth_gbps=", std::fixed, std::setprecision(3), average,
+                        " min_bandwidth_gbps=", std::fixed, std::setprecision(3), sorted.front(),
+                        " max_bandwidth_gbps=", std::fixed, std::setprecision(3), sorted.back(),
+                        " median_bandwidth_gbps=", std::fixed, std::setprecision(3), median,
+                        " variance_gbps2=", std::fixed, std::setprecision(3), variance);
+}
+
 void Proxy::report_iteration(
     uint64_t iteration,
     std::chrono::steady_clock::time_point start,
@@ -1541,10 +1579,11 @@ void Proxy::report_iteration(
     const std::vector<std::vector<QPCompletionBaseline>>& baselines,
     const std::vector<IterationAssignment>& assignments,
     std::size_t verification_errors,
-    std::size_t validation_errors) const {
+    std::size_t validation_errors) {
     const auto total_bytes = bytes_per_peer * peers_.size();
     const double gbps = seconds > 0.0 ? (static_cast<double>(total_bytes) * 8.0 / seconds / 1.0e9) : 0.0;
     const double latency_us = seconds * 1.0e6;
+    rdma_iteration_bandwidth_gbps_.push_back(gbps);
 
     RDMA_PROXY_LOG_INFO("iteration=", iteration,
                         " local_rank=", config_.node_rank,
