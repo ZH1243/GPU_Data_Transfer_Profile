@@ -69,17 +69,20 @@ private:
         double sum_batch_bandwidth_gbits_per_sec{0.0};
     };
 
+    struct LocalIterationSyncHeader;
+    struct LocalIterationSyncSlot;
+
     PeerConnectionInfo make_local_peer_info(const PeerState& peer) const;
     void setup_peer(PeerGpuBuffers& buffers);
     void synchronize_peer_ready(const PeerAddress& peer_addr, const PeerState& peer) const;
+    void initialize_local_iteration_sync();
+    void release_local_iteration_sync();
+    std::string local_iteration_sync_shm_name() const;
+    LocalIterationSyncSlot* local_iteration_sync_slot(int gpu_index) const;
     void run_iteration(uint64_t iteration);
     void synchronize_iteration_start(uint64_t iteration) const;
     void synchronize_iteration(uint64_t iteration) const;
     void synchronize_local_iteration_phase(const std::string& phase, uint64_t iteration) const;
-    std::string local_iteration_sync_file(
-        const std::string& phase,
-        uint64_t iteration,
-        int gpu_index) const;
     void fill_iteration_send_buffers(uint64_t iteration);
     std::vector<std::size_t> sequential_peer_order() const;
     std::vector<ChunkDescriptor> make_chunks() const;
@@ -153,6 +156,10 @@ private:
     std::vector<ForwardDestinationState> forwarding_destinations_;
     std::vector<ForwardingIterationStats> forwarding_iteration_stats_;
     std::string forwarding_error_;
+    LocalIterationSyncHeader* local_iteration_sync_header_{nullptr};
+    std::size_t local_iteration_sync_size_{0};
+    int local_iteration_sync_fd_{-1};
+    std::string local_iteration_sync_name_;
     bool initialized_{false};
 };
 

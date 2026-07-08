@@ -8,6 +8,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <fstream>
@@ -19,11 +20,62 @@
 #include <thread>
 
 #if defined(__unix__) || defined(__APPLE__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
 namespace rdma_proxy {
+
+struct alignas(64) Proxy::LocalIterationSyncHeader {
+    uint64_t magic{0};
+    uint32_t version{0};
+    uint32_t initialized{0};
+    int32_t node_rank{-1};
+    uint32_t num_gpus_per_node{0};
+    uint32_t header_bytes{0};
+    uint32_t slot_bytes{0};
+    uint32_t reserved{0};
+    char padding[28]{};
+};
+
+struct alignas(64) Proxy::LocalIterationSyncSlot {
+    int32_t pid{0};
+    int32_t gpu_index{-1};
+    uint64_t iteration_start{0};
+    uint64_t iteration_done{0};
+    char padding[40]{};
+};
+
 namespace {
+
+constexpr uint64_t kLocalIterationSyncMagic = 0x52444d415053594eULL;  // "RDMAPSyn"
+constexpr uint32_t kLocalIterationSyncVersion = 1;
+
+uint32_t atomic_load_u32(const uint32_t* ptr) {
+    return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+}
+
+void atomic_store_u32(uint32_t* ptr, uint32_t value) {
+    __atomic_store_n(ptr, value, __ATOMIC_RELEASE);
+}
+
+int32_t atomic_load_i32(const int32_t* ptr) {
+    return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+}
+
+void atomic_store_i32(int32_t* ptr, int32_t value) {
+    __atomic_store_n(ptr, value, __ATOMIC_RELEASE);
+}
+
+uint64_t atomic_load_u64(const uint64_t* ptr) {
+    return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+}
+
+void atomic_store_u64(uint64_t* ptr, uint64_t value) {
+    __atomic_store_n(ptr, value, __ATOMIC_RELEASE);
+}
 
 int current_process_id() {
 #if defined(__unix__) || defined(__APPLE__)
@@ -54,6 +106,22 @@ std::string sanitize_path_component(const std::string& value) {
         }
     }
     return out.empty() ? "default" : out;
+}
+
+std::string default_local_iteration_sync_run_id(const ProxyConfig& config) {
+    std::ostringstream out;
+    out << "nodes_" << config.num_nodes
+        << "_gpus_" << config.num_gpus_per_node;
+    return out.str();
+}
+
+uint64_t fnv1a64(const std::string& value) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (const auto c : value) {
+        hash ^= static_cast<unsigned char>(c);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
 }
 
 uint8_t routing_column_mask(std::size_t column) {
@@ -114,6 +182,7 @@ void Proxy::initialize() {
     if (initialized_) return;
     RDMA_PROXY_LOG_INFO("initializing proxy: ", config_summary(config_));
 
+    initialize_local_iteration_sync();
     cuda_buffers_.initialize();
     rdma_context_.initialize();
 
@@ -150,6 +219,7 @@ void Proxy::shutdown() {
         rdma_context_.deregister_memory(peer.local_recv_mr);
     }
     peers_.clear();
+    release_local_iteration_sync();
     initialized_ = false;
 }
 
@@ -229,6 +299,169 @@ void Proxy::synchronize_peer_ready(const PeerAddress& peer_addr, const PeerState
                         " local_gpu=", config_.local_gpu_index,
                         " peer ready remote_rank=", peer.peer_rank,
                         " remote_gpu=", peer.remote_gpu_index);
+}
+
+std::string Proxy::local_iteration_sync_shm_name() const {
+    const auto run_id = config_.local_iteration_sync_run_id.empty() ?
+        default_local_iteration_sync_run_id(config_) : config_.local_iteration_sync_run_id;
+    std::ostringstream material;
+    material << run_id
+             << "|node=" << config_.node_rank
+             << "|num_nodes=" << config_.num_nodes
+             << "|gpus=" << config_.num_gpus_per_node;
+    std::ostringstream out;
+    out << "/rdma_lis_" << std::hex << fnv1a64(material.str());
+    return out.str();
+}
+
+Proxy::LocalIterationSyncSlot* Proxy::local_iteration_sync_slot(int gpu_index) const {
+    if (!local_iteration_sync_header_) return nullptr;
+    if (gpu_index < 0 || gpu_index >= config_.num_gpus_per_node) {
+        throw std::runtime_error("local iteration sync GPU index out of range");
+    }
+    auto* base = reinterpret_cast<char*>(local_iteration_sync_header_);
+    return reinterpret_cast<LocalIterationSyncSlot*>(
+        base + sizeof(LocalIterationSyncHeader) +
+        static_cast<std::size_t>(gpu_index) * sizeof(LocalIterationSyncSlot));
+}
+
+void Proxy::initialize_local_iteration_sync() {
+    if (!config_.local_iteration_sync_enabled || config_.num_gpus_per_node <= 1) return;
+    if (local_iteration_sync_header_) return;
+
+#if defined(__unix__) || defined(__APPLE__)
+    local_iteration_sync_name_ = local_iteration_sync_shm_name();
+    local_iteration_sync_size_ = sizeof(LocalIterationSyncHeader) +
+        static_cast<std::size_t>(config_.num_gpus_per_node) * sizeof(LocalIterationSyncSlot);
+
+    bool created = false;
+    int fd = shm_open(local_iteration_sync_name_.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd >= 0) {
+        created = true;
+        if (ftruncate(fd, static_cast<off_t>(local_iteration_sync_size_)) != 0) {
+            const auto error = errno;
+            close(fd);
+            throw std::runtime_error("failed to size local iteration shared memory " +
+                                     local_iteration_sync_name_ + ": errno=" + std::to_string(error));
+        }
+    } else if (errno == EEXIST) {
+        fd = shm_open(local_iteration_sync_name_.c_str(), O_RDWR, 0600);
+        if (fd < 0) {
+            throw std::runtime_error("failed to open local iteration shared memory " +
+                                     local_iteration_sync_name_ + ": errno=" + std::to_string(errno));
+        }
+    } else {
+        throw std::runtime_error("failed to create local iteration shared memory " +
+                                 local_iteration_sync_name_ + ": errno=" + std::to_string(errno));
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(config_.completion_timeout_ms);
+    while (!created) {
+        struct stat st {};
+        if (fstat(fd, &st) != 0) {
+            const auto error = errno;
+            close(fd);
+            throw std::runtime_error("failed to stat local iteration shared memory " +
+                                     local_iteration_sync_name_ + ": errno=" + std::to_string(error));
+        }
+        if (st.st_size >= static_cast<off_t>(local_iteration_sync_size_)) break;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            close(fd);
+            throw std::runtime_error("timed out waiting for local iteration shared memory sizing: " +
+                                     local_iteration_sync_name_);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    void* mapping = mmap(
+        nullptr,
+        local_iteration_sync_size_,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED,
+        fd,
+        0);
+    if (mapping == MAP_FAILED) {
+        const auto error = errno;
+        close(fd);
+        throw std::runtime_error("failed to map local iteration shared memory " +
+                                 local_iteration_sync_name_ + ": errno=" + std::to_string(error));
+    }
+
+    auto* header = reinterpret_cast<LocalIterationSyncHeader*>(mapping);
+    if (created) {
+        std::memset(mapping, 0, local_iteration_sync_size_);
+        header->magic = kLocalIterationSyncMagic;
+        header->version = kLocalIterationSyncVersion;
+        header->node_rank = config_.node_rank;
+        header->num_gpus_per_node = static_cast<uint32_t>(config_.num_gpus_per_node);
+        header->header_bytes = static_cast<uint32_t>(sizeof(LocalIterationSyncHeader));
+        header->slot_bytes = static_cast<uint32_t>(sizeof(LocalIterationSyncSlot));
+        atomic_store_u32(&header->initialized, 1);
+    } else {
+        while (atomic_load_u32(&header->initialized) != 1) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                munmap(mapping, local_iteration_sync_size_);
+                close(fd);
+                throw std::runtime_error("timed out waiting for local iteration shared memory initialization: " +
+                                         local_iteration_sync_name_);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (header->magic != kLocalIterationSyncMagic ||
+            header->version != kLocalIterationSyncVersion ||
+            header->node_rank != config_.node_rank ||
+            header->num_gpus_per_node != static_cast<uint32_t>(config_.num_gpus_per_node) ||
+            header->header_bytes != sizeof(LocalIterationSyncHeader) ||
+            header->slot_bytes != sizeof(LocalIterationSyncSlot)) {
+            munmap(mapping, local_iteration_sync_size_);
+            close(fd);
+            throw std::runtime_error("local iteration shared memory metadata mismatch for " +
+                                     local_iteration_sync_name_ +
+                                     "; use a unique local_iteration_sync_run_id for this launch");
+        }
+    }
+
+    local_iteration_sync_fd_ = fd;
+    local_iteration_sync_header_ = header;
+
+    auto* slot = local_iteration_sync_slot(config_.local_gpu_index);
+    atomic_store_i32(&slot->gpu_index, config_.local_gpu_index);
+    atomic_store_u64(&slot->iteration_start, 0);
+    atomic_store_u64(&slot->iteration_done, 0);
+    atomic_store_i32(&slot->pid, current_process_id());
+
+    RDMA_PROXY_LOG_INFO("mapped local iteration shared memory local_rank=", config_.node_rank,
+                        " local_gpu=", config_.local_gpu_index,
+                        " name=", local_iteration_sync_name_,
+                        " bytes=", local_iteration_sync_size_,
+                        " created=", created ? "true" : "false");
+#else
+    throw std::runtime_error("local iteration shared-memory synchronization requires POSIX shared memory");
+#endif
+}
+
+void Proxy::release_local_iteration_sync() {
+#if defined(__unix__) || defined(__APPLE__)
+    if (local_iteration_sync_header_) {
+        munmap(local_iteration_sync_header_, local_iteration_sync_size_);
+        local_iteration_sync_header_ = nullptr;
+    }
+    if (local_iteration_sync_fd_ >= 0) {
+        close(local_iteration_sync_fd_);
+        local_iteration_sync_fd_ = -1;
+    }
+    if (!local_iteration_sync_name_.empty()) {
+        shm_unlink(local_iteration_sync_name_.c_str());
+    }
+    local_iteration_sync_size_ = 0;
+    local_iteration_sync_name_.clear();
+#else
+    local_iteration_sync_header_ = nullptr;
+    local_iteration_sync_size_ = 0;
+    local_iteration_sync_fd_ = -1;
+    local_iteration_sync_name_.clear();
+#endif
 }
 
 void Proxy::run_iteration(uint64_t iteration) {
@@ -365,142 +598,80 @@ void Proxy::synchronize_iteration(uint64_t iteration) const {
     synchronize_local_iteration_phase("iteration_done", iteration);
 }
 
-std::string Proxy::local_iteration_sync_file(
-    const std::string& phase,
-    uint64_t iteration,
-    int gpu_index) const {
-    std::filesystem::path path(config_.local_iteration_sync_dir);
-    std::ostringstream default_run_id;
-    default_run_id << "nodes_" << config_.num_nodes
-                   << "_gpus_" << config_.num_gpus_per_node;
-    path /= sanitize_path_component(
-        config_.local_iteration_sync_run_id.empty() ?
-            default_run_id.str() : config_.local_iteration_sync_run_id);
-    path /= "node_" + std::to_string(config_.node_rank);
-    path /= phase + "_iteration_" + std::to_string(iteration) +
-            "_gpu_" + std::to_string(gpu_index) + ".txt";
-    return path.string();
-}
-
 void Proxy::synchronize_local_iteration_phase(const std::string& phase, uint64_t iteration) const {
     if (!config_.local_iteration_sync_enabled || config_.num_gpus_per_node <= 1) return;
-
-    const auto local_path = local_iteration_sync_file(phase, iteration, config_.local_gpu_index);
-    const auto tmp_path = local_path + ".tmp." + std::to_string(current_process_id());
-    std::filesystem::create_directories(std::filesystem::path(local_path).parent_path());
-
-    {
-        std::ofstream out(tmp_path, std::ios::trunc);
-        if (!out) throw std::runtime_error("failed to write local iteration sync file: " + tmp_path);
-        out << "phase " << phase << '\n'
-            << "node_rank " << config_.node_rank << '\n'
-            << "gpu_index " << config_.local_gpu_index << '\n'
-            << "iteration " << iteration << '\n'
-            << "num_gpus_per_node " << config_.num_gpus_per_node << '\n'
-            << "pid " << current_process_id() << '\n';
-        out.close();
-        if (!out) throw std::runtime_error("failed to flush local iteration sync file: " + tmp_path);
+    if (!local_iteration_sync_header_) {
+        throw std::runtime_error("local iteration shared memory is not initialized");
     }
-    std::filesystem::rename(tmp_path, local_path);
 
-    RDMA_PROXY_LOG_INFO("iteration=", iteration,
-                        " waiting for local ", phase,
-                        " barrier local_rank=", config_.node_rank,
-                        " local_gpu=", config_.local_gpu_index,
-                        " gpus=", config_.num_gpus_per_node);
+    const uint64_t marker = iteration + 1;
+    uint64_t Proxy::LocalIterationSyncSlot::* marker_field = nullptr;
+    if (phase == "iteration_start") {
+        marker_field = &LocalIterationSyncSlot::iteration_start;
+    } else if (phase == "iteration_done") {
+        marker_field = &LocalIterationSyncSlot::iteration_done;
+    } else {
+        throw std::runtime_error("unknown local iteration synchronization phase: " + phase);
+    }
+
+    auto* local_slot = local_iteration_sync_slot(config_.local_gpu_index);
+    atomic_store_i32(&local_slot->gpu_index, config_.local_gpu_index);
+    atomic_store_i32(&local_slot->pid, current_process_id());
+    atomic_store_u64(&(local_slot->*marker_field), marker);
 
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(config_.completion_timeout_ms);
     std::vector<std::string> waiting_reasons(static_cast<std::size_t>(config_.num_gpus_per_node));
-    auto file_matches = [&](int gpu_index, std::string& reason) {
-        const auto path = local_iteration_sync_file(phase, iteration, gpu_index);
-        if (!std::filesystem::exists(path)) {
-            reason = "missing";
-            return false;
-        }
-
-        std::ifstream in(path);
-        if (!in) {
-            reason = "not readable";
-            return false;
-        }
-
-        std::string file_phase;
-        int node_rank = -1;
-        int file_gpu_index = -1;
-        uint64_t file_iteration = 0;
-        int num_gpus_per_node = -1;
-        int pid = -1;
-        std::string key;
-        while (in >> key) {
-            if (key == "phase") {
-                in >> file_phase;
-            } else if (key == "node_rank") {
-                in >> node_rank;
-            } else if (key == "gpu_index") {
-                in >> file_gpu_index;
-            } else if (key == "iteration") {
-                in >> file_iteration;
-            } else if (key == "num_gpus_per_node") {
-                in >> num_gpus_per_node;
-            } else if (key == "pid") {
-                in >> pid;
-            } else {
-                reason = "unknown key " + key;
-                return false;
-            }
-        }
-
-        if (!in.eof()) {
-            reason = "malformed";
-            return false;
-        }
-        if (file_phase != phase ||
-            node_rank != config_.node_rank ||
-            file_gpu_index != gpu_index ||
-            file_iteration != iteration ||
-            num_gpus_per_node != config_.num_gpus_per_node) {
-            reason = "metadata mismatch";
-            return false;
-        }
-        if (!process_is_alive(pid)) {
-            reason = "process not alive";
-            return false;
-        }
-        reason.clear();
-        return true;
-    };
+    RDMA_PROXY_LOG_INFO("iteration=", iteration,
+                        " waiting for local shared-memory ", phase,
+                        " barrier local_rank=", config_.node_rank,
+                        " local_gpu=", config_.local_gpu_index,
+                        " gpus=", config_.num_gpus_per_node);
 
     while (true) {
         bool complete = true;
         for (int gpu = 0; gpu < config_.num_gpus_per_node; ++gpu) {
-            std::string reason;
-            if (!file_matches(gpu, reason)) {
-                waiting_reasons[static_cast<std::size_t>(gpu)] = reason;
+            const auto* slot = local_iteration_sync_slot(gpu);
+            const auto pid = atomic_load_i32(&slot->pid);
+            const auto slot_gpu = atomic_load_i32(&slot->gpu_index);
+            const auto slot_marker = atomic_load_u64(&(slot->*marker_field));
+            auto& reason = waiting_reasons[static_cast<std::size_t>(gpu)];
+            if (pid <= 0) {
+                reason = "missing";
                 complete = false;
+            } else if (slot_gpu != gpu) {
+                reason = "metadata mismatch";
+                complete = false;
+            } else if (slot_marker != marker) {
+                reason = process_is_alive(pid) ?
+                    "waiting marker=" + std::to_string(slot_marker) :
+                    "process not alive";
+                complete = false;
+            } else {
+                reason.clear();
             }
         }
         if (complete) {
             RDMA_PROXY_LOG_INFO("iteration=", iteration,
-                                " local ", phase,
+                                " local shared-memory ", phase,
                                 " barrier complete local_rank=", config_.node_rank,
                                 " local_gpu=", config_.local_gpu_index);
             return;
         }
         if (std::chrono::steady_clock::now() >= deadline) {
             std::ostringstream out;
-            out << "timed out waiting for local " << phase
+            out << "timed out waiting for local shared-memory " << phase
                 << " barrier iteration=" << iteration
                 << " local_rank=" << config_.node_rank
                 << " local_gpu=" << config_.local_gpu_index
-                << " sync_dir=" << config_.local_iteration_sync_dir;
+                << " shm_name=" << local_iteration_sync_name_;
             for (int gpu = 0; gpu < config_.num_gpus_per_node; ++gpu) {
                 const auto& reason = waiting_reasons[static_cast<std::size_t>(gpu)];
                 if (!reason.empty()) out << " gpu" << gpu << "=" << reason;
             }
             throw std::runtime_error(out.str());
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
 }
 
