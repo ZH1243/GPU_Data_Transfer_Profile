@@ -622,11 +622,11 @@ void Proxy::synchronize_local_iteration_phase(const std::string& phase, uint64_t
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(config_.completion_timeout_ms);
     std::vector<std::string> waiting_reasons(static_cast<std::size_t>(config_.num_gpus_per_node));
-    RDMA_PROXY_LOG_INFO("iteration=", iteration,
-                        " waiting for local shared-memory ", phase,
-                        " barrier local_rank=", config_.node_rank,
-                        " local_gpu=", config_.local_gpu_index,
-                        " gpus=", config_.num_gpus_per_node);
+    RDMA_PROXY_LOG_DEBUG("iteration=", iteration,
+                         " waiting for local shared-memory ", phase,
+                         " barrier local_rank=", config_.node_rank,
+                         " local_gpu=", config_.local_gpu_index,
+                         " gpus=", config_.num_gpus_per_node);
 
     while (true) {
         bool complete = true;
