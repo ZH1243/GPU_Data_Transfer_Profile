@@ -43,6 +43,7 @@
   "local_iteration_sync_enabled": false,
   "local_iteration_sync_dir": "/tmp/rdma_cpu_proxy_local_iteration_sync",
   "local_iteration_sync_run_id": "",
+  "rdma_bandwidth_summary_dir": "/tmp/rdma_cpu_proxy_results",
   "nvlink_forward_destinations": [
   ],
   "cpu_affinity": "auto",

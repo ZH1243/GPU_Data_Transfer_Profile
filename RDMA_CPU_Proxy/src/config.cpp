@@ -344,6 +344,7 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     }
     else if (key == "local_iteration_sync_dir") config.local_iteration_sync_dir = value;
     else if (key == "local_iteration_sync_run_id") config.local_iteration_sync_run_id = value;
+    else if (key == "rdma_bandwidth_summary_dir") config.rdma_bandwidth_summary_dir = value;
     else if (key == "cpu_affinity") config.cpu_affinity = value;
     else if (key == "log_level") config.log_level = value;
 }
@@ -455,6 +456,8 @@ ProxyConfig load_config_file(const std::string& path) {
         object, "local_iteration_sync_dir", config.local_iteration_sync_dir);
     config.local_iteration_sync_run_id = get_string(
         object, "local_iteration_sync_run_id", config.local_iteration_sync_run_id);
+    config.rdma_bandwidth_summary_dir = get_string(
+        object, "rdma_bandwidth_summary_dir", config.rdma_bandwidth_summary_dir);
     config.cpu_affinity = get_string(object, "cpu_affinity", config.cpu_affinity);
     config.log_level = get_string(object, "log_level", config.log_level);
 
@@ -641,6 +644,7 @@ std::string config_summary(const ProxyConfig& config) {
         << " local_iteration_sync_dir=" << config.local_iteration_sync_dir
         << " local_iteration_sync_run_id="
         << (config.local_iteration_sync_run_id.empty() ? "default" : config.local_iteration_sync_run_id)
+        << " rdma_bandwidth_summary_dir=" << config.rdma_bandwidth_summary_dir
         << " cpu_affinity=" << (config.cpu_affinity.empty() ? "none" : config.cpu_affinity)
         << " mock_mode=" << (config.mock_mode ? "true" : "false");
     return out.str();

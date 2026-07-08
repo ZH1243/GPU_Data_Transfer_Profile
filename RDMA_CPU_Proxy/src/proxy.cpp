@@ -1561,14 +1561,46 @@ void Proxy::report_rdma_bandwidth_summary() const {
         (sorted[count / 2 - 1] + sorted[count / 2]) * 0.5 :
         sorted[count / 2];
 
-    RDMA_PROXY_LOG_INFO("rdma_bandwidth_summary local_rank=", config_.node_rank,
-                        " local_gpu=", config_.local_gpu_index,
-                        " iterations=", count,
-                        " average_bandwidth_gbps=", std::fixed, std::setprecision(3), average,
-                        " min_bandwidth_gbps=", std::fixed, std::setprecision(3), sorted.front(),
-                        " max_bandwidth_gbps=", std::fixed, std::setprecision(3), sorted.back(),
-                        " median_bandwidth_gbps=", std::fixed, std::setprecision(3), median,
-                        " variance_gbps2=", std::fixed, std::setprecision(3), variance);
+    std::ostringstream summary;
+    summary << std::fixed << std::setprecision(3)
+            << "rdma_bandwidth_summary"
+            << " local_rank=" << config_.node_rank
+            << " local_gpu=" << config_.local_gpu_index
+            << " iterations=" << count
+            << " average_bandwidth_gbps=" << average
+            << " min_bandwidth_gbps=" << sorted.front()
+            << " max_bandwidth_gbps=" << sorted.back()
+            << " median_bandwidth_gbps=" << median
+            << " variance_gbps2=" << variance;
+
+    if (config_.rdma_bandwidth_summary_dir.empty()) {
+        RDMA_PROXY_LOG_INFO(summary.str());
+        return;
+    }
+
+    std::filesystem::path dir(config_.rdma_bandwidth_summary_dir);
+    std::filesystem::create_directories(dir);
+    const auto filename = "rdma_bandwidth_summary_rank_" +
+        std::to_string(config_.node_rank) + "_gpu_" +
+        std::to_string(config_.local_gpu_index) + ".txt";
+    const auto path = dir / filename;
+    const auto tmp_path = path.string() + ".tmp." + std::to_string(current_process_id());
+
+    {
+        std::ofstream out(tmp_path, std::ios::trunc);
+        if (!out) {
+            throw std::runtime_error("failed to write RDMA bandwidth summary file: " + tmp_path);
+        }
+        out << summary.str() << '\n';
+        out.close();
+        if (!out) {
+            throw std::runtime_error("failed to flush RDMA bandwidth summary file: " + tmp_path);
+        }
+    }
+    std::filesystem::rename(tmp_path, path);
+    RDMA_PROXY_LOG_DEBUG("wrote RDMA bandwidth summary local_rank=", config_.node_rank,
+                         " local_gpu=", config_.local_gpu_index,
+                         " path=", path.string());
 }
 
 void Proxy::report_iteration(

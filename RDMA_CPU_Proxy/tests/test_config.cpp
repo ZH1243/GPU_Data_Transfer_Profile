@@ -42,6 +42,7 @@ int main(int argc, char** argv) {
     assert(!config.local_iteration_sync_enabled);
     assert(config.local_iteration_sync_dir == "/tmp/rdma_cpu_proxy_local_iteration_sync");
     assert(config.local_iteration_sync_run_id.empty());
+    assert(config.rdma_bandwidth_summary_dir == "/tmp/rdma_cpu_proxy_results");
     assert(config.nvlink_forward_destinations.empty());
     assert(config.cpu_affinity == "auto");
     assert(config.peers.size() == 3);
@@ -124,9 +125,10 @@ int main(int argc, char** argv) {
         "--local_iteration_sync_enabled=true",
         "--local_iteration_sync_dir=/tmp/rdma_cpu_proxy_test_local_sync",
         "--local_iteration_sync_run_id=test_cli",
+        "--rdma_bandwidth_summary_dir=/tmp/rdma_cpu_proxy_test_results",
         "--cpu_affinity=0-95,192-287",
     };
-    const auto peer_port_config = rdma_proxy::load_config(14, const_cast<char**>(peer_port_args));
+    const auto peer_port_config = rdma_proxy::load_config(15, const_cast<char**>(peer_port_args));
     for (const auto& peer : peer_port_config.peers) {
         assert(peer.port == 18521);
     }
@@ -139,6 +141,7 @@ int main(int argc, char** argv) {
     assert(peer_port_config.local_iteration_sync_enabled);
     assert(peer_port_config.local_iteration_sync_dir == "/tmp/rdma_cpu_proxy_test_local_sync");
     assert(peer_port_config.local_iteration_sync_run_id == "test_cli");
+    assert(peer_port_config.rdma_bandwidth_summary_dir == "/tmp/rdma_cpu_proxy_test_results");
     assert(peer_port_config.cpu_affinity == "0-95,192-287");
 
     const char* signal_interval_args[] = {

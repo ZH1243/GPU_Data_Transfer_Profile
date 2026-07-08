@@ -74,6 +74,7 @@ struct ProxyConfig {
     bool local_iteration_sync_enabled{false};
     std::string local_iteration_sync_dir{"/tmp/rdma_cpu_proxy_local_iteration_sync"};
     std::string local_iteration_sync_run_id;
+    std::string rdma_bandwidth_summary_dir{"/tmp/rdma_cpu_proxy_results"};
     std::string cpu_affinity;
     std::string log_level{"info"};
     std::vector<PeerAddress> peers;
