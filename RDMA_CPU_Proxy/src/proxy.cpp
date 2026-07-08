@@ -431,11 +431,11 @@ void Proxy::initialize_local_iteration_sync() {
     atomic_store_u64(&slot->iteration_done, 0);
     atomic_store_i32(&slot->pid, current_process_id());
 
-    RDMA_PROXY_LOG_INFO("mapped local iteration shared memory local_rank=", config_.node_rank,
-                        " local_gpu=", config_.local_gpu_index,
-                        " name=", local_iteration_sync_name_,
-                        " bytes=", local_iteration_sync_size_,
-                        " created=", created ? "true" : "false");
+    RDMA_PROXY_LOG_DEBUG("mapped local iteration shared memory local_rank=", config_.node_rank,
+                         " local_gpu=", config_.local_gpu_index,
+                         " name=", local_iteration_sync_name_,
+                         " bytes=", local_iteration_sync_size_,
+                         " created=", created ? "true" : "false");
 #else
     throw std::runtime_error("local iteration shared-memory synchronization requires POSIX shared memory");
 #endif
@@ -652,10 +652,10 @@ void Proxy::synchronize_local_iteration_phase(const std::string& phase, uint64_t
             }
         }
         if (complete) {
-            RDMA_PROXY_LOG_INFO("iteration=", iteration,
-                                " local shared-memory ", phase,
-                                " barrier complete local_rank=", config_.node_rank,
-                                " local_gpu=", config_.local_gpu_index);
+            RDMA_PROXY_LOG_DEBUG("iteration=", iteration,
+                                 " local shared-memory ", phase,
+                                 " barrier complete local_rank=", config_.node_rank,
+                                 " local_gpu=", config_.local_gpu_index);
             return;
         }
         if (std::chrono::steady_clock::now() >= deadline) {
