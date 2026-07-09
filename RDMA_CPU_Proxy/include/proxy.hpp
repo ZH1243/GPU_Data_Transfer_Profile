@@ -122,6 +122,7 @@ private:
         uint64_t iteration,
         std::size_t batch_index_in_iteration,
         std::size_t batch_start_token);
+    void forwarding_ready_loop();
     void wait_for_forwarding_iteration(uint64_t iteration);
     void set_forwarding_error(const std::string& error);
     void check_forwarding_error() const;
@@ -150,9 +151,12 @@ private:
     std::vector<PeerState> peers_;
     std::atomic<bool> forwarding_stop_{false};
     std::thread forwarding_thread_;
+    std::thread forwarding_ready_thread_;
     void* forwarding_stream_{nullptr};
     mutable std::mutex forwarding_mutex_;
     std::vector<std::size_t> forwarding_next_batch_by_peer_;
+    std::unique_ptr<std::atomic<std::size_t>[]> forwarding_ready_batches_by_peer_;
+    std::size_t forwarding_ready_peer_count_{0};
     std::vector<std::vector<uint8_t>> forwarding_routing_tables_by_peer_;
     std::vector<ForwardDestinationState> forwarding_destinations_;
     std::vector<ForwardingIterationStats> forwarding_iteration_stats_;
