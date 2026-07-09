@@ -1113,23 +1113,27 @@ bool Proxy::forwarding_batch_available(
     std::size_t batch_start_token,
     std::size_t batch_tokens,
     uint64_t required_count) const {
+    if (chunks.empty() || batch_tokens == 0) return false;
     const auto batch_end_token = batch_start_token + batch_tokens;
-    std::vector<uint64_t> totals(chunks.size(), 0);
-    for (const auto& worker : peer.workers) {
-        const auto counts = worker->received_immediate_counts();
-        for (std::size_t i = 0; i < counts.size() && i < totals.size(); ++i) {
-            totals[i] += counts[i];
-        }
-    }
+    const auto first_chunk = batch_start_token / config_.tokens_per_chunk;
+    const auto last_chunk = (batch_end_token - 1) / config_.tokens_per_chunk;
+    if (first_chunk >= chunks.size()) return false;
 
     bool overlaps_any_chunk = false;
-    for (const auto& chunk : chunks) {
+    const auto last_existing_chunk = std::min(last_chunk, chunks.size() - 1);
+    for (std::size_t chunk_pos = first_chunk; chunk_pos <= last_existing_chunk; ++chunk_pos) {
+        const auto& chunk = chunks[chunk_pos];
         const auto chunk_end_token = chunk.start_token + chunk.num_tokens;
         if (chunk.start_token >= batch_end_token || chunk_end_token <= batch_start_token) {
             continue;
         }
         overlaps_any_chunk = true;
-        if (chunk.chunk_index >= totals.size() || totals[chunk.chunk_index] < required_count) {
+
+        uint64_t total = 0;
+        for (const auto& worker : peer.workers) {
+            total += worker->received_immediate_count(chunk.chunk_index);
+        }
+        if (total < required_count) {
             return false;
         }
     }
