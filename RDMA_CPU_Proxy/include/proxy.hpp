@@ -157,6 +157,9 @@ private:
     std::vector<ForwardDestinationState> forwarding_destinations_;
     std::vector<ForwardingIterationStats> forwarding_iteration_stats_;
     std::string forwarding_error_;
+    std::atomic<uint64_t> forwarding_batch_available_calls_{0};
+    std::atomic<uint64_t> forwarding_batch_available_total_ns_{0};
+    std::atomic<uint64_t> forwarding_batches_issued_{0};
     std::vector<double> rdma_iteration_bandwidth_gbps_;
     LocalIterationSyncHeader* local_iteration_sync_header_{nullptr};
     std::size_t local_iteration_sync_size_{0};

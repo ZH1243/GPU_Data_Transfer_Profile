@@ -876,6 +876,9 @@ void Proxy::start_forwarding_thread() {
         forwarding_iteration_stats_.clear();
         forwarding_error_.clear();
     }
+    forwarding_batch_available_calls_.store(0);
+    forwarding_batch_available_total_ns_.store(0);
+    forwarding_batches_issued_.store(0);
     forwarding_stop_.store(false);
     forwarding_thread_ = std::thread(&Proxy::forwarding_loop, this);
     RDMA_PROXY_LOG_INFO("NVLink forwarding thread started local_rank=", config_.node_rank,
@@ -1360,12 +1363,20 @@ void Proxy::forwarding_loop() {
                     batch_in_iteration * config_.nvlink_forward_threshold_tokens;
                 const auto required_count = iteration + 1;
                 const auto& peer = peers_[peer_index];
-                if (!forwarding_batch_available(
-                        peer,
-                        chunks,
-                        batch_start_token,
-                        config_.nvlink_forward_threshold_tokens,
-                        required_count)) {
+                const auto availability_start = std::chrono::steady_clock::now();
+                const bool batch_available = forwarding_batch_available(
+                    peer,
+                    chunks,
+                    batch_start_token,
+                    config_.nvlink_forward_threshold_tokens,
+                    required_count);
+                const auto availability_elapsed_ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - availability_start).count();
+                forwarding_batch_available_calls_.fetch_add(1);
+                forwarding_batch_available_total_ns_.fetch_add(
+                    static_cast<uint64_t>(std::max<int64_t>(0, availability_elapsed_ns)));
+                if (!batch_available) {
                     continue;
                 }
 
@@ -1388,6 +1399,7 @@ void Proxy::forwarding_loop() {
                     std::lock_guard<std::mutex> lock(forwarding_mutex_);
                     forwarding_next_batch_by_peer_.at(peer_index) = next_batch + 1;
                 }
+                forwarding_batches_issued_.fetch_add(1);
                 progressed = true;
             }
             if (!progressed) {
@@ -1560,6 +1572,19 @@ void Proxy::report_rdma_bandwidth_summary() const {
     const double median = count % 2 == 0 ?
         (sorted[count / 2 - 1] + sorted[count / 2]) * 0.5 :
         sorted[count / 2];
+    const auto forwarding_availability_calls = forwarding_batch_available_calls_.load();
+    const auto forwarding_availability_total_ns = forwarding_batch_available_total_ns_.load();
+    const auto forwarding_batches_issued = forwarding_batches_issued_.load();
+    const double forwarding_availability_avg_us_per_call =
+        forwarding_availability_calls > 0 ?
+            static_cast<double>(forwarding_availability_total_ns) /
+                static_cast<double>(forwarding_availability_calls) / 1000.0 :
+            0.0;
+    const double forwarding_availability_avg_us_per_batch =
+        forwarding_batches_issued > 0 ?
+            static_cast<double>(forwarding_availability_total_ns) /
+                static_cast<double>(forwarding_batches_issued) / 1000.0 :
+            0.0;
 
     std::ostringstream summary;
     summary << std::fixed << std::setprecision(3)
@@ -1571,7 +1596,13 @@ void Proxy::report_rdma_bandwidth_summary() const {
             << " min_bandwidth_gbps=" << sorted.front()
             << " max_bandwidth_gbps=" << sorted.back()
             << " median_bandwidth_gbps=" << median
-            << " variance_gbps2=" << variance;
+            << " variance_gbps2=" << variance
+            << " forwarding_batch_available_calls=" << forwarding_availability_calls
+            << " forwarding_batches_issued=" << forwarding_batches_issued
+            << " forwarding_batch_available_avg_us_per_call="
+                << forwarding_availability_avg_us_per_call
+            << " forwarding_batch_available_avg_us_per_batch="
+                << forwarding_availability_avg_us_per_batch;
 
     if (config_.rdma_bandwidth_summary_dir.empty()) {
         RDMA_PROXY_LOG_INFO(summary.str());
