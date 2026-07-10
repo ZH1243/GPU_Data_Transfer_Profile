@@ -756,7 +756,7 @@ void Proxy::synchronize_local_nvlink_forward_batch_start(
             }
             throw std::runtime_error(out.str());
         }
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        std::this_thread::sleep_for(std::chrono::microseconds(5));
     }
 }
 
