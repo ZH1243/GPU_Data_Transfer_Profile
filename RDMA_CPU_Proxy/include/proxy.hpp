@@ -79,7 +79,7 @@ private:
     void release_local_iteration_sync();
     std::string local_iteration_sync_shm_name() const;
     LocalIterationSyncSlot* local_iteration_sync_slot(int gpu_index) const;
-    void synchronize_local_nvlink_forward_batch(
+    void synchronize_local_nvlink_forward_batch_start(
         uint64_t iteration,
         std::size_t batch_index_in_iteration,
         uint64_t batch_sequence) const;
