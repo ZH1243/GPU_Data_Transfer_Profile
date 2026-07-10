@@ -3,6 +3,7 @@
 #include <cassert>
 #include <fstream>
 #include <iostream>
+#include <stdexcept>
 
 int main(int argc, char** argv) {
     assert(argc == 2);
@@ -31,6 +32,7 @@ int main(int argc, char** argv) {
     assert(config.nvlink_forward_use_batch_api);
     assert(config.nvlink_forward_stream_nonblocking);
     assert(!config.nvlink_forward_synchronize_batches);
+    assert(!config.nvlink_forward_local_batch_sync_enabled);
     assert(config.nvlink_forward_synchronize_iteration);
     assert(!config.nvlink_forward_log_batches);
     assert(!config.log_qp_reports);
@@ -122,13 +124,14 @@ int main(int argc, char** argv) {
         "--sequential_peer_transfers=true",
         "--log_qp_reports=true",
         "--log_marker_wait_reports=true",
+        "--nvlink_forward_local_batch_sync_enabled=false",
         "--local_iteration_sync_enabled=true",
         "--local_iteration_sync_dir=/tmp/rdma_cpu_proxy_test_local_sync",
         "--local_iteration_sync_run_id=test_cli",
         "--rdma_bandwidth_summary_dir=/tmp/rdma_cpu_proxy_test_results",
         "--cpu_affinity=0-95,192-287",
     };
-    const auto peer_port_config = rdma_proxy::load_config(15, const_cast<char**>(peer_port_args));
+    const auto peer_port_config = rdma_proxy::load_config(16, const_cast<char**>(peer_port_args));
     for (const auto& peer : peer_port_config.peers) {
         assert(peer.port == 18521);
     }
@@ -185,6 +188,7 @@ int main(int argc, char** argv) {
   "nvlink_forward_use_batch_api": true,
   "nvlink_forward_stream_nonblocking": true,
   "nvlink_forward_synchronize_batches": false,
+  "nvlink_forward_local_batch_sync_enabled": false,
   "nvlink_forward_synchronize_iteration": true,
   "nvlink_forward_log_batches": true,
   "log_qp_reports": true,
@@ -208,6 +212,7 @@ int main(int argc, char** argv) {
     }
     const auto nvlink_config = rdma_proxy::load_config_file(nvlink_config_path);
     assert(nvlink_config.nvlink_forwarding_enabled);
+    assert(!nvlink_config.nvlink_forward_local_batch_sync_enabled);
     assert(nvlink_config.nvlink_forward_log_batches);
     assert(nvlink_config.log_qp_reports);
     assert(nvlink_config.log_marker_wait_reports);
@@ -216,6 +221,22 @@ int main(int argc, char** argv) {
     assert(nvlink_config.nvlink_routing_seed == 1234);
     assert(nvlink_config.nvlink_forward_destinations.size() == 3);
     assert(nvlink_config.nvlink_forward_destinations[0].buffer_addr == 0x100000ULL);
+
+    auto invalid_batch_sync_config = nvlink_config;
+    invalid_batch_sync_config.nvlink_forward_local_batch_sync_enabled = true;
+    invalid_batch_sync_config.nvlink_forward_synchronize_batches = false;
+    bool rejected_batch_sync_without_stream_sync = false;
+    try {
+        rdma_proxy::validate_config(invalid_batch_sync_config);
+    } catch (const std::runtime_error&) {
+        rejected_batch_sync_without_stream_sync = true;
+    }
+    assert(rejected_batch_sync_without_stream_sync);
+
+    auto valid_batch_sync_config = nvlink_config;
+    valid_batch_sync_config.nvlink_forward_local_batch_sync_enabled = true;
+    valid_batch_sync_config.nvlink_forward_synchronize_batches = true;
+    rdma_proxy::validate_config(valid_batch_sync_config);
 
     std::cout << rdma_proxy::config_summary(config) << '\n';
     std::cout << "test_config passed\n";

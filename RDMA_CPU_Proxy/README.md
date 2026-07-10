@@ -87,6 +87,8 @@ Set `nvlink_forward_log_batches=true` to emit per-batch/per-copy forwarding trac
 
 When `nvlink_forward_synchronize_batches=true`, each forwarding batch is timed from before its copy operations are enqueued until after `cudaStreamSynchronize()` returns. If `nvlink_forward_log_batches=true`, each synchronized batch also logs `elapsed_us`, `bandwidth_GBps`, and `bandwidth_gbps`. At iteration completion, zero-byte batches are counted as synchronized batches but excluded from bandwidth samples. The proxy reports the arithmetic mean of non-empty synchronized batch bandwidths as `average_batch_bandwidth_GBps` / `average_batch_bandwidth_gbps` and the aggregate `total_forwarded_bytes / non_empty_synchronized_seconds` as `aggregate_synchronized_bandwidth_GBps` / `aggregate_synchronized_bandwidth_gbps`.
 
+Set `nvlink_forward_local_batch_sync_enabled=true` to add a same-node GPU-proxy barrier after every synchronized NVLink forwarding batch. After `cudaStreamSynchronize()` returns for a batch, each proxy marks its local batch sequence in shared memory and waits until every local GPU proxy has reached the same sequence before issuing another forwarding batch. This option requires `nvlink_forward_synchronize_batches=true` and uses the same local shared-memory run identity as `local_iteration_sync_run_id`.
+
 ## RDMA and GPUDirect RDMA
 
 The real path uses libibverbs/rdma-core APIs:
@@ -240,6 +242,7 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_use_batch_api`
 - `nvlink_forward_stream_nonblocking`
 - `nvlink_forward_synchronize_batches`
+- `nvlink_forward_local_batch_sync_enabled`
 - `nvlink_forward_synchronize_iteration`
 - `nvlink_forward_log_batches`
 - `local_iteration_sync_enabled`

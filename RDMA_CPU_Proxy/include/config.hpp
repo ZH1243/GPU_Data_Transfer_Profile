@@ -63,6 +63,7 @@ struct ProxyConfig {
     bool nvlink_forward_use_batch_api{true};
     bool nvlink_forward_stream_nonblocking{true};
     bool nvlink_forward_synchronize_batches{false};
+    bool nvlink_forward_local_batch_sync_enabled{false};
     bool nvlink_forward_synchronize_iteration{true};
     bool nvlink_forward_log_batches{false};
     bool log_qp_reports{false};

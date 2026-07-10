@@ -129,6 +129,80 @@ int main() {
 
     {
         auto config0 = make_config();
+        config0.num_tokens = 64;
+        config0.tokens_per_chunk = 8;
+        config0.num_gpus_per_node = 2;
+        config0.num_iterations = 1;
+        config0.nvlink_forwarding_enabled = true;
+        config0.nvlink_forward_use_round_robin = true;
+        config0.nvlink_forward_threshold_tokens = 32;
+        config0.nvlink_forward_chunk_tokens = 32;
+        config0.nvlink_forward_synchronize_batches = true;
+        config0.nvlink_forward_local_batch_sync_enabled = true;
+        config0.local_iteration_sync_run_id = "test_measured_run_nvlink_batch_sync";
+        config0.local_gpu_index = 0;
+        config0.cuda_device_id = 0;
+
+        auto config1 = config0;
+        config1.local_gpu_index = 1;
+        config1.cuda_device_id = 1;
+
+        const auto destination_bytes = config0.num_tokens * config0.token_dimension * dtype_size(config0.dtype);
+        std::vector<uint8_t> destination0(destination_bytes, 0);
+        std::vector<uint8_t> destination1(destination_bytes, 0);
+        config0.nvlink_forward_destinations.push_back(
+            NvlinkForwardDestination{
+                1,
+                1,
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(destination0.data())),
+                destination0.size()});
+        config1.nvlink_forward_destinations.push_back(
+            NvlinkForwardDestination{
+                0,
+                0,
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(destination1.data())),
+                destination1.size()});
+
+        validate_config(config0);
+        validate_config(config1);
+
+        std::exception_ptr error0;
+        std::exception_ptr error1;
+        std::thread gpu0([&] {
+            try {
+                Proxy proxy(config0);
+                proxy.initialize();
+                proxy.run();
+                proxy.shutdown();
+            } catch (...) {
+                error0 = std::current_exception();
+            }
+        });
+        std::thread gpu1([&] {
+            try {
+                Proxy proxy(config1);
+                proxy.initialize();
+                proxy.run();
+                proxy.shutdown();
+            } catch (...) {
+                error1 = std::current_exception();
+            }
+        });
+        gpu0.join();
+        gpu1.join();
+        if (error0) std::rethrow_exception(error0);
+        if (error1) std::rethrow_exception(error1);
+
+        const bool copied0 = std::any_of(destination0.begin(), destination0.end(), [](uint8_t v) { return v != 0; });
+        const bool copied1 = std::any_of(destination1.begin(), destination1.end(), [](uint8_t v) { return v != 0; });
+        if (!copied0 || !copied1) {
+            std::cerr << "NVLink mock batch-synchronized forwarding destination remained empty\n";
+            return 1;
+        }
+    }
+
+    {
+        auto config0 = make_config();
         config0.node_rank = 0;
         config0.num_nodes = 1;
         config0.local_gpu_index = 0;
