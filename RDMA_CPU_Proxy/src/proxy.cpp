@@ -78,6 +78,16 @@ void atomic_store_u64(uint64_t* ptr, uint64_t value) {
     __atomic_store_n(ptr, value, __ATOMIC_RELEASE);
 }
 
+void cpu_relax() {
+#if defined(__x86_64__) || defined(__i386__)
+    __asm__ __volatile__("pause" ::: "memory");
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield" ::: "memory");
+#else
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+}
+
 int current_process_id() {
 #if defined(__unix__) || defined(__APPLE__)
     return static_cast<int>(getpid());
@@ -700,7 +710,6 @@ void Proxy::synchronize_local_nvlink_forward_batch_start(
 
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(config_.completion_timeout_ms);
-    std::vector<std::string> waiting_reasons(static_cast<std::size_t>(config_.num_gpus_per_node));
     RDMA_PROXY_LOG_DEBUG("iteration=", iteration,
                          " waiting for local NVLink forwarding batch-start barrier"
                          " local_rank=", config_.node_rank,
@@ -709,6 +718,7 @@ void Proxy::synchronize_local_nvlink_forward_batch_start(
                          " sequence=", batch_sequence,
                          " gpus=", config_.num_gpus_per_node);
 
+    uint64_t poll_count = 0;
     while (true) {
         bool complete = true;
         for (int gpu = 0; gpu < config_.num_gpus_per_node; ++gpu) {
@@ -716,20 +726,9 @@ void Proxy::synchronize_local_nvlink_forward_batch_start(
             const auto pid = atomic_load_i32(&slot->pid);
             const auto slot_gpu = atomic_load_i32(&slot->gpu_index);
             const auto slot_marker = atomic_load_u64(&slot->nvlink_forward_batch_start);
-            auto& reason = waiting_reasons[static_cast<std::size_t>(gpu)];
-            if (pid <= 0) {
-                reason = "missing";
+            if (pid <= 0 || slot_gpu != gpu || slot_marker < batch_sequence) {
                 complete = false;
-            } else if (slot_gpu != gpu) {
-                reason = "metadata mismatch";
-                complete = false;
-            } else if (slot_marker < batch_sequence) {
-                reason = process_is_alive(pid) ?
-                    "waiting marker=" + std::to_string(slot_marker) :
-                    "process not alive";
-                complete = false;
-            } else {
-                reason.clear();
+                break;
             }
         }
         if (complete) {
@@ -741,7 +740,9 @@ void Proxy::synchronize_local_nvlink_forward_batch_start(
                                  " sequence=", batch_sequence);
             return;
         }
-        if (std::chrono::steady_clock::now() >= deadline) {
+
+        ++poll_count;
+        if ((poll_count & 0x3ffULL) == 0 && std::chrono::steady_clock::now() >= deadline) {
             std::ostringstream out;
             out << "timed out waiting for local NVLink forwarding batch-start barrier"
                 << " iteration=" << iteration
@@ -751,12 +752,23 @@ void Proxy::synchronize_local_nvlink_forward_batch_start(
                 << " local_gpu=" << config_.local_gpu_index
                 << " shm_name=" << local_iteration_sync_name_;
             for (int gpu = 0; gpu < config_.num_gpus_per_node; ++gpu) {
-                const auto& reason = waiting_reasons[static_cast<std::size_t>(gpu)];
-                if (!reason.empty()) out << " gpu" << gpu << "=" << reason;
+                const auto* slot = local_iteration_sync_slot(gpu);
+                const auto pid = atomic_load_i32(&slot->pid);
+                const auto slot_gpu = atomic_load_i32(&slot->gpu_index);
+                const auto slot_marker = atomic_load_u64(&slot->nvlink_forward_batch_start);
+                if (pid <= 0) {
+                    out << " gpu" << gpu << "=missing";
+                } else if (slot_gpu != gpu) {
+                    out << " gpu" << gpu << "=metadata mismatch";
+                } else if (slot_marker < batch_sequence) {
+                    out << " gpu" << gpu << "="
+                        << (process_is_alive(pid) ? "waiting marker=" : "process not alive marker=")
+                        << slot_marker;
+                }
             }
             throw std::runtime_error(out.str());
         }
-        std::this_thread::sleep_for(std::chrono::microseconds(5));
+        cpu_relax();
     }
 }
 
