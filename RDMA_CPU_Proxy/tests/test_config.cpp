@@ -29,6 +29,9 @@ int main(int argc, char** argv) {
     assert(!config.nvlink_forwarding_enabled);
     assert(config.nvlink_forward_threshold_tokens == 700);
     assert(config.nvlink_forward_threshold_chunks == 0);
+    assert(config.nvlink_forward_min_threshold_chunks == 0);
+    assert(config.nvlink_forward_max_threshold_chunks == 0);
+    assert(!rdma_proxy::nvlink_forward_dynamic_threshold_enabled(config));
     assert(rdma_proxy::effective_nvlink_forward_threshold_tokens(config) == 700);
     assert(config.nvlink_forward_chunk_tokens == 100);
     assert(config.nvlink_forward_use_batch_api);
@@ -220,6 +223,9 @@ int main(int argc, char** argv) {
     assert(nvlink_config.nvlink_forward_log_batches);
     assert(nvlink_config.nvlink_forward_threshold_tokens == 0);
     assert(nvlink_config.nvlink_forward_threshold_chunks == 12);
+    assert(nvlink_config.nvlink_forward_min_threshold_chunks == 0);
+    assert(nvlink_config.nvlink_forward_max_threshold_chunks == 0);
+    assert(!rdma_proxy::nvlink_forward_dynamic_threshold_enabled(nvlink_config));
     assert(rdma_proxy::effective_nvlink_forward_threshold_tokens(nvlink_config) == 300);
     assert(nvlink_config.log_qp_reports);
     assert(nvlink_config.log_marker_wait_reports);
@@ -228,6 +234,27 @@ int main(int argc, char** argv) {
     assert(nvlink_config.nvlink_routing_seed == 1234);
     assert(nvlink_config.nvlink_forward_destinations.size() == 3);
     assert(nvlink_config.nvlink_forward_destinations[0].buffer_addr == 0x100000ULL);
+
+    auto dynamic_threshold_config = nvlink_config;
+    dynamic_threshold_config.nvlink_forward_use_round_robin = false;
+    dynamic_threshold_config.nvlink_forward_threshold_chunks = 0;
+    dynamic_threshold_config.nvlink_forward_min_threshold_chunks = 4;
+    dynamic_threshold_config.nvlink_forward_max_threshold_chunks = 6;
+    rdma_proxy::validate_config(dynamic_threshold_config);
+    assert(rdma_proxy::nvlink_forward_dynamic_threshold_enabled(dynamic_threshold_config));
+    assert(rdma_proxy::effective_nvlink_forward_min_threshold_chunks(dynamic_threshold_config) == 4);
+    assert(rdma_proxy::effective_nvlink_forward_max_threshold_chunks(dynamic_threshold_config) == 6);
+    assert(rdma_proxy::effective_nvlink_forward_threshold_tokens(dynamic_threshold_config) == 150);
+
+    auto invalid_dynamic_round_robin_config = dynamic_threshold_config;
+    invalid_dynamic_round_robin_config.nvlink_forward_use_round_robin = true;
+    bool rejected_dynamic_round_robin = false;
+    try {
+        rdma_proxy::validate_config(invalid_dynamic_round_robin_config);
+    } catch (const std::runtime_error&) {
+        rejected_dynamic_round_robin = true;
+    }
+    assert(rejected_dynamic_round_robin);
 
     auto invalid_threshold_config = nvlink_config;
     invalid_threshold_config.nvlink_forward_threshold_tokens = 301;
