@@ -60,8 +60,6 @@ struct ProxyConfig {
     bool nvlink_forwarding_enabled{false};
     std::size_t nvlink_forward_threshold_tokens{0};
     std::size_t nvlink_forward_threshold_chunks{0};
-    std::size_t nvlink_forward_min_threshold_chunks{0};
-    std::size_t nvlink_forward_max_threshold_chunks{0};
     std::size_t nvlink_forward_chunk_tokens{0};
     bool nvlink_forward_use_batch_api{true};
     bool nvlink_forward_stream_nonblocking{true};
@@ -89,9 +87,6 @@ std::size_t dtype_size(DataType dtype);
 std::string to_string(DataType dtype);
 DataType dtype_from_string(const std::string& value);
 std::size_t effective_nvlink_forward_threshold_tokens(const ProxyConfig& config);
-bool nvlink_forward_dynamic_threshold_enabled(const ProxyConfig& config);
-std::size_t effective_nvlink_forward_min_threshold_chunks(const ProxyConfig& config);
-std::size_t effective_nvlink_forward_max_threshold_chunks(const ProxyConfig& config);
 
 ProxyConfig load_config_file(const std::string& path);
 ProxyConfig load_config(int argc, char** argv);

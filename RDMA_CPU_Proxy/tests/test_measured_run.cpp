@@ -72,8 +72,7 @@ int main() {
         config.num_gpus_per_node = 2;
         config.num_iterations = 1;
         config.nvlink_forwarding_enabled = true;
-        config.nvlink_forward_min_threshold_chunks = 4;
-        config.nvlink_forward_max_threshold_chunks = 6;
+        config.nvlink_forward_threshold_tokens = config.num_tokens;
         config.nvlink_forward_chunk_tokens = config.num_tokens;
         config.nvlink_routing_probability = 1.0;
         const auto destination_bytes = config.num_tokens * config.token_dimension * dtype_size(config.dtype);

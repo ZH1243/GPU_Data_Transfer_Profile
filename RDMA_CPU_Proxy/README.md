@@ -68,8 +68,7 @@ The routing-table implementation requires:
 
 ```text
 num_gpus_per_node <= 8
-fixed-size token thresholds require num_tokens to be a multiple of the effective NVLink forwarding threshold
-fixed-size chunk thresholds require the RDMA chunk count to be a multiple of nvlink_forward_threshold_chunks
+num_tokens must be a multiple of the effective NVLink forwarding threshold
 ```
 
 Set `nvlink_forward_threshold_tokens` to choose the forwarding batch size directly in tokens. Alternatively, set `nvlink_forward_threshold_chunks` to choose the batch size in RDMA chunks; the effective token count becomes:
@@ -79,8 +78,6 @@ nvlink_forward_threshold_chunks * tokens_per_chunk
 ```
 
 For example, with `nvlink_forward_threshold_chunks=10` and `tokens_per_chunk=32`, each forwarding batch contains 320 tokens. If both `nvlink_forward_threshold_tokens` and `nvlink_forward_threshold_chunks` are set, they must describe the same effective token count.
-
-Set `nvlink_forward_min_threshold_chunks` and `nvlink_forward_max_threshold_chunks` to make forwarding batches adjustable. In that mode, a batch becomes ready once at least the minimum number of contiguous RDMA chunks has arrived. The forwarding ready thread then chooses the largest currently available batch up to the maximum, while avoiding a too-small tail batch when possible. The final batch of an iteration may be smaller than the minimum if fewer chunks remain. Dynamic min/max thresholds use the routing-table forwarding path; variable-size batches are rejected with round-robin forwarding.
 
 In round-robin mode, the previous full-fanout rule is restored:
 
@@ -98,7 +95,7 @@ Set `nvlink_forward_log_batches=true` to emit per-batch/per-copy forwarding trac
 
 When `nvlink_forward_synchronize_batches=true`, each forwarding batch is timed from before its copy operations are enqueued until after `cudaStreamSynchronize()` returns. If `nvlink_forward_log_batches=true`, each synchronized batch also logs `elapsed_us`, `bandwidth_GBps`, and `bandwidth_gbps`. At iteration completion, zero-byte batches are counted as synchronized batches but excluded from bandwidth samples. The proxy reports the arithmetic mean of non-empty synchronized batch bandwidths as `average_batch_bandwidth_GBps` / `average_batch_bandwidth_gbps` and the aggregate `total_forwarded_bytes / non_empty_synchronized_seconds` as `aggregate_synchronized_bandwidth_GBps` / `aggregate_synchronized_bandwidth_gbps`.
 
-Set `nvlink_forward_local_batch_sync_enabled=true` to coordinate same-node GPU proxies before every synchronized NVLink forwarding batch. Once a proxy has observed that its next batch is ready, it writes the batch-start sequence and intended RDMA chunk count into its shared-memory slot. A local coordinator thread on GPU 0 polls all GPU slots; when every local proxy has reported the same sequence, it writes the smallest reported chunk count into the shared-memory release fields and advances the release sequence. Forwarding threads poll only that release sequence/value, then issue the selected batch size. Because each forwarding thread reaches the next batch-start release only after the previous batch's `cudaStreamSynchronize()` has returned, this makes the proxies start each batch together while still allowing them to move directly from a completed batch to checking readiness for the next one. The first batch uses the same mechanism, with the previous batch treated as already complete. This option requires `nvlink_forward_synchronize_batches=true` and uses the same local shared-memory run identity as `local_iteration_sync_run_id`.
+Set `nvlink_forward_local_batch_sync_enabled=true` to add a same-node GPU-proxy barrier before every synchronized NVLink forwarding batch. Once a proxy has observed that the next batch is ready for forwarding, it marks the batch-start sequence in shared memory and waits until every local GPU proxy has reached the same sequence before issuing that batch. Because each forwarding thread reaches the next batch-start barrier only after the previous batch's `cudaStreamSynchronize()` has returned, this makes the proxies start each batch together while still allowing them to move directly from a completed batch to checking readiness for the next one. The first batch uses the same barrier, with the previous batch treated as already complete. This option requires `nvlink_forward_synchronize_batches=true` and uses the same local shared-memory run identity as `local_iteration_sync_run_id`.
 
 ## RDMA and GPUDirect RDMA
 
@@ -250,8 +247,6 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forwarding_enabled`
 - `nvlink_forward_threshold_tokens`
 - `nvlink_forward_threshold_chunks`
-- `nvlink_forward_min_threshold_chunks`
-- `nvlink_forward_max_threshold_chunks`
 - `nvlink_forward_chunk_tokens`
 - `nvlink_forward_use_batch_api`
 - `nvlink_forward_stream_nonblocking`
