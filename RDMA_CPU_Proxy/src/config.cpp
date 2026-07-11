@@ -308,6 +308,12 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "nvlink_forward_threshold_chunks") {
         config.nvlink_forward_threshold_chunks = static_cast<std::size_t>(std::stoull(value));
     }
+    else if (key == "nvlink_forward_min_threshold_chunks") {
+        config.nvlink_forward_min_threshold_chunks = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "nvlink_forward_max_threshold_chunks") {
+        config.nvlink_forward_max_threshold_chunks = static_cast<std::size_t>(std::stoull(value));
+    }
     else if (key == "nvlink_forward_chunk_tokens") {
         config.nvlink_forward_chunk_tokens = static_cast<std::size_t>(std::stoull(value));
     }
@@ -389,6 +395,11 @@ DataType dtype_from_string(const std::string& value) {
     throw std::runtime_error("unsupported dtype: " + value);
 }
 
+bool nvlink_forward_dynamic_threshold_enabled(const ProxyConfig& config) {
+    return config.nvlink_forward_min_threshold_chunks != 0 ||
+           config.nvlink_forward_max_threshold_chunks != 0;
+}
+
 std::size_t effective_nvlink_forward_threshold_tokens(const ProxyConfig& config) {
     if (config.nvlink_forward_threshold_chunks == 0) {
         return config.nvlink_forward_threshold_tokens;
@@ -447,6 +458,10 @@ ProxyConfig load_config_file(const std::string& path) {
         object, "nvlink_forward_threshold_tokens", config.nvlink_forward_threshold_tokens);
     config.nvlink_forward_threshold_chunks = number_as<std::size_t>(
         object, "nvlink_forward_threshold_chunks", config.nvlink_forward_threshold_chunks);
+    config.nvlink_forward_min_threshold_chunks = number_as<std::size_t>(
+        object, "nvlink_forward_min_threshold_chunks", config.nvlink_forward_min_threshold_chunks);
+    config.nvlink_forward_max_threshold_chunks = number_as<std::size_t>(
+        object, "nvlink_forward_max_threshold_chunks", config.nvlink_forward_max_threshold_chunks);
     config.nvlink_forward_chunk_tokens = number_as<std::size_t>(
         object, "nvlink_forward_chunk_tokens", config.nvlink_forward_chunk_tokens);
     config.nvlink_forward_use_batch_api = get_bool(
@@ -584,6 +599,7 @@ void validate_config(const ProxyConfig& config) {
         }
     }
     if (config.nvlink_forwarding_enabled) {
+        const auto dynamic_threshold = nvlink_forward_dynamic_threshold_enabled(config);
         const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config);
         if (config.num_gpus_per_node <= 1) {
             throw std::runtime_error("nvlink_forwarding_enabled requires num_gpus_per_node > 1");
@@ -591,12 +607,28 @@ void validate_config(const ProxyConfig& config) {
         if (config.num_gpus_per_node > 8) {
             throw std::runtime_error("nvlink_forwarding_enabled supports at most 8 local GPUs");
         }
-        if (forward_threshold_tokens == 0) {
+        if (dynamic_threshold) {
+            if (config.nvlink_forward_min_threshold_chunks == 0 ||
+                config.nvlink_forward_max_threshold_chunks == 0) {
+                throw std::runtime_error(
+                    "dynamic NVLink forwarding requires both "
+                    "nvlink_forward_min_threshold_chunks and nvlink_forward_max_threshold_chunks to be > 0");
+            }
+            if (config.nvlink_forward_min_threshold_chunks > config.nvlink_forward_max_threshold_chunks) {
+                throw std::runtime_error(
+                    "nvlink_forward_min_threshold_chunks must be <= nvlink_forward_max_threshold_chunks");
+            }
+            if (config.nvlink_forward_use_round_robin) {
+                throw std::runtime_error(
+                    "dynamic NVLink forwarding chunk thresholds do not support round-robin forwarding");
+            }
+        } else if (forward_threshold_tokens == 0) {
             throw std::runtime_error(
                 "nvlink_forward_threshold_tokens or nvlink_forward_threshold_chunks must be > 0 when "
                 "NVLink forwarding is enabled");
         }
-        if (config.nvlink_forward_threshold_tokens != 0 &&
+        if (!dynamic_threshold &&
+            config.nvlink_forward_threshold_tokens != 0 &&
             config.nvlink_forward_threshold_chunks != 0 &&
             config.nvlink_forward_threshold_tokens != forward_threshold_tokens) {
             throw std::runtime_error(
@@ -606,7 +638,7 @@ void validate_config(const ProxyConfig& config) {
         if (config.nvlink_forward_chunk_tokens == 0) {
             throw std::runtime_error("nvlink_forward_chunk_tokens must be > 0 when NVLink forwarding is enabled");
         }
-        if (config.nvlink_forward_use_round_robin) {
+        if (!dynamic_threshold && config.nvlink_forward_use_round_robin) {
             const auto expected_threshold =
                 config.nvlink_forward_chunk_tokens * static_cast<std::size_t>(config.num_gpus_per_node - 1);
             if (forward_threshold_tokens != expected_threshold) {
@@ -615,11 +647,11 @@ void validate_config(const ProxyConfig& config) {
                     "nvlink_forward_chunk_tokens * (num_gpus_per_node - 1)");
             }
         }
-        if (forward_threshold_tokens > config.num_tokens) {
+        if (!dynamic_threshold && forward_threshold_tokens > config.num_tokens) {
             throw std::runtime_error(
                 "effective NVLink forwarding threshold must be <= num_tokens when NVLink forwarding is enabled");
         }
-        if (config.num_tokens % forward_threshold_tokens != 0) {
+        if (!dynamic_threshold && config.num_tokens % forward_threshold_tokens != 0) {
             throw std::runtime_error(
                 "unsupported NVLink forwarding configuration: num_tokens must be an exact multiple of "
                 "the effective NVLink forwarding threshold");
@@ -678,6 +710,8 @@ std::string config_summary(const ProxyConfig& config) {
         << " nvlink_forwarding_enabled=" << (config.nvlink_forwarding_enabled ? "true" : "false")
         << " nvlink_forward_threshold_tokens=" << config.nvlink_forward_threshold_tokens
         << " nvlink_forward_threshold_chunks=" << config.nvlink_forward_threshold_chunks
+        << " nvlink_forward_min_threshold_chunks=" << config.nvlink_forward_min_threshold_chunks
+        << " nvlink_forward_max_threshold_chunks=" << config.nvlink_forward_max_threshold_chunks
         << " nvlink_forward_effective_threshold_tokens="
         << effective_nvlink_forward_threshold_tokens(config)
         << " nvlink_forward_chunk_tokens=" << config.nvlink_forward_chunk_tokens

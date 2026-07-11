@@ -79,10 +79,11 @@ private:
     void release_local_iteration_sync();
     std::string local_iteration_sync_shm_name() const;
     LocalIterationSyncSlot* local_iteration_sync_slot(int gpu_index) const;
-    void synchronize_local_nvlink_forward_batch_start(
+    std::size_t synchronize_local_nvlink_forward_batch_start(
         uint64_t iteration,
         std::size_t batch_index_in_iteration,
-        uint64_t batch_sequence) const;
+        uint64_t batch_sequence,
+        std::size_t available_batch_chunks) const;
     void run_iteration(uint64_t iteration);
     void synchronize_iteration_start(uint64_t iteration) const;
     void synchronize_iteration(uint64_t iteration) const;
@@ -120,12 +121,17 @@ private:
         std::size_t batch_start_token,
         std::size_t batch_tokens,
         uint64_t required_count) const;
+    bool forwarding_chunk_available(
+        const PeerState& peer,
+        const ChunkDescriptor& chunk,
+        uint64_t required_count) const;
     void issue_forwarding_batch(
         const PeerState& peer,
         const PeerGpuBuffers& buffers,
         uint64_t iteration,
         std::size_t batch_index_in_iteration,
-        std::size_t batch_start_token);
+        std::size_t batch_start_token,
+        std::size_t batch_tokens);
     void forwarding_ready_loop();
     void wait_for_forwarding_iteration(uint64_t iteration);
     void set_forwarding_error(const std::string& error);
@@ -159,7 +165,9 @@ private:
     void* forwarding_stream_{nullptr};
     mutable std::mutex forwarding_mutex_;
     std::vector<std::size_t> forwarding_next_batch_by_peer_;
+    std::vector<std::size_t> forwarding_next_chunk_by_peer_;
     std::unique_ptr<std::atomic<std::size_t>[]> forwarding_ready_batches_by_peer_;
+    std::unique_ptr<std::atomic<std::size_t>[]> forwarding_ready_chunks_by_peer_;
     std::size_t forwarding_ready_peer_count_{0};
     std::vector<std::vector<uint8_t>> forwarding_routing_tables_by_peer_;
     std::vector<ForwardDestinationState> forwarding_destinations_;

@@ -23,7 +23,7 @@ The CQ worker reposts receive WRs after receive/immediate completions so the res
 The measured run waits until every chunk has produced both a send completion and a receive-with-immediate completion on the local QPs before reporting an iteration complete.
 Before the first measured send, peers also exchange a TCP ready barrier after QPs are connected and receive WQEs are posted.
 
-When `nvlink_forwarding_enabled=true`, each proxy also starts one forwarding thread for its local GPU. The QP CQ workers still own CQ polling and immediate decoding; the forwarding thread monitors their per-chunk immediate counters, processes peer-node receive buffers in deterministic descending ring order, and issues intra-node GPU-to-GPU copies after a complete forwarding batch has arrived.
+When `nvlink_forwarding_enabled=true`, each proxy also starts NVLink forwarding threads for its local GPU. The QP CQ workers still own CQ polling and immediate decoding; the forwarding-ready thread monitors their per-chunk immediate counters, while the forwarding thread processes peer-node receive buffers in deterministic descending ring order and issues intra-node GPU-to-GPU copies after a forwarding batch has arrived.
 
 ## GPU Buffer Layout
 
@@ -78,6 +78,10 @@ nvlink_forward_threshold_chunks * tokens_per_chunk
 ```
 
 For example, with `nvlink_forward_threshold_chunks=10` and `tokens_per_chunk=32`, each forwarding batch contains 320 tokens. If both `nvlink_forward_threshold_tokens` and `nvlink_forward_threshold_chunks` are set, they must describe the same effective token count.
+
+Set `nvlink_forward_min_threshold_chunks` and `nvlink_forward_max_threshold_chunks` to enable dynamic chunk-threshold forwarding instead of fixed token-threshold forwarding. In this mode, the forwarding-ready thread tracks the contiguous RDMA chunk frontier for each peer buffer: if chunks through `N` are ready but chunk `N+1` is missing, later completed chunks do not move the frontier until the gap arrives. The forwarding thread compares that contiguous ready frontier with its own forwarded frontier, caps the next candidate batch at `nvlink_forward_max_threshold_chunks`, and waits until at least `nvlink_forward_min_threshold_chunks` are available. A final iteration tail smaller than the minimum is allowed once all remaining chunks for that iteration are ready.
+
+When dynamic chunk-threshold forwarding is combined with `nvlink_forward_local_batch_sync_enabled=true`, each GPU proxy writes its candidate chunk count into the same-node shared-memory barrier. After all local GPU proxies have arrived, they use the minimum posted candidate count as the common next batch size, so all local proxies issue the same dynamic forwarding span. Dynamic chunk thresholds are not supported with `nvlink_forward_use_round_robin=true`.
 
 In round-robin mode, the previous full-fanout rule is restored:
 
@@ -247,6 +251,8 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forwarding_enabled`
 - `nvlink_forward_threshold_tokens`
 - `nvlink_forward_threshold_chunks`
+- `nvlink_forward_min_threshold_chunks`
+- `nvlink_forward_max_threshold_chunks`
 - `nvlink_forward_chunk_tokens`
 - `nvlink_forward_use_batch_api`
 - `nvlink_forward_stream_nonblocking`

@@ -29,6 +29,9 @@ int main(int argc, char** argv) {
     assert(!config.nvlink_forwarding_enabled);
     assert(config.nvlink_forward_threshold_tokens == 700);
     assert(config.nvlink_forward_threshold_chunks == 0);
+    assert(config.nvlink_forward_min_threshold_chunks == 0);
+    assert(config.nvlink_forward_max_threshold_chunks == 0);
+    assert(!rdma_proxy::nvlink_forward_dynamic_threshold_enabled(config));
     assert(rdma_proxy::effective_nvlink_forward_threshold_tokens(config) == 700);
     assert(config.nvlink_forward_chunk_tokens == 100);
     assert(config.nvlink_forward_use_batch_api);
@@ -132,9 +135,11 @@ int main(int argc, char** argv) {
         "--local_iteration_sync_run_id=test_cli",
         "--rdma_bandwidth_summary_dir=/tmp/rdma_cpu_proxy_test_results",
         "--nvlink_forward_threshold_chunks=5",
+        "--nvlink_forward_min_threshold_chunks=2",
+        "--nvlink_forward_max_threshold_chunks=6",
         "--cpu_affinity=0-95,192-287",
     };
-    const auto peer_port_config = rdma_proxy::load_config(17, const_cast<char**>(peer_port_args));
+    const auto peer_port_config = rdma_proxy::load_config(19, const_cast<char**>(peer_port_args));
     for (const auto& peer : peer_port_config.peers) {
         assert(peer.port == 18521);
     }
@@ -149,6 +154,8 @@ int main(int argc, char** argv) {
     assert(peer_port_config.local_iteration_sync_run_id == "test_cli");
     assert(peer_port_config.rdma_bandwidth_summary_dir == "/tmp/rdma_cpu_proxy_test_results");
     assert(peer_port_config.nvlink_forward_threshold_chunks == 5);
+    assert(peer_port_config.nvlink_forward_min_threshold_chunks == 2);
+    assert(peer_port_config.nvlink_forward_max_threshold_chunks == 6);
     assert(peer_port_config.cpu_affinity == "0-95,192-287");
 
     const char* signal_interval_args[] = {
@@ -188,6 +195,8 @@ int main(int argc, char** argv) {
   "mock_mode": true,
   "nvlink_forwarding_enabled": true,
   "nvlink_forward_threshold_chunks": 12,
+  "nvlink_forward_min_threshold_chunks": 0,
+  "nvlink_forward_max_threshold_chunks": 0,
   "nvlink_forward_chunk_tokens": 100,
   "nvlink_forward_use_batch_api": true,
   "nvlink_forward_stream_nonblocking": true,
@@ -220,6 +229,9 @@ int main(int argc, char** argv) {
     assert(nvlink_config.nvlink_forward_log_batches);
     assert(nvlink_config.nvlink_forward_threshold_tokens == 0);
     assert(nvlink_config.nvlink_forward_threshold_chunks == 12);
+    assert(nvlink_config.nvlink_forward_min_threshold_chunks == 0);
+    assert(nvlink_config.nvlink_forward_max_threshold_chunks == 0);
+    assert(!rdma_proxy::nvlink_forward_dynamic_threshold_enabled(nvlink_config));
     assert(rdma_proxy::effective_nvlink_forward_threshold_tokens(nvlink_config) == 300);
     assert(nvlink_config.log_qp_reports);
     assert(nvlink_config.log_marker_wait_reports);
@@ -254,6 +266,34 @@ int main(int argc, char** argv) {
     valid_batch_sync_config.nvlink_forward_local_batch_sync_enabled = true;
     valid_batch_sync_config.nvlink_forward_synchronize_batches = true;
     rdma_proxy::validate_config(valid_batch_sync_config);
+
+    auto dynamic_config = nvlink_config;
+    dynamic_config.nvlink_forward_use_round_robin = false;
+    dynamic_config.nvlink_forward_min_threshold_chunks = 2;
+    dynamic_config.nvlink_forward_max_threshold_chunks = 4;
+    assert(rdma_proxy::nvlink_forward_dynamic_threshold_enabled(dynamic_config));
+    rdma_proxy::validate_config(dynamic_config);
+
+    auto invalid_dynamic_range_config = dynamic_config;
+    invalid_dynamic_range_config.nvlink_forward_min_threshold_chunks = 5;
+    invalid_dynamic_range_config.nvlink_forward_max_threshold_chunks = 4;
+    bool rejected_dynamic_range = false;
+    try {
+        rdma_proxy::validate_config(invalid_dynamic_range_config);
+    } catch (const std::runtime_error&) {
+        rejected_dynamic_range = true;
+    }
+    assert(rejected_dynamic_range);
+
+    auto invalid_dynamic_round_robin_config = dynamic_config;
+    invalid_dynamic_round_robin_config.nvlink_forward_use_round_robin = true;
+    bool rejected_dynamic_round_robin = false;
+    try {
+        rdma_proxy::validate_config(invalid_dynamic_round_robin_config);
+    } catch (const std::runtime_error&) {
+        rejected_dynamic_round_robin = true;
+    }
+    assert(rejected_dynamic_round_robin);
 
     std::cout << rdma_proxy::config_summary(config) << '\n';
     std::cout << "test_config passed\n";
