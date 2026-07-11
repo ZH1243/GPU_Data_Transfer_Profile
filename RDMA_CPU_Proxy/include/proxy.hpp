@@ -85,6 +85,8 @@ private:
         std::size_t next_chunk_abs{0};
         std::size_t completed_chunk_abs{0};
         std::size_t batch_index_in_iteration{0};
+        uint64_t local_sync_sequence{0};
+        bool local_sync_published{false};
         ForwardingBatchPlan ready_plan;
     };
 
@@ -108,7 +110,8 @@ private:
         uint64_t iteration,
         std::size_t batch_index_in_iteration,
         uint64_t batch_sequence,
-        std::size_t intended_batch_chunks) const;
+        std::size_t available_batch_chunks,
+        std::size_t min_release_chunks) const;
     void local_nvlink_forward_batch_coordinator_loop();
     void run_iteration(uint64_t iteration);
     void synchronize_iteration_start(uint64_t iteration) const;
