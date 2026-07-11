@@ -31,6 +31,7 @@ int main(int argc, char** argv) {
     assert(config.nvlink_forward_threshold_chunks == 0);
     assert(config.nvlink_forward_min_threshold_chunks == 0);
     assert(config.nvlink_forward_max_threshold_chunks == 0);
+    assert(!config.nvlink_forward_out_of_order_chunks_enabled);
     assert(!rdma_proxy::nvlink_forward_dynamic_threshold_enabled(config));
     assert(rdma_proxy::effective_nvlink_forward_threshold_tokens(config) == 700);
     assert(config.nvlink_forward_chunk_tokens == 100);
@@ -137,9 +138,10 @@ int main(int argc, char** argv) {
         "--nvlink_forward_threshold_chunks=5",
         "--nvlink_forward_min_threshold_chunks=2",
         "--nvlink_forward_max_threshold_chunks=6",
+        "--nvlink_forward_out_of_order_chunks_enabled=true",
         "--cpu_affinity=0-95,192-287",
     };
-    const auto peer_port_config = rdma_proxy::load_config(19, const_cast<char**>(peer_port_args));
+    const auto peer_port_config = rdma_proxy::load_config(20, const_cast<char**>(peer_port_args));
     for (const auto& peer : peer_port_config.peers) {
         assert(peer.port == 18521);
     }
@@ -156,6 +158,7 @@ int main(int argc, char** argv) {
     assert(peer_port_config.nvlink_forward_threshold_chunks == 5);
     assert(peer_port_config.nvlink_forward_min_threshold_chunks == 2);
     assert(peer_port_config.nvlink_forward_max_threshold_chunks == 6);
+    assert(peer_port_config.nvlink_forward_out_of_order_chunks_enabled);
     assert(peer_port_config.cpu_affinity == "0-95,192-287");
 
     const char* signal_interval_args[] = {
@@ -197,6 +200,7 @@ int main(int argc, char** argv) {
   "nvlink_forward_threshold_chunks": 12,
   "nvlink_forward_min_threshold_chunks": 0,
   "nvlink_forward_max_threshold_chunks": 0,
+  "nvlink_forward_out_of_order_chunks_enabled": false,
   "nvlink_forward_chunk_tokens": 100,
   "nvlink_forward_use_batch_api": true,
   "nvlink_forward_stream_nonblocking": true,
@@ -231,6 +235,7 @@ int main(int argc, char** argv) {
     assert(nvlink_config.nvlink_forward_threshold_chunks == 12);
     assert(nvlink_config.nvlink_forward_min_threshold_chunks == 0);
     assert(nvlink_config.nvlink_forward_max_threshold_chunks == 0);
+    assert(!nvlink_config.nvlink_forward_out_of_order_chunks_enabled);
     assert(!rdma_proxy::nvlink_forward_dynamic_threshold_enabled(nvlink_config));
     assert(rdma_proxy::effective_nvlink_forward_threshold_tokens(nvlink_config) == 300);
     assert(nvlink_config.log_qp_reports);
@@ -273,6 +278,20 @@ int main(int argc, char** argv) {
     dynamic_config.nvlink_forward_max_threshold_chunks = 4;
     assert(rdma_proxy::nvlink_forward_dynamic_threshold_enabled(dynamic_config));
     rdma_proxy::validate_config(dynamic_config);
+
+    auto dynamic_out_of_order_config = dynamic_config;
+    dynamic_out_of_order_config.nvlink_forward_out_of_order_chunks_enabled = true;
+    rdma_proxy::validate_config(dynamic_out_of_order_config);
+
+    auto invalid_out_of_order_infinite_config = dynamic_out_of_order_config;
+    invalid_out_of_order_infinite_config.num_iterations = 0;
+    bool rejected_out_of_order_infinite = false;
+    try {
+        rdma_proxy::validate_config(invalid_out_of_order_infinite_config);
+    } catch (const std::runtime_error&) {
+        rejected_out_of_order_infinite = true;
+    }
+    assert(rejected_out_of_order_infinite);
 
     auto invalid_dynamic_range_config = dynamic_config;
     invalid_dynamic_range_config.nvlink_forward_min_threshold_chunks = 5;

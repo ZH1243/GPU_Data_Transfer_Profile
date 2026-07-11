@@ -62,6 +62,7 @@ struct ProxyConfig {
     std::size_t nvlink_forward_threshold_chunks{0};
     std::size_t nvlink_forward_min_threshold_chunks{0};
     std::size_t nvlink_forward_max_threshold_chunks{0};
+    bool nvlink_forward_out_of_order_chunks_enabled{false};
     std::size_t nvlink_forward_chunk_tokens{0};
     bool nvlink_forward_use_batch_api{true};
     bool nvlink_forward_stream_nonblocking{true};

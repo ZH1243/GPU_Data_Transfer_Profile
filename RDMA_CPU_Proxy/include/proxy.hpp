@@ -69,6 +69,12 @@ private:
         double sum_batch_bandwidth_gbits_per_sec{0.0};
     };
 
+    struct ForwardingOutOfOrderPeerState {
+        std::vector<uint8_t> ready_chunks;
+        std::vector<uint8_t> forwarded_chunks;
+        uint64_t applied_batch_sequence{0};
+    };
+
     struct LocalIterationSyncHeader;
     struct LocalIterationSyncSlot;
 
@@ -166,9 +172,22 @@ private:
     mutable std::mutex forwarding_mutex_;
     std::vector<std::size_t> forwarding_next_batch_by_peer_;
     std::vector<std::size_t> forwarding_next_chunk_by_peer_;
+    std::vector<uint64_t> forwarding_out_of_order_next_batch_by_peer_;
     std::unique_ptr<std::atomic<std::size_t>[]> forwarding_ready_batches_by_peer_;
     std::unique_ptr<std::atomic<std::size_t>[]> forwarding_ready_chunks_by_peer_;
+    std::unique_ptr<std::atomic<std::size_t>[]> forwarding_out_of_order_current_start_by_peer_;
+    std::unique_ptr<std::atomic<std::size_t>[]> forwarding_out_of_order_current_end_by_peer_;
+    std::unique_ptr<std::atomic<std::size_t>[]> forwarding_out_of_order_current_length_by_peer_;
+    std::unique_ptr<std::atomic<std::size_t>[]> forwarding_out_of_order_current_tail_ready_by_peer_;
+    std::unique_ptr<std::atomic<uint64_t>[]> forwarding_out_of_order_current_version_by_peer_;
+    std::unique_ptr<std::atomic<uint64_t>[]> forwarding_out_of_order_ready_next_batch_by_peer_;
+    std::unique_ptr<std::atomic<std::size_t>[]> forwarding_out_of_order_command_start_by_peer_;
+    std::unique_ptr<std::atomic<std::size_t>[]> forwarding_out_of_order_command_length_by_peer_;
+    std::unique_ptr<std::atomic<uint64_t>[]> forwarding_out_of_order_command_sequence_by_peer_;
+    std::unique_ptr<std::atomic<uint64_t>[]> forwarding_out_of_order_command_ack_by_peer_;
+    std::unique_ptr<std::atomic<std::size_t>[]> forwarding_out_of_order_issued_chunks_by_peer_;
     std::size_t forwarding_ready_peer_count_{0};
+    std::vector<ForwardingOutOfOrderPeerState> forwarding_out_of_order_peer_states_;
     std::vector<std::vector<uint8_t>> forwarding_routing_tables_by_peer_;
     std::vector<ForwardDestinationState> forwarding_destinations_;
     std::vector<ForwardingIterationStats> forwarding_iteration_stats_;

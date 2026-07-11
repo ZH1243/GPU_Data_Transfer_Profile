@@ -83,6 +83,8 @@ Set `nvlink_forward_min_threshold_chunks` and `nvlink_forward_max_threshold_chun
 
 When dynamic chunk-threshold forwarding is combined with `nvlink_forward_local_batch_sync_enabled=true`, each GPU proxy writes its candidate chunk count into the same-node shared-memory barrier. After all local GPU proxies have arrived, they use the minimum posted candidate count as the common next batch size, so all local proxies issue the same dynamic forwarding span. Dynamic chunk thresholds are not supported with `nvlink_forward_use_round_robin=true`.
 
+Set `nvlink_forward_out_of_order_chunks_enabled=true` to remove the contiguous-frontier requirement from dynamic chunk forwarding. In this mode, the forwarding-ready thread keeps per-chunk ready and forwarded state, finds the largest contiguous ready-but-not-forwarded chunk run, and publishes that run's start/end/length to the forwarding thread. The forwarding thread publishes each selected forwarded range back to the ready thread as a batch sequence, issues the GPU-to-GPU copy, and waits for the ready thread to acknowledge and publish the next batch sequence before selecting another range. This allows chunks 12 and 13 to forward even if chunk 11 is still missing. The selected batch size is still capped by `nvlink_forward_max_threshold_chunks`, still needs `nvlink_forward_min_threshold_chunks` unless it is a fully ready iteration tail, and still uses the same local GPU-proxy minimum-size sync when local batch sync is enabled. This mode requires finite `num_iterations`.
+
 In round-robin mode, the previous full-fanout rule is restored:
 
 ```text
@@ -253,6 +255,7 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_threshold_chunks`
 - `nvlink_forward_min_threshold_chunks`
 - `nvlink_forward_max_threshold_chunks`
+- `nvlink_forward_out_of_order_chunks_enabled`
 - `nvlink_forward_chunk_tokens`
 - `nvlink_forward_use_batch_api`
 - `nvlink_forward_stream_nonblocking`

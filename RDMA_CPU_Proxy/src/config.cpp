@@ -314,6 +314,9 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "nvlink_forward_max_threshold_chunks") {
         config.nvlink_forward_max_threshold_chunks = static_cast<std::size_t>(std::stoull(value));
     }
+    else if (key == "nvlink_forward_out_of_order_chunks_enabled") {
+        config.nvlink_forward_out_of_order_chunks_enabled = (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "nvlink_forward_chunk_tokens") {
         config.nvlink_forward_chunk_tokens = static_cast<std::size_t>(std::stoull(value));
     }
@@ -462,6 +465,10 @@ ProxyConfig load_config_file(const std::string& path) {
         object, "nvlink_forward_min_threshold_chunks", config.nvlink_forward_min_threshold_chunks);
     config.nvlink_forward_max_threshold_chunks = number_as<std::size_t>(
         object, "nvlink_forward_max_threshold_chunks", config.nvlink_forward_max_threshold_chunks);
+    config.nvlink_forward_out_of_order_chunks_enabled = get_bool(
+        object,
+        "nvlink_forward_out_of_order_chunks_enabled",
+        config.nvlink_forward_out_of_order_chunks_enabled);
     config.nvlink_forward_chunk_tokens = number_as<std::size_t>(
         object, "nvlink_forward_chunk_tokens", config.nvlink_forward_chunk_tokens);
     config.nvlink_forward_use_batch_api = get_bool(
@@ -622,10 +629,18 @@ void validate_config(const ProxyConfig& config) {
                 throw std::runtime_error(
                     "dynamic NVLink forwarding chunk thresholds do not support round-robin forwarding");
             }
+            if (config.nvlink_forward_out_of_order_chunks_enabled && config.num_iterations == 0) {
+                throw std::runtime_error(
+                    "nvlink_forward_out_of_order_chunks_enabled requires finite num_iterations");
+            }
         } else if (forward_threshold_tokens == 0) {
             throw std::runtime_error(
                 "nvlink_forward_threshold_tokens or nvlink_forward_threshold_chunks must be > 0 when "
                 "NVLink forwarding is enabled");
+        }
+        if (config.nvlink_forward_out_of_order_chunks_enabled && !dynamic_threshold) {
+            throw std::runtime_error(
+                "nvlink_forward_out_of_order_chunks_enabled requires dynamic chunk thresholds");
         }
         if (!dynamic_threshold &&
             config.nvlink_forward_threshold_tokens != 0 &&
@@ -712,6 +727,8 @@ std::string config_summary(const ProxyConfig& config) {
         << " nvlink_forward_threshold_chunks=" << config.nvlink_forward_threshold_chunks
         << " nvlink_forward_min_threshold_chunks=" << config.nvlink_forward_min_threshold_chunks
         << " nvlink_forward_max_threshold_chunks=" << config.nvlink_forward_max_threshold_chunks
+        << " nvlink_forward_out_of_order_chunks_enabled="
+        << (config.nvlink_forward_out_of_order_chunks_enabled ? "true" : "false")
         << " nvlink_forward_effective_threshold_tokens="
         << effective_nvlink_forward_threshold_tokens(config)
         << " nvlink_forward_chunk_tokens=" << config.nvlink_forward_chunk_tokens

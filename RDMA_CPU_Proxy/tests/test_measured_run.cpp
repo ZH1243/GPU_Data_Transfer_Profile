@@ -210,6 +210,7 @@ int main() {
         config0.nvlink_forwarding_enabled = true;
         config0.nvlink_forward_min_threshold_chunks = 1;
         config0.nvlink_forward_max_threshold_chunks = 3;
+        config0.nvlink_forward_out_of_order_chunks_enabled = true;
         config0.nvlink_forward_chunk_tokens = 8;
         config0.nvlink_forward_synchronize_batches = true;
         config0.nvlink_forward_local_batch_sync_enabled = true;

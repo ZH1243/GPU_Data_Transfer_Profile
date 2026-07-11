@@ -31,6 +31,7 @@
   "nvlink_forward_threshold_chunks": 0,
   "nvlink_forward_min_threshold_chunks": 0,
   "nvlink_forward_max_threshold_chunks": 0,
+  "nvlink_forward_out_of_order_chunks_enabled": false,
   "nvlink_forward_chunk_tokens": 100,
   "nvlink_forward_use_batch_api": true,
   "nvlink_forward_stream_nonblocking": true,

@@ -1036,6 +1036,7 @@ void Proxy::start_forwarding_thread() {
         std::lock_guard<std::mutex> lock(forwarding_mutex_);
         forwarding_next_batch_by_peer_.assign(peers_.size(), 0);
         forwarding_next_chunk_by_peer_.assign(peers_.size(), 0);
+        forwarding_out_of_order_next_batch_by_peer_.assign(peers_.size(), 0);
         forwarding_iteration_stats_.clear();
         forwarding_error_.clear();
     }
@@ -1050,6 +1051,52 @@ void Proxy::start_forwarding_thread() {
     for (std::size_t i = 0; i < forwarding_ready_peer_count_; ++i) {
         forwarding_ready_chunks_by_peer_[i].store(0);
     }
+    const bool out_of_order_chunks = config_.nvlink_forward_out_of_order_chunks_enabled;
+    forwarding_out_of_order_current_start_by_peer_.reset(
+        new std::atomic<std::size_t>[forwarding_ready_peer_count_]);
+    forwarding_out_of_order_current_end_by_peer_.reset(
+        new std::atomic<std::size_t>[forwarding_ready_peer_count_]);
+    forwarding_out_of_order_current_length_by_peer_.reset(
+        new std::atomic<std::size_t>[forwarding_ready_peer_count_]);
+    forwarding_out_of_order_current_tail_ready_by_peer_.reset(
+        new std::atomic<std::size_t>[forwarding_ready_peer_count_]);
+    forwarding_out_of_order_current_version_by_peer_.reset(
+        new std::atomic<uint64_t>[forwarding_ready_peer_count_]);
+    forwarding_out_of_order_ready_next_batch_by_peer_.reset(
+        new std::atomic<uint64_t>[forwarding_ready_peer_count_]);
+    forwarding_out_of_order_command_start_by_peer_.reset(
+        new std::atomic<std::size_t>[forwarding_ready_peer_count_]);
+    forwarding_out_of_order_command_length_by_peer_.reset(
+        new std::atomic<std::size_t>[forwarding_ready_peer_count_]);
+    forwarding_out_of_order_command_sequence_by_peer_.reset(
+        new std::atomic<uint64_t>[forwarding_ready_peer_count_]);
+    forwarding_out_of_order_command_ack_by_peer_.reset(
+        new std::atomic<uint64_t>[forwarding_ready_peer_count_]);
+    forwarding_out_of_order_issued_chunks_by_peer_.reset(
+        new std::atomic<std::size_t>[forwarding_ready_peer_count_]);
+    for (std::size_t i = 0; i < forwarding_ready_peer_count_; ++i) {
+        forwarding_out_of_order_current_start_by_peer_[i].store(0);
+        forwarding_out_of_order_current_end_by_peer_[i].store(0);
+        forwarding_out_of_order_current_length_by_peer_[i].store(0);
+        forwarding_out_of_order_current_tail_ready_by_peer_[i].store(0);
+        forwarding_out_of_order_current_version_by_peer_[i].store(0);
+        forwarding_out_of_order_ready_next_batch_by_peer_[i].store(0);
+        forwarding_out_of_order_command_start_by_peer_[i].store(0);
+        forwarding_out_of_order_command_length_by_peer_[i].store(0);
+        forwarding_out_of_order_command_sequence_by_peer_[i].store(0);
+        forwarding_out_of_order_command_ack_by_peer_[i].store(0);
+        forwarding_out_of_order_issued_chunks_by_peer_[i].store(0);
+    }
+    forwarding_out_of_order_peer_states_.clear();
+    if (out_of_order_chunks) {
+        const auto total_chunks = config_.num_iterations * make_chunks().size();
+        forwarding_out_of_order_peer_states_.resize(peers_.size());
+        for (auto& state : forwarding_out_of_order_peer_states_) {
+            state.ready_chunks.assign(total_chunks, 0);
+            state.forwarded_chunks.assign(total_chunks, 0);
+            state.applied_batch_sequence = 0;
+        }
+    }
     forwarding_batch_available_calls_.store(0);
     forwarding_batch_available_total_ns_.store(0);
     forwarding_batches_issued_.store(0);
@@ -1063,6 +1110,7 @@ void Proxy::start_forwarding_thread() {
                         " threshold_chunks=", config_.nvlink_forward_threshold_chunks,
                         " min_threshold_chunks=", config_.nvlink_forward_min_threshold_chunks,
                         " max_threshold_chunks=", config_.nvlink_forward_max_threshold_chunks,
+                        " out_of_order_chunks=", out_of_order_chunks ? "true" : "false",
                         " chunk_tokens=", config_.nvlink_forward_chunk_tokens,
                         " use_batch_api=", config_.nvlink_forward_use_batch_api ? "true" : "false");
 }
@@ -1082,7 +1130,19 @@ void Proxy::stop_forwarding_thread() {
     forwarding_routing_tables_by_peer_.clear();
     forwarding_ready_batches_by_peer_.reset();
     forwarding_ready_chunks_by_peer_.reset();
+    forwarding_out_of_order_current_start_by_peer_.reset();
+    forwarding_out_of_order_current_end_by_peer_.reset();
+    forwarding_out_of_order_current_length_by_peer_.reset();
+    forwarding_out_of_order_current_tail_ready_by_peer_.reset();
+    forwarding_out_of_order_current_version_by_peer_.reset();
+    forwarding_out_of_order_ready_next_batch_by_peer_.reset();
+    forwarding_out_of_order_command_start_by_peer_.reset();
+    forwarding_out_of_order_command_length_by_peer_.reset();
+    forwarding_out_of_order_command_sequence_by_peer_.reset();
+    forwarding_out_of_order_command_ack_by_peer_.reset();
+    forwarding_out_of_order_issued_chunks_by_peer_.reset();
     forwarding_ready_peer_count_ = 0;
+    forwarding_out_of_order_peer_states_.clear();
     destroy_cuda_stream(forwarding_stream_, config_.mock_mode);
     forwarding_stream_ = nullptr;
 }
@@ -1556,7 +1616,119 @@ void Proxy::forwarding_ready_loop() {
 
                 const auto& peer = peers_[peer_index];
 
-                if (dynamic_threshold) {
+                if (dynamic_threshold && config_.nvlink_forward_out_of_order_chunks_enabled) {
+                    if (peer_index >= forwarding_out_of_order_peer_states_.size()) {
+                        throw std::runtime_error("missing NVLink out-of-order forwarding state");
+                    }
+                    auto& state = forwarding_out_of_order_peer_states_[peer_index];
+                    bool state_changed = false;
+                    uint64_t pending_ack_sequence = 0;
+
+                    const auto command_sequence =
+                        forwarding_out_of_order_command_sequence_by_peer_[peer_index].load();
+                    if (command_sequence > state.applied_batch_sequence) {
+                        const auto command_start =
+                            forwarding_out_of_order_command_start_by_peer_[peer_index].load();
+                        const auto command_length =
+                            forwarding_out_of_order_command_length_by_peer_[peer_index].load();
+                        if (command_length == 0 || command_start + command_length > state.forwarded_chunks.size()) {
+                            throw std::runtime_error("invalid NVLink out-of-order forwarded range command");
+                        }
+                        for (std::size_t i = 0; i < command_length; ++i) {
+                            state.forwarded_chunks[command_start + i] = 1;
+                        }
+                        state.applied_batch_sequence = command_sequence;
+                        pending_ack_sequence = command_sequence;
+                        state_changed = true;
+                    }
+
+                    const auto availability_start = std::chrono::steady_clock::now();
+                    for (std::size_t global_chunk = 0; global_chunk < total_chunks; ++global_chunk) {
+                        if (state.ready_chunks[global_chunk] != 0) continue;
+                        const uint64_t iteration =
+                            static_cast<uint64_t>(global_chunk / chunks_per_iteration);
+                        const auto chunk_in_iteration = global_chunk % chunks_per_iteration;
+                        const auto required_count = iteration + 1;
+                        if (forwarding_chunk_available(peer, chunks[chunk_in_iteration], required_count)) {
+                            state.ready_chunks[global_chunk] = 1;
+                            state_changed = true;
+                        }
+                    }
+                    const auto availability_elapsed_ns =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - availability_start).count();
+                    forwarding_batch_available_calls_.fetch_add(1);
+                    forwarding_batch_available_total_ns_.fetch_add(
+                        static_cast<uint64_t>(std::max<int64_t>(0, availability_elapsed_ns)));
+
+                    if (!state_changed) {
+                        continue;
+                    }
+
+                    std::size_t best_start = 0;
+                    std::size_t best_length = 0;
+                    bool best_tail_ready = false;
+                    for (std::size_t iteration = 0; iteration < config_.num_iterations; ++iteration) {
+                        const auto iteration_start = iteration * chunks_per_iteration;
+                        const auto iteration_end = iteration_start + chunks_per_iteration;
+                        bool any_unforwarded = false;
+                        bool all_unforwarded_ready = true;
+                        for (std::size_t global_chunk = iteration_start;
+                             global_chunk < iteration_end;
+                             ++global_chunk) {
+                            if (state.forwarded_chunks[global_chunk] != 0) continue;
+                            any_unforwarded = true;
+                            if (state.ready_chunks[global_chunk] == 0) {
+                                all_unforwarded_ready = false;
+                            }
+                        }
+                        if (!any_unforwarded) continue;
+
+                        std::size_t run_start = 0;
+                        std::size_t run_length = 0;
+                        auto flush_run = [&]() {
+                            if (run_length == 0) return;
+                            if (run_length > best_length) {
+                                best_start = run_start;
+                                best_length = run_length;
+                                best_tail_ready = all_unforwarded_ready;
+                            }
+                            run_length = 0;
+                        };
+                        for (std::size_t global_chunk = iteration_start;
+                             global_chunk < iteration_end;
+                             ++global_chunk) {
+                            const bool available =
+                                state.ready_chunks[global_chunk] != 0 &&
+                                state.forwarded_chunks[global_chunk] == 0;
+                            if (!available) {
+                                flush_run();
+                                continue;
+                            }
+                            if (run_length == 0) {
+                                run_start = global_chunk;
+                            }
+                            ++run_length;
+                        }
+                        flush_run();
+                    }
+
+                    const auto current_version =
+                        forwarding_out_of_order_current_version_by_peer_[peer_index].load();
+                    forwarding_out_of_order_current_version_by_peer_[peer_index].store(current_version + 1);
+                    forwarding_out_of_order_current_start_by_peer_[peer_index].store(best_start);
+                    forwarding_out_of_order_current_end_by_peer_[peer_index].store(
+                        best_length == 0 ? best_start : best_start + best_length - 1);
+                    forwarding_out_of_order_current_length_by_peer_[peer_index].store(best_length);
+                    forwarding_out_of_order_current_tail_ready_by_peer_[peer_index].store(
+                        best_tail_ready ? 1 : 0);
+                    forwarding_out_of_order_current_version_by_peer_[peer_index].store(current_version + 2);
+                    if (pending_ack_sequence != 0) {
+                        forwarding_out_of_order_ready_next_batch_by_peer_[peer_index].store(pending_ack_sequence);
+                        forwarding_out_of_order_command_ack_by_peer_[peer_index].store(pending_ack_sequence);
+                    }
+                    progressed = true;
+                } else if (dynamic_threshold) {
                     auto next_ready_chunk =
                         forwarding_ready_chunks_by_peer_[peer_index].load();
                     if (finite_iterations && next_ready_chunk >= total_chunks) {
@@ -1662,7 +1834,128 @@ void Proxy::forwarding_loop() {
                 }
                 const auto& peer = peers_[peer_index];
 
-                if (dynamic_threshold) {
+                if (dynamic_threshold && config_.nvlink_forward_out_of_order_chunks_enabled) {
+                    uint64_t next_batch = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(forwarding_mutex_);
+                        next_batch = forwarding_out_of_order_next_batch_by_peer_.at(peer_index);
+                    }
+                    const auto ready_next_batch =
+                        forwarding_out_of_order_ready_next_batch_by_peer_[peer_index].load();
+                    if (ready_next_batch != next_batch) {
+                        continue;
+                    }
+                    if (finite_iterations) {
+                        const auto issued_chunks =
+                            forwarding_out_of_order_issued_chunks_by_peer_[peer_index].load();
+                        if (issued_chunks >= total_chunks) {
+                            continue;
+                        }
+                    }
+
+                    std::size_t current_start = 0;
+                    std::size_t current_length = 0;
+                    bool tail_ready = false;
+                    bool snapshot_valid = false;
+                    for (int attempt = 0; attempt < 4; ++attempt) {
+                        const auto version_before =
+                            forwarding_out_of_order_current_version_by_peer_[peer_index].load();
+                        if ((version_before & 1ULL) != 0) {
+                            cpu_relax();
+                            continue;
+                        }
+                        current_start =
+                            forwarding_out_of_order_current_start_by_peer_[peer_index].load();
+                        current_length =
+                            forwarding_out_of_order_current_length_by_peer_[peer_index].load();
+                        tail_ready =
+                            forwarding_out_of_order_current_tail_ready_by_peer_[peer_index].load() != 0;
+                        const auto version_after =
+                            forwarding_out_of_order_current_version_by_peer_[peer_index].load();
+                        if (version_before == version_after && (version_after & 1ULL) == 0) {
+                            snapshot_valid = true;
+                            break;
+                        }
+                        cpu_relax();
+                    }
+                    if (!snapshot_valid) {
+                        continue;
+                    }
+                    if (current_length == 0) {
+                        continue;
+                    }
+
+                    std::size_t batch_chunks =
+                        std::min(current_length, config_.nvlink_forward_max_threshold_chunks);
+                    if (batch_chunks < config_.nvlink_forward_min_threshold_chunks) {
+                        if (!tail_ready) {
+                            continue;
+                        }
+                        batch_chunks = current_length;
+                    }
+                    if (batch_chunks == 0) {
+                        continue;
+                    }
+
+                    const uint64_t iteration = static_cast<uint64_t>(current_start / chunks_per_iteration);
+                    const auto chunk_in_iteration = current_start % chunks_per_iteration;
+                    if (chunk_in_iteration + batch_chunks > chunks_per_iteration) {
+                        throw std::runtime_error("NVLink out-of-order forwarding batch crosses iteration boundary");
+                    }
+
+                    if (config_.nvlink_forward_local_batch_sync_enabled) {
+                        ++local_batch_sync_sequence;
+                        batch_chunks = synchronize_local_nvlink_forward_batch_start(
+                            iteration,
+                            chunk_in_iteration,
+                            local_batch_sync_sequence,
+                            batch_chunks);
+                    }
+                    if (batch_chunks == 0 || batch_chunks > current_length ||
+                        chunk_in_iteration + batch_chunks > chunks_per_iteration) {
+                        throw std::runtime_error("local NVLink forwarding batch synchronization selected "
+                                                 "an invalid out-of-order batch size");
+                    }
+
+                    const auto command_sequence = next_batch + 1;
+                    forwarding_out_of_order_command_start_by_peer_[peer_index].store(current_start);
+                    forwarding_out_of_order_command_length_by_peer_[peer_index].store(batch_chunks);
+                    forwarding_out_of_order_command_sequence_by_peer_[peer_index].store(command_sequence);
+
+                    const auto batch_start_token = chunks[chunk_in_iteration].start_token;
+                    const auto last_chunk = chunk_in_iteration + batch_chunks - 1;
+                    const auto batch_end_token =
+                        chunks[last_chunk].start_token + chunks[last_chunk].num_tokens;
+                    const auto batch_tokens = batch_end_token - batch_start_token;
+
+                    if (config_.nvlink_forward_log_batches) {
+                        RDMA_PROXY_LOG_INFO("nvlink_forward_out_of_order_batch_ready iteration=", iteration,
+                                            " local_rank=", config_.node_rank,
+                                            " local_gpu=", config_.local_gpu_index,
+                                            " peer_rank=", peer.peer_rank,
+                                            " batch_sequence=", command_sequence,
+                                            " batch_start_chunk=", chunk_in_iteration,
+                                            " global_start_chunk=", current_start,
+                                            " batch_chunks=", batch_chunks,
+                                            " available_run_chunks=", current_length,
+                                            " batch_start_token=", batch_start_token,
+                                            " batch_tokens=", batch_tokens);
+                    }
+                    issue_forwarding_batch(
+                        peer,
+                        cuda_buffers_.peer_buffers()[peer_index],
+                        iteration,
+                        chunk_in_iteration,
+                        batch_start_token,
+                        batch_tokens);
+                    {
+                        std::lock_guard<std::mutex> lock(forwarding_mutex_);
+                        forwarding_out_of_order_next_batch_by_peer_.at(peer_index) = command_sequence;
+                    }
+                    forwarding_out_of_order_issued_chunks_by_peer_[peer_index].fetch_add(batch_chunks);
+                    forwarding_batches_issued_.fetch_add(1);
+                    progressed = true;
+                } else if (dynamic_threshold) {
                     std::size_t next_chunk = 0;
                     {
                         std::lock_guard<std::mutex> lock(forwarding_mutex_);
@@ -1808,6 +2101,8 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
     if (!config_.nvlink_forwarding_enabled) return;
     const auto chunks = make_chunks();
     const bool dynamic_threshold = nvlink_forward_dynamic_threshold_enabled(config_);
+    const bool out_of_order_chunks =
+        dynamic_threshold && config_.nvlink_forward_out_of_order_chunks_enabled;
     const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config_);
     const auto batches_per_iteration =
         dynamic_threshold ? std::size_t{0} : config_.num_tokens / forward_threshold_tokens;
@@ -1823,7 +2118,14 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
         bool complete = true;
         {
             std::lock_guard<std::mutex> lock(forwarding_mutex_);
-            if (dynamic_threshold) {
+            if (out_of_order_chunks) {
+                for (std::size_t i = 0; i < forwarding_ready_peer_count_; ++i) {
+                    if (forwarding_out_of_order_issued_chunks_by_peer_[i].load() < required_chunks) {
+                        complete = false;
+                        break;
+                    }
+                }
+            } else if (dynamic_threshold) {
                 for (const auto next_chunk : forwarding_next_chunk_by_peer_) {
                     if (next_chunk < required_chunks) {
                         complete = false;
@@ -1866,6 +2168,7 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
                                     " batches_per_peer=", dynamic_threshold ? std::size_t{0} : batches_per_iteration,
                                     " chunks_per_peer=", dynamic_threshold ? chunks_per_iteration : std::size_t{0},
                                     " dynamic_batch_count=", dynamic_threshold ? stats.batch_count : std::size_t{0},
+                                    " out_of_order_chunks=", out_of_order_chunks ? "true" : "false",
                                     " synchronized_batch_count=", stats.batch_count,
                                     " bandwidth_sample_count=", stats.bandwidth_sample_count,
                                     " empty_bandwidth_sample_count=",
@@ -1884,7 +2187,8 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
                                     " local_rank=", config_.node_rank,
                                     " local_gpu=", config_.local_gpu_index,
                                     " batches_per_peer=", dynamic_threshold ? std::size_t{0} : batches_per_iteration,
-                                    " chunks_per_peer=", dynamic_threshold ? chunks_per_iteration : std::size_t{0});
+                                    " chunks_per_peer=", dynamic_threshold ? chunks_per_iteration : std::size_t{0},
+                                    " out_of_order_chunks=", out_of_order_chunks ? "true" : "false");
             }
             return;
         }
@@ -1896,7 +2200,12 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
                 << " required_batches_per_peer=" << required_batches
                 << " required_chunks_per_peer=" << required_chunks;
             std::lock_guard<std::mutex> lock(forwarding_mutex_);
-            if (dynamic_threshold) {
+            if (out_of_order_chunks) {
+                for (std::size_t i = 0; i < forwarding_ready_peer_count_; ++i) {
+                    out << " peer" << peers_[i].peer_rank
+                        << "_issued_chunks=" << forwarding_out_of_order_issued_chunks_by_peer_[i].load();
+                }
+            } else if (dynamic_threshold) {
                 for (std::size_t i = 0; i < forwarding_next_chunk_by_peer_.size(); ++i) {
                     out << " peer" << peers_[i].peer_rank
                         << "_chunks=" << forwarding_next_chunk_by_peer_[i];
