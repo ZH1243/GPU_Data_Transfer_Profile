@@ -1642,13 +1642,33 @@ void Proxy::forwarding_ready_loop() {
                         state_changed = true;
                     }
 
+                    if (pending_ack_sequence == 0) {
+                        const auto published_length =
+                            forwarding_out_of_order_current_length_by_peer_[peer_index].load();
+                        const bool published_tail_ready =
+                            forwarding_out_of_order_current_tail_ready_by_peer_[peer_index].load() != 0;
+                        if (published_length >= config_.nvlink_forward_min_threshold_chunks ||
+                            (published_tail_ready && published_length > 0)) {
+                            continue;
+                        }
+                    }
+
+                    const auto issued_chunks =
+                        forwarding_out_of_order_issued_chunks_by_peer_[peer_index].load();
+                    if (finite_iterations && issued_chunks >= total_chunks) {
+                        continue;
+                    }
+                    const auto active_iteration = issued_chunks / chunks_per_iteration;
+                    const auto active_iteration_start = active_iteration * chunks_per_iteration;
+                    const auto active_iteration_end = active_iteration_start + chunks_per_iteration;
+
                     const auto availability_start = std::chrono::steady_clock::now();
-                    for (std::size_t global_chunk = 0; global_chunk < total_chunks; ++global_chunk) {
+                    for (std::size_t global_chunk = active_iteration_start;
+                         global_chunk < active_iteration_end;
+                         ++global_chunk) {
                         if (state.ready_chunks[global_chunk] != 0) continue;
-                        const uint64_t iteration =
-                            static_cast<uint64_t>(global_chunk / chunks_per_iteration);
                         const auto chunk_in_iteration = global_chunk % chunks_per_iteration;
-                        const auto required_count = iteration + 1;
+                        const auto required_count = active_iteration + 1;
                         if (forwarding_chunk_available(peer, chunks[chunk_in_iteration], required_count)) {
                             state.ready_chunks[global_chunk] = 1;
                             state_changed = true;
@@ -1668,50 +1688,44 @@ void Proxy::forwarding_ready_loop() {
                     std::size_t best_start = 0;
                     std::size_t best_length = 0;
                     bool best_tail_ready = false;
-                    for (std::size_t iteration = 0; iteration < config_.num_iterations; ++iteration) {
-                        const auto iteration_start = iteration * chunks_per_iteration;
-                        const auto iteration_end = iteration_start + chunks_per_iteration;
-                        bool any_unforwarded = false;
-                        bool all_unforwarded_ready = true;
-                        for (std::size_t global_chunk = iteration_start;
-                             global_chunk < iteration_end;
-                             ++global_chunk) {
-                            if (state.forwarded_chunks[global_chunk] != 0) continue;
-                            any_unforwarded = true;
-                            if (state.ready_chunks[global_chunk] == 0) {
-                                all_unforwarded_ready = false;
-                            }
+                    bool any_unforwarded = false;
+                    bool all_unforwarded_ready = true;
+                    for (std::size_t global_chunk = active_iteration_start;
+                         global_chunk < active_iteration_end;
+                         ++global_chunk) {
+                        if (state.forwarded_chunks[global_chunk] != 0) continue;
+                        any_unforwarded = true;
+                        if (state.ready_chunks[global_chunk] == 0) {
+                            all_unforwarded_ready = false;
                         }
-                        if (!any_unforwarded) continue;
-
-                        std::size_t run_start = 0;
-                        std::size_t run_length = 0;
-                        auto flush_run = [&]() {
-                            if (run_length == 0) return;
-                            if (run_length > best_length) {
-                                best_start = run_start;
-                                best_length = run_length;
-                                best_tail_ready = all_unforwarded_ready;
-                            }
-                            run_length = 0;
-                        };
-                        for (std::size_t global_chunk = iteration_start;
-                             global_chunk < iteration_end;
-                             ++global_chunk) {
-                            const bool available =
-                                state.ready_chunks[global_chunk] != 0 &&
-                                state.forwarded_chunks[global_chunk] == 0;
-                            if (!available) {
-                                flush_run();
-                                continue;
-                            }
-                            if (run_length == 0) {
-                                run_start = global_chunk;
-                            }
-                            ++run_length;
-                        }
-                        flush_run();
                     }
+                    std::size_t run_start = 0;
+                    std::size_t run_length = 0;
+                    auto flush_run = [&]() {
+                        if (run_length == 0) return;
+                        if (run_length > best_length) {
+                            best_start = run_start;
+                            best_length = run_length;
+                            best_tail_ready = any_unforwarded && all_unforwarded_ready;
+                        }
+                        run_length = 0;
+                    };
+                    for (std::size_t global_chunk = active_iteration_start;
+                         global_chunk < active_iteration_end;
+                         ++global_chunk) {
+                        const bool available =
+                            state.ready_chunks[global_chunk] != 0 &&
+                            state.forwarded_chunks[global_chunk] == 0;
+                        if (!available) {
+                            flush_run();
+                            continue;
+                        }
+                        if (run_length == 0) {
+                            run_start = global_chunk;
+                        }
+                        ++run_length;
+                    }
+                    flush_run();
 
                     const auto current_version =
                         forwarding_out_of_order_current_version_by_peer_[peer_index].load();
