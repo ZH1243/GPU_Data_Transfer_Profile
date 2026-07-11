@@ -70,8 +70,7 @@ private:
     };
 
     struct ForwardingOutOfOrderPeerState {
-        std::vector<uint8_t> ready_chunks;
-        std::vector<uint8_t> forwarded_chunks;
+        std::vector<int8_t> chunk_status;
         uint64_t applied_batch_sequence{0};
     };
 

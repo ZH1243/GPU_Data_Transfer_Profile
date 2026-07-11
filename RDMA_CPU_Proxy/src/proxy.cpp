@@ -1092,8 +1092,7 @@ void Proxy::start_forwarding_thread() {
         const auto total_chunks = config_.num_iterations * make_chunks().size();
         forwarding_out_of_order_peer_states_.resize(peers_.size());
         for (auto& state : forwarding_out_of_order_peer_states_) {
-            state.ready_chunks.assign(total_chunks, 0);
-            state.forwarded_chunks.assign(total_chunks, 0);
+            state.chunk_status.assign(total_chunks, -1);
             state.applied_batch_sequence = 0;
         }
     }
@@ -1631,11 +1630,11 @@ void Proxy::forwarding_ready_loop() {
                             forwarding_out_of_order_command_start_by_peer_[peer_index].load();
                         const auto command_length =
                             forwarding_out_of_order_command_length_by_peer_[peer_index].load();
-                        if (command_length == 0 || command_start + command_length > state.forwarded_chunks.size()) {
+                        if (command_length == 0 || command_start + command_length > state.chunk_status.size()) {
                             throw std::runtime_error("invalid NVLink out-of-order forwarded range command");
                         }
                         for (std::size_t i = 0; i < command_length; ++i) {
-                            state.forwarded_chunks[command_start + i] = 1;
+                            state.chunk_status[command_start + i] = 1;
                         }
                         state.applied_batch_sequence = command_sequence;
                         pending_ack_sequence = command_sequence;
@@ -1662,15 +1661,26 @@ void Proxy::forwarding_ready_loop() {
                     const auto active_iteration_start = active_iteration * chunks_per_iteration;
                     const auto active_iteration_end = active_iteration_start + chunks_per_iteration;
 
+                    std::vector<std::vector<uint64_t>> worker_immediate_counts;
+                    worker_immediate_counts.reserve(peer.workers.size());
                     const auto availability_start = std::chrono::steady_clock::now();
+                    for (const auto& worker : peer.workers) {
+                        worker_immediate_counts.push_back(worker->received_immediate_counts());
+                    }
                     for (std::size_t global_chunk = active_iteration_start;
                          global_chunk < active_iteration_end;
                          ++global_chunk) {
-                        if (state.ready_chunks[global_chunk] != 0) continue;
+                        if (state.chunk_status[global_chunk] != -1) continue;
                         const auto chunk_in_iteration = global_chunk % chunks_per_iteration;
                         const auto required_count = active_iteration + 1;
-                        if (forwarding_chunk_available(peer, chunks[chunk_in_iteration], required_count)) {
-                            state.ready_chunks[global_chunk] = 1;
+                        uint64_t total = 0;
+                        for (const auto& counts : worker_immediate_counts) {
+                            if (chunk_in_iteration < counts.size()) {
+                                total += counts[chunk_in_iteration];
+                            }
+                        }
+                        if (total >= required_count) {
+                            state.chunk_status[global_chunk] = 0;
                             state_changed = true;
                         }
                     }
@@ -1693,9 +1703,9 @@ void Proxy::forwarding_ready_loop() {
                     for (std::size_t global_chunk = active_iteration_start;
                          global_chunk < active_iteration_end;
                          ++global_chunk) {
-                        if (state.forwarded_chunks[global_chunk] != 0) continue;
+                        if (state.chunk_status[global_chunk] == 1) continue;
                         any_unforwarded = true;
-                        if (state.ready_chunks[global_chunk] == 0) {
+                        if (state.chunk_status[global_chunk] == -1) {
                             all_unforwarded_ready = false;
                         }
                     }
@@ -1703,7 +1713,9 @@ void Proxy::forwarding_ready_loop() {
                     std::size_t run_length = 0;
                     auto flush_run = [&]() {
                         if (run_length == 0) return;
-                        if (run_length > best_length) {
+                        if (best_length == 0 &&
+                            (run_length >= config_.nvlink_forward_min_threshold_chunks ||
+                             (any_unforwarded && all_unforwarded_ready))) {
                             best_start = run_start;
                             best_length = run_length;
                             best_tail_ready = any_unforwarded && all_unforwarded_ready;
@@ -1713,11 +1725,10 @@ void Proxy::forwarding_ready_loop() {
                     for (std::size_t global_chunk = active_iteration_start;
                          global_chunk < active_iteration_end;
                          ++global_chunk) {
-                        const bool available =
-                            state.ready_chunks[global_chunk] != 0 &&
-                            state.forwarded_chunks[global_chunk] == 0;
+                        const bool available = state.chunk_status[global_chunk] == 0;
                         if (!available) {
                             flush_run();
+                            if (best_length != 0) break;
                             continue;
                         }
                         if (run_length == 0) {
@@ -1725,7 +1736,9 @@ void Proxy::forwarding_ready_loop() {
                         }
                         ++run_length;
                     }
-                    flush_run();
+                    if (best_length == 0) {
+                        flush_run();
+                    }
 
                     const auto current_version =
                         forwarding_out_of_order_current_version_by_peer_[peer_index].load();
