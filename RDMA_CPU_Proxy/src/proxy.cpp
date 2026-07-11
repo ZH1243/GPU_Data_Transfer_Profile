@@ -1371,6 +1371,67 @@ Proxy::ForwardingBatchPlan Proxy::make_forwarding_batch_plan(
     return plan;
 }
 
+bool Proxy::try_prepare_forwarding_plan(
+    std::size_t peer_index,
+    const std::vector<ChunkDescriptor>& chunks,
+    bool finite_iterations,
+    std::size_t total_chunks) {
+    if (chunks.empty()) return false;
+
+    const auto chunks_per_iteration = chunks.size();
+    std::size_t next_chunk_abs = 0;
+    std::size_t batch_index_in_iteration = 0;
+    {
+        std::lock_guard<std::mutex> lock(forwarding_mutex_);
+        if (peer_index >= forwarding_peer_progress_.size()) {
+            throw std::runtime_error("NVLink forwarding ready peer index out of range");
+        }
+        const auto& progress = forwarding_peer_progress_[peer_index];
+        if (progress.ready_plan.ready) return false;
+        next_chunk_abs = progress.next_chunk_abs;
+        batch_index_in_iteration = progress.batch_index_in_iteration;
+    }
+
+    if (finite_iterations && next_chunk_abs >= total_chunks) return false;
+
+    const uint64_t iteration = static_cast<uint64_t>(next_chunk_abs / chunks_per_iteration);
+    const auto start_chunk_index = next_chunk_abs % chunks_per_iteration;
+    const auto remaining_chunks = chunks_per_iteration - start_chunk_index;
+    const auto max_probe_chunks =
+        std::min(effective_nvlink_forward_max_threshold_chunks(config_), remaining_chunks);
+    const auto required_count = iteration + 1;
+    const auto& peer = peers_[peer_index];
+
+    const auto availability_start = std::chrono::steady_clock::now();
+    const auto available_chunks = available_forwarding_chunks(
+        peer,
+        chunks,
+        start_chunk_index,
+        max_probe_chunks,
+        required_count);
+    const auto availability_elapsed_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - availability_start).count();
+    forwarding_batch_available_calls_.fetch_add(1);
+    forwarding_batch_available_total_ns_.fetch_add(
+        static_cast<uint64_t>(std::max<int64_t>(0, availability_elapsed_ns)));
+
+    auto plan = make_forwarding_batch_plan(
+        chunks,
+        next_chunk_abs,
+        batch_index_in_iteration,
+        available_chunks);
+    if (!plan.ready) return false;
+
+    std::lock_guard<std::mutex> lock(forwarding_mutex_);
+    auto& progress = forwarding_peer_progress_.at(peer_index);
+    if (!progress.ready_plan.ready && progress.next_chunk_abs == next_chunk_abs) {
+        progress.ready_plan = plan;
+        return true;
+    }
+    return false;
+}
+
 void Proxy::issue_forwarding_batch(
     const PeerState& peer,
     const PeerGpuBuffers& buffers,
@@ -1597,63 +1658,14 @@ void Proxy::forwarding_ready_loop() {
             check_forwarding_error();
             bool progressed = false;
             for (const auto peer_index : peer_order) {
-                std::size_t next_chunk_abs = 0;
-                std::size_t batch_index_in_iteration = 0;
-                {
-                    std::lock_guard<std::mutex> lock(forwarding_mutex_);
-                    if (peer_index >= forwarding_peer_progress_.size()) {
-                        throw std::runtime_error("NVLink forwarding ready peer index out of range");
-                    }
-                    const auto& progress = forwarding_peer_progress_[peer_index];
-                    if (progress.ready_plan.ready) continue;
-                    next_chunk_abs = progress.next_chunk_abs;
-                    batch_index_in_iteration = progress.batch_index_in_iteration;
-                }
-
-                if (finite_iterations && next_chunk_abs >= total_chunks) continue;
-
-                const uint64_t iteration = static_cast<uint64_t>(next_chunk_abs / chunks_per_iteration);
-                const auto start_chunk_index = next_chunk_abs % chunks_per_iteration;
-                const auto remaining_chunks = chunks_per_iteration - start_chunk_index;
-                const auto max_probe_chunks =
-                    std::min(effective_nvlink_forward_max_threshold_chunks(config_), remaining_chunks);
-                const auto required_count = iteration + 1;
-                const auto& peer = peers_[peer_index];
-
-                const auto availability_start = std::chrono::steady_clock::now();
-                const auto available_chunks = available_forwarding_chunks(
-                    peer,
+                progressed = try_prepare_forwarding_plan(
+                    peer_index,
                     chunks,
-                    start_chunk_index,
-                    max_probe_chunks,
-                    required_count);
-                const auto availability_elapsed_ns =
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - availability_start).count();
-                forwarding_batch_available_calls_.fetch_add(1);
-                forwarding_batch_available_total_ns_.fetch_add(
-                    static_cast<uint64_t>(std::max<int64_t>(0, availability_elapsed_ns)));
-
-                auto plan = make_forwarding_batch_plan(
-                    chunks,
-                    next_chunk_abs,
-                    batch_index_in_iteration,
-                    available_chunks);
-                if (!plan.ready) {
-                    continue;
-                }
-
-                {
-                    std::lock_guard<std::mutex> lock(forwarding_mutex_);
-                    auto& progress = forwarding_peer_progress_.at(peer_index);
-                    if (!progress.ready_plan.ready && progress.next_chunk_abs == next_chunk_abs) {
-                        progress.ready_plan = plan;
-                        progressed = true;
-                    }
-                }
+                    finite_iterations,
+                    total_chunks) || progressed;
             }
             if (!progressed) {
-                std::this_thread::sleep_for(std::chrono::microseconds(10));
+                cpu_relax();
             }
         }
     } catch (const std::exception& e) {
@@ -1733,11 +1745,16 @@ void Proxy::forwarding_loop() {
                         ++progress.batch_index_in_iteration;
                     }
                 }
+                try_prepare_forwarding_plan(
+                    peer_index,
+                    chunks,
+                    finite_iterations,
+                    total_chunks);
                 forwarding_batches_issued_.fetch_add(1);
                 progressed = true;
             }
             if (!progressed) {
-                std::this_thread::sleep_for(std::chrono::microseconds(10));
+                cpu_relax();
             }
         }
     } catch (const std::exception& e) {

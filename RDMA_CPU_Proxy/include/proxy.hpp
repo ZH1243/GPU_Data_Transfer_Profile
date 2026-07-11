@@ -149,6 +149,11 @@ private:
         std::size_t next_chunk_abs,
         std::size_t batch_index_in_iteration,
         std::size_t available_chunk_count) const;
+    bool try_prepare_forwarding_plan(
+        std::size_t peer_index,
+        const std::vector<ChunkDescriptor>& chunks,
+        bool finite_iterations,
+        std::size_t total_chunks);
     std::size_t select_forwarding_batch_chunks(
         std::size_t remaining_chunks,
         std::size_t available_chunk_count) const;
