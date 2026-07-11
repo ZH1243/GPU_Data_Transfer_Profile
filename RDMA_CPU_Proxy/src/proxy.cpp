@@ -980,9 +980,11 @@ void Proxy::start_forwarding_thread() {
     forwarding_stop_.store(false);
     forwarding_ready_thread_ = std::thread(&Proxy::forwarding_ready_loop, this);
     forwarding_thread_ = std::thread(&Proxy::forwarding_loop, this);
+    const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config_);
     RDMA_PROXY_LOG_INFO("NVLink forwarding thread started local_rank=", config_.node_rank,
                         " local_gpu=", config_.local_gpu_index,
-                        " threshold_tokens=", config_.nvlink_forward_threshold_tokens,
+                        " threshold_tokens=", forward_threshold_tokens,
+                        " threshold_chunks=", config_.nvlink_forward_threshold_chunks,
                         " chunk_tokens=", config_.nvlink_forward_chunk_tokens,
                         " use_batch_api=", config_.nvlink_forward_use_batch_api ? "true" : "false");
 }
@@ -1241,7 +1243,7 @@ void Proxy::issue_forwarding_batch(
     const auto token_bytes = config_.token_dimension * dtype_size(config_.dtype);
     const auto batch_timing_start = std::chrono::steady_clock::now();
     std::size_t batch_bytes = 0;
-    const auto batch_tokens = config_.nvlink_forward_threshold_tokens;
+    const auto batch_tokens = effective_nvlink_forward_threshold_tokens(config_);
     if (batch_start_token + batch_tokens > config_.num_tokens) {
         throw std::runtime_error("NVLink forwarding batch exceeds token range");
     }
@@ -1445,8 +1447,8 @@ void Proxy::forwarding_ready_loop() {
     try {
         const auto chunks = make_chunks();
         const auto peer_order = nvlink_forward_peer_order();
-        const auto batches_per_iteration =
-            config_.num_tokens / config_.nvlink_forward_threshold_tokens;
+        const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config_);
+        const auto batches_per_iteration = config_.num_tokens / forward_threshold_tokens;
         const bool finite_iterations = config_.num_iterations != 0;
         const auto total_batches = config_.num_iterations * batches_per_iteration;
 
@@ -1467,7 +1469,7 @@ void Proxy::forwarding_ready_loop() {
                 const uint64_t iteration = static_cast<uint64_t>(next_batch / batches_per_iteration);
                 const auto batch_in_iteration = next_batch % batches_per_iteration;
                 const auto batch_start_token =
-                    batch_in_iteration * config_.nvlink_forward_threshold_tokens;
+                    batch_in_iteration * forward_threshold_tokens;
                 const auto required_count = iteration + 1;
                 const auto& peer = peers_[peer_index];
 
@@ -1476,7 +1478,7 @@ void Proxy::forwarding_ready_loop() {
                     peer,
                     chunks,
                     batch_start_token,
-                    config_.nvlink_forward_threshold_tokens,
+                    forward_threshold_tokens,
                     required_count);
                 const auto availability_elapsed_ns =
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1504,8 +1506,8 @@ void Proxy::forwarding_ready_loop() {
 void Proxy::forwarding_loop() {
     try {
         const auto peer_order = nvlink_forward_peer_order();
-        const auto batches_per_iteration =
-            config_.num_tokens / config_.nvlink_forward_threshold_tokens;
+        const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config_);
+        const auto batches_per_iteration = config_.num_tokens / forward_threshold_tokens;
         const bool finite_iterations = config_.num_iterations != 0;
         const auto total_batches = config_.num_iterations * batches_per_iteration;
         uint64_t local_batch_sync_sequence = 0;
@@ -1526,7 +1528,7 @@ void Proxy::forwarding_loop() {
                 const uint64_t iteration = static_cast<uint64_t>(next_batch / batches_per_iteration);
                 const auto batch_in_iteration = next_batch % batches_per_iteration;
                 const auto batch_start_token =
-                    batch_in_iteration * config_.nvlink_forward_threshold_tokens;
+                    batch_in_iteration * forward_threshold_tokens;
                 const auto& peer = peers_[peer_index];
                 if (peer_index >= forwarding_ready_peer_count_) {
                     throw std::runtime_error("NVLink forwarding ready peer index out of range");
@@ -1544,7 +1546,7 @@ void Proxy::forwarding_loop() {
                                         " peer_rank=", peer.peer_rank,
                                         " batch=", batch_in_iteration,
                                         " batch_start_token=", batch_start_token,
-                                        " batch_tokens=", config_.nvlink_forward_threshold_tokens);
+                                        " batch_tokens=", forward_threshold_tokens);
                 }
                 if (config_.nvlink_forward_local_batch_sync_enabled) {
                     ++local_batch_sync_sequence;
@@ -1577,7 +1579,8 @@ void Proxy::forwarding_loop() {
 
 void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
     if (!config_.nvlink_forwarding_enabled) return;
-    const auto batches_per_iteration = config_.num_tokens / config_.nvlink_forward_threshold_tokens;
+    const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config_);
+    const auto batches_per_iteration = config_.num_tokens / forward_threshold_tokens;
     const auto required_batches = static_cast<std::size_t>(iteration + 1) * batches_per_iteration;
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(config_.completion_timeout_ms);

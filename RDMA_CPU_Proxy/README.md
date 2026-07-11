@@ -68,13 +68,21 @@ The routing-table implementation requires:
 
 ```text
 num_gpus_per_node <= 8
-num_tokens must be a multiple of nvlink_forward_threshold_tokens
+num_tokens must be a multiple of the effective NVLink forwarding threshold
 ```
+
+Set `nvlink_forward_threshold_tokens` to choose the forwarding batch size directly in tokens. Alternatively, set `nvlink_forward_threshold_chunks` to choose the batch size in RDMA chunks; the effective token count becomes:
+
+```text
+nvlink_forward_threshold_chunks * tokens_per_chunk
+```
+
+For example, with `nvlink_forward_threshold_chunks=10` and `tokens_per_chunk=32`, each forwarding batch contains 320 tokens. If both `nvlink_forward_threshold_tokens` and `nvlink_forward_threshold_chunks` are set, they must describe the same effective token count.
 
 In round-robin mode, the previous full-fanout rule is restored:
 
 ```text
-nvlink_forward_threshold_tokens == nvlink_forward_chunk_tokens * (num_gpus_per_node - 1)
+effective forwarding threshold == nvlink_forward_chunk_tokens * (num_gpus_per_node - 1)
 ```
 
 For source GPU `g`, chunk `i` in a forwarding batch goes to `(g + 1 + i) % num_gpus_per_node`.
@@ -238,6 +246,7 @@ Required parameters are represented in `config/example_config.json`:
 - `fill_test_data`, `validate_data`
 - `nvlink_forwarding_enabled`
 - `nvlink_forward_threshold_tokens`
+- `nvlink_forward_threshold_chunks`
 - `nvlink_forward_chunk_tokens`
 - `nvlink_forward_use_batch_api`
 - `nvlink_forward_stream_nonblocking`
