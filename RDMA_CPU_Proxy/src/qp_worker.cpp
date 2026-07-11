@@ -166,6 +166,10 @@ void QPWorker::configure_expected_chunks(std::size_t num_chunks) {
     immediate_counts_.assign(num_chunks, 0);
 }
 
+void QPWorker::set_receive_immediate_callback(std::function<void(std::size_t)> callback) {
+    receive_immediate_callback_ = std::move(callback);
+}
+
 uint64_t QPWorker::received_immediate_count(std::size_t chunk_index) const {
     std::lock_guard<std::mutex> lock(stats_mutex_);
     if (chunk_index >= immediate_counts_.size()) return 0;
@@ -333,14 +337,19 @@ void QPWorker::cq_loop() {
                     } else {
                         recv_completions_.fetch_add(1);
                         const auto chunk_index = decode_immediate(c.imm_data);
+                        bool valid_chunk = false;
                         {
                             std::lock_guard<std::mutex> lock(stats_mutex_);
                             latest_recv_completion_time_ = std::chrono::steady_clock::now();
                             if (chunk_index < immediate_counts_.size()) {
                                 ++immediate_counts_[chunk_index];
+                                valid_chunk = true;
                             } else {
                                 unexpected_immediate_completions_.fetch_add(1);
                             }
+                        }
+                        if (valid_chunk && receive_immediate_callback_) {
+                            receive_immediate_callback_(chunk_index);
                         }
                         RDMA_PROXY_LOG_DEBUG("recv imm completion peer=", qp_.peer_rank(),
                                              " qp=", qp_.qp_index(),

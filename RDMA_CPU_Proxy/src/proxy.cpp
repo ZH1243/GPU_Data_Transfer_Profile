@@ -285,6 +285,13 @@ void Proxy::setup_peer(PeerGpuBuffers& buffers) {
             config_.completion_poll_batch_size,
             config_.max_in_flight_chunks_per_qp);
         worker->configure_expected_chunks(make_chunks().size());
+        if (config_.nvlink_forward_out_of_order_chunks_enabled) {
+            const auto peer_index = peers_.size();
+            worker->set_receive_immediate_callback(
+                [this, peer_index](std::size_t chunk_index) {
+                    record_out_of_order_forwarding_arrival(peer_index, chunk_index);
+                });
+        }
         worker->post_initial_receives(config_.recv_queue_depth);
         worker->start();
         peer.workers.emplace_back(std::move(worker));
@@ -1089,10 +1096,21 @@ void Proxy::start_forwarding_thread() {
     }
     forwarding_out_of_order_peer_states_.clear();
     if (out_of_order_chunks) {
-        const auto total_chunks = config_.num_iterations * make_chunks().size();
+        const auto chunks = make_chunks();
+        const auto chunks_per_iteration = chunks.size();
+        const auto total_chunks = config_.num_iterations * chunks_per_iteration;
         forwarding_out_of_order_peer_states_.resize(peers_.size());
         for (auto& state : forwarding_out_of_order_peer_states_) {
-            state.chunk_status.assign(total_chunks, -1);
+            state.total_chunks = total_chunks;
+            state.chunks_per_iteration = chunks_per_iteration;
+            state.chunk_status.reset(new std::atomic<int8_t>[total_chunks]);
+            state.arrivals_by_chunk.reset(new std::atomic<uint64_t>[chunks_per_iteration]);
+            for (std::size_t i = 0; i < total_chunks; ++i) {
+                state.chunk_status[i].store(-1);
+            }
+            for (std::size_t i = 0; i < chunks_per_iteration; ++i) {
+                state.arrivals_by_chunk[i].store(0);
+            }
             state.applied_batch_sequence = 0;
         }
     }
@@ -1620,7 +1638,6 @@ void Proxy::forwarding_ready_loop() {
                         throw std::runtime_error("missing NVLink out-of-order forwarding state");
                     }
                     auto& state = forwarding_out_of_order_peer_states_[peer_index];
-                    bool state_changed = false;
                     uint64_t pending_ack_sequence = 0;
 
                     const auto command_sequence =
@@ -1630,15 +1647,14 @@ void Proxy::forwarding_ready_loop() {
                             forwarding_out_of_order_command_start_by_peer_[peer_index].load();
                         const auto command_length =
                             forwarding_out_of_order_command_length_by_peer_[peer_index].load();
-                        if (command_length == 0 || command_start + command_length > state.chunk_status.size()) {
+                        if (command_length == 0 || command_start + command_length > state.total_chunks) {
                             throw std::runtime_error("invalid NVLink out-of-order forwarded range command");
                         }
                         for (std::size_t i = 0; i < command_length; ++i) {
-                            state.chunk_status[command_start + i] = 1;
+                            state.chunk_status[command_start + i].store(1);
                         }
                         state.applied_batch_sequence = command_sequence;
                         pending_ack_sequence = command_sequence;
-                        state_changed = true;
                     }
 
                     if (pending_ack_sequence == 0) {
@@ -1661,40 +1677,6 @@ void Proxy::forwarding_ready_loop() {
                     const auto active_iteration_start = active_iteration * chunks_per_iteration;
                     const auto active_iteration_end = active_iteration_start + chunks_per_iteration;
 
-                    std::vector<std::vector<uint64_t>> worker_immediate_counts;
-                    worker_immediate_counts.reserve(peer.workers.size());
-                    const auto availability_start = std::chrono::steady_clock::now();
-                    for (const auto& worker : peer.workers) {
-                        worker_immediate_counts.push_back(worker->received_immediate_counts());
-                    }
-                    for (std::size_t global_chunk = active_iteration_start;
-                         global_chunk < active_iteration_end;
-                         ++global_chunk) {
-                        if (state.chunk_status[global_chunk] != -1) continue;
-                        const auto chunk_in_iteration = global_chunk % chunks_per_iteration;
-                        const auto required_count = active_iteration + 1;
-                        uint64_t total = 0;
-                        for (const auto& counts : worker_immediate_counts) {
-                            if (chunk_in_iteration < counts.size()) {
-                                total += counts[chunk_in_iteration];
-                            }
-                        }
-                        if (total >= required_count) {
-                            state.chunk_status[global_chunk] = 0;
-                            state_changed = true;
-                        }
-                    }
-                    const auto availability_elapsed_ns =
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - availability_start).count();
-                    forwarding_batch_available_calls_.fetch_add(1);
-                    forwarding_batch_available_total_ns_.fetch_add(
-                        static_cast<uint64_t>(std::max<int64_t>(0, availability_elapsed_ns)));
-
-                    if (!state_changed) {
-                        continue;
-                    }
-
                     std::size_t best_start = 0;
                     std::size_t best_length = 0;
                     bool best_tail_ready = false;
@@ -1703,9 +1685,10 @@ void Proxy::forwarding_ready_loop() {
                     for (std::size_t global_chunk = active_iteration_start;
                          global_chunk < active_iteration_end;
                          ++global_chunk) {
-                        if (state.chunk_status[global_chunk] == 1) continue;
+                        const auto status = state.chunk_status[global_chunk].load();
+                        if (status == 1) continue;
                         any_unforwarded = true;
-                        if (state.chunk_status[global_chunk] == -1) {
+                        if (status == -1) {
                             all_unforwarded_ready = false;
                         }
                     }
@@ -1725,7 +1708,7 @@ void Proxy::forwarding_ready_loop() {
                     for (std::size_t global_chunk = active_iteration_start;
                          global_chunk < active_iteration_end;
                          ++global_chunk) {
-                        const bool available = state.chunk_status[global_chunk] == 0;
+                        const bool available = state.chunk_status[global_chunk].load() == 0;
                         if (!available) {
                             flush_run();
                             if (best_length != 0) break;
@@ -1836,6 +1819,32 @@ void Proxy::forwarding_ready_loop() {
     } catch (const std::exception& e) {
         set_forwarding_error(e.what());
     }
+}
+
+void Proxy::record_out_of_order_forwarding_arrival(
+    std::size_t peer_index,
+    std::size_t chunk_index) {
+    if (!config_.nvlink_forward_out_of_order_chunks_enabled ||
+        forwarding_stop_.load() ||
+        peer_index >= forwarding_out_of_order_peer_states_.size()) {
+        return;
+    }
+    auto& state = forwarding_out_of_order_peer_states_[peer_index];
+    if (!state.arrivals_by_chunk || !state.chunk_status ||
+        chunk_index >= state.chunks_per_iteration) {
+        return;
+    }
+    const auto arrival_count = state.arrivals_by_chunk[chunk_index].fetch_add(1) + 1;
+    if (arrival_count == 0 || arrival_count > config_.num_iterations) {
+        return;
+    }
+    const auto global_chunk =
+        static_cast<std::size_t>(arrival_count - 1) * state.chunks_per_iteration + chunk_index;
+    if (global_chunk >= state.total_chunks) {
+        return;
+    }
+    int8_t expected = -1;
+    state.chunk_status[global_chunk].compare_exchange_strong(expected, 0);
 }
 
 void Proxy::forwarding_loop() {

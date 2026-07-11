@@ -7,6 +7,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -93,6 +94,7 @@ public:
     void enqueue(SendTask task);
     void post_initial_receives(int recv_queue_depth);
     void configure_expected_chunks(std::size_t num_chunks);
+    void set_receive_immediate_callback(std::function<void(std::size_t)> callback);
 
     uint64_t send_completions() const { return send_completions_.load(); }
     uint64_t recv_completions() const { return recv_completions_.load(); }
@@ -134,6 +136,7 @@ private:
     std::condition_variable completion_cv_;
     std::mutex completion_mutex_;
     mutable std::mutex stats_mutex_;
+    std::function<void(std::size_t)> receive_immediate_callback_;
     std::vector<uint64_t> immediate_counts_;
     std::chrono::steady_clock::time_point latest_send_completion_time_{};
     std::chrono::steady_clock::time_point latest_recv_completion_time_{};

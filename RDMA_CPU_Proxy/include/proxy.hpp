@@ -70,7 +70,10 @@ private:
     };
 
     struct ForwardingOutOfOrderPeerState {
-        std::vector<int8_t> chunk_status;
+        std::unique_ptr<std::atomic<int8_t>[]> chunk_status;
+        std::unique_ptr<std::atomic<uint64_t>[]> arrivals_by_chunk;
+        std::size_t total_chunks{0};
+        std::size_t chunks_per_iteration{0};
         uint64_t applied_batch_sequence{0};
     };
 
@@ -138,6 +141,7 @@ private:
         std::size_t batch_start_token,
         std::size_t batch_tokens);
     void forwarding_ready_loop();
+    void record_out_of_order_forwarding_arrival(std::size_t peer_index, std::size_t chunk_index);
     void wait_for_forwarding_iteration(uint64_t iteration);
     void set_forwarding_error(const std::string& error);
     void check_forwarding_error() const;
