@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <mutex>
 #include <netdb.h>
 #include <random>
@@ -26,6 +27,27 @@ namespace {
 uint32_t make_psn() {
     std::random_device rd;
     return rd() & 0x00ffffffU;
+}
+
+std::size_t rdma_token_bytes(const ProxyConfig& config) {
+    const auto element_bytes = dtype_size(config.dtype);
+    if (config.token_dimension > std::numeric_limits<std::size_t>::max() / element_bytes) {
+        throw std::runtime_error("token byte size overflows size_t");
+    }
+    return config.token_dimension * element_bytes;
+}
+
+std::size_t per_token_sge_count(const ProxyConfig& config, std::size_t length) {
+    if (length == 0) return 0;
+    const auto token_bytes = rdma_token_bytes(config);
+    if (token_bytes == 0 || length % token_bytes != 0) {
+        throw std::runtime_error("RDMA per-token SGE write length is not an exact token multiple");
+    }
+    const auto count = length / token_bytes;
+    if (count > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("RDMA per-token SGE count exceeds verbs num_sge range");
+    }
+    return count;
 }
 
 std::string gid_to_string(const uint8_t gid[16]) {
@@ -209,7 +231,13 @@ RdmaQueuePair::RdmaQueuePair(RdmaContext& context, const ProxyConfig& config, in
     qp_attr.qp_type = IBV_QPT_RC;
     qp_attr.cap.max_send_wr = static_cast<uint32_t>(config_.send_queue_depth);
     qp_attr.cap.max_recv_wr = static_cast<uint32_t>(config_.recv_queue_depth);
-    qp_attr.cap.max_send_sge = 1;
+    const auto requested_send_sge = config_.rdma_chunk_per_token_sge_enabled
+        ? config_.tokens_per_chunk
+        : std::size_t{1};
+    if (requested_send_sge > std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error("requested max_send_sge exceeds verbs capability field range");
+    }
+    qp_attr.cap.max_send_sge = static_cast<uint32_t>(requested_send_sge);
     qp_attr.cap.max_recv_sge = 1;
     qp_attr.cap.max_inline_data = 0;
     impl_->qp = ibv_create_qp(pd, &qp_attr);
@@ -358,6 +386,9 @@ void RdmaQueuePair::post_write_with_immediate(
     uint32_t imm_data,
     bool signaled) {
     if (config_.mock_mode) {
+        if (config_.rdma_chunk_per_token_sge_enabled) {
+            (void)per_token_sge_count(config_, length);
+        }
         std::memcpy(reinterpret_cast<void*>(remote_addr), reinterpret_cast<const void*>(local_addr), length);
         std::lock_guard<std::mutex> lock(impl_->mock_mutex);
         if (signaled) {
@@ -369,7 +400,25 @@ void RdmaQueuePair::post_write_with_immediate(
 
 #if RDMA_PROXY_HAVE_VERBS
     ibv_sge sge{};
-    if (length > 0) {
+    std::vector<ibv_sge> sges;
+    if (length > 0 && config_.rdma_chunk_per_token_sge_enabled) {
+        const auto token_bytes = rdma_token_bytes(config_);
+        if (token_bytes > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error("single token byte size exceeds verbs SGE length range");
+        }
+        const auto sge_count = per_token_sge_count(config_, length);
+        sges.reserve(sge_count);
+        for (std::size_t i = 0; i < sge_count; ++i) {
+            ibv_sge entry{};
+            entry.addr = local_addr + i * token_bytes;
+            entry.length = static_cast<uint32_t>(token_bytes);
+            entry.lkey = local_lkey;
+            sges.push_back(entry);
+        }
+    } else if (length > 0) {
+        if (length > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error("RDMA write length exceeds single verbs SGE length range");
+        }
         sge.addr = local_addr;
         sge.length = static_cast<uint32_t>(length);
         sge.lkey = local_lkey;
@@ -377,8 +426,12 @@ void RdmaQueuePair::post_write_with_immediate(
 
     ibv_send_wr wr{};
     wr.wr_id = wr_id;
-    wr.sg_list = length > 0 ? &sge : nullptr;
-    wr.num_sge = length > 0 ? 1 : 0;
+    wr.sg_list = config_.rdma_chunk_per_token_sge_enabled
+        ? (sges.empty() ? nullptr : sges.data())
+        : (length > 0 ? &sge : nullptr);
+    wr.num_sge = config_.rdma_chunk_per_token_sge_enabled
+        ? static_cast<int>(sges.size())
+        : (length > 0 ? 1 : 0);
     wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
     wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
     wr.imm_data = htonl(imm_data);

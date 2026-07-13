@@ -19,6 +19,7 @@ int main(int argc, char** argv) {
     assert(config.num_qps_per_peer == 10);
     assert(config.data_signal_interval == 16);
     assert(config.max_in_flight_chunks_per_qp == 4);
+    assert(!config.rdma_chunk_per_token_sge_enabled);
     assert(config.num_iterations == 1);
     assert(config.completion_timeout_ms == 30000);
     assert(config.dtype == rdma_proxy::DataType::kBF16);
@@ -167,10 +168,12 @@ int main(int argc, char** argv) {
         argv[1],
         "--data_signal_interval=0",
         "--max_in_flight_chunks_per_qp=8",
+        "--rdma_chunk_per_token_sge_enabled=true",
     };
-    const auto signal_interval_config = rdma_proxy::load_config(5, const_cast<char**>(signal_interval_args));
+    const auto signal_interval_config = rdma_proxy::load_config(6, const_cast<char**>(signal_interval_args));
     assert(signal_interval_config.data_signal_interval == 0);
     assert(signal_interval_config.max_in_flight_chunks_per_qp == 8);
+    assert(signal_interval_config.rdma_chunk_per_token_sge_enabled);
 
     const char* nvlink_config_path = "nvlink_forward_config.json";
     {

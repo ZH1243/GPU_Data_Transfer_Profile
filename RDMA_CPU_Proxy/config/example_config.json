@@ -16,6 +16,7 @@
   "completion_poll_batch_size": 16,
   "data_signal_interval": 16,
   "max_in_flight_chunks_per_qp": 4,
+  "rdma_chunk_per_token_sge_enabled": false,
   "send_queue_depth": 256,
   "recv_queue_depth": 256,
   "cq_depth": 512,

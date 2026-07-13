@@ -287,6 +287,9 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "completion_poll_batch_size") config.completion_poll_batch_size = std::stoi(value);
     else if (key == "data_signal_interval") config.data_signal_interval = std::stoi(value);
     else if (key == "max_in_flight_chunks_per_qp") config.max_in_flight_chunks_per_qp = std::stoi(value);
+    else if (key == "rdma_chunk_per_token_sge_enabled") {
+        config.rdma_chunk_per_token_sge_enabled = (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "send_queue_depth") config.send_queue_depth = std::stoi(value);
     else if (key == "recv_queue_depth") config.recv_queue_depth = std::stoi(value);
     else if (key == "cq_depth") config.cq_depth = std::stoi(value);
@@ -443,6 +446,8 @@ ProxyConfig load_config_file(const std::string& path) {
     config.data_signal_interval = number_as<int>(object, "data_signal_interval", config.data_signal_interval);
     config.max_in_flight_chunks_per_qp = number_as<int>(
         object, "max_in_flight_chunks_per_qp", config.max_in_flight_chunks_per_qp);
+    config.rdma_chunk_per_token_sge_enabled = get_bool(
+        object, "rdma_chunk_per_token_sge_enabled", config.rdma_chunk_per_token_sge_enabled);
     config.send_queue_depth = number_as<int>(object, "send_queue_depth", config.send_queue_depth);
     config.recv_queue_depth = number_as<int>(object, "recv_queue_depth", config.recv_queue_depth);
     config.cq_depth = number_as<int>(object, "cq_depth", config.cq_depth);
@@ -576,6 +581,10 @@ void validate_config(const ProxyConfig& config) {
     if (config.data_signal_interval < 0) throw std::runtime_error("data_signal_interval must be >= 0");
     if (config.max_in_flight_chunks_per_qp <= 0) {
         throw std::runtime_error("max_in_flight_chunks_per_qp must be > 0");
+    }
+    if (config.rdma_chunk_per_token_sge_enabled &&
+        config.tokens_per_chunk > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("tokens_per_chunk exceeds verbs num_sge range for per-token SGE mode");
     }
     if (config.send_queue_depth <= 0 || config.recv_queue_depth <= 0 || config.cq_depth <= 0) {
         throw std::runtime_error("queue and CQ depths must be > 0");
@@ -719,6 +728,8 @@ std::string config_summary(const ProxyConfig& config) {
         << " qps_per_peer=" << config.num_qps_per_peer
         << " data_signal_interval=" << config.data_signal_interval
         << " max_in_flight_chunks_per_qp=" << config.max_in_flight_chunks_per_qp
+        << " rdma_chunk_per_token_sge_enabled="
+        << (config.rdma_chunk_per_token_sge_enabled ? "true" : "false")
         << " iterations=" << config.num_iterations
         << " dtype=" << to_string(config.dtype)
         << " sequential_peer_transfers=" << (config.sequential_peer_transfers ? "true" : "false")
