@@ -239,13 +239,15 @@ void QPWorker::post_task(const SendTask& task) {
     } else {
         qp_.post_write_with_immediate(
             task.wr_id,
-            task.local_base + task.chunk.src_offset_bytes,
+            task.chunk.source_token_indices.empty() ?
+                task.local_base + task.chunk.src_offset_bytes : task.local_base,
             task.local_lkey,
             task.remote_base + task.chunk.dst_offset_bytes,
             task.remote_rkey,
             task.chunk.length_bytes,
             task.chunk.imm_data,
-            task.signaled);
+            task.signaled,
+            task.chunk.source_token_indices);
     }
 }
 

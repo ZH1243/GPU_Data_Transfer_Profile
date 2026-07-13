@@ -37,6 +37,7 @@ struct ChunkDescriptor {
     std::size_t length_bytes{0};
     int qp_index{-1};
     uint32_t imm_data{0};
+    std::vector<std::size_t> source_token_indices;
 };
 
 uint32_t encode_immediate(std::size_t chunk_index);
@@ -49,7 +50,8 @@ std::vector<ChunkDescriptor> compute_chunks(
     std::size_t token_dimension,
     std::size_t dtype_size,
     std::size_t tokens_per_chunk,
-    int num_qps_per_peer);
+    int num_qps_per_peer,
+    bool discontinuous_token_payload = false);
 
 std::string serialize_peer_info(const PeerConnectionInfo& info);
 PeerConnectionInfo deserialize_peer_info(const std::string& payload);

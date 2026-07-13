@@ -290,6 +290,9 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "rdma_chunk_per_token_sge_enabled") {
         config.rdma_chunk_per_token_sge_enabled = (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "rdma_discontinuous_token_payload_enabled") {
+        config.rdma_discontinuous_token_payload_enabled = (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "send_queue_depth") config.send_queue_depth = std::stoi(value);
     else if (key == "recv_queue_depth") config.recv_queue_depth = std::stoi(value);
     else if (key == "cq_depth") config.cq_depth = std::stoi(value);
@@ -448,6 +451,8 @@ ProxyConfig load_config_file(const std::string& path) {
         object, "max_in_flight_chunks_per_qp", config.max_in_flight_chunks_per_qp);
     config.rdma_chunk_per_token_sge_enabled = get_bool(
         object, "rdma_chunk_per_token_sge_enabled", config.rdma_chunk_per_token_sge_enabled);
+    config.rdma_discontinuous_token_payload_enabled = get_bool(
+        object, "rdma_discontinuous_token_payload_enabled", config.rdma_discontinuous_token_payload_enabled);
     config.send_queue_depth = number_as<int>(object, "send_queue_depth", config.send_queue_depth);
     config.recv_queue_depth = number_as<int>(object, "recv_queue_depth", config.recv_queue_depth);
     config.cq_depth = number_as<int>(object, "cq_depth", config.cq_depth);
@@ -585,6 +590,14 @@ void validate_config(const ProxyConfig& config) {
     if (config.rdma_chunk_per_token_sge_enabled &&
         config.tokens_per_chunk > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("tokens_per_chunk exceeds verbs num_sge range for per-token SGE mode");
+    }
+    if (config.rdma_discontinuous_token_payload_enabled && !config.rdma_chunk_per_token_sge_enabled) {
+        throw std::runtime_error(
+            "rdma_discontinuous_token_payload_enabled requires rdma_chunk_per_token_sge_enabled=true");
+    }
+    if (config.rdma_discontinuous_token_payload_enabled && config.nvlink_forwarding_enabled) {
+        throw std::runtime_error(
+            "rdma_discontinuous_token_payload_enabled is only supported when NVLink forwarding is disabled");
     }
     if (config.send_queue_depth <= 0 || config.recv_queue_depth <= 0 || config.cq_depth <= 0) {
         throw std::runtime_error("queue and CQ depths must be > 0");
@@ -730,6 +743,8 @@ std::string config_summary(const ProxyConfig& config) {
         << " max_in_flight_chunks_per_qp=" << config.max_in_flight_chunks_per_qp
         << " rdma_chunk_per_token_sge_enabled="
         << (config.rdma_chunk_per_token_sge_enabled ? "true" : "false")
+        << " rdma_discontinuous_token_payload_enabled="
+        << (config.rdma_discontinuous_token_payload_enabled ? "true" : "false")
         << " iterations=" << config.num_iterations
         << " dtype=" << to_string(config.dtype)
         << " sequential_peer_transfers=" << (config.sequential_peer_transfers ? "true" : "false")

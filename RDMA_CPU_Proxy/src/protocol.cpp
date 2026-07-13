@@ -1,6 +1,9 @@
 #include "protocol.hpp"
 
+#include <algorithm>
 #include <cstring>
+#include <numeric>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 
@@ -30,12 +33,20 @@ std::vector<ChunkDescriptor> compute_chunks(
     std::size_t token_dimension,
     std::size_t dtype_size,
     std::size_t tokens_per_chunk,
-    int num_qps_per_peer) {
+    int num_qps_per_peer,
+    bool discontinuous_token_payload) {
     if (tokens_per_chunk == 0) throw std::runtime_error("tokens_per_chunk must be > 0");
     if (num_qps_per_peer <= 0) throw std::runtime_error("num_qps_per_peer must be > 0");
 
     const std::size_t token_bytes = token_dimension * dtype_size;
     const std::size_t num_chunks = (num_tokens + tokens_per_chunk - 1) / tokens_per_chunk;
+    std::vector<std::size_t> token_order;
+    if (discontinuous_token_payload) {
+        token_order.resize(num_tokens);
+        std::iota(token_order.begin(), token_order.end(), std::size_t{0});
+        std::mt19937_64 rng(1);
+        std::shuffle(token_order.begin(), token_order.end(), rng);
+    }
     std::vector<ChunkDescriptor> chunks;
     chunks.reserve(num_chunks);
 
@@ -51,6 +62,11 @@ std::vector<ChunkDescriptor> compute_chunks(
         desc.length_bytes = count * token_bytes;
         desc.qp_index = -1;
         desc.imm_data = encode_immediate(chunk);
+        if (discontinuous_token_payload) {
+            desc.source_token_indices.assign(
+                token_order.begin() + static_cast<std::ptrdiff_t>(start),
+                token_order.begin() + static_cast<std::ptrdiff_t>(start + count));
+        }
         chunks.push_back(desc);
     }
     return chunks;

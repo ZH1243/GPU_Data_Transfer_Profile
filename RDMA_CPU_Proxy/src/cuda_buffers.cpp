@@ -167,6 +167,61 @@ bool CudaBuffers::validate_recv_pattern(
     return true;
 }
 
+bool CudaBuffers::validate_recv_pattern(
+    int peer_rank,
+    int source_rank,
+    int destination_rank,
+    uint64_t iteration,
+    const std::vector<ChunkDescriptor>& chunks,
+    std::string* error) const {
+    const auto& peer = buffers_for_peer(peer_rank);
+    std::vector<uint8_t> actual(peer.recv.bytes);
+    if (config_.mock_mode) {
+        std::memcpy(actual.data(), peer.recv.ptr, actual.size());
+    } else {
+#if RDMA_PROXY_HAVE_CUDA
+        check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize before validation");
+        check_cuda(cudaMemcpy(actual.data(), peer.recv.ptr, actual.size(), cudaMemcpyDeviceToHost),
+                   "cudaMemcpy D2H recv validation");
+#else
+        throw std::runtime_error("CUDA receive validation requested but CUDA support was not built");
+#endif
+    }
+
+    const auto token_bytes = config_.token_dimension * dtype_size(config_.dtype);
+    for (const auto& chunk : chunks) {
+        if (chunk.source_token_indices.empty()) {
+            throw std::runtime_error("discontinuous receive validation requires chunk token indices");
+        }
+        for (std::size_t ordinal = 0; ordinal < chunk.source_token_indices.size(); ++ordinal) {
+            const auto source_token = chunk.source_token_indices[ordinal];
+            const auto dst_offset = chunk.dst_offset_bytes + ordinal * token_bytes;
+            const auto src_offset = source_token * token_bytes;
+            if (dst_offset + token_bytes > actual.size()) {
+                throw std::runtime_error("discontinuous receive validation chunk exceeds receive buffer");
+            }
+            for (std::size_t byte = 0; byte < token_bytes; ++byte) {
+                const auto offset = dst_offset + byte;
+                const auto expected = test_pattern_byte(
+                    source_rank, destination_rank, config_.local_gpu_index, iteration, src_offset + byte);
+                if (actual[offset] != expected) {
+                    if (error) {
+                        std::ostringstream out;
+                        out << "peer=" << peer_rank
+                            << " offset=" << offset
+                            << " source_token=" << source_token
+                            << " expected=0x" << std::hex << static_cast<unsigned>(expected)
+                            << " actual=0x" << static_cast<unsigned>(actual[offset]);
+                        *error = out.str();
+                    }
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 PeerGpuBuffers& CudaBuffers::buffers_for_peer(int peer_rank) {
     auto it = std::find_if(buffers_.begin(), buffers_.end(), [&](const auto& entry) {
         return entry.peer_rank == peer_rank;

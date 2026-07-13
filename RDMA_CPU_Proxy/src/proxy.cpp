@@ -855,7 +855,8 @@ std::vector<ChunkDescriptor> Proxy::make_chunks() const {
         config_.token_dimension,
         dtype_size(config_.dtype),
         config_.tokens_per_chunk,
-        config_.num_qps_per_peer);
+        config_.num_qps_per_peer,
+        config_.rdma_discontinuous_token_payload_enabled);
 }
 
 std::vector<std::size_t> Proxy::sequential_peer_order() const {
@@ -2302,13 +2303,19 @@ std::size_t Proxy::verify_immediates(
 
 std::size_t Proxy::validate_received_data(uint64_t iteration) const {
     if (!config_.validate_data) return 0;
+    const auto chunks = config_.rdma_discontinuous_token_payload_enabled ?
+        make_chunks() : std::vector<ChunkDescriptor>{};
     std::size_t errors = 0;
     for (const auto& buffers : cuda_buffers_.peer_buffers()) {
         std::string error;
         const int expected_source = config_.mock_mode ? config_.node_rank : buffers.peer_rank;
         const int expected_destination = config_.mock_mode ? buffers.peer_rank : config_.node_rank;
-        if (!cuda_buffers_.validate_recv_pattern(
-                buffers.peer_rank, expected_source, expected_destination, iteration, &error)) {
+        const bool valid = config_.rdma_discontinuous_token_payload_enabled ?
+            cuda_buffers_.validate_recv_pattern(
+                buffers.peer_rank, expected_source, expected_destination, iteration, chunks, &error) :
+            cuda_buffers_.validate_recv_pattern(
+                buffers.peer_rank, expected_source, expected_destination, iteration, &error);
+        if (!valid) {
             ++errors;
             RDMA_PROXY_LOG_ERROR("receive validation failed: ", error);
         }

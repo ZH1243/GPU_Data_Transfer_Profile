@@ -20,6 +20,7 @@ int main(int argc, char** argv) {
     assert(config.data_signal_interval == 16);
     assert(config.max_in_flight_chunks_per_qp == 4);
     assert(!config.rdma_chunk_per_token_sge_enabled);
+    assert(!config.rdma_discontinuous_token_payload_enabled);
     assert(config.num_iterations == 1);
     assert(config.completion_timeout_ms == 30000);
     assert(config.dtype == rdma_proxy::DataType::kBF16);
@@ -169,11 +170,23 @@ int main(int argc, char** argv) {
         "--data_signal_interval=0",
         "--max_in_flight_chunks_per_qp=8",
         "--rdma_chunk_per_token_sge_enabled=true",
+        "--rdma_discontinuous_token_payload_enabled=true",
     };
-    const auto signal_interval_config = rdma_proxy::load_config(6, const_cast<char**>(signal_interval_args));
+    const auto signal_interval_config = rdma_proxy::load_config(7, const_cast<char**>(signal_interval_args));
     assert(signal_interval_config.data_signal_interval == 0);
     assert(signal_interval_config.max_in_flight_chunks_per_qp == 8);
     assert(signal_interval_config.rdma_chunk_per_token_sge_enabled);
+    assert(signal_interval_config.rdma_discontinuous_token_payload_enabled);
+
+    auto invalid_discontinuous_config = signal_interval_config;
+    invalid_discontinuous_config.rdma_chunk_per_token_sge_enabled = false;
+    bool rejected_discontinuous_without_sge = false;
+    try {
+        rdma_proxy::validate_config(invalid_discontinuous_config);
+    } catch (const std::runtime_error&) {
+        rejected_discontinuous_without_sge = true;
+    }
+    assert(rejected_discontinuous_without_sge);
 
     const char* nvlink_config_path = "nvlink_forward_config.json";
     {

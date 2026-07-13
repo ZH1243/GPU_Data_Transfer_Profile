@@ -62,6 +62,18 @@ int main() {
 
     {
         auto config = make_config();
+        config.rdma_chunk_per_token_sge_enabled = true;
+        config.rdma_discontinuous_token_payload_enabled = true;
+        validate_config(config);
+
+        Proxy proxy(config);
+        proxy.initialize();
+        proxy.run();
+        proxy.shutdown();
+    }
+
+    {
+        auto config = make_config();
         config.num_nodes = 4;
         config.num_iterations = 1;
         config.sequential_peer_transfers = true;

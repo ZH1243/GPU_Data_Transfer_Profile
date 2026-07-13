@@ -133,6 +133,8 @@ imm_data = chunk_index
 
 By default, each data chunk is posted as one `IBV_WR_RDMA_WRITE_WITH_IMM` with one SGE covering the full contiguous chunk. When `rdma_chunk_per_token_sge_enabled=true`, the proxy still posts one write-with-immediate per chunk, but builds one local SGE per token in that chunk. For example, `tokens_per_chunk=32` creates 32 SGEs for full chunks and fewer SGEs for the final partial chunk. The remote write target remains the same contiguous destination span.
 
+When both `rdma_chunk_per_token_sge_enabled=true` and `rdma_discontinuous_token_payload_enabled=true`, the proxy shuffles token indices with a fixed seed and assigns that randomized order to chunks. A chunk can therefore gather non-contiguous source tokens, such as `[3, 1, 8]`, into one write-with-immediate. The gathered payload is packed into the chunk's contiguous remote destination span. This mode is intended for RDMA-only testing and is rejected when NVLink forwarding is enabled.
+
 Chunks are not statically bound to QPs when the chunk list is built. For each peer and iteration, the proxy creates one shared dynamic chunk distributor. Each QP send worker asks the distributor for chunks while its local in-flight count is below `max_in_flight_chunks_per_qp`. The worker posts signaled RDMA Write-with-Immediate WRs, its CQ worker observes send CQEs, and each send CQE frees one in-flight slot so the send worker can pull more chunks. Faster QPs therefore pull more chunks during that iteration.
 
 ```text

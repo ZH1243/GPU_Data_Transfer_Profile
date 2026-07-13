@@ -1,9 +1,11 @@
 #include "protocol.hpp"
 #include "qp_worker.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <iostream>
+#include <vector>
 
 int main() {
     using namespace rdma_proxy;
@@ -29,6 +31,34 @@ int main() {
     assert(chunks.back().start_token == 4992);
     assert(chunks.back().num_tokens == 8);
     assert(chunks.back().length_bytes == 8 * 128 * 2);
+    assert(chunks.back().source_token_indices.empty());
+
+    const auto discontinuous_chunks = compute_chunks(
+        /*num_tokens=*/10,
+        /*token_dimension=*/4,
+        /*dtype_size=*/2,
+        /*tokens_per_chunk=*/3,
+        /*num_qps_per_peer=*/2,
+        /*discontinuous_token_payload=*/true);
+    assert(discontinuous_chunks.size() == 4);
+    std::vector<std::size_t> assigned;
+    for (const auto& chunk : discontinuous_chunks) {
+        assert(chunk.source_token_indices.size() == chunk.num_tokens);
+        assigned.insert(
+            assigned.end(),
+            chunk.source_token_indices.begin(),
+            chunk.source_token_indices.end());
+    }
+    auto sorted = assigned;
+    std::sort(sorted.begin(), sorted.end());
+    for (std::size_t i = 0; i < sorted.size(); ++i) {
+        assert(sorted[i] == i);
+    }
+    bool differs_from_contiguous = false;
+    for (std::size_t i = 0; i < assigned.size(); ++i) {
+        differs_from_contiguous = differs_from_contiguous || assigned[i] != i;
+    }
+    assert(differs_from_contiguous);
     assert(decode_immediate(encode_immediate(1234)) == 1234);
 
     PeerConnectionInfo info;

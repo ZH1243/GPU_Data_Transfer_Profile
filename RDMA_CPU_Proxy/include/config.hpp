@@ -47,6 +47,7 @@ struct ProxyConfig {
     int data_signal_interval{1};
     int max_in_flight_chunks_per_qp{1};
     bool rdma_chunk_per_token_sge_enabled{false};
+    bool rdma_discontinuous_token_payload_enabled{false};
     int send_queue_depth{128};
     int recv_queue_depth{128};
     int cq_depth{256};

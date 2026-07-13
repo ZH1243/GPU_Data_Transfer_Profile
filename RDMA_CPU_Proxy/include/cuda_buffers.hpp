@@ -50,6 +50,13 @@ public:
         int destination_rank,
         uint64_t iteration,
         std::string* error) const;
+    bool validate_recv_pattern(
+        int peer_rank,
+        int source_rank,
+        int destination_rank,
+        uint64_t iteration,
+        const std::vector<ChunkDescriptor>& chunks,
+        std::string* error) const;
 
     const std::vector<PeerGpuBuffers>& peer_buffers() const { return buffers_; }
     std::vector<PeerGpuBuffers>& peer_buffers() { return buffers_; }

@@ -45,7 +45,8 @@ public:
         uint32_t remote_rkey,
         std::size_t length,
         uint32_t imm_data,
-        bool signaled);
+        bool signaled,
+        const std::vector<std::size_t>& source_token_indices = {});
     void post_send_with_immediate(uint64_t wr_id, uint32_t imm_data);
     int poll(std::vector<Completion>& completions, int max_entries);
 

@@ -384,12 +384,28 @@ void RdmaQueuePair::post_write_with_immediate(
     uint32_t remote_rkey,
     std::size_t length,
     uint32_t imm_data,
-    bool signaled) {
+    bool signaled,
+    const std::vector<std::size_t>& source_token_indices) {
     if (config_.mock_mode) {
         if (config_.rdma_chunk_per_token_sge_enabled) {
             (void)per_token_sge_count(config_, length);
         }
-        std::memcpy(reinterpret_cast<void*>(remote_addr), reinterpret_cast<const void*>(local_addr), length);
+        if (!source_token_indices.empty()) {
+            const auto token_bytes = rdma_token_bytes(config_);
+            if (source_token_indices.size() * token_bytes != length) {
+                throw std::runtime_error("RDMA mock discontinuous SGE count does not match write length");
+            }
+            auto* dst = reinterpret_cast<char*>(remote_addr);
+            const auto* src_base = reinterpret_cast<const char*>(local_addr);
+            for (std::size_t i = 0; i < source_token_indices.size(); ++i) {
+                std::memcpy(
+                    dst + i * token_bytes,
+                    src_base + source_token_indices[i] * token_bytes,
+                    token_bytes);
+            }
+        } else {
+            std::memcpy(reinterpret_cast<void*>(remote_addr), reinterpret_cast<const void*>(local_addr), length);
+        }
         std::lock_guard<std::mutex> lock(impl_->mock_mutex);
         if (signaled) {
             impl_->mock_completions.push_back(Completion{CompletionKind::kSend, wr_id, imm_data, length});
@@ -407,10 +423,14 @@ void RdmaQueuePair::post_write_with_immediate(
             throw std::runtime_error("single token byte size exceeds verbs SGE length range");
         }
         const auto sge_count = per_token_sge_count(config_, length);
+        if (!source_token_indices.empty() && source_token_indices.size() != sge_count) {
+            throw std::runtime_error("RDMA discontinuous SGE count does not match write length");
+        }
         sges.reserve(sge_count);
         for (std::size_t i = 0; i < sge_count; ++i) {
+            const auto token_index = source_token_indices.empty() ? i : source_token_indices[i];
             ibv_sge entry{};
-            entry.addr = local_addr + i * token_bytes;
+            entry.addr = local_addr + token_index * token_bytes;
             entry.length = static_cast<uint32_t>(token_bytes);
             entry.lkey = local_lkey;
             sges.push_back(entry);
