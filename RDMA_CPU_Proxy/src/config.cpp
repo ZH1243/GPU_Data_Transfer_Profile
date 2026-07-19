@@ -342,6 +342,13 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "nvlink_forward_notification_queue_depth") {
         config.nvlink_forward_notification_queue_depth = static_cast<std::size_t>(std::stoull(value));
     }
+    else if (key == "nvlink_forward_notification_log_enabled") {
+        config.nvlink_forward_notification_log_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_notification_log_dir") {
+        config.nvlink_forward_notification_log_dir = value;
+    }
     else if (key == "nvlink_forward_local_batch_sync_enabled") {
         config.nvlink_forward_local_batch_sync_enabled = (value == "1" || value == "true" || value == "yes");
     }
@@ -502,6 +509,14 @@ ProxyConfig load_config_file(const std::string& path) {
         object,
         "nvlink_forward_notification_queue_depth",
         config.nvlink_forward_notification_queue_depth);
+    config.nvlink_forward_notification_log_enabled = get_bool(
+        object,
+        "nvlink_forward_notification_log_enabled",
+        config.nvlink_forward_notification_log_enabled);
+    config.nvlink_forward_notification_log_dir = get_string(
+        object,
+        "nvlink_forward_notification_log_dir",
+        config.nvlink_forward_notification_log_dir);
     config.nvlink_forward_local_batch_sync_enabled = get_bool(
         object, "nvlink_forward_local_batch_sync_enabled", config.nvlink_forward_local_batch_sync_enabled);
     config.nvlink_forward_synchronize_iteration = get_bool(
@@ -660,6 +675,17 @@ void validate_config(const ProxyConfig& config) {
             throw std::runtime_error("nvlink_forward_notification_queue_depth exceeds uint32 range");
         }
     }
+    if (config.nvlink_forward_notification_log_enabled) {
+        if (!config.nvlink_forward_completion_notifications_enabled) {
+            throw std::runtime_error(
+                "nvlink_forward_notification_log_enabled requires "
+                "nvlink_forward_completion_notifications_enabled=true");
+        }
+        if (config.nvlink_forward_notification_log_dir.empty()) {
+            throw std::runtime_error(
+                "nvlink_forward_notification_log_dir must be non-empty when notification logging is enabled");
+        }
+    }
     if (config.nvlink_forwarding_enabled) {
         const auto dynamic_threshold = nvlink_forward_dynamic_threshold_enabled(config);
         const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config);
@@ -798,6 +824,10 @@ std::string config_summary(const ProxyConfig& config) {
         << (config.nvlink_forward_completion_notifications_enabled ? "true" : "false")
         << " nvlink_forward_notification_queue_depth="
         << config.nvlink_forward_notification_queue_depth
+        << " nvlink_forward_notification_log_enabled="
+        << (config.nvlink_forward_notification_log_enabled ? "true" : "false")
+        << " nvlink_forward_notification_log_dir="
+        << config.nvlink_forward_notification_log_dir
         << " nvlink_forward_local_batch_sync_enabled="
         << (config.nvlink_forward_local_batch_sync_enabled ? "true" : "false")
         << " nvlink_forward_synchronize_iteration="

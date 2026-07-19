@@ -71,6 +71,8 @@ struct ProxyConfig {
     bool nvlink_forward_synchronize_batches{false};
     bool nvlink_forward_completion_notifications_enabled{false};
     std::size_t nvlink_forward_notification_queue_depth{1024};
+    bool nvlink_forward_notification_log_enabled{false};
+    std::string nvlink_forward_notification_log_dir{"/tmp/rdma_cpu_proxy_nvlink_notifications"};
     bool nvlink_forward_local_batch_sync_enabled{false};
     bool nvlink_forward_synchronize_iteration{true};
     bool nvlink_forward_log_batches{false};

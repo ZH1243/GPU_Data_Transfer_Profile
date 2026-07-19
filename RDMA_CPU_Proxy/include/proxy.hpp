@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -111,9 +112,15 @@ private:
     void enqueue_forward_completion_notifications(
         const std::vector<NvlinkForwardNotification>& notifications);
     void publish_forward_completion_notification(const NvlinkForwardNotification& notification);
+    void mark_forward_notification_senders_done();
+    bool nvlink_forward_notification_queues_complete() const;
     void nvlink_forward_notification_dispatch_loop();
     void nvlink_forward_notification_loop();
     void drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQueue* queue);
+    std::string format_nvlink_forward_notification_log(
+        const NvlinkForwardNotification& notification) const;
+    void enqueue_nvlink_forward_notification_log(const NvlinkForwardNotification& notification);
+    void flush_nvlink_forward_notification_log_queue();
     std::size_t synchronize_local_nvlink_forward_batch_start(
         uint64_t iteration,
         std::size_t batch_index_in_iteration,
@@ -234,10 +241,13 @@ private:
     std::string nvlink_forward_notification_name_;
     std::unique_ptr<NvlinkForwardNotificationDispatchState> nvlink_forward_notification_dispatch_;
     std::atomic<bool> nvlink_forward_notification_dispatch_stop_{false};
+    std::atomic<bool> nvlink_forward_notification_receiver_stop_{false};
     std::atomic<uint64_t> nvlink_forward_notifications_enqueued_{0};
     std::atomic<uint64_t> nvlink_forward_notifications_sent_{0};
     std::atomic<uint64_t> nvlink_forward_notifications_received_{0};
     std::atomic<uint64_t> nvlink_forward_notifications_dropped_{0};
+    std::mutex nvlink_forward_notification_log_mutex_;
+    std::deque<std::string> nvlink_forward_notification_log_queue_;
     std::vector<double> rdma_iteration_bandwidth_gbps_;
     LocalIterationSyncHeader* local_iteration_sync_header_{nullptr};
     std::size_t local_iteration_sync_size_{0};

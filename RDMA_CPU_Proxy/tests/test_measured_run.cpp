@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <thread>
 #include <vector>
@@ -163,6 +164,8 @@ int main() {
         config0.nvlink_forward_synchronize_batches = true;
         config0.nvlink_forward_completion_notifications_enabled = true;
         config0.nvlink_forward_notification_queue_depth = 8;
+        config0.nvlink_forward_notification_log_enabled = true;
+        config0.nvlink_forward_notification_log_dir = "/tmp/rdma_cpu_proxy_test_notification_logs";
         config0.nvlink_forward_local_batch_sync_enabled = true;
         config0.local_iteration_sync_run_id = "test_measured_run_nvlink_batch_sync";
         config0.local_gpu_index = 0;
@@ -222,6 +225,17 @@ int main() {
         const bool copied1 = std::any_of(destination1.begin(), destination1.end(), [](uint8_t v) { return v != 0; });
         if (!copied0 || !copied1) {
             std::cerr << "NVLink mock batch-synchronized forwarding destination remained empty\n";
+            return 1;
+        }
+        const std::filesystem::path log0 =
+            std::filesystem::path(config0.nvlink_forward_notification_log_dir) /
+            "nvlink_forward_notifications_rank_0_gpu_0.log";
+        const std::filesystem::path log1 =
+            std::filesystem::path(config0.nvlink_forward_notification_log_dir) /
+            "nvlink_forward_notifications_rank_0_gpu_1.log";
+        if (!std::filesystem::exists(log0) || !std::filesystem::exists(log1) ||
+            std::filesystem::file_size(log0) == 0 || std::filesystem::file_size(log1) == 0) {
+            std::cerr << "NVLink notification log files were not written\n";
             return 1;
         }
     }
