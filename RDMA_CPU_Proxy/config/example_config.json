@@ -38,6 +38,8 @@
   "nvlink_forward_use_batch_api": true,
   "nvlink_forward_stream_nonblocking": true,
   "nvlink_forward_synchronize_batches": false,
+  "nvlink_forward_completion_notifications_enabled": false,
+  "nvlink_forward_notification_queue_depth": 1024,
   "nvlink_forward_local_batch_sync_enabled": false,
   "nvlink_forward_synchronize_iteration": true,
   "nvlink_forward_log_batches": false,

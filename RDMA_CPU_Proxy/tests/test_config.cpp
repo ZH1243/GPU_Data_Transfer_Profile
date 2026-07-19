@@ -40,6 +40,8 @@ int main(int argc, char** argv) {
     assert(config.nvlink_forward_use_batch_api);
     assert(config.nvlink_forward_stream_nonblocking);
     assert(!config.nvlink_forward_synchronize_batches);
+    assert(!config.nvlink_forward_completion_notifications_enabled);
+    assert(config.nvlink_forward_notification_queue_depth == 1024);
     assert(!config.nvlink_forward_local_batch_sync_enabled);
     assert(config.nvlink_forward_synchronize_iteration);
     assert(!config.nvlink_forward_log_batches);
@@ -221,6 +223,8 @@ int main(int argc, char** argv) {
   "nvlink_forward_use_batch_api": true,
   "nvlink_forward_stream_nonblocking": true,
   "nvlink_forward_synchronize_batches": false,
+  "nvlink_forward_completion_notifications_enabled": false,
+  "nvlink_forward_notification_queue_depth": 256,
   "nvlink_forward_local_batch_sync_enabled": false,
   "nvlink_forward_synchronize_iteration": true,
   "nvlink_forward_log_batches": true,
@@ -254,6 +258,8 @@ int main(int argc, char** argv) {
     assert(!nvlink_config.nvlink_forward_out_of_order_chunks_enabled);
     assert(!rdma_proxy::nvlink_forward_dynamic_threshold_enabled(nvlink_config));
     assert(rdma_proxy::effective_nvlink_forward_threshold_tokens(nvlink_config) == 300);
+    assert(!nvlink_config.nvlink_forward_completion_notifications_enabled);
+    assert(nvlink_config.nvlink_forward_notification_queue_depth == 256);
     assert(nvlink_config.log_qp_reports);
     assert(nvlink_config.log_marker_wait_reports);
     assert(nvlink_config.nvlink_forward_use_round_robin);
@@ -287,6 +293,23 @@ int main(int argc, char** argv) {
     valid_batch_sync_config.nvlink_forward_local_batch_sync_enabled = true;
     valid_batch_sync_config.nvlink_forward_synchronize_batches = true;
     rdma_proxy::validate_config(valid_batch_sync_config);
+
+    auto invalid_notification_config = nvlink_config;
+    invalid_notification_config.nvlink_forward_completion_notifications_enabled = true;
+    invalid_notification_config.nvlink_forward_synchronize_batches = false;
+    bool rejected_notifications_without_stream_sync = false;
+    try {
+        rdma_proxy::validate_config(invalid_notification_config);
+    } catch (const std::runtime_error&) {
+        rejected_notifications_without_stream_sync = true;
+    }
+    assert(rejected_notifications_without_stream_sync);
+
+    auto valid_notification_config = nvlink_config;
+    valid_notification_config.nvlink_forward_completion_notifications_enabled = true;
+    valid_notification_config.nvlink_forward_synchronize_batches = true;
+    valid_notification_config.nvlink_forward_notification_queue_depth = 8;
+    rdma_proxy::validate_config(valid_notification_config);
 
     auto dynamic_config = nvlink_config;
     dynamic_config.nvlink_forward_use_round_robin = false;

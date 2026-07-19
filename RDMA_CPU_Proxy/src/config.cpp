@@ -305,7 +305,7 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "sequential_peer_transfers") {
         config.sequential_peer_transfers = (value == "1" || value == "true" || value == "yes");
     }
-    else if (key == "nvlink_forwarding_enabled") {
+    else if (key == "nvlink_forwarding_enabled" || key == "nvlink_forwarding_enable") {
         config.nvlink_forwarding_enabled = (value == "1" || value == "true" || value == "yes");
     }
     else if (key == "nvlink_forward_threshold_tokens") {
@@ -334,6 +334,13 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     }
     else if (key == "nvlink_forward_synchronize_batches") {
         config.nvlink_forward_synchronize_batches = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_completion_notifications_enabled") {
+        config.nvlink_forward_completion_notifications_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_notification_queue_depth") {
+        config.nvlink_forward_notification_queue_depth = static_cast<std::size_t>(std::stoull(value));
     }
     else if (key == "nvlink_forward_local_batch_sync_enabled") {
         config.nvlink_forward_local_batch_sync_enabled = (value == "1" || value == "true" || value == "yes");
@@ -487,6 +494,14 @@ ProxyConfig load_config_file(const std::string& path) {
         object, "nvlink_forward_stream_nonblocking", config.nvlink_forward_stream_nonblocking);
     config.nvlink_forward_synchronize_batches = get_bool(
         object, "nvlink_forward_synchronize_batches", config.nvlink_forward_synchronize_batches);
+    config.nvlink_forward_completion_notifications_enabled = get_bool(
+        object,
+        "nvlink_forward_completion_notifications_enabled",
+        config.nvlink_forward_completion_notifications_enabled);
+    config.nvlink_forward_notification_queue_depth = number_as<std::size_t>(
+        object,
+        "nvlink_forward_notification_queue_depth",
+        config.nvlink_forward_notification_queue_depth);
     config.nvlink_forward_local_batch_sync_enabled = get_bool(
         object, "nvlink_forward_local_batch_sync_enabled", config.nvlink_forward_local_batch_sync_enabled);
     config.nvlink_forward_synchronize_iteration = get_bool(
@@ -627,6 +642,24 @@ void validate_config(const ProxyConfig& config) {
                 "local_iteration_sync_dir must be non-empty when NVLink local batch synchronization is enabled");
         }
     }
+    if (config.nvlink_forward_completion_notifications_enabled) {
+        if (!config.nvlink_forwarding_enabled) {
+            throw std::runtime_error(
+                "nvlink_forward_completion_notifications_enabled requires nvlink_forwarding_enabled=true");
+        }
+        if (!config.nvlink_forward_synchronize_batches) {
+            throw std::runtime_error(
+                "nvlink_forward_completion_notifications_enabled requires nvlink_forward_synchronize_batches=true");
+        }
+        if (config.nvlink_forward_notification_queue_depth == 0) {
+            throw std::runtime_error(
+                "nvlink_forward_notification_queue_depth must be > 0 when NVLink completion notifications are enabled");
+        }
+        if (config.nvlink_forward_notification_queue_depth >
+            static_cast<std::size_t>(std::numeric_limits<uint32_t>::max())) {
+            throw std::runtime_error("nvlink_forward_notification_queue_depth exceeds uint32 range");
+        }
+    }
     if (config.nvlink_forwarding_enabled) {
         const auto dynamic_threshold = nvlink_forward_dynamic_threshold_enabled(config);
         const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config);
@@ -761,6 +794,10 @@ std::string config_summary(const ProxyConfig& config) {
         << " nvlink_forward_use_batch_api=" << (config.nvlink_forward_use_batch_api ? "true" : "false")
         << " nvlink_forward_synchronize_batches="
         << (config.nvlink_forward_synchronize_batches ? "true" : "false")
+        << " nvlink_forward_completion_notifications_enabled="
+        << (config.nvlink_forward_completion_notifications_enabled ? "true" : "false")
+        << " nvlink_forward_notification_queue_depth="
+        << config.nvlink_forward_notification_queue_depth
         << " nvlink_forward_local_batch_sync_enabled="
         << (config.nvlink_forward_local_batch_sync_enabled ? "true" : "false")
         << " nvlink_forward_synchronize_iteration="

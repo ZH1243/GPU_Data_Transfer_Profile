@@ -79,6 +79,16 @@ private:
 
     struct LocalIterationSyncHeader;
     struct LocalIterationSyncSlot;
+    struct NvlinkForwardNotification;
+    struct NvlinkForwardNotificationHeader;
+    struct NvlinkForwardNotificationQueue;
+    struct NvlinkForwardNotificationDispatchState;
+    struct ForwardNotificationDestinationState {
+        int gpu_index{-1};
+        NvlinkForwardNotificationHeader* header{nullptr};
+        std::size_t bytes{0};
+        int fd{-1};
+    };
 
     PeerConnectionInfo make_local_peer_info(const PeerState& peer) const;
     void setup_peer(PeerGpuBuffers& buffers);
@@ -87,6 +97,23 @@ private:
     void release_local_iteration_sync();
     std::string local_iteration_sync_shm_name() const;
     LocalIterationSyncSlot* local_iteration_sync_slot(int gpu_index) const;
+    void initialize_nvlink_forward_notifications();
+    void release_nvlink_forward_notifications();
+    std::string nvlink_forward_notification_shm_name(int gpu_index) const;
+    NvlinkForwardNotificationQueue* nvlink_forward_notification_queue_for_source(
+        NvlinkForwardNotificationHeader* header,
+        int source_gpu) const;
+    NvlinkForwardNotification* nvlink_forward_notification_entries(
+        NvlinkForwardNotificationHeader* header,
+        NvlinkForwardNotificationQueue* queue) const;
+    void prepare_forwarding_notification_destinations();
+    void initialize_nvlink_forward_notification_dispatch();
+    void enqueue_forward_completion_notifications(
+        const std::vector<NvlinkForwardNotification>& notifications);
+    void publish_forward_completion_notification(const NvlinkForwardNotification& notification);
+    void nvlink_forward_notification_dispatch_loop();
+    void nvlink_forward_notification_loop();
+    void drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQueue* queue);
     std::size_t synchronize_local_nvlink_forward_batch_start(
         uint64_t iteration,
         std::size_t batch_index_in_iteration,
@@ -193,11 +220,24 @@ private:
     std::vector<ForwardingOutOfOrderPeerState> forwarding_out_of_order_peer_states_;
     std::vector<std::vector<uint8_t>> forwarding_routing_tables_by_peer_;
     std::vector<ForwardDestinationState> forwarding_destinations_;
+    std::vector<ForwardNotificationDestinationState> forwarding_notification_destinations_;
     std::vector<ForwardingIterationStats> forwarding_iteration_stats_;
     std::string forwarding_error_;
     std::atomic<uint64_t> forwarding_batch_available_calls_{0};
     std::atomic<uint64_t> forwarding_batch_available_total_ns_{0};
     std::atomic<uint64_t> forwarding_batches_issued_{0};
+    std::thread nvlink_forward_notification_thread_;
+    std::thread nvlink_forward_notification_dispatch_thread_;
+    NvlinkForwardNotificationHeader* nvlink_forward_notification_header_{nullptr};
+    std::size_t nvlink_forward_notification_size_{0};
+    int nvlink_forward_notification_fd_{-1};
+    std::string nvlink_forward_notification_name_;
+    std::unique_ptr<NvlinkForwardNotificationDispatchState> nvlink_forward_notification_dispatch_;
+    std::atomic<bool> nvlink_forward_notification_dispatch_stop_{false};
+    std::atomic<uint64_t> nvlink_forward_notifications_enqueued_{0};
+    std::atomic<uint64_t> nvlink_forward_notifications_sent_{0};
+    std::atomic<uint64_t> nvlink_forward_notifications_received_{0};
+    std::atomic<uint64_t> nvlink_forward_notifications_dropped_{0};
     std::vector<double> rdma_iteration_bandwidth_gbps_;
     LocalIterationSyncHeader* local_iteration_sync_header_{nullptr};
     std::size_t local_iteration_sync_size_{0};

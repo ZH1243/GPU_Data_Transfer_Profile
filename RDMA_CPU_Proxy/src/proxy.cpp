@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cerrno>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <fstream>
@@ -53,10 +54,58 @@ struct alignas(64) Proxy::LocalIterationSyncSlot {
     char padding[8]{};
 };
 
+struct alignas(64) Proxy::NvlinkForwardNotification {
+    uint64_t sequence{0};
+    uint64_t iteration{0};
+    uint64_t batch_index{0};
+    uint64_t peer_slot{0};
+    uint64_t start_token{0};
+    uint64_t num_tokens{0};
+    uint64_t byte_offset{0};
+    uint64_t bytes{0};
+    int32_t source_gpu{-1};
+    int32_t destination_gpu{-1};
+    int32_t peer_rank{-1};
+    uint32_t flags{0};
+    char padding[12]{};
+};
+
+struct alignas(64) Proxy::NvlinkForwardNotificationQueue {
+    int32_t source_gpu{-1};
+    uint32_t capacity{0};
+    uint64_t head{0};
+    uint64_t tail{0};
+    uint64_t dropped{0};
+    char padding[32]{};
+};
+
+struct alignas(64) Proxy::NvlinkForwardNotificationHeader {
+    uint64_t magic{0};
+    uint32_t version{0};
+    uint32_t initialized{0};
+    int32_t node_rank{-1};
+    int32_t gpu_index{-1};
+    int32_t pid{0};
+    uint32_t num_gpus_per_node{0};
+    uint32_t queue_count{0};
+    uint32_t queue_capacity{0};
+    uint32_t header_bytes{0};
+    uint32_t queue_bytes{0};
+    uint32_t notification_bytes{0};
+    char padding[8]{};
+};
+
+struct Proxy::NvlinkForwardNotificationDispatchState {
+    std::mutex mutex;
+    std::deque<NvlinkForwardNotification> pending;
+};
+
 namespace {
 
 constexpr uint64_t kLocalIterationSyncMagic = 0x52444d415053594eULL;  // "RDMAPSyn"
 constexpr uint32_t kLocalIterationSyncVersion = 3;
+constexpr uint64_t kNvlinkForwardNotificationMagic = 0x52444d414e464e51ULL;  // "RDMANFNQ"
+constexpr uint32_t kNvlinkForwardNotificationVersion = 1;
 
 uint32_t atomic_load_u32(const uint32_t* ptr) {
     return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
@@ -80,6 +129,18 @@ uint64_t atomic_load_u64(const uint64_t* ptr) {
 
 void atomic_store_u64(uint64_t* ptr, uint64_t value) {
     __atomic_store_n(ptr, value, __ATOMIC_RELEASE);
+}
+
+uint64_t atomic_fetch_add_u64(uint64_t* ptr, uint64_t value) {
+    return __atomic_fetch_add(ptr, value, __ATOMIC_ACQ_REL);
+}
+
+void atomic_thread_fence_release() {
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+}
+
+void atomic_thread_fence_acquire() {
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
 }
 
 void cpu_relax() {
@@ -179,6 +240,13 @@ std::size_t routing_column_for_gpu(int local_gpu, int dst_gpu, int num_gpus_per_
         throw std::runtime_error("NVLink routing destination maps outside active routing columns");
     }
     return column;
+}
+
+std::size_t nvlink_notification_queue_index_for_source(int receiver_gpu, int source_gpu) {
+    if (source_gpu == receiver_gpu) {
+        throw std::runtime_error("NVLink notification source GPU cannot match receiver GPU");
+    }
+    return static_cast<std::size_t>(source_gpu < receiver_gpu ? source_gpu : source_gpu - 1);
 }
 
 }  // namespace
@@ -495,6 +563,474 @@ void Proxy::release_local_iteration_sync() {
     local_iteration_sync_fd_ = -1;
     local_iteration_sync_name_.clear();
 #endif
+}
+
+std::string Proxy::nvlink_forward_notification_shm_name(int gpu_index) const {
+    const auto run_id = config_.local_iteration_sync_run_id.empty() ?
+        default_local_iteration_sync_run_id(config_) : config_.local_iteration_sync_run_id;
+    std::ostringstream material;
+    material << run_id
+             << "|node=" << config_.node_rank
+             << "|num_nodes=" << config_.num_nodes
+             << "|gpus=" << config_.num_gpus_per_node
+             << "|nvlink_notifications_gpu=" << gpu_index;
+    std::ostringstream out;
+    out << "/rdma_nfn_" << std::hex << fnv1a64(material.str());
+    return out.str();
+}
+
+Proxy::NvlinkForwardNotificationQueue* Proxy::nvlink_forward_notification_queue_for_source(
+    NvlinkForwardNotificationHeader* header,
+    int source_gpu) const {
+    if (!header) throw std::runtime_error("NVLink notification shared memory is not mapped");
+    if (source_gpu < 0 || source_gpu >= static_cast<int>(header->num_gpus_per_node)) {
+        throw std::runtime_error("NVLink notification source GPU out of range");
+    }
+    const auto queue_index = nvlink_notification_queue_index_for_source(header->gpu_index, source_gpu);
+    if (queue_index >= header->queue_count) {
+        throw std::runtime_error("NVLink notification queue index out of range");
+    }
+    auto* base = reinterpret_cast<char*>(header);
+    auto* queues = reinterpret_cast<NvlinkForwardNotificationQueue*>(base + header->header_bytes);
+    auto* queue = reinterpret_cast<NvlinkForwardNotificationQueue*>(
+        reinterpret_cast<char*>(queues) + queue_index * header->queue_bytes);
+    if (queue->source_gpu != source_gpu) {
+        throw std::runtime_error("NVLink notification queue source GPU metadata mismatch");
+    }
+    return queue;
+}
+
+Proxy::NvlinkForwardNotification* Proxy::nvlink_forward_notification_entries(
+    NvlinkForwardNotificationHeader* header,
+    NvlinkForwardNotificationQueue* queue) const {
+    if (!header || !queue) throw std::runtime_error("NVLink notification queue is not mapped");
+    const auto queue_index = nvlink_notification_queue_index_for_source(header->gpu_index, queue->source_gpu);
+    auto* base = reinterpret_cast<char*>(header);
+    const auto queues_bytes =
+        static_cast<std::size_t>(header->queue_count) * static_cast<std::size_t>(header->queue_bytes);
+    const auto entries_offset = static_cast<std::size_t>(header->header_bytes) + queues_bytes +
+        queue_index * static_cast<std::size_t>(header->queue_capacity) *
+            static_cast<std::size_t>(header->notification_bytes);
+    return reinterpret_cast<NvlinkForwardNotification*>(base + entries_offset);
+}
+
+void Proxy::initialize_nvlink_forward_notifications() {
+    if (!config_.nvlink_forward_completion_notifications_enabled || config_.num_gpus_per_node <= 1) return;
+    if (nvlink_forward_notification_header_) return;
+
+#if defined(__unix__) || defined(__APPLE__)
+    const auto queue_count = static_cast<std::size_t>(config_.num_gpus_per_node - 1);
+    const auto queue_capacity = config_.nvlink_forward_notification_queue_depth;
+    nvlink_forward_notification_size_ = sizeof(NvlinkForwardNotificationHeader) +
+        queue_count * sizeof(NvlinkForwardNotificationQueue) +
+        queue_count * queue_capacity * sizeof(NvlinkForwardNotification);
+    nvlink_forward_notification_name_ = nvlink_forward_notification_shm_name(config_.local_gpu_index);
+
+    int fd = shm_open(nvlink_forward_notification_name_.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd < 0 && errno == EEXIST) {
+        int stale_fd = shm_open(nvlink_forward_notification_name_.c_str(), O_RDWR, 0600);
+        if (stale_fd >= 0) {
+            struct stat st {};
+            if (fstat(stale_fd, &st) == 0 &&
+                st.st_size >= static_cast<off_t>(nvlink_forward_notification_size_)) {
+                void* stale_mapping = mmap(
+                    nullptr,
+                    nvlink_forward_notification_size_,
+                    PROT_READ | PROT_WRITE,
+                    MAP_SHARED,
+                    stale_fd,
+                    0);
+                if (stale_mapping != MAP_FAILED) {
+                    auto* stale_header = reinterpret_cast<NvlinkForwardNotificationHeader*>(stale_mapping);
+                    const bool same_segment =
+                        stale_header->magic == kNvlinkForwardNotificationMagic &&
+                        stale_header->version == kNvlinkForwardNotificationVersion &&
+                        stale_header->node_rank == config_.node_rank &&
+                        stale_header->gpu_index == config_.local_gpu_index;
+                    const bool live_owner = same_segment && process_is_alive(atomic_load_i32(&stale_header->pid));
+                    munmap(stale_mapping, nvlink_forward_notification_size_);
+                    if (live_owner) {
+                        close(stale_fd);
+                        throw std::runtime_error("NVLink notification shared memory already has a live owner: " +
+                                                 nvlink_forward_notification_name_);
+                    }
+                }
+            }
+            close(stale_fd);
+        }
+        shm_unlink(nvlink_forward_notification_name_.c_str());
+        fd = shm_open(nvlink_forward_notification_name_.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+    }
+    if (fd < 0) {
+        throw std::runtime_error("failed to create NVLink notification shared memory " +
+                                 nvlink_forward_notification_name_ +
+                                 ": errno=" + std::to_string(errno));
+    }
+    if (ftruncate(fd, static_cast<off_t>(nvlink_forward_notification_size_)) != 0) {
+        const auto error = errno;
+        close(fd);
+        shm_unlink(nvlink_forward_notification_name_.c_str());
+        throw std::runtime_error("failed to size NVLink notification shared memory " +
+                                 nvlink_forward_notification_name_ +
+                                 ": errno=" + std::to_string(error));
+    }
+
+    void* mapping = mmap(
+        nullptr,
+        nvlink_forward_notification_size_,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED,
+        fd,
+        0);
+    if (mapping == MAP_FAILED) {
+        const auto error = errno;
+        close(fd);
+        shm_unlink(nvlink_forward_notification_name_.c_str());
+        throw std::runtime_error("failed to map NVLink notification shared memory " +
+                                 nvlink_forward_notification_name_ +
+                                 ": errno=" + std::to_string(error));
+    }
+
+    std::memset(mapping, 0, nvlink_forward_notification_size_);
+    auto* header = reinterpret_cast<NvlinkForwardNotificationHeader*>(mapping);
+    header->magic = kNvlinkForwardNotificationMagic;
+    header->version = kNvlinkForwardNotificationVersion;
+    header->node_rank = config_.node_rank;
+    header->gpu_index = config_.local_gpu_index;
+    header->num_gpus_per_node = static_cast<uint32_t>(config_.num_gpus_per_node);
+    header->queue_count = static_cast<uint32_t>(queue_count);
+    header->queue_capacity = static_cast<uint32_t>(queue_capacity);
+    header->header_bytes = static_cast<uint32_t>(sizeof(NvlinkForwardNotificationHeader));
+    header->queue_bytes = static_cast<uint32_t>(sizeof(NvlinkForwardNotificationQueue));
+    header->notification_bytes = static_cast<uint32_t>(sizeof(NvlinkForwardNotification));
+
+    auto* queues = reinterpret_cast<NvlinkForwardNotificationQueue*>(
+        reinterpret_cast<char*>(mapping) + sizeof(NvlinkForwardNotificationHeader));
+    std::size_t queue_index = 0;
+    for (int source_gpu = 0; source_gpu < config_.num_gpus_per_node; ++source_gpu) {
+        if (source_gpu == config_.local_gpu_index) continue;
+        auto* queue = reinterpret_cast<NvlinkForwardNotificationQueue*>(
+            reinterpret_cast<char*>(queues) + queue_index * sizeof(NvlinkForwardNotificationQueue));
+        queue->source_gpu = source_gpu;
+        queue->capacity = static_cast<uint32_t>(queue_capacity);
+        atomic_store_u64(&queue->head, 0);
+        atomic_store_u64(&queue->tail, 0);
+        atomic_store_u64(&queue->dropped, 0);
+        ++queue_index;
+    }
+    atomic_store_i32(&header->pid, current_process_id());
+    atomic_store_u32(&header->initialized, 1);
+
+    nvlink_forward_notification_fd_ = fd;
+    nvlink_forward_notification_header_ = header;
+    nvlink_forward_notifications_sent_.store(0);
+    nvlink_forward_notifications_received_.store(0);
+    nvlink_forward_notifications_dropped_.store(0);
+
+    RDMA_PROXY_LOG_INFO("created NVLink completion notification shared memory local_rank=", config_.node_rank,
+                        " local_gpu=", config_.local_gpu_index,
+                        " name=", nvlink_forward_notification_name_,
+                        " queues=", queue_count,
+                        " queue_depth=", queue_capacity,
+                        " bytes=", nvlink_forward_notification_size_);
+#else
+    throw std::runtime_error("NVLink completion notifications require POSIX shared memory");
+#endif
+}
+
+void Proxy::release_nvlink_forward_notifications() {
+#if defined(__unix__) || defined(__APPLE__)
+    for (auto& dst : forwarding_notification_destinations_) {
+        if (dst.header) {
+            munmap(dst.header, dst.bytes);
+            dst.header = nullptr;
+        }
+        if (dst.fd >= 0) {
+            close(dst.fd);
+            dst.fd = -1;
+        }
+    }
+    forwarding_notification_destinations_.clear();
+
+    if (nvlink_forward_notification_header_) {
+        munmap(nvlink_forward_notification_header_, nvlink_forward_notification_size_);
+        nvlink_forward_notification_header_ = nullptr;
+    }
+    if (nvlink_forward_notification_fd_ >= 0) {
+        close(nvlink_forward_notification_fd_);
+        nvlink_forward_notification_fd_ = -1;
+    }
+    if (!nvlink_forward_notification_name_.empty()) {
+        shm_unlink(nvlink_forward_notification_name_.c_str());
+    }
+    nvlink_forward_notification_size_ = 0;
+    nvlink_forward_notification_name_.clear();
+#else
+    forwarding_notification_destinations_.clear();
+    nvlink_forward_notification_header_ = nullptr;
+    nvlink_forward_notification_size_ = 0;
+    nvlink_forward_notification_fd_ = -1;
+    nvlink_forward_notification_name_.clear();
+#endif
+}
+
+void Proxy::prepare_forwarding_notification_destinations() {
+    if (!config_.nvlink_forward_completion_notifications_enabled) return;
+
+#if defined(__unix__) || defined(__APPLE__)
+    forwarding_notification_destinations_.clear();
+    forwarding_notification_destinations_.reserve(forwarding_destinations_.size());
+    const auto queue_count = static_cast<std::size_t>(config_.num_gpus_per_node - 1);
+    const auto expected_size = sizeof(NvlinkForwardNotificationHeader) +
+        queue_count * sizeof(NvlinkForwardNotificationQueue) +
+        queue_count * config_.nvlink_forward_notification_queue_depth * sizeof(NvlinkForwardNotification);
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(config_.completion_timeout_ms);
+
+    for (const auto& dst : forwarding_destinations_) {
+        const auto name = nvlink_forward_notification_shm_name(dst.gpu_index);
+        std::string last_wait_reason = "shared memory not present";
+        while (std::chrono::steady_clock::now() < deadline) {
+            int fd = shm_open(name.c_str(), O_RDWR, 0600);
+            if (fd < 0) {
+                last_wait_reason = "shm_open errno=" + std::to_string(errno);
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+            struct stat st {};
+            if (fstat(fd, &st) != 0 ||
+                st.st_size < static_cast<off_t>(expected_size)) {
+                last_wait_reason = "shared memory is not fully sized";
+                close(fd);
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
+            void* mapping = mmap(nullptr, expected_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (mapping == MAP_FAILED) {
+                last_wait_reason = "mmap errno=" + std::to_string(errno);
+                close(fd);
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
+            auto* header = reinterpret_cast<NvlinkForwardNotificationHeader*>(mapping);
+            if (atomic_load_u32(&header->initialized) != 1 ||
+                header->magic != kNvlinkForwardNotificationMagic ||
+                header->version != kNvlinkForwardNotificationVersion ||
+                header->node_rank != config_.node_rank ||
+                header->gpu_index != dst.gpu_index ||
+                header->num_gpus_per_node != static_cast<uint32_t>(config_.num_gpus_per_node) ||
+                header->queue_count != static_cast<uint32_t>(queue_count) ||
+                header->queue_capacity != static_cast<uint32_t>(config_.nvlink_forward_notification_queue_depth) ||
+                header->header_bytes != sizeof(NvlinkForwardNotificationHeader) ||
+                header->queue_bytes != sizeof(NvlinkForwardNotificationQueue) ||
+                header->notification_bytes != sizeof(NvlinkForwardNotification)) {
+                last_wait_reason = "metadata incomplete or mismatched";
+                munmap(mapping, expected_size);
+                close(fd);
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+            const auto receiver_pid = atomic_load_i32(&header->pid);
+            if (!process_is_alive(receiver_pid)) {
+                last_wait_reason = "receiver PID is not alive";
+                munmap(mapping, expected_size);
+                close(fd);
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
+            forwarding_notification_destinations_.push_back(
+                ForwardNotificationDestinationState{dst.gpu_index, header, expected_size, fd});
+            RDMA_PROXY_LOG_INFO("mapped NVLink completion notification queue local_rank=", config_.node_rank,
+                                " src_gpu=", config_.local_gpu_index,
+                                " dst_gpu=", dst.gpu_index,
+                                " receiver_pid=", receiver_pid,
+                                " name=", name);
+            break;
+        }
+        if (forwarding_notification_destinations_.empty() ||
+            forwarding_notification_destinations_.back().gpu_index != dst.gpu_index) {
+            throw std::runtime_error("timed out waiting for NVLink completion notification shared memory " +
+                                     name + " reason=" + last_wait_reason);
+        }
+    }
+#else
+    throw std::runtime_error("NVLink completion notifications require POSIX shared memory");
+#endif
+}
+
+void Proxy::initialize_nvlink_forward_notification_dispatch() {
+    if (!config_.nvlink_forward_completion_notifications_enabled) return;
+    nvlink_forward_notification_dispatch_.reset(new NvlinkForwardNotificationDispatchState);
+    nvlink_forward_notification_dispatch_stop_.store(false);
+    nvlink_forward_notifications_enqueued_.store(0);
+}
+
+void Proxy::enqueue_forward_completion_notifications(
+    const std::vector<NvlinkForwardNotification>& notifications) {
+    if (!config_.nvlink_forward_completion_notifications_enabled || notifications.empty()) return;
+    if (!nvlink_forward_notification_dispatch_) {
+        throw std::runtime_error("NVLink completion notification dispatch queue is not initialized");
+    }
+    {
+        std::lock_guard<std::mutex> lock(nvlink_forward_notification_dispatch_->mutex);
+        for (const auto& notification : notifications) {
+            nvlink_forward_notification_dispatch_->pending.push_back(notification);
+        }
+    }
+    nvlink_forward_notifications_enqueued_.fetch_add(notifications.size());
+    if (config_.nvlink_forward_log_batches) {
+        RDMA_PROXY_LOG_INFO("nvlink_forward_notifications_enqueued local_rank=", config_.node_rank,
+                            " src_gpu=", config_.local_gpu_index,
+                            " count=", notifications.size());
+    }
+}
+
+void Proxy::publish_forward_completion_notification(const NvlinkForwardNotification& notification) {
+    if (!config_.nvlink_forward_completion_notifications_enabled) return;
+    const auto dst_it = std::find_if(
+        forwarding_notification_destinations_.begin(),
+        forwarding_notification_destinations_.end(),
+        [&](const ForwardNotificationDestinationState& dst) {
+            return dst.gpu_index == notification.destination_gpu;
+        });
+    if (dst_it == forwarding_notification_destinations_.end()) {
+        throw std::runtime_error("missing NVLink completion notification destination for GPU " +
+                                 std::to_string(notification.destination_gpu));
+    }
+
+    auto* queue = nvlink_forward_notification_queue_for_source(dst_it->header, config_.local_gpu_index);
+    auto* entries = nvlink_forward_notification_entries(dst_it->header, queue);
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(config_.completion_timeout_ms);
+    while (true) {
+        const auto head = atomic_load_u64(&queue->head);
+        const auto tail = atomic_load_u64(&queue->tail);
+        if (head - tail < queue->capacity) {
+            auto entry = notification;
+            entry.sequence = head + 1;
+            entries[head % queue->capacity] = entry;
+            atomic_thread_fence_release();
+            atomic_store_u64(&queue->head, head + 1);
+            nvlink_forward_notifications_sent_.fetch_add(1);
+            if (config_.nvlink_forward_log_batches) {
+                RDMA_PROXY_LOG_INFO("nvlink_forward_notification_sent iteration=", entry.iteration,
+                                    " local_rank=", config_.node_rank,
+                                    " src_gpu=", entry.source_gpu,
+                                    " dst_gpu=", entry.destination_gpu,
+                                    " peer_rank=", entry.peer_rank,
+                                    " batch=", entry.batch_index,
+                                    " start_token=", entry.start_token,
+                                    " tokens=", entry.num_tokens,
+                                    " byte_offset=", entry.byte_offset,
+                                    " bytes=", entry.bytes,
+                                    " sequence=", entry.sequence);
+            }
+            return;
+        }
+        if (!process_is_alive(atomic_load_i32(&dst_it->header->pid))) {
+            atomic_fetch_add_u64(&queue->dropped, 1);
+            nvlink_forward_notifications_dropped_.fetch_add(1);
+            throw std::runtime_error("NVLink completion notification receiver is not alive for GPU " +
+                                     std::to_string(notification.destination_gpu));
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            atomic_fetch_add_u64(&queue->dropped, 1);
+            nvlink_forward_notifications_dropped_.fetch_add(1);
+            throw std::runtime_error("timed out waiting for NVLink completion notification queue space dst_gpu=" +
+                                     std::to_string(notification.destination_gpu) +
+                                     " source_gpu=" + std::to_string(config_.local_gpu_index));
+        }
+        cpu_relax();
+    }
+}
+
+void Proxy::nvlink_forward_notification_dispatch_loop() {
+    try {
+        if (!nvlink_forward_notification_dispatch_) return;
+        while (true) {
+            NvlinkForwardNotification notification;
+            bool have_notification = false;
+            {
+                std::lock_guard<std::mutex> lock(nvlink_forward_notification_dispatch_->mutex);
+                if (!nvlink_forward_notification_dispatch_->pending.empty()) {
+                    notification = nvlink_forward_notification_dispatch_->pending.front();
+                    nvlink_forward_notification_dispatch_->pending.pop_front();
+                    have_notification = true;
+                }
+            }
+
+            if (have_notification) {
+                publish_forward_completion_notification(notification);
+                continue;
+            }
+            if (nvlink_forward_notification_dispatch_stop_.load()) {
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+        }
+    } catch (const std::exception& e) {
+        set_forwarding_error(e.what());
+    }
+}
+
+void Proxy::drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQueue* queue) {
+    if (!queue || !nvlink_forward_notification_header_) return;
+    auto* entries = nvlink_forward_notification_entries(nvlink_forward_notification_header_, queue);
+    while (true) {
+        const auto tail = atomic_load_u64(&queue->tail);
+        const auto head = atomic_load_u64(&queue->head);
+        if (tail >= head) return;
+        atomic_thread_fence_acquire();
+        const auto notification = entries[tail % queue->capacity];
+        atomic_store_u64(&queue->tail, tail + 1);
+        nvlink_forward_notifications_received_.fetch_add(1);
+        if (config_.nvlink_forward_log_batches) {
+            RDMA_PROXY_LOG_INFO("nvlink_forward_notification_received iteration=", notification.iteration,
+                                " local_rank=", config_.node_rank,
+                                " recv_gpu=", config_.local_gpu_index,
+                                " src_gpu=", notification.source_gpu,
+                                " peer_rank=", notification.peer_rank,
+                                " batch=", notification.batch_index,
+                                " start_token=", notification.start_token,
+                                " tokens=", notification.num_tokens,
+                                " byte_offset=", notification.byte_offset,
+                                " bytes=", notification.bytes,
+                                " sequence=", notification.sequence);
+        }
+    }
+}
+
+void Proxy::nvlink_forward_notification_loop() {
+    try {
+        if (!nvlink_forward_notification_header_) return;
+        while (!forwarding_stop_.load()) {
+            bool progressed = false;
+            auto* base = reinterpret_cast<char*>(nvlink_forward_notification_header_);
+            for (std::size_t i = 0; i < nvlink_forward_notification_header_->queue_count; ++i) {
+                auto* queue = reinterpret_cast<NvlinkForwardNotificationQueue*>(
+                    base + nvlink_forward_notification_header_->header_bytes +
+                    i * nvlink_forward_notification_header_->queue_bytes);
+                const auto before = atomic_load_u64(&queue->tail);
+                drain_nvlink_forward_notification_queue(queue);
+                progressed = progressed || atomic_load_u64(&queue->tail) != before;
+            }
+            if (!progressed) {
+                std::this_thread::sleep_for(std::chrono::microseconds(10));
+            }
+        }
+        auto* base = reinterpret_cast<char*>(nvlink_forward_notification_header_);
+        for (std::size_t i = 0; i < nvlink_forward_notification_header_->queue_count; ++i) {
+            auto* queue = reinterpret_cast<NvlinkForwardNotificationQueue*>(
+                base + nvlink_forward_notification_header_->header_bytes +
+                i * nvlink_forward_notification_header_->queue_bytes);
+            drain_nvlink_forward_notification_queue(queue);
+        }
+    } catch (const std::exception& e) {
+        set_forwarding_error(e.what());
+    }
 }
 
 void Proxy::run_iteration(uint64_t iteration) {
@@ -1031,8 +1567,11 @@ void Proxy::start_forwarding_thread() {
         config_.cuda_device_id,
         config_.nvlink_forward_stream_nonblocking,
         config_.mock_mode);
+    initialize_nvlink_forward_notifications();
     publish_local_nvlink_receive_buffers();
     prepare_forwarding_destinations();
+    prepare_forwarding_notification_destinations();
+    initialize_nvlink_forward_notification_dispatch();
     if (!config_.nvlink_forward_use_round_robin) {
         prepare_forwarding_routing_tables();
     }
@@ -1119,6 +1658,12 @@ void Proxy::start_forwarding_thread() {
     forwarding_batch_available_total_ns_.store(0);
     forwarding_batches_issued_.store(0);
     forwarding_stop_.store(false);
+    if (config_.nvlink_forward_completion_notifications_enabled) {
+        nvlink_forward_notification_dispatch_thread_ =
+            std::thread(&Proxy::nvlink_forward_notification_dispatch_loop, this);
+        nvlink_forward_notification_thread_ =
+            std::thread(&Proxy::nvlink_forward_notification_loop, this);
+    }
     forwarding_ready_thread_ = std::thread(&Proxy::forwarding_ready_loop, this);
     forwarding_thread_ = std::thread(&Proxy::forwarding_loop, this);
     const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config_);
@@ -1137,6 +1682,13 @@ void Proxy::stop_forwarding_thread() {
     forwarding_stop_.store(true);
     if (forwarding_ready_thread_.joinable()) forwarding_ready_thread_.join();
     if (forwarding_thread_.joinable()) forwarding_thread_.join();
+    nvlink_forward_notification_dispatch_stop_.store(true);
+    if (nvlink_forward_notification_dispatch_thread_.joinable()) {
+        nvlink_forward_notification_dispatch_thread_.join();
+    }
+    if (nvlink_forward_notification_thread_.joinable()) {
+        nvlink_forward_notification_thread_.join();
+    }
     for (auto& dst : forwarding_destinations_) {
         if (dst.imported_cuda_ipc) {
             close_cuda_ipc_memory_handle(dst.ptr, config_.mock_mode);
@@ -1161,6 +1713,8 @@ void Proxy::stop_forwarding_thread() {
     forwarding_out_of_order_issued_chunks_by_peer_.reset();
     forwarding_ready_peer_count_ = 0;
     forwarding_out_of_order_peer_states_.clear();
+    nvlink_forward_notification_dispatch_.reset();
+    release_nvlink_forward_notifications();
     destroy_cuda_stream(forwarding_stream_, config_.mock_mode);
     forwarding_stream_ = nullptr;
 }
@@ -1412,6 +1966,7 @@ void Proxy::issue_forwarding_batch(
     const auto token_bytes = config_.token_dimension * dtype_size(config_.dtype);
     const auto batch_timing_start = std::chrono::steady_clock::now();
     std::size_t batch_bytes = 0;
+    std::vector<NvlinkForwardNotification> completed_notifications;
     if (batch_start_token + batch_tokens > config_.num_tokens) {
         throw std::runtime_error("NVLink forwarding batch exceeds token range");
     }
@@ -1476,6 +2031,21 @@ void Proxy::issue_forwarding_batch(
                 forwarding_stream_,
                 config_.nvlink_forward_use_batch_api,
                 config_.mock_mode);
+            if (config_.nvlink_forward_completion_notifications_enabled) {
+                NvlinkForwardNotification notification;
+                notification.iteration = iteration;
+                notification.batch_index = batch_index_in_iteration;
+                notification.peer_slot = peer_slot;
+                notification.start_token = token_offset;
+                notification.num_tokens = config_.nvlink_forward_chunk_tokens;
+                notification.byte_offset = destination_byte_offset;
+                notification.bytes = bytes;
+                notification.source_gpu = config_.local_gpu_index;
+                notification.destination_gpu = dst_gpu;
+                notification.peer_rank = peer.peer_rank;
+                notification.flags = 1;
+                completed_notifications.push_back(notification);
+            }
         }
     } else {
         if (peer_slot >= forwarding_routing_tables_by_peer_.size()) {
@@ -1573,11 +2143,27 @@ void Proxy::issue_forwarding_batch(
                 forwarding_stream_,
                 config_.nvlink_forward_use_batch_api,
                 config_.mock_mode);
+            if (config_.nvlink_forward_completion_notifications_enabled) {
+                NvlinkForwardNotification notification;
+                notification.iteration = iteration;
+                notification.batch_index = batch_index_in_iteration;
+                notification.peer_slot = peer_slot;
+                notification.start_token = batch_start_token;
+                notification.num_tokens = routed_tokens;
+                notification.byte_offset = destination_base_offset;
+                notification.bytes = bytes;
+                notification.source_gpu = config_.local_gpu_index;
+                notification.destination_gpu = dst.gpu_index;
+                notification.peer_rank = peer.peer_rank;
+                notification.flags = 0;
+                completed_notifications.push_back(notification);
+            }
         }
     }
     if (config_.nvlink_forward_synchronize_batches) {
         synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
         const auto batch_timing_end = std::chrono::steady_clock::now();
+        enqueue_forward_completion_notifications(completed_notifications);
         const auto batch_seconds = std::chrono::duration<double>(batch_timing_end - batch_timing_start).count();
         const double batch_gbytes_per_sec = batch_seconds > 0.0 ?
             static_cast<double>(batch_bytes) / batch_seconds / 1.0e9 : 0.0;

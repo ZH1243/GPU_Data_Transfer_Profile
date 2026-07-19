@@ -161,6 +161,8 @@ int main() {
         config0.nvlink_forward_threshold_tokens = 32;
         config0.nvlink_forward_chunk_tokens = 32;
         config0.nvlink_forward_synchronize_batches = true;
+        config0.nvlink_forward_completion_notifications_enabled = true;
+        config0.nvlink_forward_notification_queue_depth = 8;
         config0.nvlink_forward_local_batch_sync_enabled = true;
         config0.local_iteration_sync_run_id = "test_measured_run_nvlink_batch_sync";
         config0.local_gpu_index = 0;
