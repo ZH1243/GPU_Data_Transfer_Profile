@@ -250,6 +250,12 @@ std::size_t nvlink_notification_queue_index_for_source(int receiver_gpu, int sou
     return static_cast<std::size_t>(source_gpu < receiver_gpu ? source_gpu : source_gpu - 1);
 }
 
+uint64_t unix_epoch_nanoseconds_now() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
 }  // namespace
 
 Proxy::Proxy(ProxyConfig config)
@@ -1011,9 +1017,11 @@ void Proxy::nvlink_forward_notification_dispatch_loop() {
 }
 
 std::string Proxy::format_nvlink_forward_notification_log(
-    const NvlinkForwardNotification& notification) const {
+    const NvlinkForwardNotification& notification,
+    uint64_t dequeue_timestamp_ns) const {
     std::ostringstream out;
     out << "nvlink_forward_notification"
+        << " dequeue_timestamp_ns=" << dequeue_timestamp_ns
         << " local_rank=" << config_.node_rank
         << " recv_gpu=" << config_.local_gpu_index
         << " src_gpu=" << notification.source_gpu
@@ -1032,11 +1040,12 @@ std::string Proxy::format_nvlink_forward_notification_log(
 }
 
 void Proxy::enqueue_nvlink_forward_notification_log(
-    const NvlinkForwardNotification& notification) {
+    const NvlinkForwardNotification& notification,
+    uint64_t dequeue_timestamp_ns) {
     if (!config_.nvlink_forward_notification_log_enabled) return;
     std::lock_guard<std::mutex> lock(nvlink_forward_notification_log_mutex_);
     nvlink_forward_notification_log_queue_.push_back(
-        format_nvlink_forward_notification_log(notification));
+        format_nvlink_forward_notification_log(notification, dequeue_timestamp_ns));
 }
 
 void Proxy::flush_nvlink_forward_notification_log_queue() {
@@ -1084,10 +1093,12 @@ void Proxy::drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQue
         atomic_thread_fence_acquire();
         const auto notification = entries[tail % queue->capacity];
         atomic_store_u64(&queue->tail, tail + 1);
+        const auto dequeue_timestamp_ns = unix_epoch_nanoseconds_now();
         nvlink_forward_notifications_received_.fetch_add(1);
-        enqueue_nvlink_forward_notification_log(notification);
+        enqueue_nvlink_forward_notification_log(notification, dequeue_timestamp_ns);
         if (config_.nvlink_forward_log_batches) {
             RDMA_PROXY_LOG_INFO("nvlink_forward_notification_received iteration=", notification.iteration,
+                                " dequeue_timestamp_ns=", dequeue_timestamp_ns,
                                 " local_rank=", config_.node_rank,
                                 " recv_gpu=", config_.local_gpu_index,
                                 " src_gpu=", notification.source_gpu,

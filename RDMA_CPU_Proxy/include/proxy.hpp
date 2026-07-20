@@ -118,8 +118,11 @@ private:
     void nvlink_forward_notification_loop();
     void drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQueue* queue);
     std::string format_nvlink_forward_notification_log(
-        const NvlinkForwardNotification& notification) const;
-    void enqueue_nvlink_forward_notification_log(const NvlinkForwardNotification& notification);
+        const NvlinkForwardNotification& notification,
+        uint64_t dequeue_timestamp_ns) const;
+    void enqueue_nvlink_forward_notification_log(
+        const NvlinkForwardNotification& notification,
+        uint64_t dequeue_timestamp_ns);
     void flush_nvlink_forward_notification_log_queue();
     std::size_t synchronize_local_nvlink_forward_batch_start(
         uint64_t iteration,
