@@ -73,6 +73,13 @@ struct ProxyConfig {
     std::size_t nvlink_forward_notification_queue_depth{1024};
     bool nvlink_forward_notification_log_enabled{false};
     std::string nvlink_forward_notification_log_dir{"/tmp/rdma_cpu_proxy_nvlink_notifications"};
+    bool nvlink_forward_computation_enabled{false};
+    std::size_t nvlink_forward_computation_output_dim{0};
+    std::size_t nvlink_forward_computation_tile_m{128};
+    std::size_t nvlink_forward_computation_tile_n{128};
+    std::size_t nvlink_forward_computation_num_queues{1};
+    std::size_t nvlink_forward_computation_queue_depth{1024};
+    bool nvlink_forward_computation_log_enabled{false};
     bool nvlink_forward_local_batch_sync_enabled{false};
     bool nvlink_forward_synchronize_iteration{true};
     bool nvlink_forward_log_batches{false};
@@ -102,5 +109,6 @@ ProxyConfig load_config_file(const std::string& path);
 ProxyConfig load_config(int argc, char** argv);
 void validate_config(const ProxyConfig& config);
 std::string config_summary(const ProxyConfig& config);
+std::string config_help();
 
 }  // namespace rdma_proxy

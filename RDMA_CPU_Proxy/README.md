@@ -107,6 +107,8 @@ Each notification includes the source GPU, destination GPU, remote peer rank/slo
 
 Set `nvlink_forward_notification_log_enabled=true` to record receiver-side notification dequeue events to files. This mode requires `nvlink_forward_completion_notifications_enabled=true`. When the receiver notification thread dequeues an entry, it formats the notification into a single text line with `dequeue_timestamp_ns` and appends that line to an in-process log queue. During shutdown, each GPU proxy drains its log queue and writes one file under `nvlink_forward_notification_log_dir`, named `nvlink_forward_notifications_rank_<rank>_gpu_<gpu>.log`.
 
+Set `nvlink_forward_computation_enabled=true` to translate each received ready-range notification immediately into output-tile tasks for a per-iteration persistent Hopper GEMM kernel. The kernel computes `D=A*B` without waiting for all forwarding to finish. It uses mapped CPU-to-GPU queues, BF16/FP16 tensor-core fragments with FP32 accumulation, asynchronous double-buffered operand staging, one logical CTA per SM, generation checks, exact per-queue exit distribution, and receiver-completion acknowledgements that protect receive-buffer lifetime across iterations. See [docs/nvlink_forward_computation.md](docs/nvlink_forward_computation.md) for the queue protocol, lifecycle, limitations, validation commands, and the 256x4096x6400 example.
+
 Set `nvlink_forward_local_batch_sync_enabled=true` to add a same-node GPU-proxy barrier before every synchronized NVLink forwarding batch. Once a proxy has observed that the next batch is ready for forwarding, it marks the batch-start sequence in shared memory and waits until every local GPU proxy has reached the same sequence before issuing that batch. Because each forwarding thread reaches the next batch-start barrier only after the previous batch's `cudaStreamSynchronize()` has returned, this makes the proxies start each batch together while still allowing them to move directly from a completed batch to checking readiness for the next one. The first batch uses the same barrier, with the previous batch treated as already complete. This option requires `nvlink_forward_synchronize_batches=true` and uses the same local shared-memory run identity as `local_iteration_sync_run_id`.
 
 ## RDMA and GPUDirect RDMA
@@ -270,6 +272,17 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_use_batch_api`
 - `nvlink_forward_stream_nonblocking`
 - `nvlink_forward_synchronize_batches`
+- `nvlink_forward_completion_notifications_enabled`
+- `nvlink_forward_notification_queue_depth`
+- `nvlink_forward_notification_log_enabled`
+- `nvlink_forward_notification_log_dir`
+- `nvlink_forward_computation_enabled`
+- `nvlink_forward_computation_output_dim`
+- `nvlink_forward_computation_tile_m`
+- `nvlink_forward_computation_tile_n`
+- `nvlink_forward_computation_num_queues`
+- `nvlink_forward_computation_queue_depth`
+- `nvlink_forward_computation_log_enabled`
 - `nvlink_forward_local_batch_sync_enabled`
 - `nvlink_forward_synchronize_iteration`
 - `nvlink_forward_log_batches`

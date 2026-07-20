@@ -7,6 +7,7 @@
 
 int main(int argc, char** argv) {
     assert(argc == 2);
+    assert(rdma_proxy::config_help().find("nvlink_forward_computation_enabled") != std::string::npos);
     const auto config = rdma_proxy::load_config_file(argv[1]);
 
     assert(config.node_rank == 0);
@@ -44,6 +45,13 @@ int main(int argc, char** argv) {
     assert(config.nvlink_forward_notification_queue_depth == 1024);
     assert(!config.nvlink_forward_notification_log_enabled);
     assert(config.nvlink_forward_notification_log_dir == "/tmp/rdma_cpu_proxy_nvlink_notifications");
+    assert(!config.nvlink_forward_computation_enabled);
+    assert(config.nvlink_forward_computation_output_dim == 6400);
+    assert(config.nvlink_forward_computation_tile_m == 128);
+    assert(config.nvlink_forward_computation_tile_n == 128);
+    assert(config.nvlink_forward_computation_num_queues == 8);
+    assert(config.nvlink_forward_computation_queue_depth == 1024);
+    assert(!config.nvlink_forward_computation_log_enabled);
     assert(!config.nvlink_forward_local_batch_sync_enabled);
     assert(config.nvlink_forward_synchronize_iteration);
     assert(!config.nvlink_forward_log_batches);
@@ -333,6 +341,35 @@ int main(int argc, char** argv) {
     valid_notification_log_config.nvlink_forward_notification_log_dir =
         "/tmp/rdma_cpu_proxy_test_notifications_valid";
     rdma_proxy::validate_config(valid_notification_log_config);
+
+    auto valid_computation_config = valid_notification_config;
+    valid_computation_config.nvlink_forward_computation_enabled = true;
+    valid_computation_config.nvlink_forward_computation_output_dim = 32;
+    valid_computation_config.nvlink_forward_computation_tile_m = 16;
+    valid_computation_config.nvlink_forward_computation_tile_n = 16;
+    valid_computation_config.nvlink_forward_computation_num_queues = 2;
+    valid_computation_config.nvlink_forward_computation_queue_depth = 4;
+    rdma_proxy::validate_config(valid_computation_config);
+
+    auto invalid_computation_notifications = valid_computation_config;
+    invalid_computation_notifications.nvlink_forward_completion_notifications_enabled = false;
+    bool rejected_computation_without_notifications = false;
+    try {
+        rdma_proxy::validate_config(invalid_computation_notifications);
+    } catch (const std::runtime_error&) {
+        rejected_computation_without_notifications = true;
+    }
+    assert(rejected_computation_without_notifications);
+
+    auto invalid_computation_k = valid_computation_config;
+    invalid_computation_k.token_dimension = 15;
+    bool rejected_computation_unaligned_k = false;
+    try {
+        rdma_proxy::validate_config(invalid_computation_k);
+    } catch (const std::runtime_error&) {
+        rejected_computation_unaligned_k = true;
+    }
+    assert(rejected_computation_unaligned_k);
 
     auto dynamic_config = nvlink_config;
     dynamic_config.nvlink_forward_use_round_robin = false;

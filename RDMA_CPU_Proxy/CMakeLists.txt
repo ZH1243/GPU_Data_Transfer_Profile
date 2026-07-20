@@ -16,6 +16,7 @@ set(RDMA_PROXY_HAVE_CUDA 0)
 if(CMAKE_CUDA_COMPILER)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+  set(CMAKE_CUDA_ARCHITECTURES "90" CACHE STRING "CUDA architectures (persistent forwarding GEMM targets Hopper by default)")
   set(RDMA_PROXY_HAVE_CUDA 1)
 elseif(RDMA_PROXY_REQUIRE_CUDA)
   message(FATAL_ERROR "CUDA compiler not found. Install CUDA or configure with -DRDMA_PROXY_REQUIRE_CUDA=OFF.")
@@ -34,6 +35,7 @@ set(RDMA_PROXY_SOURCES
   src/config.cpp
   src/cpu_affinity.cpp
   src/cuda_buffers.cpp
+  src/forward_computation.cpp
   src/logging.cpp
   src/protocol.cpp
   src/proxy.cpp
@@ -84,6 +86,16 @@ if(RDMA_PROXY_BUILD_TESTS)
   add_executable(test_measured_run tests/test_measured_run.cpp)
   target_link_libraries(test_measured_run PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_measured_run COMMAND test_measured_run)
+
+  add_executable(test_forward_computation tests/test_forward_computation.cpp)
+  target_link_libraries(test_forward_computation PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_forward_computation COMMAND test_forward_computation)
+
+  if(RDMA_PROXY_HAVE_CUDA)
+    add_executable(validate_forward_computation tests/validate_forward_computation.cu)
+    set_target_properties(validate_forward_computation PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+    target_link_libraries(validate_forward_computation PRIVATE rdma_cpu_proxy_lib CUDA::cudart CUDA::cublas)
+  endif()
 endif()
 
 message(STATUS "RDMA_PROXY_HAVE_CUDA=${RDMA_PROXY_HAVE_CUDA}")

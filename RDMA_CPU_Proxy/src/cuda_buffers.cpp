@@ -49,6 +49,60 @@ std::vector<uint8_t> make_test_pattern(
     return pattern;
 }
 
+uint16_t float_to_bf16_bits(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t rounding_bias = 0x7fffU + ((bits >> 16) & 1U);
+    return static_cast<uint16_t>((bits + rounding_bias) >> 16);
+}
+
+uint16_t float_to_fp16_bits(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t sign = (bits >> 16) & 0x8000U;
+    const int32_t exponent = static_cast<int32_t>((bits >> 23) & 0xffU) - 127 + 15;
+    uint32_t mantissa = bits & 0x7fffffU;
+    if (exponent <= 0) {
+        if (exponent < -10) return static_cast<uint16_t>(sign);
+        mantissa |= 0x800000U;
+        const uint32_t shift = static_cast<uint32_t>(14 - exponent);
+        uint32_t half_mantissa = mantissa >> shift;
+        const uint32_t remainder = mantissa & ((1U << shift) - 1U);
+        const uint32_t halfway = 1U << (shift - 1U);
+        if (remainder > halfway || (remainder == halfway && (half_mantissa & 1U))) {
+            ++half_mantissa;
+        }
+        return static_cast<uint16_t>(sign | half_mantissa);
+    }
+    if (exponent >= 31) return static_cast<uint16_t>(sign | 0x7c00U);
+    uint32_t half_mantissa = mantissa >> 13;
+    const uint32_t remainder = mantissa & 0x1fffU;
+    if (remainder > 0x1000U || (remainder == 0x1000U && (half_mantissa & 1U))) {
+        ++half_mantissa;
+        if (half_mantissa == 0x400U) {
+            half_mantissa = 0;
+            if (exponent + 1 >= 31) return static_cast<uint16_t>(sign | 0x7c00U);
+            return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent + 1) << 10));
+        }
+    }
+    return static_cast<uint16_t>(
+        sign | (static_cast<uint32_t>(exponent) << 10) | half_mantissa);
+}
+
+std::vector<uint16_t> make_deterministic_weights(std::size_t elements, DataType dtype) {
+    std::vector<uint16_t> weights(elements);
+    uint64_t state = 0x6a09e667f3bcc909ULL;
+    for (std::size_t i = 0; i < elements; ++i) {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        const auto bucket = static_cast<int>((state * 0x2545f4914f6cdd1dULL) % 33ULL) - 16;
+        const float value = static_cast<float>(bucket) / 64.0F;
+        weights[i] = dtype == DataType::kBF16 ? float_to_bf16_bits(value) : float_to_fp16_bits(value);
+    }
+    return weights;
+}
+
 }  // namespace
 
 #if RDMA_PROXY_HAVE_CUDA
@@ -65,6 +119,10 @@ CudaBuffers::~CudaBuffers() {
     for (auto& entry : nvlink_recv_buffers_) {
         free_buffer(entry.recv);
     }
+    for (auto& entry : nvlink_computation_output_buffers_) {
+        free_buffer(entry.output);
+    }
+    free_buffer(nvlink_computation_weight_buffer_);
 }
 
 void CudaBuffers::initialize() {
@@ -105,6 +163,46 @@ void CudaBuffers::initialize() {
                                 " source_gpu=", source_gpu,
                                 " bytes=", forwarding_bytes);
         }
+    }
+
+    nvlink_computation_output_buffers_.clear();
+    if (config_.nvlink_forward_computation_enabled) {
+        const auto output_bytes = nvlink_computation_output_buffer_bytes();
+        nvlink_computation_output_buffers_.reserve(nvlink_recv_buffers_.size());
+        for (const auto& recv : nvlink_recv_buffers_) {
+            NvlinkComputationOutputBuffer entry;
+            entry.source_gpu_index = recv.source_gpu_index;
+            allocate_buffer(entry.output, output_bytes);
+            nvlink_computation_output_buffers_.push_back(entry);
+            RDMA_PROXY_LOG_INFO("allocated NVLink computation output buffer local_gpu=",
+                                config_.local_gpu_index,
+                                " source_gpu=", recv.source_gpu_index,
+                                " bytes=", output_bytes);
+        }
+
+        const auto weight_elements =
+            config_.token_dimension * config_.nvlink_forward_computation_output_dim;
+        const auto weights = make_deterministic_weights(weight_elements, config_.dtype);
+        allocate_buffer(nvlink_computation_weight_buffer_, weights.size() * sizeof(uint16_t));
+        if (config_.mock_mode) {
+            std::memcpy(nvlink_computation_weight_buffer_.ptr, weights.data(),
+                        nvlink_computation_weight_buffer_.bytes);
+        } else {
+#if RDMA_PROXY_HAVE_CUDA
+            check_cuda(cudaMemcpy(
+                           nvlink_computation_weight_buffer_.ptr,
+                           weights.data(),
+                           nvlink_computation_weight_buffer_.bytes,
+                           cudaMemcpyHostToDevice),
+                       "cudaMemcpy H2D deterministic NVLink computation weights");
+#else
+            throw std::runtime_error("CUDA weight initialization requested but CUDA support was not built");
+#endif
+        }
+        RDMA_PROXY_LOG_INFO("initialized deterministic NVLink computation weights K=",
+                            config_.token_dimension,
+                            " N=", config_.nvlink_forward_computation_output_dim,
+                            " bytes=", nvlink_computation_weight_buffer_.bytes);
     }
 }
 
@@ -246,12 +344,59 @@ const NvlinkReceiveBuffer& CudaBuffers::nvlink_receive_buffer_for_source(int sou
     return *it;
 }
 
+const NvlinkComputationOutputBuffer& CudaBuffers::nvlink_computation_output_buffer_for_source(
+    int source_gpu_index) const {
+    auto it = std::find_if(
+        nvlink_computation_output_buffers_.begin(),
+        nvlink_computation_output_buffers_.end(),
+        [&](const auto& entry) { return entry.source_gpu_index == source_gpu_index; });
+    if (it == nvlink_computation_output_buffers_.end()) {
+        throw std::runtime_error("unknown NVLink computation output source GPU");
+    }
+    return *it;
+}
+
 std::size_t CudaBuffers::token_buffer_bytes() const {
     return config_.num_tokens * config_.token_dimension * dtype_size(config_.dtype);
 }
 
 std::size_t CudaBuffers::nvlink_receive_buffer_bytes() const {
     return token_buffer_bytes() * config_.peers.size();
+}
+
+std::size_t CudaBuffers::nvlink_computation_output_buffer_bytes() const {
+    return config_.num_tokens * config_.peers.size() *
+        config_.nvlink_forward_computation_output_dim * dtype_size(config_.dtype);
+}
+
+std::size_t CudaBuffers::nvlink_computation_weight_buffer_bytes() const {
+    return config_.token_dimension * config_.nvlink_forward_computation_output_dim * dtype_size(config_.dtype);
+}
+
+void CudaBuffers::clear_nvlink_computation_outputs(void* stream) {
+    if (!config_.nvlink_forward_computation_enabled) return;
+    for (auto& entry : nvlink_computation_output_buffers_) {
+        if (config_.mock_mode) {
+            std::memset(entry.output.ptr, 0, entry.output.bytes);
+            continue;
+        }
+#if RDMA_PROXY_HAVE_CUDA
+        if (stream) {
+            check_cuda(cudaMemsetAsync(
+                           entry.output.ptr,
+                           0,
+                           entry.output.bytes,
+                           reinterpret_cast<cudaStream_t>(stream)),
+                       "cudaMemsetAsync NVLink computation output");
+        } else {
+            check_cuda(cudaMemset(entry.output.ptr, 0, entry.output.bytes),
+                       "cudaMemset NVLink computation output");
+        }
+#else
+        (void)stream;
+        throw std::runtime_error("CUDA output clear requested but CUDA support was not built");
+#endif
+    }
 }
 
 void CudaBuffers::allocate_buffer(GpuBuffer& buffer, std::size_t bytes) {

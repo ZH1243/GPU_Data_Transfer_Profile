@@ -241,6 +241,68 @@ int main() {
     }
 
     {
+        // End-to-end mock integration of notification parsing, incremental
+        // task production, per-iteration persistent workers, exit distribution,
+        // completion acknowledgements, and generation reuse.
+        auto config0 = make_config();
+        config0.num_tokens = 32;
+        config0.token_dimension = 16;
+        config0.tokens_per_chunk = 8;
+        config0.num_gpus_per_node = 2;
+        config0.num_iterations = 2;
+        config0.nvlink_forwarding_enabled = true;
+        config0.nvlink_forward_use_round_robin = true;
+        config0.nvlink_forward_threshold_tokens = 16;
+        config0.nvlink_forward_chunk_tokens = 16;
+        config0.nvlink_forward_synchronize_batches = true;
+        config0.nvlink_forward_completion_notifications_enabled = true;
+        config0.nvlink_forward_notification_queue_depth = 4;
+        config0.nvlink_forward_computation_enabled = true;
+        config0.nvlink_forward_computation_output_dim = 32;
+        config0.nvlink_forward_computation_tile_m = 16;
+        config0.nvlink_forward_computation_tile_n = 16;
+        config0.nvlink_forward_computation_num_queues = 1;
+        config0.nvlink_forward_computation_queue_depth = 2;
+        config0.nvlink_forward_exchange_dir = "/tmp/rdma_cpu_proxy_test_forward_computation_exchange";
+        config0.local_iteration_sync_run_id = "test_measured_run_forward_computation";
+        config0.local_gpu_index = 0;
+        config0.cuda_device_id = 0;
+
+        auto config1 = config0;
+        config1.local_gpu_index = 1;
+        config1.cuda_device_id = 1;
+        validate_config(config0);
+        validate_config(config1);
+
+        std::exception_ptr error0;
+        std::exception_ptr error1;
+        std::thread gpu0([&] {
+            try {
+                Proxy proxy(config0);
+                proxy.initialize();
+                proxy.run();
+                proxy.shutdown();
+            } catch (...) {
+                error0 = std::current_exception();
+            }
+        });
+        std::thread gpu1([&] {
+            try {
+                Proxy proxy(config1);
+                proxy.initialize();
+                proxy.run();
+                proxy.shutdown();
+            } catch (...) {
+                error1 = std::current_exception();
+            }
+        });
+        gpu0.join();
+        gpu1.join();
+        if (error0) std::rethrow_exception(error0);
+        if (error1) std::rethrow_exception(error1);
+    }
+
+    {
         auto config0 = make_config();
         config0.num_tokens = 64;
         config0.tokens_per_chunk = 8;

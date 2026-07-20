@@ -2,6 +2,7 @@
 
 #include "config.hpp"
 #include "cuda_buffers.hpp"
+#include "forward_computation.hpp"
 #include "protocol.hpp"
 #include "qp_worker.hpp"
 #include "rdma_connection.hpp"
@@ -111,12 +112,17 @@ private:
     void initialize_nvlink_forward_notification_dispatch();
     void enqueue_forward_completion_notifications(
         const std::vector<NvlinkForwardNotification>& notifications);
+    void enqueue_forward_iteration_done_notifications(uint64_t iteration);
     void publish_forward_completion_notification(const NvlinkForwardNotification& notification);
     void mark_forward_notification_senders_done();
     bool nvlink_forward_notification_queues_complete() const;
     void nvlink_forward_notification_dispatch_loop();
     void nvlink_forward_notification_loop();
     void drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQueue* queue);
+    void process_nvlink_forward_notification(const NvlinkForwardNotification& notification);
+    void wait_for_nvlink_forward_computation_notifications(uint64_t iteration) const;
+    void mark_nvlink_forward_computation_iteration_complete(uint64_t iteration);
+    void wait_for_nvlink_forward_computation_destination_acks(uint64_t iteration) const;
     std::string format_nvlink_forward_notification_log(
         const NvlinkForwardNotification& notification,
         uint64_t dequeue_timestamp_ns) const;
@@ -243,12 +249,15 @@ private:
     int nvlink_forward_notification_fd_{-1};
     std::string nvlink_forward_notification_name_;
     std::unique_ptr<NvlinkForwardNotificationDispatchState> nvlink_forward_notification_dispatch_;
+    std::unique_ptr<ForwardComputation> nvlink_forward_computation_;
     std::atomic<bool> nvlink_forward_notification_dispatch_stop_{false};
     std::atomic<bool> nvlink_forward_notification_receiver_stop_{false};
     std::atomic<uint64_t> nvlink_forward_notifications_enqueued_{0};
     std::atomic<uint64_t> nvlink_forward_notifications_sent_{0};
     std::atomic<uint64_t> nvlink_forward_notifications_received_{0};
     std::atomic<uint64_t> nvlink_forward_notifications_dropped_{0};
+    std::unique_ptr<std::atomic<uint64_t>[]> nvlink_forward_computation_done_generation_by_source_;
+    std::atomic<uint64_t> nvlink_forward_computation_active_generation_{0};
     std::mutex nvlink_forward_notification_log_mutex_;
     std::deque<std::string> nvlink_forward_notification_log_queue_;
     std::vector<double> rdma_iteration_bandwidth_gbps_;

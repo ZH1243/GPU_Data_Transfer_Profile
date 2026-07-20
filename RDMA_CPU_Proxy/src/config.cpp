@@ -349,6 +349,27 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "nvlink_forward_notification_log_dir") {
         config.nvlink_forward_notification_log_dir = value;
     }
+    else if (key == "nvlink_forward_computation_enabled") {
+        config.nvlink_forward_computation_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_computation_output_dim") {
+        config.nvlink_forward_computation_output_dim = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "nvlink_forward_computation_tile_m") {
+        config.nvlink_forward_computation_tile_m = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "nvlink_forward_computation_tile_n") {
+        config.nvlink_forward_computation_tile_n = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "nvlink_forward_computation_num_queues") {
+        config.nvlink_forward_computation_num_queues = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "nvlink_forward_computation_queue_depth") {
+        config.nvlink_forward_computation_queue_depth = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "nvlink_forward_computation_log_enabled") {
+        config.nvlink_forward_computation_log_enabled = (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "nvlink_forward_local_batch_sync_enabled") {
         config.nvlink_forward_local_batch_sync_enabled = (value == "1" || value == "true" || value == "yes");
     }
@@ -517,6 +538,20 @@ ProxyConfig load_config_file(const std::string& path) {
         object,
         "nvlink_forward_notification_log_dir",
         config.nvlink_forward_notification_log_dir);
+    config.nvlink_forward_computation_enabled = get_bool(
+        object, "nvlink_forward_computation_enabled", config.nvlink_forward_computation_enabled);
+    config.nvlink_forward_computation_output_dim = number_as<std::size_t>(
+        object, "nvlink_forward_computation_output_dim", config.nvlink_forward_computation_output_dim);
+    config.nvlink_forward_computation_tile_m = number_as<std::size_t>(
+        object, "nvlink_forward_computation_tile_m", config.nvlink_forward_computation_tile_m);
+    config.nvlink_forward_computation_tile_n = number_as<std::size_t>(
+        object, "nvlink_forward_computation_tile_n", config.nvlink_forward_computation_tile_n);
+    config.nvlink_forward_computation_num_queues = number_as<std::size_t>(
+        object, "nvlink_forward_computation_num_queues", config.nvlink_forward_computation_num_queues);
+    config.nvlink_forward_computation_queue_depth = number_as<std::size_t>(
+        object, "nvlink_forward_computation_queue_depth", config.nvlink_forward_computation_queue_depth);
+    config.nvlink_forward_computation_log_enabled = get_bool(
+        object, "nvlink_forward_computation_log_enabled", config.nvlink_forward_computation_log_enabled);
     config.nvlink_forward_local_batch_sync_enabled = get_bool(
         object, "nvlink_forward_local_batch_sync_enabled", config.nvlink_forward_local_batch_sync_enabled);
     config.nvlink_forward_synchronize_iteration = get_bool(
@@ -581,7 +616,7 @@ ProxyConfig load_config(int argc, char** argv) {
         }
     }
     if (path.empty()) {
-        throw std::runtime_error("usage: rdma_cpu_proxy --config config/example_config.json [--key=value ...]");
+        throw std::runtime_error(config_help());
     }
 
     auto config = load_config_file(path);
@@ -684,6 +719,76 @@ void validate_config(const ProxyConfig& config) {
         if (config.nvlink_forward_notification_log_dir.empty()) {
             throw std::runtime_error(
                 "nvlink_forward_notification_log_dir must be non-empty when notification logging is enabled");
+        }
+    }
+    if (config.nvlink_forward_computation_enabled) {
+        if (!config.nvlink_forward_completion_notifications_enabled) {
+            throw std::runtime_error(
+                "nvlink_forward_computation_enabled requires "
+                "nvlink_forward_completion_notifications_enabled=true");
+        }
+        if (config.dtype != DataType::kBF16 && config.dtype != DataType::kFP16) {
+            throw std::runtime_error(
+                "NVLink forwarding computation supports only bf16 and fp16 inputs/outputs");
+        }
+        if (config.peers.empty()) {
+            throw std::runtime_error(
+                "nvlink_forward_computation_enabled requires at least one remote peer receive-buffer slot");
+        }
+        if (config.token_dimension == 0 || config.token_dimension % 16 != 0) {
+            throw std::runtime_error(
+                "token_dimension must be a non-zero multiple of 16 for NVLink forwarding computation");
+        }
+        if (config.nvlink_forward_computation_output_dim == 0 ||
+            config.nvlink_forward_computation_output_dim % 16 != 0) {
+            throw std::runtime_error(
+                "nvlink_forward_computation_output_dim must be a non-zero multiple of 16");
+        }
+        if (config.nvlink_forward_computation_tile_m == 0 ||
+            config.nvlink_forward_computation_tile_m % 16 != 0) {
+            throw std::runtime_error(
+                "nvlink_forward_computation_tile_m must be a non-zero multiple of 16");
+        }
+        if (config.nvlink_forward_computation_tile_n == 0 ||
+            config.nvlink_forward_computation_tile_n % 16 != 0) {
+            throw std::runtime_error(
+                "nvlink_forward_computation_tile_n must be a non-zero multiple of 16");
+        }
+        const auto max_task_dimension = static_cast<std::size_t>(std::numeric_limits<uint32_t>::max());
+        if (config.token_dimension > max_task_dimension ||
+            config.nvlink_forward_computation_output_dim > max_task_dimension ||
+            config.nvlink_forward_computation_tile_m > max_task_dimension ||
+            config.nvlink_forward_computation_tile_n > max_task_dimension) {
+            throw std::runtime_error("NVLink forwarding computation matrix/tile metadata exceeds uint32 range");
+        }
+        if (config.nvlink_forward_computation_num_queues == 0) {
+            throw std::runtime_error("nvlink_forward_computation_num_queues must be > 0");
+        }
+        if (config.nvlink_forward_computation_queue_depth == 0) {
+            throw std::runtime_error("nvlink_forward_computation_queue_depth must be > 0");
+        }
+        if (config.nvlink_forward_computation_num_queues >
+                static_cast<std::size_t>(std::numeric_limits<uint32_t>::max()) ||
+            config.nvlink_forward_computation_queue_depth >
+                static_cast<std::size_t>(std::numeric_limits<uint32_t>::max())) {
+            throw std::runtime_error("NVLink forwarding computation queue count/depth exceeds uint32 range");
+        }
+        const auto max_size = std::numeric_limits<std::size_t>::max();
+        if (config.token_dimension > max_size / config.nvlink_forward_computation_output_dim ||
+            config.token_dimension * config.nvlink_forward_computation_output_dim >
+                max_size / dtype_size(config.dtype)) {
+            throw std::runtime_error("NVLink forwarding computation weight allocation size overflows size_t");
+        }
+        if (config.num_tokens > max_size / config.peers.size()) {
+            throw std::runtime_error("NVLink forwarding computation row capacity overflows size_t");
+        }
+        const auto rows = config.num_tokens * config.peers.size();
+        if (rows > max_task_dimension) {
+            throw std::runtime_error("NVLink forwarding computation row capacity exceeds uint32 range");
+        }
+        if (config.nvlink_forward_computation_output_dim > max_size / std::max<std::size_t>(rows, 1) ||
+            rows * config.nvlink_forward_computation_output_dim > max_size / dtype_size(config.dtype)) {
+            throw std::runtime_error("NVLink forwarding computation output allocation size overflows size_t");
         }
     }
     if (config.nvlink_forwarding_enabled) {
@@ -828,6 +933,20 @@ std::string config_summary(const ProxyConfig& config) {
         << (config.nvlink_forward_notification_log_enabled ? "true" : "false")
         << " nvlink_forward_notification_log_dir="
         << config.nvlink_forward_notification_log_dir
+        << " nvlink_forward_computation_enabled="
+        << (config.nvlink_forward_computation_enabled ? "true" : "false")
+        << " nvlink_forward_computation_output_dim="
+        << config.nvlink_forward_computation_output_dim
+        << " nvlink_forward_computation_tile_m="
+        << config.nvlink_forward_computation_tile_m
+        << " nvlink_forward_computation_tile_n="
+        << config.nvlink_forward_computation_tile_n
+        << " nvlink_forward_computation_num_queues="
+        << config.nvlink_forward_computation_num_queues
+        << " nvlink_forward_computation_queue_depth="
+        << config.nvlink_forward_computation_queue_depth
+        << " nvlink_forward_computation_log_enabled="
+        << (config.nvlink_forward_computation_log_enabled ? "true" : "false")
         << " nvlink_forward_local_batch_sync_enabled="
         << (config.nvlink_forward_local_batch_sync_enabled ? "true" : "false")
         << " nvlink_forward_synchronize_iteration="
@@ -847,6 +966,25 @@ std::string config_summary(const ProxyConfig& config) {
         << " cpu_affinity=" << (config.cpu_affinity.empty() ? "none" : config.cpu_affinity)
         << " mock_mode=" << (config.mock_mode ? "true" : "false");
     return out.str();
+}
+
+std::string config_help() {
+    return
+        "usage: rdma_cpu_proxy --config FILE [--key=value ...]\n"
+        "\n"
+        "Persistent NVLink forwarding computation options:\n"
+        "  --nvlink_forward_computation_enabled=BOOL       consume ready notifications with a persistent GEMM\n"
+        "  --nvlink_forward_computation_output_dim=N       output feature dimension (multiple of 16)\n"
+        "  --nvlink_forward_computation_tile_m=M           output-tile row dimension (multiple of 16)\n"
+        "  --nvlink_forward_computation_tile_n=N           output-tile column dimension (multiple of 16)\n"
+        "  --nvlink_forward_computation_num_queues=Q       mapped CPU-to-GPU queue count\n"
+        "  --nvlink_forward_computation_queue_depth=D      entries per queue (default 1024)\n"
+        "  --nvlink_forward_computation_log_enabled=BOOL   enable per-notification/per-queue diagnostics\n"
+        "\n"
+        "The computation mode also requires nvlink_forwarding_enabled,\n"
+        "nvlink_forward_synchronize_batches, and\n"
+        "nvlink_forward_completion_notifications_enabled. Input K is token_dimension;\n"
+        "BF16 and FP16 are supported on Hopper (compute capability 9.0+).";
 }
 
 }  // namespace rdma_proxy

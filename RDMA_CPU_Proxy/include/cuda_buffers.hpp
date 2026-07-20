@@ -27,6 +27,11 @@ struct NvlinkReceiveBuffer {
     GpuBuffer recv;
 };
 
+struct NvlinkComputationOutputBuffer {
+    int source_gpu_index{-1};
+    GpuBuffer output;
+};
+
 struct CudaForwardCopy {
     void* dst{nullptr};
     const void* src{nullptr};
@@ -61,12 +66,22 @@ public:
     const std::vector<PeerGpuBuffers>& peer_buffers() const { return buffers_; }
     std::vector<PeerGpuBuffers>& peer_buffers() { return buffers_; }
     const std::vector<NvlinkReceiveBuffer>& nvlink_receive_buffers() const { return nvlink_recv_buffers_; }
+    const std::vector<NvlinkComputationOutputBuffer>& nvlink_computation_output_buffers() const {
+        return nvlink_computation_output_buffers_;
+    }
     PeerGpuBuffers& buffers_for_peer(int peer_rank);
     const PeerGpuBuffers& buffers_for_peer(int peer_rank) const;
     const NvlinkReceiveBuffer& nvlink_receive_buffer_for_source(int source_gpu_index) const;
+    const NvlinkComputationOutputBuffer& nvlink_computation_output_buffer_for_source(
+        int source_gpu_index) const;
+    const GpuBuffer& nvlink_computation_weight_buffer() const { return nvlink_computation_weight_buffer_; }
+
+    void clear_nvlink_computation_outputs(void* stream = nullptr);
 
     std::size_t token_buffer_bytes() const;
     std::size_t nvlink_receive_buffer_bytes() const;
+    std::size_t nvlink_computation_output_buffer_bytes() const;
+    std::size_t nvlink_computation_weight_buffer_bytes() const;
 
 private:
     void allocate_buffer(GpuBuffer& buffer, std::size_t bytes);
@@ -75,6 +90,8 @@ private:
     ProxyConfig config_;
     std::vector<PeerGpuBuffers> buffers_;
     std::vector<NvlinkReceiveBuffer> nvlink_recv_buffers_;
+    std::vector<NvlinkComputationOutputBuffer> nvlink_computation_output_buffers_;
+    GpuBuffer nvlink_computation_weight_buffer_;
 };
 
 void launch_copy_tokens(void* dst, const void* src, std::size_t bytes, bool mock_mode);
