@@ -154,17 +154,32 @@ public:
 
     void initialize() {
         if (initialized_) return;
-        allocate_host_visible(
-            published_host_, published_device_, sizeof(ForwardQueueSignal) * capacity_);
+        if (mock_mode_) {
+            allocate_mock(consumed_host_, sizeof(ForwardQueueSignal) * capacity_);
+            consumed_device_ = consumed_host_;
+            allocate_mock(tasks_host_, sizeof(ForwardComputeTask) * capacity_);
+            tasks_device_ = tasks_host_;
+            initialized_ = true;
+            return;
+        }
+#if RDMA_PROXY_HAVE_CUDA
+        allocate_host_staging(publication_staging_, sizeof(uint64_t) * capacity_);
         allocate_host_visible(
             consumed_host_, consumed_device_, sizeof(ForwardQueueSignal) * capacity_);
-        allocate_host_visible(tasks_host_, tasks_device_, sizeof(ForwardComputeTask) * capacity_);
-#if RDMA_PROXY_HAVE_CUDA
-        if (!mock_mode_) {
-            check_cuda(cudaMalloc(&dequeue_device_, sizeof(uint64_t)), "cudaMalloc CPU-to-GPU dequeue position");
-            check_cuda(cudaMalloc(&stats_device_, sizeof(ForwardDeviceQueueStats)),
-                       "cudaMalloc CPU-to-GPU queue stats");
-        }
+        allocate_host_staging(tasks_host_, sizeof(ForwardComputeTask) * capacity_);
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&published_head_device_),
+                              sizeof(uint64_t)),
+                   "cudaMalloc CPU-to-GPU published head");
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&tasks_device_),
+                              sizeof(ForwardComputeTask) * capacity_),
+                   "cudaMalloc CPU-to-GPU task ring");
+        check_cuda(cudaMalloc(&dequeue_device_, sizeof(uint64_t)), "cudaMalloc CPU-to-GPU dequeue position");
+        check_cuda(cudaMalloc(&stats_device_, sizeof(ForwardDeviceQueueStats)),
+                   "cudaMalloc CPU-to-GPU queue stats");
+        check_cuda(cudaStreamCreateWithFlags(&publication_stream_, cudaStreamNonBlocking),
+                   "cudaStreamCreateWithFlags CPU-to-GPU publication");
+#else
+        throw std::runtime_error("device-resident CPU-to-GPU queues require CUDA support");
 #endif
         initialized_ = true;
     }
@@ -176,13 +191,19 @@ public:
         generated_.store(0);
         full_stalls_.store(0);
         mock_stats_ = {};
+        store_release(&mock_published_head_, 0);
         for (uint64_t i = 0; i < capacity_; ++i) {
             tasks_host_[i] = {};
-            store_release(&published_host_[i].sequence, 0);
+            if (publication_staging_) publication_staging_[i] = 0;
             store_release(&consumed_host_[i].sequence, i);
         }
 #if RDMA_PROXY_HAVE_CUDA
         if (!mock_mode_) {
+            check_cuda(cudaMemsetAsync(
+                           published_head_device_, 0, sizeof(uint64_t), publication_stream_),
+                       "cudaMemsetAsync CPU-to-GPU published head");
+            check_cuda(cudaStreamSynchronize(publication_stream_),
+                       "cudaStreamSynchronize CPU-to-GPU publication reset");
             check_cuda(cudaMemsetAsync(
                            dequeue_device_, 0, sizeof(uint64_t), reinterpret_cast<cudaStream_t>(stream)),
                        "cudaMemsetAsync CPU-to-GPU dequeue position");
@@ -195,39 +216,67 @@ public:
 #endif
     }
 
-    void enqueue(
-        ForwardComputeTask task,
+    void enqueue_batch(
+        const std::vector<ForwardComputeTask>& tasks,
         std::chrono::steady_clock::time_point deadline,
         const std::atomic<bool>* abort_requested) {
-        const uint64_t position = producer_position_;
-        auto& consumed = consumed_host_[position % capacity_].sequence;
-        bool recorded_stall = false;
-        while (load_acquire(&consumed) != position) {
-            if (!recorded_stall) {
-                full_stalls_.fetch_add(1);
-                recorded_stall = true;
-            }
-            if ((abort_requested && abort_requested->load(std::memory_order_acquire)) ||
-                std::chrono::steady_clock::now() >= deadline) {
-                throw std::runtime_error(
-                    "timed out waiting for CPU-to-GPU queue space queue=" + std::to_string(id_) +
-                    " producer_position=" + std::to_string(position));
-            }
-            cpu_relax();
-        }
+        std::size_t task_index = 0;
+        while (task_index < tasks.size()) {
+            const std::size_t ring_index = static_cast<std::size_t>(producer_position_ % capacity_);
+            const std::size_t batch_size = std::min<std::size_t>(
+                tasks.size() - task_index, static_cast<std::size_t>(capacity_) - ring_index);
 
-        task.queue_id = id_;
-        task.enqueue_timestamp_ns = steady_nanoseconds_now();
-        tasks_host_[position % capacity_] = task;
-        store_release(&published_host_[position % capacity_].sequence, position + 1);
-        producer_position_ = position + 1;
-        generated_.fetch_add(task.type == static_cast<uint32_t>(ForwardTaskType::kCompute) ? 1 : 0);
+            for (std::size_t i = 0; i < batch_size; ++i) {
+                const uint64_t position = producer_position_ + i;
+                wait_for_slot(position, deadline, abort_requested);
+                auto task = tasks[task_index + i];
+                task.queue_id = id_;
+                task.enqueue_timestamp_ns = steady_nanoseconds_now();
+                tasks_host_[ring_index + i] = task;
+                if (task.type == static_cast<uint32_t>(ForwardTaskType::kCompute)) {
+                    generated_.fetch_add(1);
+                }
+            }
+
+            if (mock_mode_) {
+                store_release(&mock_published_head_, producer_position_ + batch_size);
+                producer_position_ += batch_size;
+                task_index += batch_size;
+                continue;
+            }
+#if RDMA_PROXY_HAVE_CUDA
+            // The descriptor copy and published-head copy share a stream. The
+            // GPU can observe the advanced head only after every corresponding
+            // descriptor byte has reached the device-resident task ring.
+            check_cuda(cudaMemcpyAsync(
+                           tasks_device_ + ring_index,
+                           tasks_host_ + ring_index,
+                           sizeof(ForwardComputeTask) * batch_size,
+                           cudaMemcpyHostToDevice,
+                           publication_stream_),
+                       "cudaMemcpyAsync CPU-to-GPU task batch");
+            const std::size_t publication_staging_index = ring_index + batch_size - 1;
+            // This staging slot cannot be reused until the corresponding last
+            // task completes, which is necessarily after this 8-byte DMA has
+            // consumed the value.
+            publication_staging_[publication_staging_index] = producer_position_ + batch_size;
+            check_cuda(cudaMemcpyAsync(
+                           published_head_device_,
+                           publication_staging_ + publication_staging_index,
+                           sizeof(uint64_t),
+                           cudaMemcpyHostToDevice,
+                           publication_stream_),
+                       "cudaMemcpyAsync CPU-to-GPU publication batch");
+#endif
+            producer_position_ += batch_size;
+            task_index += batch_size;
+        }
     }
 
     bool try_claim_mock(ForwardComputeTask* task, uint64_t* position) {
         while (true) {
             uint64_t current = mock_dequeue_position_.load(std::memory_order_relaxed);
-            if (load_acquire(&published_host_[current % capacity_].sequence) != current + 1) {
+            if (current >= load_acquire(&mock_published_head_)) {
                 return false;
             }
             if (mock_dequeue_position_.compare_exchange_weak(
@@ -245,7 +294,7 @@ public:
 
     ForwardDeviceQueueView device_view() const {
         ForwardDeviceQueueView view;
-        view.published = published_device_;
+        view.published_head = published_head_device_;
         view.consumed = consumed_device_;
         view.tasks = tasks_device_;
         view.dequeue_position = static_cast<uint64_t*>(dequeue_device_);
@@ -283,35 +332,60 @@ public:
     uint64_t full_stalls() const { return full_stalls_.load(); }
 
 private:
-    template <typename T>
-    void allocate_host_visible(T*& host, T*& device, std::size_t bytes) {
-        if (mock_mode_) {
-            host = static_cast<T*>(::operator new(bytes, std::align_val_t(128)));
-            device = host;
-            std::memset(host, 0, bytes);
-            return;
+    void wait_for_slot(
+        uint64_t position,
+        std::chrono::steady_clock::time_point deadline,
+        const std::atomic<bool>* abort_requested) {
+        auto& consumed = consumed_host_[position % capacity_].sequence;
+        bool recorded_stall = false;
+        while (load_acquire(&consumed) != position) {
+            if (!recorded_stall) {
+                full_stalls_.fetch_add(1);
+                recorded_stall = true;
+            }
+            if ((abort_requested && abort_requested->load(std::memory_order_acquire)) ||
+                std::chrono::steady_clock::now() >= deadline) {
+                throw std::runtime_error(
+                    "timed out waiting for CPU-to-GPU queue space queue=" + std::to_string(id_) +
+                    " producer_position=" + std::to_string(position));
+            }
+            cpu_relax();
         }
-#if RDMA_PROXY_HAVE_CUDA
-        void* raw = nullptr;
-        const unsigned flags = cudaHostAllocMapped | cudaHostAllocPortable;
-        check_cuda(cudaHostAlloc(&raw, bytes, flags),
-                   "cudaHostAllocMapped CPU-to-GPU queue");
-        host = static_cast<T*>(raw);
-        void* device_raw = nullptr;
-        check_cuda(cudaHostGetDevicePointer(&device_raw, raw, 0),
-                   "cudaHostGetDevicePointer CPU-to-GPU queue");
-        device = static_cast<T*>(device_raw);
-        std::memset(host, 0, bytes);
-#else
-        (void)host;
-        (void)device;
-        (void)bytes;
-        throw std::runtime_error("mapped CPU-to-GPU queues require CUDA support");
-#endif
     }
 
     template <typename T>
-    void free_host_visible(T*& host) noexcept {
+    void allocate_mock(T*& pointer, std::size_t bytes) {
+        pointer = static_cast<T*>(::operator new(bytes, std::align_val_t(128)));
+        std::memset(pointer, 0, bytes);
+    }
+
+#if RDMA_PROXY_HAVE_CUDA
+    template <typename T>
+    void allocate_host_staging(T*& host, std::size_t bytes) {
+        void* raw = nullptr;
+        check_cuda(cudaHostAlloc(&raw, bytes, cudaHostAllocPortable),
+                   "cudaHostAlloc CPU-to-GPU staging ring");
+        host = static_cast<T*>(raw);
+        std::memset(host, 0, bytes);
+    }
+
+    template <typename T>
+    void allocate_host_visible(T*& host, T*& device, std::size_t bytes) {
+        void* raw = nullptr;
+        const unsigned flags = cudaHostAllocMapped | cudaHostAllocPortable;
+        check_cuda(cudaHostAlloc(&raw, bytes, flags),
+                   "cudaHostAllocMapped GPU-to-CPU reuse ring");
+        host = static_cast<T*>(raw);
+        void* device_raw = nullptr;
+        check_cuda(cudaHostGetDevicePointer(&device_raw, raw, 0),
+                   "cudaHostGetDevicePointer GPU-to-CPU reuse ring");
+        device = static_cast<T*>(device_raw);
+        std::memset(host, 0, bytes);
+    }
+#endif
+
+    template <typename T>
+    void free_host_allocation(T*& host) noexcept {
         if (!host) return;
         if (mock_mode_) {
             ::operator delete(host, std::align_val_t(128));
@@ -319,7 +393,8 @@ private:
 #if RDMA_PROXY_HAVE_CUDA
             const auto status = cudaFreeHost(host);
             if (status != cudaSuccess) {
-                RDMA_PROXY_LOG_WARN("cudaFreeHost CPU-to-GPU queue failed: ", cudaGetErrorString(status));
+                RDMA_PROXY_LOG_WARN("cudaFreeHost CPU/GPU queue allocation failed: ",
+                                    cudaGetErrorString(status));
             }
 #endif
         }
@@ -328,15 +403,22 @@ private:
 
     void release() noexcept {
 #if RDMA_PROXY_HAVE_CUDA
+        if (!mock_mode_ && publication_stream_) {
+            (void)cudaStreamSynchronize(publication_stream_);
+            (void)cudaStreamDestroy(publication_stream_);
+        }
+        publication_stream_ = nullptr;
+        if (!mock_mode_ && published_head_device_) (void)cudaFree(published_head_device_);
+        if (!mock_mode_ && tasks_device_) (void)cudaFree(tasks_device_);
         if (!mock_mode_ && dequeue_device_) (void)cudaFree(dequeue_device_);
         if (!mock_mode_ && stats_device_) (void)cudaFree(stats_device_);
 #endif
         dequeue_device_ = nullptr;
         stats_device_ = nullptr;
-        free_host_visible(published_host_);
-        free_host_visible(consumed_host_);
-        free_host_visible(tasks_host_);
-        published_device_ = nullptr;
+        free_host_allocation(publication_staging_);
+        free_host_allocation(consumed_host_);
+        free_host_allocation(tasks_host_);
+        published_head_device_ = nullptr;
         consumed_device_ = nullptr;
         tasks_device_ = nullptr;
         initialized_ = false;
@@ -348,15 +430,19 @@ private:
     bool initialized_{false};
     uint64_t generation_{0};
     uint64_t producer_position_{0};
+    uint64_t mock_published_head_{0};
     std::atomic<uint64_t> mock_dequeue_position_{0};
-    ForwardQueueSignal* published_host_{nullptr};
-    ForwardQueueSignal* published_device_{nullptr};
+    uint64_t* publication_staging_{nullptr};
+    uint64_t* published_head_device_{nullptr};
     ForwardQueueSignal* consumed_host_{nullptr};
     ForwardQueueSignal* consumed_device_{nullptr};
     ForwardComputeTask* tasks_host_{nullptr};
     ForwardComputeTask* tasks_device_{nullptr};
     void* dequeue_device_{nullptr};
     void* stats_device_{nullptr};
+#if RDMA_PROXY_HAVE_CUDA
+    cudaStream_t publication_stream_{nullptr};
+#endif
     std::atomic<uint64_t> generated_{0};
     std::atomic<uint64_t> full_stalls_{0};
     ForwardDeviceQueueStats mock_stats_{};
@@ -486,15 +572,11 @@ public:
                    "cudaMalloc persistent queue views");
         check_cuda(cudaMalloc(&device_sm_ids_, sizeof(uint32_t) * num_ctas_),
                    "cudaMalloc persistent physical SM diagnostics");
-        check_cuda(cudaHostAlloc(
-                       reinterpret_cast<void**>(&abort_host_),
-                       sizeof(ForwardQueueSignal),
-                       cudaHostAllocMapped | cudaHostAllocPortable),
-                   "cudaHostAllocMapped persistent abort signal");
-        void* abort_device = nullptr;
-        check_cuda(cudaHostGetDevicePointer(&abort_device, abort_host_, 0),
-                   "cudaHostGetDevicePointer persistent abort signal");
-        abort_device_ = static_cast<ForwardQueueSignal*>(abort_device);
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&abort_device_),
+                              sizeof(ForwardQueueSignal)),
+                   "cudaMalloc persistent abort signal");
+        check_cuda(cudaStreamCreateWithFlags(&control_stream_, cudaStreamNonBlocking),
+                   "cudaStreamCreateWithFlags persistent control");
         initialized_ = true;
 #else
         throw std::runtime_error("persistent computation requires a CUDA build or mock_mode=true");
@@ -536,7 +618,8 @@ public:
         std::vector<ForwardDeviceQueueView> views;
         views.reserve(queues_.size());
         for (const auto& queue : queues_) views.push_back(queue->device_view());
-        store_release(&abort_host_->sequence, 0);
+        check_cuda(cudaMemsetAsync(abort_device_, 0, sizeof(ForwardQueueSignal), stream_),
+                   "cudaMemsetAsync persistent abort signal");
         check_cuda(cudaMemcpyAsync(
                        device_views_,
                        views.data(),
@@ -615,9 +698,13 @@ public:
 
         const auto enqueue_start = std::chrono::steady_clock::now();
         const auto deadline = enqueue_start + std::chrono::milliseconds(config_.completion_timeout_ms);
+        std::vector<std::vector<ForwardComputeTask>> tasks_by_queue(queues_.size());
         for (auto& task : tasks) {
-            queues_[next_queue_]->enqueue(task, deadline, &abort_requested_);
+            tasks_by_queue[next_queue_].push_back(task);
             next_queue_ = (next_queue_ + 1) % queues_.size();
+        }
+        for (std::size_t q = 0; q < queues_.size(); ++q) {
+            queues_[q]->enqueue_batch(tasks_by_queue[q], deadline, &abort_requested_);
         }
         const auto enqueue_end = std::chrono::steady_clock::now();
         enqueue_nanoseconds_.fetch_add(static_cast<uint64_t>(
@@ -642,13 +729,16 @@ public:
             const auto deadline = std::chrono::steady_clock::now() +
                 std::chrono::milliseconds(config_.completion_timeout_ms);
             for (std::size_t q = 0; q < queues_.size(); ++q) {
+                std::vector<ForwardComputeTask> exits;
+                exits.reserve(ctas_per_queue_[q]);
                 for (uint32_t i = 0; i < ctas_per_queue_[q]; ++i) {
                     ForwardComputeTask exit;
                     exit.type = static_cast<uint32_t>(ForwardTaskType::kExit);
                     exit.dtype = static_cast<uint32_t>(config_.dtype);
                     exit.generation = generation_;
-                    queues_[q]->enqueue(exit, deadline, &abort_requested_);
+                    exits.push_back(exit);
                 }
+                queues_[q]->enqueue_batch(exits, deadline, &abort_requested_);
             }
             wait_for_kernel(deadline);
             collect_stats();
@@ -723,7 +813,7 @@ public:
             }
             if (!terminated) {
                 // Resource lifetime wins over a bounded teardown here: freeing
-                // mapped queue pages while a CTA can still poll them is unsafe.
+                // device queue storage while a CTA can still poll it is unsafe.
                 const auto status = cudaStreamSynchronize(stream_);
                 if (status != cudaSuccess) {
                     RDMA_PROXY_LOG_ERROR("persistent computation abort synchronization failed: ",
@@ -741,15 +831,16 @@ public:
         if (!config_.mock_mode) {
             if (device_views_) (void)cudaFree(device_views_);
             if (device_sm_ids_) (void)cudaFree(device_sm_ids_);
-            if (abort_host_) (void)cudaFreeHost(abort_host_);
+            if (abort_device_) (void)cudaFree(abort_device_);
+            if (control_stream_) (void)cudaStreamDestroy(control_stream_);
             if (stream_) (void)cudaStreamDestroy(stream_);
         }
 #endif
         device_views_ = nullptr;
         device_sm_ids_ = nullptr;
-        abort_host_ = nullptr;
         abort_device_ = nullptr;
 #if RDMA_PROXY_HAVE_CUDA
+        control_stream_ = nullptr;
         stream_ = nullptr;
 #endif
         queues_.clear();
@@ -854,7 +945,19 @@ private:
 
     void signal_abort() noexcept {
         abort_requested_.store(true, std::memory_order_release);
-        if (abort_host_) store_release(&abort_host_->sequence, 1);
+#if RDMA_PROXY_HAVE_CUDA
+        if (!config_.mock_mode && abort_device_ && control_stream_) {
+            // The abort flag is device-resident because it is polled in the
+            // kernel's hot loop. A dedicated nonblocking stream lets the copy
+            // engine update it even while the persistent kernel occupies SMs.
+            auto status = cudaMemsetAsync(abort_device_, 1, sizeof(uint64_t), control_stream_);
+            if (status == cudaSuccess) status = cudaStreamSynchronize(control_stream_);
+            if (status != cudaSuccess) {
+                RDMA_PROXY_LOG_ERROR("persistent computation abort publication failed: ",
+                                     cudaGetErrorString(status));
+            }
+        }
+#endif
     }
 
     void join_mock_threads() noexcept {
@@ -945,9 +1048,9 @@ private:
     ForwardComputationStats last_stats_;
     void* device_views_{nullptr};
     void* device_sm_ids_{nullptr};
-    ForwardQueueSignal* abort_host_{nullptr};
     ForwardQueueSignal* abort_device_{nullptr};
 #if RDMA_PROXY_HAVE_CUDA
+    cudaStream_t control_stream_{nullptr};
     cudaStream_t stream_{nullptr};
 #endif
 };

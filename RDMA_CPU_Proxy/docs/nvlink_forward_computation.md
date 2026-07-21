@@ -19,7 +19,7 @@ The complete iteration sequence is:
 7. Publish `receiver_completed_generation` acknowledgements to every source.
 8. Each source waits for all destination acknowledgements before it can finish the iteration and reuse the receive-buffer generation.
 
-With the feature disabled, none of the computation buffers, mapped queues, done records, acknowledgement waits, streams, or kernels are created; the prior forwarding behavior is unchanged.
+With the feature disabled, none of the computation buffers, device task/publication queues, mapped reuse signals, done records, acknowledgement waits, streams, or kernels are created; the prior forwarding behavior is unchanged.
 
 ## Modified files
 
@@ -33,29 +33,51 @@ With the feature disabled, none of the computation buffers, mapped queues, done 
 
 ## CPU-to-GPU queue
 
-The design is adapted from UCCL-EP's `ep/include/ring_buffer.cuh` and `d2h_queue_*` generation/ownership scheme, with producer and consumer directions reversed. It is implemented locally to avoid depending on UCCL headers, verbs types, or build flags.
+The design is adapted from UCCL-EP's `ep/include/fifo_device.hpp` and
+`d2h_queue_*` ownership scheme, with producer and consumer directions reversed.
+It is implemented locally to avoid depending on UCCL headers, verbs types, or
+build flags.
 
-Each queue has three normally cached `cudaHostAllocMapped` arrays:
+Each queue follows the same consumer-local polling principle as UCCL-EP, with
+the producer and consumer directions reversed:
 
-- 128-byte `ForwardComputeTask` entries;
-- 128-byte publication signals, written only by the CPU;
-- 128-byte reuse signals, written only by the GPU.
+- a pinned host staging ring and a matching device-memory `ForwardComputeTask`
+  ring;
+- pinned host publication staging and a device-memory published-head counter;
+- 128-byte reuse signals in `cudaHostAllocMapped` memory, written only by the
+  GPU and polled only by the CPU.
 
-Signals are isolated on cache lines to avoid false sharing. A device-memory `dequeue_position` is shared by the CTAs assigned to that queue. Only GPU consumers perform CAS on that position, so the protocol does not require CPU/GPU atomic RMW on mapped PCIe memory.
+The persistent GPU CTAs poll only the device-memory published head. The
+emergency abort flag is also device memory. Consequently, an empty queue does
+not generate repeated mapped-host reads over PCIe. A device-memory
+`dequeue_position` is shared by the CTAs assigned to that queue. Only GPU
+consumers perform CAS on that position, so the protocol does not require
+CPU/GPU atomic RMW on mapped PCIe memory.
 
 For absolute position `p` and slot `p % capacity`:
 
 - The CPU may reuse the slot only when `consumed_sequence == p`.
-- It writes the complete descriptor, then publishes `published_sequence = p + 1` with a host release store.
-- A CTA reads publication with PTX `ld.acquire.sys.global`, then claims `p` using `atomicCAS` on the device dequeue counter. Exactly one CTA wins.
+- It writes the complete descriptor into pinned staging memory.
+- A nonblocking publication stream copies one or more contiguous descriptors
+  into the device task ring, then advances the device-resident published head
+  with one 8-byte copy. Ring wrap is split into contiguous batches.
+- A CTA polls the published head in GPU memory. When `p < published_head`, it
+  claims `p` using `atomicCAS` on the device dequeue counter. Exactly one CTA
+  wins.
 - The winning CTA computes the tile. Only after D is visible does it write `consumed_sequence = p + capacity` with `st.release.sys.global`.
 - The CPU observes reuse with an acquire load.
 
 This prevents overwrite both before claim and while a claimed task is still reading A/B or writing D. Positions are 64-bit monotonic values; modulo is used only to select storage. Queues are reset only after the prior persistent kernel terminates, so practical wraparound is bounded by 2^64 operations within one iteration.
 
-Write-combined host memory is deliberately not used for queue metadata. Keeping the mapped pages normally cached makes the host release/acquire operations well-defined without relying on architecture-specific write-combining flush behavior. The descriptor is published only after all descriptor stores complete; the GPU's system-scope acquire then makes those stores visible.
+The two H2D copies use the same CUDA stream, so the published head cannot
+advance before its descriptors reach device memory. Ready-region tasks are
+grouped per queue and copied in contiguous batches, amortizing CUDA submission
+overhead.
+Write-combined host memory is deliberately not used for the CPU-polled reuse
+signals; normal cached mapped memory keeps the host acquire operations
+well-defined without architecture-specific write-combining flush behavior.
 
-When a queue is full, the notification thread applies bounded backpressure and reports a timeout using `completion_timeout_ms`. It never drops a compute task. Queue-full stall counters are reported at iteration completion. An emergency mapped abort signal lets every CTA leave its polling loop during partial shutdown; normal shutdown uses exit tasks.
+When a queue is full, the notification thread applies bounded backpressure and reports a timeout using `completion_timeout_ms`. It never drops a compute task. Queue-full stall counters are reported at iteration completion. An emergency device-resident abort signal lets every CTA leave its polling loop during partial shutdown; normal shutdown uses exit tasks.
 
 ## Task descriptor
 
@@ -150,6 +172,9 @@ The full mode compares all 256x6400 output values for K=4096 against `cublasGemm
 - TMA is not used yet. Hopper's TMA tensor-map setup is awkward for dynamically supplied per-task base addresses and partial tails; the current kernel uses correct system-scope queues plus asynchronous `cp.async`-class pipeline intrinsics and WMMA. A future specialization can prebuild tensor maps for stable buffer IDs.
 - Output conversion/store is synchronous. Loading K tile `i+1` overlaps tensor-core work for K tile `i`, while independent CTAs overlap stores with other tasks.
 - One CTA owns an entire configured output tile. Very large tiles increase per-task latency; 128x128 is the intended starting point.
-- Mapped queue performance and system-scope visibility must be validated on the deployment platform/IOMMU. Initialization rejects non-Hopper GPUs; cluster validation is required because the development Mac has no CUDA device.
+- The device-resident publication protocol and mapped reuse-signal visibility
+  must be validated on the deployment platform/IOMMU. Initialization rejects
+  non-Hopper GPUs; cluster validation is required because the development Mac
+  has no CUDA device.
 - The mapped notification ABI version was increased from 2 to 3 for the receiver completion acknowledgement. Every local proxy in a run must use the same build.
 - Every local proxy must use the same computation enablement and dimensional configuration. Mixed enabled/disabled peers are rejected indirectly by the bounded generation-ack timeout rather than through a separate configuration negotiation protocol.

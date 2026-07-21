@@ -235,9 +235,10 @@ __global__ void persistent_forward_computation_kernel(
             } else {
                 const uint64_t position = atomicAdd(
                     reinterpret_cast<unsigned long long*>(queue.dequeue_position), 0ULL);
-                const uint64_t published =
-                    load_acquire_system(&queue.published[position % queue.capacity].sequence);
-                if (published == position + 1) {
+                // published_head is device memory. Keeping this hot poll target in
+                // HBM avoids repeated mapped-host reads over PCIe.
+                const uint64_t published_head = load_acquire_system(queue.published_head);
+                if (position < published_head) {
                     const auto prior = atomicCAS(
                         reinterpret_cast<unsigned long long*>(queue.dequeue_position),
                         static_cast<unsigned long long>(position),

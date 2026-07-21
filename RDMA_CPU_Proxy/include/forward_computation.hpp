@@ -46,13 +46,14 @@ struct alignas(128) ForwardComputeTask {
 
 static_assert(sizeof(ForwardComputeTask) == 128, "ForwardComputeTask must occupy one 128-byte cache line");
 
-// Protocol reference: UCCL-EP ep/include/ring_buffer.cuh and its d2h_queue
+// Protocol reference: UCCL-EP ep/include/fifo_device.hpp and its d2h_queue
 // wrappers. This is an independent reverse-direction adaptation: one CPU
-// producer publishes work for multiple GPU consumers.
-// Publication and reuse signals are deliberately kept on separate cache lines.
-// The host is the sole writer of published_sequence; the GPU is the sole writer
-// of consumed_sequence. This mirrors UCCL-EP's generation-based ring ownership,
-// with the producer/consumer direction reversed.
+// producer publishes work for multiple GPU consumers. As in UCCL-EP, the hot
+// poll target lives in memory local to the consumer: published_head and the
+// task ring are in device memory, while consumed_sequence is mapped pinned host
+// memory. The host stages a task and copies it to the device ring before it
+// advances the device-resident published head. The GPU writes the
+// host-resident reuse sequence only after the task has completed.
 struct alignas(128) ForwardQueueSignal {
     uint64_t sequence{0};
     uint8_t padding[120]{};
@@ -67,10 +68,11 @@ struct ForwardDeviceQueueStats {
     uint64_t invalid_tasks{0};
 };
 
-// Plain pointers in this view are device addresses. The signal/task arrays use
-// cudaHostAllocMapped storage; dequeue_position and stats use device memory.
+// Plain pointers in this view are device addresses. published_head, tasks,
+// dequeue_position, and stats use device memory. consumed is a device mapping
+// of pinned host memory so the CPU can observe slot reuse without a D2H copy.
 struct ForwardDeviceQueueView {
-    ForwardQueueSignal* published{nullptr};
+    uint64_t* published_head{nullptr};
     ForwardQueueSignal* consumed{nullptr};
     ForwardComputeTask* tasks{nullptr};
     uint64_t* dequeue_position{nullptr};
