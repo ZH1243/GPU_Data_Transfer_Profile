@@ -192,6 +192,27 @@ int main() {
     }
     load_only_computation.shutdown();
 
+    // Dequeue-only mode exercises just the persistent queue lifecycle. It
+    // claims and completes every task without reading A/B or writing D.
+    auto dequeue_only_config = config;
+    dequeue_only_config.nvlink_forward_computation_dequeue_only_enabled = true;
+    rdma_proxy::ForwardComputation dequeue_only_computation(dequeue_only_config, buffers);
+    dequeue_only_computation.initialize();
+    dequeue_only_computation.begin_iteration(3);
+    assert(dequeue_only_computation.enqueue_ready_region(3, 1, 0, 0, 32, 0) == 4);
+    dequeue_only_computation.finish_iteration(3);
+    const auto dequeue_only_stats = dequeue_only_computation.stats();
+    assert(dequeue_only_stats.generated_tasks == 4);
+    assert(dequeue_only_stats.tasks_claimed == 4);
+    assert(dequeue_only_stats.tasks_completed == 4);
+    assert(dequeue_only_stats.exit_tasks_consumed == 4);
+    const auto* dequeue_only_output = static_cast<const uint16_t*>(
+        buffers.nvlink_computation_output_buffer_for_source(1).output.ptr);
+    for (std::size_t i = 0; i < config.num_tokens * config.nvlink_forward_computation_output_dim; ++i) {
+        assert(dequeue_only_output[i] == 0);
+    }
+    dequeue_only_computation.shutdown();
+
     std::cout << "forward computation host validation passed\n";
     return 0;
 }

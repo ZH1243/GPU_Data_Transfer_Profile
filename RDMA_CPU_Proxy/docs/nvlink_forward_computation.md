@@ -119,6 +119,24 @@ and cleared to keep the existing descriptor ABI and buffer lookup unchanged,
 so they remain zero after a load-only iteration. This sub-mode is rejected
 unless `nvlink_forward_computation_enabled=true`.
 
+### Dequeue-only mode
+
+Set `nvlink_forward_computation_dequeue_only_enabled=true` to isolate the
+control/task queue path. For every compute task, the assigned CTA polls the
+device-resident publication state, atomically claims the queue position, copies
+the task descriptor into CTA shared state, and performs the normal completion
+accounting and mapped-host slot-reuse acknowledgement. It does not dereference
+the A, B, or D tensor pointers, stage tensor operands, execute WMMA/scalar
+matrix operations, or store output tensor values.
+
+The dequeue-only path is a separate compile-time kernel specialization, so the
+operand-loading and computation routines are absent from that task path. Exit
+handling, generation/type validation, queue statistics, and iteration lifetime
+protection remain active. Output buffers retain the normal allocation/clear
+lifecycle and therefore stay zero. This sub-mode requires
+`nvlink_forward_computation_enabled=true` and is mutually exclusive with
+`nvlink_forward_computation_load_only_enabled=true`.
+
 ## Buffer and weight lifetime
 
 Every per-source NVLink receive buffer has a matching output buffer with row capacity `num_tokens * remote_peer_count` and feature width `nvlink_forward_computation_output_dim`. One row-major KxN weight buffer is allocated in GPU global memory and initialized once with deterministic small pseudo-random values before any persistent kernel launch. A and B use BF16 or FP16; WMMA accumulates in FP32; D is converted back to the input type.
@@ -145,6 +163,7 @@ nvlink_forward_computation_tile_n
 nvlink_forward_computation_num_queues
 nvlink_forward_computation_queue_depth
 nvlink_forward_computation_load_only_enabled
+nvlink_forward_computation_dequeue_only_enabled
 nvlink_forward_computation_log_enabled
 ```
 

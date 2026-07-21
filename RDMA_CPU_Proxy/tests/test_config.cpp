@@ -9,6 +9,7 @@ int main(int argc, char** argv) {
     assert(argc == 2);
     assert(rdma_proxy::config_help().find("nvlink_forward_computation_enabled") != std::string::npos);
     assert(rdma_proxy::config_help().find("nvlink_forward_computation_load_only_enabled") != std::string::npos);
+    assert(rdma_proxy::config_help().find("nvlink_forward_computation_dequeue_only_enabled") != std::string::npos);
     const auto config = rdma_proxy::load_config_file(argv[1]);
 
     assert(config.node_rank == 0);
@@ -53,6 +54,7 @@ int main(int argc, char** argv) {
     assert(config.nvlink_forward_computation_num_queues == 8);
     assert(config.nvlink_forward_computation_queue_depth == 1024);
     assert(!config.nvlink_forward_computation_load_only_enabled);
+    assert(!config.nvlink_forward_computation_dequeue_only_enabled);
     assert(!config.nvlink_forward_computation_log_enabled);
     assert(!config.nvlink_forward_local_batch_sync_enabled);
     assert(config.nvlink_forward_synchronize_iteration);
@@ -366,6 +368,30 @@ int main(int argc, char** argv) {
         rejected_load_only_without_computation = true;
     }
     assert(rejected_load_only_without_computation);
+
+    auto valid_dequeue_only_config = valid_computation_config;
+    valid_dequeue_only_config.nvlink_forward_computation_dequeue_only_enabled = true;
+    rdma_proxy::validate_config(valid_dequeue_only_config);
+
+    auto invalid_dequeue_only_config = valid_dequeue_only_config;
+    invalid_dequeue_only_config.nvlink_forward_computation_enabled = false;
+    bool rejected_dequeue_only_without_computation = false;
+    try {
+        rdma_proxy::validate_config(invalid_dequeue_only_config);
+    } catch (const std::runtime_error&) {
+        rejected_dequeue_only_without_computation = true;
+    }
+    assert(rejected_dequeue_only_without_computation);
+
+    auto invalid_combined_submodes = valid_load_only_config;
+    invalid_combined_submodes.nvlink_forward_computation_dequeue_only_enabled = true;
+    bool rejected_combined_submodes = false;
+    try {
+        rdma_proxy::validate_config(invalid_combined_submodes);
+    } catch (const std::runtime_error&) {
+        rejected_combined_submodes = true;
+    }
+    assert(rejected_combined_submodes);
 
     auto invalid_computation_notifications = valid_computation_config;
     invalid_computation_notifications.nvlink_forward_completion_notifications_enabled = false;

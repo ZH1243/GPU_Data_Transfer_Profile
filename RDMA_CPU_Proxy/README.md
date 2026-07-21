@@ -111,6 +111,8 @@ Set `nvlink_forward_computation_enabled=true` to translate each received ready-r
 
 Set `nvlink_forward_computation_load_only_enabled=true` to keep the same persistent task lifecycle and global-to-shared staging of both GEMM operands while skipping tensor-core/scalar matrix computation and all output-tensor stores. This special mode requires `nvlink_forward_computation_enabled=true`; output buffers are still allocated and cleared for a consistent task ABI, but remain unchanged after load-only tasks.
 
+Set `nvlink_forward_computation_dequeue_only_enabled=true` to measure the CPU-to-GPU control/task channel with no tensor payload work. Each persistent CTA only polls its device queue, claims and dequeues task descriptors, updates completion accounting, and publishes the existing slot-reuse acknowledgement. It does not load A or B, perform matrix computation, or write D. This mode requires `nvlink_forward_computation_enabled=true` and is mutually exclusive with load-only mode.
+
 Set `nvlink_forward_local_batch_sync_enabled=true` to add a same-node GPU-proxy barrier before every synchronized NVLink forwarding batch. Once a proxy has observed that the next batch is ready for forwarding, it marks the batch-start sequence in shared memory and waits until every local GPU proxy has reached the same sequence before issuing that batch. Because each forwarding thread reaches the next batch-start barrier only after the previous batch's `cudaStreamSynchronize()` has returned, this makes the proxies start each batch together while still allowing them to move directly from a completed batch to checking readiness for the next one. The first batch uses the same barrier, with the previous batch treated as already complete. This option requires `nvlink_forward_synchronize_batches=true` and uses the same local shared-memory run identity as `local_iteration_sync_run_id`.
 
 ## RDMA and GPUDirect RDMA
@@ -285,6 +287,7 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_computation_num_queues`
 - `nvlink_forward_computation_queue_depth`
 - `nvlink_forward_computation_load_only_enabled`
+- `nvlink_forward_computation_dequeue_only_enabled`
 - `nvlink_forward_computation_log_enabled`
 - `nvlink_forward_local_batch_sync_enabled`
 - `nvlink_forward_synchronize_iteration`

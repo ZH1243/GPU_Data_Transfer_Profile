@@ -323,7 +323,7 @@ __device__ void load_forward_tile_operands(const ForwardComputeTask& task, float
     }
 }
 
-template <typename T, bool LoadOnly>
+template <typename T, bool LoadOnly, bool DequeueOnly>
 __global__ void persistent_forward_computation_kernel(
     const ForwardDeviceQueueView* queue_views,
     uint32_t num_queues,
@@ -420,7 +420,11 @@ __global__ void persistent_forward_computation_kernel(
             if (threadIdx.x == 0) {
                 atomicAdd(reinterpret_cast<unsigned long long*>(&queue.stats->tasks_claimed), 1ULL);
             }
-            if constexpr (LoadOnly) {
+            if constexpr (DequeueOnly) {
+                // Queue benchmarking mode: claiming and acknowledging the task
+                // is the entire payload. In particular, do not dereference A,
+                // B, or D and do not stage any tensor data in shared memory.
+            } else if constexpr (LoadOnly) {
                 load_forward_tile_operands<T>(shared_task, shared_storage);
             } else {
                 compute_forward_tile<T>(shared_task, shared_storage);
@@ -441,7 +445,7 @@ __global__ void persistent_forward_computation_kernel(
     }
 }
 
-template <typename T, bool LoadOnly>
+template <typename T, bool LoadOnly, bool DequeueOnly>
 void launch_persistent_typed(
     const ForwardDeviceQueueView* queues,
     uint32_t num_queues,
@@ -452,13 +456,13 @@ void launch_persistent_typed(
     cudaStream_t stream) {
     check_cuda(
         cudaFuncSetAttribute(
-            persistent_forward_computation_kernel<T, LoadOnly>,
+            persistent_forward_computation_kernel<T, LoadOnly, DequeueOnly>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             static_cast<int>(dynamic_shared_bytes)),
         "cudaFuncSetAttribute persistent dynamic shared memory");
     check_cuda(
         cudaFuncSetAttribute(
-            persistent_forward_computation_kernel<T, LoadOnly>,
+            persistent_forward_computation_kernel<T, LoadOnly, DequeueOnly>,
             cudaFuncAttributePreferredSharedMemoryCarveout,
             100),
         "cudaFuncSetAttribute persistent shared-memory carveout");
@@ -466,7 +470,7 @@ void launch_persistent_typed(
     check_cuda(
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &active_blocks_per_sm,
-            persistent_forward_computation_kernel<T, LoadOnly>,
+            persistent_forward_computation_kernel<T, LoadOnly, DequeueOnly>,
             256,
             dynamic_shared_bytes),
         "cudaOccupancyMaxActiveBlocksPerMultiprocessor persistent computation");
@@ -475,7 +479,8 @@ void launch_persistent_typed(
             "persistent forwarding computation requires exactly one resident CTA per SM; occupancy API reported " +
             std::to_string(active_blocks_per_sm));
     }
-    persistent_forward_computation_kernel<T, LoadOnly><<<num_ctas, 256, dynamic_shared_bytes, stream>>>(
+    persistent_forward_computation_kernel<T, LoadOnly, DequeueOnly>
+        <<<num_ctas, 256, dynamic_shared_bytes, stream>>>(
         queues, num_queues, abort_signal, physical_sm_ids);
     check_cuda(cudaGetLastError(), "persistent forwarding computation kernel launch");
 }
@@ -498,6 +503,7 @@ void launch_persistent_forward_computation_kernel(
     uint32_t num_ctas,
     DataType dtype,
     bool load_only,
+    bool dequeue_only,
     ForwardQueueSignal* abort_signal,
     uint32_t* physical_sm_ids,
     std::size_t dynamic_shared_bytes,
@@ -507,19 +513,25 @@ void launch_persistent_forward_computation_kernel(
     }
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     if (dtype == DataType::kBF16) {
-        if (load_only) {
-            launch_persistent_typed<__nv_bfloat16, true>(
+        if (dequeue_only) {
+            launch_persistent_typed<__nv_bfloat16, false, true>(
+                queues, num_queues, num_ctas, abort_signal, physical_sm_ids, dynamic_shared_bytes, cuda_stream);
+        } else if (load_only) {
+            launch_persistent_typed<__nv_bfloat16, true, false>(
                 queues, num_queues, num_ctas, abort_signal, physical_sm_ids, dynamic_shared_bytes, cuda_stream);
         } else {
-            launch_persistent_typed<__nv_bfloat16, false>(
+            launch_persistent_typed<__nv_bfloat16, false, false>(
                 queues, num_queues, num_ctas, abort_signal, physical_sm_ids, dynamic_shared_bytes, cuda_stream);
         }
     } else if (dtype == DataType::kFP16) {
-        if (load_only) {
-            launch_persistent_typed<__half, true>(
+        if (dequeue_only) {
+            launch_persistent_typed<__half, false, true>(
+                queues, num_queues, num_ctas, abort_signal, physical_sm_ids, dynamic_shared_bytes, cuda_stream);
+        } else if (load_only) {
+            launch_persistent_typed<__half, true, false>(
                 queues, num_queues, num_ctas, abort_signal, physical_sm_ids, dynamic_shared_bytes, cuda_stream);
         } else {
-            launch_persistent_typed<__half, false>(
+            launch_persistent_typed<__half, false, false>(
                 queues, num_queues, num_ctas, abort_signal, physical_sm_ids, dynamic_shared_bytes, cuda_stream);
         }
     } else {

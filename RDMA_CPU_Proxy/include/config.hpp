@@ -80,6 +80,7 @@ struct ProxyConfig {
     std::size_t nvlink_forward_computation_num_queues{1};
     std::size_t nvlink_forward_computation_queue_depth{1024};
     bool nvlink_forward_computation_load_only_enabled{false};
+    bool nvlink_forward_computation_dequeue_only_enabled{false};
     bool nvlink_forward_computation_log_enabled{false};
     bool nvlink_forward_local_batch_sync_enabled{false};
     bool nvlink_forward_synchronize_iteration{true};

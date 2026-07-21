@@ -200,6 +200,34 @@ int main(int argc, char** argv) {
                   << " nonzero_outputs=" << load_only_nonzero_outputs << '\n';
         load_only_computation.shutdown();
         if (load_only_stats.tasks_completed != load_only_tasks || load_only_nonzero_outputs != 0) return 3;
+
+        auto dequeue_only_config = config;
+        dequeue_only_config.nvlink_forward_computation_dequeue_only_enabled = true;
+        rdma_proxy::validate_config(dequeue_only_config);
+        rdma_proxy::ForwardComputation dequeue_only_computation(dequeue_only_config, buffers);
+        dequeue_only_computation.initialize();
+        dequeue_only_computation.begin_iteration(2);
+        const auto dequeue_only_tasks = dequeue_only_computation.enqueue_ready_region(
+            2, 1, 0, 0, config.num_tokens, 0);
+        dequeue_only_computation.finish_iteration(2);
+        const auto dequeue_only_stats = dequeue_only_computation.stats();
+        check_cuda(cudaMemcpy(
+                       actual.data(), output.output.ptr, actual.size() * sizeof(__nv_bfloat16),
+                       cudaMemcpyDeviceToHost),
+                   "cudaMemcpy dequeue-only D");
+        std::size_t dequeue_only_nonzero_outputs = 0;
+        for (const auto value : actual) {
+            if (__bfloat162float(value) != 0.0F) ++dequeue_only_nonzero_outputs;
+        }
+        std::cout << "persistent_forward_dequeue_only_validation mode=" << (full ? "full" : "quick")
+                  << " generated=" << dequeue_only_stats.generated_tasks
+                  << " completed=" << dequeue_only_stats.tasks_completed
+                  << " exits=" << dequeue_only_stats.exit_tasks_consumed
+                  << " expected_tasks=" << dequeue_only_tasks
+                  << " nonzero_outputs=" << dequeue_only_nonzero_outputs << '\n';
+        dequeue_only_computation.shutdown();
+        if (dequeue_only_stats.tasks_completed != dequeue_only_tasks ||
+            dequeue_only_nonzero_outputs != 0) return 4;
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "validate_forward_computation failed: " << error.what() << '\n';
