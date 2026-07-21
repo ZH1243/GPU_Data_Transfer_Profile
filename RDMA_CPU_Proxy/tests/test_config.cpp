@@ -8,6 +8,7 @@
 int main(int argc, char** argv) {
     assert(argc == 2);
     assert(rdma_proxy::config_help().find("nvlink_forward_computation_enabled") != std::string::npos);
+    assert(rdma_proxy::config_help().find("nvlink_forward_computation_load_only_enabled") != std::string::npos);
     const auto config = rdma_proxy::load_config_file(argv[1]);
 
     assert(config.node_rank == 0);
@@ -51,6 +52,7 @@ int main(int argc, char** argv) {
     assert(config.nvlink_forward_computation_tile_n == 128);
     assert(config.nvlink_forward_computation_num_queues == 8);
     assert(config.nvlink_forward_computation_queue_depth == 1024);
+    assert(!config.nvlink_forward_computation_load_only_enabled);
     assert(!config.nvlink_forward_computation_log_enabled);
     assert(!config.nvlink_forward_local_batch_sync_enabled);
     assert(config.nvlink_forward_synchronize_iteration);
@@ -350,6 +352,20 @@ int main(int argc, char** argv) {
     valid_computation_config.nvlink_forward_computation_num_queues = 2;
     valid_computation_config.nvlink_forward_computation_queue_depth = 4;
     rdma_proxy::validate_config(valid_computation_config);
+
+    auto valid_load_only_config = valid_computation_config;
+    valid_load_only_config.nvlink_forward_computation_load_only_enabled = true;
+    rdma_proxy::validate_config(valid_load_only_config);
+
+    auto invalid_load_only_config = valid_load_only_config;
+    invalid_load_only_config.nvlink_forward_computation_enabled = false;
+    bool rejected_load_only_without_computation = false;
+    try {
+        rdma_proxy::validate_config(invalid_load_only_config);
+    } catch (const std::runtime_error&) {
+        rejected_load_only_without_computation = true;
+    }
+    assert(rejected_load_only_without_computation);
 
     auto invalid_computation_notifications = valid_computation_config;
     invalid_computation_notifications.nvlink_forward_completion_notifications_enabled = false;

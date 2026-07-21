@@ -102,6 +102,23 @@ Logical CTA `blockIdx.x` polls queue `blockIdx.x % num_queues`. This is determin
 
 Each 256-thread CTA uses eight warps. For a task, warps distribute the 16x16 output fragments. Full fragments use FP16/BF16 WMMA tensor-core operations with FP32 accumulation. Global A/B fragments are staged into per-warp shared-memory double buffers with `__pipeline_memcpy_async`; staging of K tile `i+1` overlaps tensor-core work for K tile `i`. Results are converted to the configured 16-bit output type. Partial 16x16 edge fragments use a scalar correctness fallback. Different CTAs naturally overlap queue polling, operand loading, tensor-core work, and stores across independent output tiles.
 
+### Load-only mode
+
+Set `nvlink_forward_computation_load_only_enabled=true` to execute each normal
+compute task as an operand-staging task. Each assigned warp walks the same
+output fragments and K tiles as GEMM and transfers both A (forwarded token rows)
+and B (weights) from global memory into its double-buffered shared-memory
+stages. Full fragments retain the asynchronous pipeline; partial token/output
+tails use guarded global-to-shared loads. Shared values are consumed only enough
+to prevent compiler dead-code elimination. The kernel performs no WMMA or
+scalar multiply-accumulate operations and writes nothing to D.
+
+Queue claim/completion counters, exit tasks, reuse acknowledgements, and
+iteration lifetime protection remain active. Output buffers are still allocated
+and cleared to keep the existing descriptor ABI and buffer lookup unchanged,
+so they remain zero after a load-only iteration. This sub-mode is rejected
+unless `nvlink_forward_computation_enabled=true`.
+
 ## Buffer and weight lifetime
 
 Every per-source NVLink receive buffer has a matching output buffer with row capacity `num_tokens * remote_peer_count` and feature width `nvlink_forward_computation_output_dim`. One row-major KxN weight buffer is allocated in GPU global memory and initialized once with deterministic small pseudo-random values before any persistent kernel launch. A and B use BF16 or FP16; WMMA accumulates in FP32; D is converted back to the input type.
@@ -127,6 +144,7 @@ nvlink_forward_computation_tile_m
 nvlink_forward_computation_tile_n
 nvlink_forward_computation_num_queues
 nvlink_forward_computation_queue_depth
+nvlink_forward_computation_load_only_enabled
 nvlink_forward_computation_log_enabled
 ```
 
@@ -165,7 +183,7 @@ RDMA_CPU_Proxy/build-hopper/validate_forward_computation
 RDMA_CPU_Proxy/build-hopper/validate_forward_computation --full
 ```
 
-The full mode compares all 256x6400 output values for K=4096 against `cublasGemmEx`. It also waits until all tasks from the first half-notification complete before publishing the second, demonstrating incremental computation. Iteration logs report generated/claimed/completed/exit counts, full-queue stalls, enqueue and total time, per-queue load when verbose logging is enabled, and how many tasks were already complete when the final notification was parsed.
+The full mode compares all 256x6400 output values for K=4096 against `cublasGemmEx`. Both quick and full validation then run a second load-only iteration, check that every task completes, and verify that every output element remains zero. The normal iteration also waits until all tasks from the first half-notification complete before publishing the second, demonstrating incremental computation. Iteration logs report generated/claimed/completed/exit counts, full-queue stalls, enqueue and total time, per-queue load when verbose logging is enabled, and how many tasks were already complete when the final notification was parsed.
 
 ## Known limitations
 

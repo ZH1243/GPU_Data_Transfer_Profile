@@ -170,6 +170,28 @@ int main() {
     }
 
     computation.shutdown();
+
+    // Load-only mode preserves task lifecycle and completion accounting but
+    // intentionally leaves the cleared output tensor untouched.
+    auto load_only_config = config;
+    load_only_config.nvlink_forward_computation_load_only_enabled = true;
+    rdma_proxy::ForwardComputation load_only_computation(load_only_config, buffers);
+    load_only_computation.initialize();
+    load_only_computation.begin_iteration(2);
+    assert(load_only_computation.enqueue_ready_region(2, 1, 0, 0, 32, 0) == 4);
+    load_only_computation.finish_iteration(2);
+    const auto load_only_stats = load_only_computation.stats();
+    assert(load_only_stats.generated_tasks == 4);
+    assert(load_only_stats.tasks_claimed == 4);
+    assert(load_only_stats.tasks_completed == 4);
+    assert(load_only_stats.exit_tasks_consumed == 4);
+    const auto* load_only_output = static_cast<const uint16_t*>(
+        buffers.nvlink_computation_output_buffer_for_source(1).output.ptr);
+    for (std::size_t i = 0; i < config.num_tokens * config.nvlink_forward_computation_output_dim; ++i) {
+        assert(load_only_output[i] == 0);
+    }
+    load_only_computation.shutdown();
+
     std::cout << "forward computation host validation passed\n";
     return 0;
 }

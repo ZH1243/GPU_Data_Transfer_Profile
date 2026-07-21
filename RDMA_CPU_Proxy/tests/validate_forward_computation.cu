@@ -173,6 +173,33 @@ int main(int argc, char** argv) {
         cudaFree(reference_device);
         computation.shutdown();
         if (mismatches != 0) return 2;
+
+        auto load_only_config = config;
+        load_only_config.nvlink_forward_computation_load_only_enabled = true;
+        rdma_proxy::validate_config(load_only_config);
+        rdma_proxy::ForwardComputation load_only_computation(load_only_config, buffers);
+        load_only_computation.initialize();
+        load_only_computation.begin_iteration(1);
+        const auto load_only_tasks = load_only_computation.enqueue_ready_region(
+            1, 1, 0, 0, config.num_tokens, 0);
+        load_only_computation.finish_iteration(1);
+        const auto load_only_stats = load_only_computation.stats();
+        check_cuda(cudaMemcpy(
+                       actual.data(), output.output.ptr, actual.size() * sizeof(__nv_bfloat16),
+                       cudaMemcpyDeviceToHost),
+                   "cudaMemcpy load-only D");
+        std::size_t load_only_nonzero_outputs = 0;
+        for (const auto value : actual) {
+            if (__bfloat162float(value) != 0.0F) ++load_only_nonzero_outputs;
+        }
+        std::cout << "persistent_forward_load_only_validation mode=" << (full ? "full" : "quick")
+                  << " generated=" << load_only_stats.generated_tasks
+                  << " completed=" << load_only_stats.tasks_completed
+                  << " exits=" << load_only_stats.exit_tasks_consumed
+                  << " expected_tasks=" << load_only_tasks
+                  << " nonzero_outputs=" << load_only_nonzero_outputs << '\n';
+        load_only_computation.shutdown();
+        if (load_only_stats.tasks_completed != load_only_tasks || load_only_nonzero_outputs != 0) return 3;
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "validate_forward_computation failed: " << error.what() << '\n';

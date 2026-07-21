@@ -24,6 +24,7 @@ void launch_persistent_forward_computation_kernel(
     uint32_t num_queues,
     uint32_t num_ctas,
     DataType dtype,
+    bool load_only,
     ForwardQueueSignal* abort_signal,
     uint32_t* physical_sm_ids,
     std::size_t dynamic_shared_bytes,
@@ -634,6 +635,7 @@ public:
             static_cast<uint32_t>(queues_.size()),
             num_ctas_,
             config_.dtype,
+            config_.nvlink_forward_computation_load_only_enabled,
             abort_device_,
             static_cast<uint32_t*>(device_sm_ids_),
             dynamic_shared_bytes_,
@@ -641,6 +643,8 @@ public:
 #endif
         RDMA_PROXY_LOG_INFO("launched persistent forwarding computation iteration=", iteration,
                             " generation=", generation,
+                            " load_only=",
+                            config_.nvlink_forward_computation_load_only_enabled ? "true" : "false",
                             " CTAs=", num_ctas_,
                             " queues=", queues_.size(),
                             " dynamic_shared_bytes=", dynamic_shared_bytes_);
@@ -936,7 +940,9 @@ private:
                 continue;
             }
             __atomic_fetch_add(&stats.tasks_claimed, 1ULL, __ATOMIC_RELAXED);
-            execute_mock_task(task);
+            if (!config_.nvlink_forward_computation_load_only_enabled) {
+                execute_mock_task(task);
+            }
             __atomic_fetch_add(&stats.tasks_completed, 1ULL, __ATOMIC_RELEASE);
             queue.complete_mock(position);
         }

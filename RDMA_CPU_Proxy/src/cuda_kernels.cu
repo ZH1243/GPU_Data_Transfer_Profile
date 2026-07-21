@@ -205,6 +205,125 @@ __device__ void compute_forward_tile(const ForwardComputeTask& task, float* warp
 }
 
 template <typename T>
+__device__ __forceinline__ void consume_staged_operands(const T* a_shared, const T* b_shared) {
+    const uint32_t lane = threadIdx.x % warpSize;
+    const uint32_t stage_element = (lane / 2U) * 16U + (lane % 2U) * 8U;
+    const volatile uint16_t* a_bits = reinterpret_cast<const volatile uint16_t*>(a_shared);
+    const volatile uint16_t* b_bits = reinterpret_cast<const volatile uint16_t*>(b_shared);
+    const uint32_t sink = static_cast<uint32_t>(a_bits[stage_element]) |
+        (static_cast<uint32_t>(b_bits[stage_element]) << 16U);
+    // The empty asm makes the shared-memory reads observable to the compiler,
+    // preventing the global-to-shared copies from being optimized away.
+    asm volatile("" : : "r"(sink) : "memory");
+}
+
+template <typename T>
+__device__ __forceinline__ void stage_partial_operands(
+    T* a_shared,
+    T* b_shared,
+    const T* a,
+    const T* b,
+    uint32_t global_row,
+    uint32_t global_column,
+    uint32_t local_row,
+    uint32_t local_column,
+    uint32_t k_offset,
+    const ForwardComputeTask& task) {
+    const uint32_t lane = threadIdx.x % warpSize;
+    for (uint32_t element = lane; element < 256U; element += warpSize) {
+        const uint32_t row = element / 16U;
+        const uint32_t column = element % 16U;
+        a_shared[element] = local_row + row < task.valid_token_rows
+            ? a[static_cast<uint64_t>(global_row + row) * task.matrix_k + k_offset + column]
+            : T{};
+        b_shared[element] = local_column + column < task.valid_output_columns
+            ? b[static_cast<uint64_t>(k_offset + row) * task.matrix_n + global_column + column]
+            : T{};
+    }
+}
+
+template <typename T>
+__device__ void load_forward_tile_operands(const ForwardComputeTask& task, float* warp_scratch) {
+    const auto* a = reinterpret_cast<const T*>(task.a_base);
+    const auto* b = reinterpret_cast<const T*>(task.b_base);
+    const uint32_t warp = threadIdx.x / warpSize;
+    const uint32_t warps = blockDim.x / warpSize;
+    const uint32_t fragment_rows = (task.valid_token_rows + 15U) / 16U;
+    const uint32_t fragment_columns = (task.valid_output_columns + 15U) / 16U;
+    const uint32_t fragment_count = fragment_rows * fragment_columns;
+    T* operand_storage = reinterpret_cast<T*>(warp_scratch + warps * 16U * 16U);
+    T* warp_operands = operand_storage + warp * 4U * 16U * 16U;
+    T* a_stage[2] = {warp_operands, warp_operands + 16U * 16U};
+    T* b_stage[2] = {
+        warp_operands + 2U * 16U * 16U,
+        warp_operands + 3U * 16U * 16U};
+
+    for (uint32_t fragment_index = warp; fragment_index < fragment_count; fragment_index += warps) {
+        const uint32_t fragment_row = fragment_index / fragment_columns;
+        const uint32_t fragment_column = fragment_index % fragment_columns;
+        const uint32_t local_row = fragment_row * 16U;
+        const uint32_t local_column = fragment_column * 16U;
+        const uint32_t global_row = task.token_row_offset + local_row;
+        const uint32_t global_column = task.output_column_offset + local_column;
+        const bool full_fragment =
+            local_row + 16U <= task.valid_token_rows &&
+            local_column + 16U <= task.valid_output_columns;
+        const uint32_t k_tiles = task.matrix_k / 16U;
+
+        if (full_fragment) {
+            stage_wmma_operands_async(
+                a_stage[0], b_stage[0], a, b, global_row, global_column, 0, task.matrix_k, task.matrix_n);
+            __pipeline_commit();
+            for (uint32_t k_tile = 0; k_tile < k_tiles; ++k_tile) {
+                const uint32_t stage = k_tile & 1U;
+                const bool has_next = k_tile + 1U < k_tiles;
+                if (has_next) {
+                    const uint32_t next_stage = stage ^ 1U;
+                    stage_wmma_operands_async(
+                        a_stage[next_stage],
+                        b_stage[next_stage],
+                        a,
+                        b,
+                        global_row,
+                        global_column,
+                        (k_tile + 1U) * 16U,
+                        task.matrix_k,
+                        task.matrix_n);
+                    __pipeline_commit();
+                    __pipeline_wait_prior(1);
+                } else {
+                    __pipeline_wait_prior(0);
+                }
+                __syncwarp();
+                consume_staged_operands(a_stage[stage], b_stage[stage]);
+                __syncwarp();
+            }
+            continue;
+        }
+
+        // Partial row/output fragments use guarded scalar loads into shared
+        // memory so a tail task never reads beyond A or B.
+        for (uint32_t k_tile = 0; k_tile < k_tiles; ++k_tile) {
+            const uint32_t stage = k_tile & 1U;
+            stage_partial_operands(
+                a_stage[stage],
+                b_stage[stage],
+                a,
+                b,
+                global_row,
+                global_column,
+                local_row,
+                local_column,
+                k_tile * 16U,
+                task);
+            __syncwarp();
+            consume_staged_operands(a_stage[stage], b_stage[stage]);
+            __syncwarp();
+        }
+    }
+}
+
+template <typename T, bool LoadOnly>
 __global__ void persistent_forward_computation_kernel(
     const ForwardDeviceQueueView* queue_views,
     uint32_t num_queues,
@@ -301,7 +420,11 @@ __global__ void persistent_forward_computation_kernel(
             if (threadIdx.x == 0) {
                 atomicAdd(reinterpret_cast<unsigned long long*>(&queue.stats->tasks_claimed), 1ULL);
             }
-            compute_forward_tile<T>(shared_task, shared_storage);
+            if constexpr (LoadOnly) {
+                load_forward_tile_operands<T>(shared_task, shared_storage);
+            } else {
+                compute_forward_tile<T>(shared_task, shared_storage);
+            }
             __syncthreads();
             if (threadIdx.x == 0) {
                 atomicAdd(reinterpret_cast<unsigned long long*>(&queue.stats->tasks_completed), 1ULL);
@@ -318,7 +441,7 @@ __global__ void persistent_forward_computation_kernel(
     }
 }
 
-template <typename T>
+template <typename T, bool LoadOnly>
 void launch_persistent_typed(
     const ForwardDeviceQueueView* queues,
     uint32_t num_queues,
@@ -329,13 +452,13 @@ void launch_persistent_typed(
     cudaStream_t stream) {
     check_cuda(
         cudaFuncSetAttribute(
-            persistent_forward_computation_kernel<T>,
+            persistent_forward_computation_kernel<T, LoadOnly>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             static_cast<int>(dynamic_shared_bytes)),
         "cudaFuncSetAttribute persistent dynamic shared memory");
     check_cuda(
         cudaFuncSetAttribute(
-            persistent_forward_computation_kernel<T>,
+            persistent_forward_computation_kernel<T, LoadOnly>,
             cudaFuncAttributePreferredSharedMemoryCarveout,
             100),
         "cudaFuncSetAttribute persistent shared-memory carveout");
@@ -343,7 +466,7 @@ void launch_persistent_typed(
     check_cuda(
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &active_blocks_per_sm,
-            persistent_forward_computation_kernel<T>,
+            persistent_forward_computation_kernel<T, LoadOnly>,
             256,
             dynamic_shared_bytes),
         "cudaOccupancyMaxActiveBlocksPerMultiprocessor persistent computation");
@@ -352,7 +475,7 @@ void launch_persistent_typed(
             "persistent forwarding computation requires exactly one resident CTA per SM; occupancy API reported " +
             std::to_string(active_blocks_per_sm));
     }
-    persistent_forward_computation_kernel<T><<<num_ctas, 256, dynamic_shared_bytes, stream>>>(
+    persistent_forward_computation_kernel<T, LoadOnly><<<num_ctas, 256, dynamic_shared_bytes, stream>>>(
         queues, num_queues, abort_signal, physical_sm_ids);
     check_cuda(cudaGetLastError(), "persistent forwarding computation kernel launch");
 }
@@ -374,6 +497,7 @@ void launch_persistent_forward_computation_kernel(
     uint32_t num_queues,
     uint32_t num_ctas,
     DataType dtype,
+    bool load_only,
     ForwardQueueSignal* abort_signal,
     uint32_t* physical_sm_ids,
     std::size_t dynamic_shared_bytes,
@@ -383,11 +507,21 @@ void launch_persistent_forward_computation_kernel(
     }
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     if (dtype == DataType::kBF16) {
-        launch_persistent_typed<__nv_bfloat16>(
-            queues, num_queues, num_ctas, abort_signal, physical_sm_ids, dynamic_shared_bytes, cuda_stream);
+        if (load_only) {
+            launch_persistent_typed<__nv_bfloat16, true>(
+                queues, num_queues, num_ctas, abort_signal, physical_sm_ids, dynamic_shared_bytes, cuda_stream);
+        } else {
+            launch_persistent_typed<__nv_bfloat16, false>(
+                queues, num_queues, num_ctas, abort_signal, physical_sm_ids, dynamic_shared_bytes, cuda_stream);
+        }
     } else if (dtype == DataType::kFP16) {
-        launch_persistent_typed<__half>(
-            queues, num_queues, num_ctas, abort_signal, physical_sm_ids, dynamic_shared_bytes, cuda_stream);
+        if (load_only) {
+            launch_persistent_typed<__half, true>(
+                queues, num_queues, num_ctas, abort_signal, physical_sm_ids, dynamic_shared_bytes, cuda_stream);
+        } else {
+            launch_persistent_typed<__half, false>(
+                queues, num_queues, num_ctas, abort_signal, physical_sm_ids, dynamic_shared_bytes, cuda_stream);
+        }
     } else {
         throw std::runtime_error("persistent forwarding computation supports only BF16/FP16");
     }
