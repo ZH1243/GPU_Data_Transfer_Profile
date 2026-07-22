@@ -132,6 +132,8 @@ struct Options {
     uint64_t timeout_ms{10000};
     bool auxiliary_threads{true};
     std::string cpu_affinity;
+    std::string proxy_cpus;
+    std::string proxy_cpu_sets;
 };
 
 std::size_t parse_size(const std::string& text, const std::string& option) {
@@ -167,6 +169,8 @@ void print_help(const char* program) {
         << "  --timeout-ms=N        iteration timeout (default: 10000)\n"
         << "  --aux-threads=BOOL    keep forwarding/ready threads (default: true)\n"
         << "  --cpu-affinity=LIST   Linux process affinity inherited by threads\n"
+        << "  --proxy-cpus=LIST     one distinct Linux CPU per proxy, e.g. 0,2,4,6\n"
+        << "  --proxy-cpu-sets=SETS one distinct CPU set per proxy, e.g. '0-3;4-7'\n"
         << "  --help                show this help\n";
 }
 
@@ -191,6 +195,8 @@ Options parse_options(int argc, char** argv) {
         else if (key == "--timeout-ms") options.timeout_ms = parse_size(value, key);
         else if (key == "--aux-threads") options.auxiliary_threads = parse_bool(value, key);
         else if (key == "--cpu-affinity") options.cpu_affinity = value;
+        else if (key == "--proxy-cpus") options.proxy_cpus = value;
+        else if (key == "--proxy-cpu-sets") options.proxy_cpu_sets = value;
         else throw std::runtime_error("unknown option: " + key);
     }
     if (options.proxies < 2 || options.proxies > 64) {
@@ -201,6 +207,14 @@ Options parse_options(int argc, char** argv) {
         throw std::runtime_error("--queue-depth must be in [1, UINT32_MAX]");
     }
     if (options.timeout_ms == 0) throw std::runtime_error("--timeout-ms must be > 0");
+    const int affinity_modes =
+        (!options.cpu_affinity.empty() && options.cpu_affinity != "none" ? 1 : 0) +
+        (!options.proxy_cpus.empty() ? 1 : 0) +
+        (!options.proxy_cpu_sets.empty() ? 1 : 0);
+    if (affinity_modes > 1) {
+        throw std::runtime_error(
+            "--cpu-affinity, --proxy-cpus, and --proxy-cpu-sets are mutually exclusive");
+    }
     return options;
 }
 
@@ -222,6 +236,21 @@ std::vector<int> parse_cpu_list(const std::string& specification) {
     }
     if (cpus.empty()) throw std::runtime_error("CPU-affinity list is empty");
     return cpus;
+}
+
+std::vector<std::string> parse_cpu_sets(const std::string& specification) {
+    std::vector<std::string> sets;
+    std::stringstream stream(specification);
+    std::string cpu_set;
+    while (std::getline(stream, cpu_set, ';')) {
+        if (cpu_set.empty()) throw std::runtime_error("empty CPU set in --proxy-cpu-sets");
+        // Parse now as validation; apply_process_affinity() parses it again in
+        // the child that owns this set.
+        (void)parse_cpu_list(cpu_set);
+        sets.push_back(cpu_set);
+    }
+    if (sets.empty()) throw std::runtime_error("--proxy-cpu-sets must not be empty");
+    return sets;
 }
 
 void apply_process_affinity(const std::string& specification) {
@@ -331,7 +360,17 @@ public:
     }
 
     void run() {
-        apply_process_affinity(options_.cpu_affinity);
+        if (!options_.proxy_cpu_sets.empty()) {
+            const auto proxy_cpu_sets = parse_cpu_sets(options_.proxy_cpu_sets);
+            apply_process_affinity(
+                proxy_cpu_sets.at(static_cast<std::size_t>(local_gpu_)));
+        } else if (options_.proxy_cpus.empty()) {
+            apply_process_affinity(options_.cpu_affinity);
+        } else {
+            const auto proxy_cpus = parse_cpu_list(options_.proxy_cpus);
+            apply_process_affinity(
+                std::to_string(proxy_cpus.at(static_cast<std::size_t>(local_gpu_))));
+        }
         dispatch_thread_ = std::thread(&ProxySimulation::dispatch_loop, this);
         receiver_thread_ = std::thread(&ProxySimulation::receiver_loop, this);
         if (options_.auxiliary_threads) {
@@ -694,7 +733,10 @@ void report_results(const Options& options, const Measurement* measurements) {
               << " warmup_iterations=" << options.warmup
               << " queue_depth=" << options.queue_depth
               << " auxiliary_threads=" << (options.auxiliary_threads ? "true" : "false")
-              << " cpu_affinity=" << (options.cpu_affinity.empty() ? "inherited" : options.cpu_affinity)
+              << " cpu_affinity="
+              << (!options.proxy_cpu_sets.empty() ? "per-proxy-sets:" + options.proxy_cpu_sets :
+                  (!options.proxy_cpus.empty() ? "per-proxy:" + options.proxy_cpus :
+                   (options.cpu_affinity.empty() ? "inherited" : options.cpu_affinity)))
               << "\n\n"
               << std::left << std::setw(18) << "scope"
               << std::right << std::setw(11) << "mean_us"
@@ -730,6 +772,33 @@ void report_results(const Options& options, const Measurement* measurements) {
 }
 
 int run_benchmark(const Options& options) {
+    if (!options.proxy_cpus.empty()) {
+        auto proxy_cpus = parse_cpu_list(options.proxy_cpus);
+        if (proxy_cpus.size() != options.proxies) {
+            throw std::runtime_error("--proxy-cpus must contain exactly one CPU for each proxy");
+        }
+        std::sort(proxy_cpus.begin(), proxy_cpus.end());
+        if (std::adjacent_find(proxy_cpus.begin(), proxy_cpus.end()) != proxy_cpus.end()) {
+            throw std::runtime_error("--proxy-cpus must assign a different CPU to every proxy");
+        }
+    }
+    if (!options.proxy_cpu_sets.empty()) {
+        const auto proxy_cpu_sets = parse_cpu_sets(options.proxy_cpu_sets);
+        if (proxy_cpu_sets.size() != options.proxies) {
+            throw std::runtime_error(
+                "--proxy-cpu-sets must contain exactly one CPU set for each proxy");
+        }
+        std::vector<int> assigned_cpus;
+        for (const auto& cpu_set : proxy_cpu_sets) {
+            const auto cpus = parse_cpu_list(cpu_set);
+            assigned_cpus.insert(assigned_cpus.end(), cpus.begin(), cpus.end());
+        }
+        std::sort(assigned_cpus.begin(), assigned_cpus.end());
+        if (std::adjacent_find(assigned_cpus.begin(), assigned_cpus.end()) != assigned_cpus.end()) {
+            throw std::runtime_error("--proxy-cpu-sets must not overlap");
+        }
+    }
+
     std::vector<SegmentMapping> segments;
     segments.reserve(options.proxies);
     try {

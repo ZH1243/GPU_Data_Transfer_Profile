@@ -61,12 +61,50 @@ Options:
 --timeout-ms=N          Per-iteration timeout (default: 10000)
 --aux-threads=BOOL      Keep forwarding and forwarding-ready busy threads (default: true)
 --cpu-affinity=LIST     Linux CPU mask inherited by every child thread, e.g. 0-31,64-95
+--proxy-cpus=LIST       Assign one distinct Linux CPU per proxy, e.g. 0,2,4,6
+--proxy-cpu-sets=SETS   Assign one distinct CPU set per proxy, e.g. '0-3;4-7'
 --help                  Show command-line help
 ```
 
 `--cpu-affinity` deliberately binds the whole proxy process before its threads
 are created, matching `RDMA_CPU_Proxy` rather than pinning individual threads.
 Leave it as `none` to use the launcher environment's inherited affinity.
+
+To bind different proxies to different CPUs, provide exactly one CPU ID per
+proxy:
+
+```bash
+NVLink_Iteration_Done_Benchmark/build/iteration_done_benchmark \
+  --proxies=4 \
+  --proxy-cpus=0,2,4,6 \
+  --warmup=2000 \
+  --iterations=100000
+```
+
+Here proxy 0 uses CPU 0, proxy 1 uses CPU 2, and so on. Every thread inside a
+proxy inherits that proxy's single-CPU mask. Since the default model has five
+active threads per proxy, this intentionally creates intra-proxy CPU
+contention. Use `--aux-threads=false` if the experiment should include only the
+main, dispatch, and receiver threads. `--proxy-cpus` and `--cpu-affinity` are
+mutually exclusive.
+
+To give each proxy multiple CPUs, use a quoted semicolon-separated list of CPU
+sets:
+
+```bash
+NVLink_Iteration_Done_Benchmark/build/iteration_done_benchmark \
+  --proxies=4 \
+  --proxy-cpu-sets='0-4;5-9;10-14;15-19' \
+  --warmup=2000 \
+  --iterations=100000
+```
+
+This maps proxy 0 to CPUs 0-4, proxy 1 to CPUs 5-9, and so on. Each proxy must
+have exactly one non-empty CPU set, and sets may not overlap. The shell quotes
+are required because an unquoted semicolon terminates a shell command. All
+threads belonging to a proxy inherit its assigned set and may migrate only
+within that set. `--proxy-cpu-sets` is mutually exclusive with `--proxy-cpus`
+and `--cpu-affinity`.
 
 The output reports aggregate and per-proxy distributions for:
 
