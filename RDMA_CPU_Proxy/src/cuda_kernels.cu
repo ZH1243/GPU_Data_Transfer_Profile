@@ -379,6 +379,22 @@ __global__ void persistent_forward_computation_kernel(
             continue;
         }
 
+        // The descriptor is now private to this CTA in shared memory. Commit
+        // dequeues in logical-position order before publishing the compact
+        // host-visible tail. Claiming can occur out of order across CTAs, so a
+        // separate device-local commit position prevents a later claim from
+        // making an earlier, not-yet-copied descriptor appear reusable.
+        if (threadIdx.x == 0) {
+            while (load_acquire_system(queue.dequeue_commit_position) != shared_position) {
+                __nanosleep(64);
+            }
+            __threadfence_system();
+            store_release_system(&queue.dequeued_tail->sequence, shared_position + 1);
+            __threadfence_system();
+            store_release_system(queue.dequeue_commit_position, shared_position + 1);
+        }
+        __syncthreads();
+
         if (threadIdx.x == 0 && local_empty_polls != 0) {
             atomicAdd(
                 reinterpret_cast<unsigned long long*>(&queue.stats->poll_iterations),
@@ -396,9 +412,6 @@ __global__ void persistent_forward_computation_kernel(
         } else if (shared_task.type == static_cast<uint32_t>(ForwardTaskType::kExit)) {
             if (threadIdx.x == 0) {
                 atomicAdd(reinterpret_cast<unsigned long long*>(&queue.stats->exit_tasks_consumed), 1ULL);
-                store_release_system(
-                    &queue.consumed[shared_position % queue.capacity].sequence,
-                    shared_position + queue.capacity);
             }
             return;
         } else if (
@@ -433,13 +446,6 @@ __global__ void persistent_forward_computation_kernel(
             if (threadIdx.x == 0) {
                 atomicAdd(reinterpret_cast<unsigned long long*>(&queue.stats->tasks_completed), 1ULL);
             }
-        }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            __threadfence_system();
-            store_release_system(
-                &queue.consumed[shared_position % queue.capacity].sequence,
-                shared_position + queue.capacity);
         }
         __syncthreads();
     }

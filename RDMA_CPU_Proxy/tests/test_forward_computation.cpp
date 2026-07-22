@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -122,6 +123,20 @@ int main() {
     }
 
     {
+        assert(rdma_proxy::forward_queue_available_slots(0, 0, 8192) == 8192);
+        assert(rdma_proxy::forward_queue_available_slots(100, 0, 8192) == 8092);
+        assert(rdma_proxy::forward_queue_available_slots(100, 75, 8192) == 8167);
+        assert(rdma_proxy::forward_queue_available_slots(8192, 0, 8192) == 0);
+        bool rejected_invalid_tail = false;
+        try {
+            (void)rdma_proxy::forward_queue_available_slots(10, 11, 8192);
+        } catch (const std::runtime_error&) {
+            rejected_invalid_tail = true;
+        }
+        assert(rejected_invalid_tail);
+    }
+
+    {
         const auto balanced = rdma_proxy::allocate_forward_tasks_for_wave(
             {200, 200, 200, 200, 200, 200, 200, 200}, 1000);
         assert(balanced == std::vector<std::size_t>({125, 125, 125, 125, 125, 125, 125, 125}));
@@ -171,7 +186,6 @@ int main() {
     assert(first_stats.exit_tasks_consumed == 4);
     assert(first_stats.stale_tasks == 0);
     assert(first_stats.invalid_tasks == 0);
-    assert(first_stats.queue_full_stalls > 0);
     validate_output(buffers, 1, config);
     validate_output(buffers, 2, config);
 

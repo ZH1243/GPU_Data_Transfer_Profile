@@ -165,8 +165,8 @@ public:
     void initialize() {
         if (initialized_) return;
         if (mock_mode_) {
-            allocate_mock(consumed_host_, sizeof(ForwardQueueSignal) * capacity_);
-            consumed_device_ = consumed_host_;
+            allocate_mock(dequeued_tail_host_, sizeof(ForwardQueueSignal));
+            dequeued_tail_device_ = dequeued_tail_host_;
             allocate_mock(tasks_host_, sizeof(ForwardComputeTask) * capacity_);
             tasks_device_ = tasks_host_;
             initialized_ = true;
@@ -175,7 +175,7 @@ public:
 #if RDMA_PROXY_HAVE_CUDA
         allocate_host_staging(publication_staging_, sizeof(uint64_t) * capacity_);
         allocate_host_visible(
-            consumed_host_, consumed_device_, sizeof(ForwardQueueSignal) * capacity_);
+            dequeued_tail_host_, dequeued_tail_device_, sizeof(ForwardQueueSignal));
         allocate_host_staging(tasks_host_, sizeof(ForwardComputeTask) * capacity_);
         check_cuda(cudaMalloc(reinterpret_cast<void**>(&published_head_device_),
                               sizeof(uint64_t)),
@@ -184,6 +184,8 @@ public:
                               sizeof(ForwardComputeTask) * capacity_),
                    "cudaMalloc CPU-to-GPU task ring");
         check_cuda(cudaMalloc(&dequeue_device_, sizeof(uint64_t)), "cudaMalloc CPU-to-GPU dequeue position");
+        check_cuda(cudaMalloc(&dequeue_commit_device_, sizeof(uint64_t)),
+                   "cudaMalloc CPU-to-GPU dequeue commit position");
         check_cuda(cudaMalloc(&stats_device_, sizeof(ForwardDeviceQueueStats)),
                    "cudaMalloc CPU-to-GPU queue stats");
         check_cuda(cudaStreamCreateWithFlags(&publication_stream_, cudaStreamNonBlocking),
@@ -197,15 +199,16 @@ public:
     void reset(uint64_t generation, void* stream) {
         producer_position_ = 0;
         mock_dequeue_position_.store(0, std::memory_order_relaxed);
+        mock_dequeue_commit_position_.store(0, std::memory_order_relaxed);
         generation_ = generation;
         generated_.store(0);
         full_stalls_.store(0);
         mock_stats_ = {};
         store_release(&mock_published_head_, 0);
+        store_release(&dequeued_tail_host_->sequence, 0);
         for (uint64_t i = 0; i < capacity_; ++i) {
             tasks_host_[i] = {};
             if (publication_staging_) publication_staging_[i] = 0;
-            store_release(&consumed_host_[i].sequence, i);
         }
 #if RDMA_PROXY_HAVE_CUDA
         if (!mock_mode_) {
@@ -217,6 +220,9 @@ public:
             check_cuda(cudaMemsetAsync(
                            dequeue_device_, 0, sizeof(uint64_t), reinterpret_cast<cudaStream_t>(stream)),
                        "cudaMemsetAsync CPU-to-GPU dequeue position");
+            check_cuda(cudaMemsetAsync(
+                           dequeue_commit_device_, 0, sizeof(uint64_t), reinterpret_cast<cudaStream_t>(stream)),
+                       "cudaMemsetAsync CPU-to-GPU dequeue commit position");
             check_cuda(cudaMemsetAsync(
                            stats_device_, 0, sizeof(ForwardDeviceQueueStats), reinterpret_cast<cudaStream_t>(stream)),
                        "cudaMemsetAsync CPU-to-GPU queue stats");
@@ -236,9 +242,8 @@ public:
             const std::size_t batch_size = std::min<std::size_t>(
                 tasks.size() - task_index, static_cast<std::size_t>(capacity_) - ring_index);
 
+            wait_for_slots(batch_size, deadline, abort_requested);
             for (std::size_t i = 0; i < batch_size; ++i) {
-                const uint64_t position = producer_position_ + i;
-                wait_for_slot(position, deadline, abort_requested);
                 auto task = tasks[task_index + i];
                 task.queue_id = id_;
                 task.enqueue_timestamp_ns = steady_nanoseconds_now();
@@ -267,8 +272,8 @@ public:
                        "cudaMemcpyAsync CPU-to-GPU task batch");
             const std::size_t publication_staging_index = ring_index + batch_size - 1;
             // This staging slot cannot be reused until the corresponding last
-            // task completes, which is necessarily after this 8-byte DMA has
-            // consumed the value.
+            // descriptor is dequeued, which is necessarily after this 8-byte
+            // DMA has consumed the value and exposed that descriptor.
             publication_staging_[publication_staging_index] = producer_position_ + batch_size;
             check_cuda(cudaMemcpyAsync(
                            published_head_device_,
@@ -283,23 +288,17 @@ public:
         }
     }
 
-    std::size_t consecutive_reusable_slots() const {
-        std::size_t available = 0;
-        while (available < capacity_) {
-            const uint64_t position = producer_position_ + available;
-            const auto& consumed = consumed_host_[position % capacity_].sequence;
-            if (load_acquire(&consumed) != position) break;
-            ++available;
-        }
-        return available;
+    std::size_t reusable_slots() const {
+        const auto dequeued_tail = load_acquire(&dequeued_tail_host_->sequence);
+        return forward_queue_available_slots(producer_position_, dequeued_tail, capacity_);
     }
 
     PreparedQueuePublication prepare_wave(const std::vector<ForwardComputeTask>& tasks) {
         PreparedQueuePublication prepared;
         if (tasks.empty()) return prepared;
-        if (tasks.size() > capacity_ || tasks.size() > consecutive_reusable_slots()) {
+        if (tasks.size() > capacity_ || tasks.size() > reusable_slots()) {
             throw std::runtime_error(
-                "CPU-to-GPU wave publication exceeds consecutive reusable queue slots queue=" +
+                "CPU-to-GPU wave publication exceeds reusable queue slots queue=" +
                 std::to_string(id_));
         }
         if (producer_position_ > std::numeric_limits<uint64_t>::max() - tasks.size()) {
@@ -356,7 +355,7 @@ public:
 
     void record_full_stall() { full_stalls_.fetch_add(1); }
 
-    bool try_claim_mock(ForwardComputeTask* task, uint64_t* position) {
+    bool try_claim_mock(ForwardComputeTask* task) {
         while (true) {
             uint64_t current = mock_dequeue_position_.load(std::memory_order_relaxed);
             if (current >= load_acquire(&mock_published_head_)) {
@@ -365,22 +364,23 @@ public:
             if (mock_dequeue_position_.compare_exchange_weak(
                     current, current + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
                 *task = tasks_host_[current % capacity_];
-                *position = current;
+                while (mock_dequeue_commit_position_.load(std::memory_order_acquire) != current) {
+                    cpu_relax();
+                }
+                store_release(&dequeued_tail_host_->sequence, current + 1);
+                mock_dequeue_commit_position_.store(current + 1, std::memory_order_release);
                 return true;
             }
         }
     }
 
-    void complete_mock(uint64_t position) {
-        store_release(&consumed_host_[position % capacity_].sequence, position + capacity_);
-    }
-
     ForwardDeviceQueueView device_view() const {
         ForwardDeviceQueueView view;
         view.published_head = published_head_device_;
-        view.consumed = consumed_device_;
+        view.dequeued_tail = dequeued_tail_device_;
         view.tasks = tasks_device_;
         view.dequeue_position = static_cast<uint64_t*>(dequeue_device_);
+        view.dequeue_commit_position = static_cast<uint64_t*>(dequeue_commit_device_);
         view.stats = static_cast<ForwardDeviceQueueStats*>(stats_device_);
         view.capacity = capacity_;
         view.queue_id = id_;
@@ -415,13 +415,15 @@ public:
     uint64_t full_stalls() const { return full_stalls_.load(); }
 
 private:
-    void wait_for_slot(
-        uint64_t position,
+    void wait_for_slots(
+        std::size_t count,
         std::chrono::steady_clock::time_point deadline,
         const std::atomic<bool>* abort_requested) {
-        auto& consumed = consumed_host_[position % capacity_].sequence;
+        if (count > capacity_) {
+            throw std::runtime_error("CPU-to-GPU queue request exceeds capacity");
+        }
         bool recorded_stall = false;
-        while (load_acquire(&consumed) != position) {
+        while (reusable_slots() < count) {
             if (!recorded_stall) {
                 full_stalls_.fetch_add(1);
                 recorded_stall = true;
@@ -430,7 +432,8 @@ private:
                 std::chrono::steady_clock::now() >= deadline) {
                 throw std::runtime_error(
                     "timed out waiting for CPU-to-GPU queue space queue=" + std::to_string(id_) +
-                    " producer_position=" + std::to_string(position));
+                    " producer_position=" + std::to_string(producer_position_) +
+                    " requested_slots=" + std::to_string(count));
             }
             cpu_relax();
         }
@@ -457,11 +460,11 @@ private:
         void* raw = nullptr;
         const unsigned flags = cudaHostAllocMapped | cudaHostAllocPortable;
         check_cuda(cudaHostAlloc(&raw, bytes, flags),
-                   "cudaHostAllocMapped GPU-to-CPU reuse ring");
+                   "cudaHostAllocMapped GPU-to-CPU dequeued tail");
         host = static_cast<T*>(raw);
         void* device_raw = nullptr;
         check_cuda(cudaHostGetDevicePointer(&device_raw, raw, 0),
-                   "cudaHostGetDevicePointer GPU-to-CPU reuse ring");
+                   "cudaHostGetDevicePointer GPU-to-CPU dequeued tail");
         device = static_cast<T*>(device_raw);
         std::memset(host, 0, bytes);
     }
@@ -494,15 +497,17 @@ private:
         if (!mock_mode_ && published_head_device_) (void)cudaFree(published_head_device_);
         if (!mock_mode_ && tasks_device_) (void)cudaFree(tasks_device_);
         if (!mock_mode_ && dequeue_device_) (void)cudaFree(dequeue_device_);
+        if (!mock_mode_ && dequeue_commit_device_) (void)cudaFree(dequeue_commit_device_);
         if (!mock_mode_ && stats_device_) (void)cudaFree(stats_device_);
 #endif
         dequeue_device_ = nullptr;
+        dequeue_commit_device_ = nullptr;
         stats_device_ = nullptr;
         free_host_allocation(publication_staging_);
-        free_host_allocation(consumed_host_);
+        free_host_allocation(dequeued_tail_host_);
         free_host_allocation(tasks_host_);
         published_head_device_ = nullptr;
-        consumed_device_ = nullptr;
+        dequeued_tail_device_ = nullptr;
         tasks_device_ = nullptr;
         initialized_ = false;
     }
@@ -515,13 +520,15 @@ private:
     uint64_t producer_position_{0};
     uint64_t mock_published_head_{0};
     std::atomic<uint64_t> mock_dequeue_position_{0};
+    std::atomic<uint64_t> mock_dequeue_commit_position_{0};
     uint64_t* publication_staging_{nullptr};
     uint64_t* published_head_device_{nullptr};
-    ForwardQueueSignal* consumed_host_{nullptr};
-    ForwardQueueSignal* consumed_device_{nullptr};
+    ForwardQueueSignal* dequeued_tail_host_{nullptr};
+    ForwardQueueSignal* dequeued_tail_device_{nullptr};
     ForwardComputeTask* tasks_host_{nullptr};
     ForwardComputeTask* tasks_device_{nullptr};
     void* dequeue_device_{nullptr};
+    void* dequeue_commit_device_{nullptr};
     void* stats_device_{nullptr};
 #if RDMA_PROXY_HAVE_CUDA
     cudaStream_t publication_stream_{nullptr};
@@ -532,6 +539,20 @@ private:
 };
 
 }  // namespace
+
+std::size_t forward_queue_available_slots(
+    uint64_t producer_head,
+    uint64_t dequeued_tail,
+    std::size_t capacity) {
+    if (dequeued_tail > producer_head) {
+        throw std::runtime_error("CPU-to-GPU dequeued tail exceeds producer head");
+    }
+    const auto queued = producer_head - dequeued_tail;
+    if (queued > capacity) {
+        throw std::runtime_error("CPU-to-GPU queue occupancy exceeds capacity");
+    }
+    return capacity - static_cast<std::size_t>(queued);
+}
 
 std::vector<ForwardComputeTask> partition_forward_ready_region(const ForwardReadyRegion& region) {
     if (region.generation == 0 || region.valid_token_rows == 0 || region.matrix_n == 0 ||
@@ -1124,7 +1145,7 @@ private:
             available.reserve(queues_.size());
             std::size_t total_available = 0;
             for (const auto& queue : queues_) {
-                const auto slots = queue->consecutive_reusable_slots();
+                const auto slots = queue->reusable_slots();
                 available.push_back(slots);
                 total_available += slots;
             }
@@ -1179,7 +1200,7 @@ private:
                 const auto remaining = tasks_by_queue[q].size() - next_task[q];
                 if (remaining == 0) continue;
                 complete = false;
-                const auto count = std::min(remaining, queues_[q]->consecutive_reusable_slots());
+                const auto count = std::min(remaining, queues_[q]->reusable_slots());
                 wave[q].insert(
                     wave[q].end(),
                     tasks_by_queue[q].begin() + static_cast<std::ptrdiff_t>(next_task[q]),
@@ -1227,8 +1248,7 @@ private:
         uint64_t empty_polls = 0;
         while (!abort_requested_.load(std::memory_order_acquire)) {
             ForwardComputeTask task;
-            uint64_t position = 0;
-            if (!queue.try_claim_mock(&task, &position)) {
+            if (!queue.try_claim_mock(&task)) {
                 ++empty_polls;
                 if ((empty_polls & 0xffU) == 0) std::this_thread::yield();
                 continue;
@@ -1236,18 +1256,15 @@ private:
             auto& stats = queue.mock_stats();
             if (task.generation != generation_) {
                 __atomic_fetch_add(&stats.stale_tasks, 1ULL, __ATOMIC_RELAXED);
-                queue.complete_mock(position);
                 continue;
             }
             if (task.type == static_cast<uint32_t>(ForwardTaskType::kExit)) {
                 __atomic_fetch_add(&stats.exit_tasks_consumed, 1ULL, __ATOMIC_RELAXED);
-                queue.complete_mock(position);
                 __atomic_fetch_add(&stats.poll_iterations, empty_polls, __ATOMIC_RELAXED);
                 return;
             }
             if (task.type != static_cast<uint32_t>(ForwardTaskType::kCompute)) {
                 __atomic_fetch_add(&stats.invalid_tasks, 1ULL, __ATOMIC_RELAXED);
-                queue.complete_mock(position);
                 continue;
             }
             __atomic_fetch_add(&stats.tasks_claimed, 1ULL, __ATOMIC_RELAXED);
@@ -1256,7 +1273,6 @@ private:
                 execute_mock_task(task);
             }
             __atomic_fetch_add(&stats.tasks_completed, 1ULL, __ATOMIC_RELEASE);
-            queue.complete_mock(position);
         }
         __atomic_fetch_add(&queue.mock_stats().poll_iterations, empty_polls, __ATOMIC_RELAXED);
     }

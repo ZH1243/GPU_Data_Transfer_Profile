@@ -46,14 +46,9 @@ struct alignas(128) ForwardComputeTask {
 
 static_assert(sizeof(ForwardComputeTask) == 128, "ForwardComputeTask must occupy one 128-byte cache line");
 
-// Protocol reference: UCCL-EP ep/include/fifo_device.hpp and its d2h_queue
-// wrappers. This is an independent reverse-direction adaptation: one CPU
-// producer publishes work for multiple GPU consumers. As in UCCL-EP, the hot
-// poll target lives in memory local to the consumer: published_head and the
-// task ring are in device memory, while consumed_sequence is mapped pinned host
-// memory. The host stages a task and copies it to the device ring before it
-// advances the device-resident published head. The GPU writes the
-// host-resident reuse sequence only after the task has completed.
+// One cache-line-isolated system-scope signal. Computation queues use one
+// mapped instance as a compact committed dequeue tail; the persistent kernel
+// also uses the same representation for its abort flag.
 struct alignas(128) ForwardQueueSignal {
     uint64_t sequence{0};
     uint8_t padding[120]{};
@@ -69,13 +64,17 @@ struct ForwardDeviceQueueStats {
 };
 
 // Plain pointers in this view are device addresses. published_head, tasks,
-// dequeue_position, and stats use device memory. consumed is a device mapping
-// of pinned host memory so the CPU can observe slot reuse without a D2H copy.
+// dequeue_position, dequeue_commit_position, and stats use device memory.
+// dequeued_tail is a device mapping of one pinned host signal. A CTA advances
+// it, in claim order, immediately after copying its descriptor into shared
+// memory, allowing the CPU to reuse that physical task-ring slot without
+// waiting for the task's tensor computation to finish.
 struct ForwardDeviceQueueView {
     uint64_t* published_head{nullptr};
-    ForwardQueueSignal* consumed{nullptr};
+    ForwardQueueSignal* dequeued_tail{nullptr};
     ForwardComputeTask* tasks{nullptr};
     uint64_t* dequeue_position{nullptr};
+    uint64_t* dequeue_commit_position{nullptr};
     ForwardDeviceQueueStats* stats{nullptr};
     uint32_t capacity{0};
     uint32_t queue_id{0};
@@ -120,6 +119,10 @@ struct ForwardReadyRegion {
 
 std::vector<ForwardComputeTask> partition_forward_ready_region(const ForwardReadyRegion& region);
 std::vector<uint32_t> partition_ctas_across_queues(uint32_t num_ctas, uint32_t num_queues);
+std::size_t forward_queue_available_slots(
+    uint64_t producer_head,
+    uint64_t dequeued_tail,
+    std::size_t capacity);
 std::vector<std::size_t> allocate_forward_tasks_for_wave(
     const std::vector<std::size_t>& available,
     std::size_t task_count,

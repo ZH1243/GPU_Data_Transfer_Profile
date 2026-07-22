@@ -19,7 +19,7 @@ The complete iteration sequence is:
 7. Publish `receiver_completed_generation` acknowledgements to every source.
 8. Each source waits for all destination acknowledgements before it can finish the iteration and reuse the receive-buffer generation.
 
-With the feature disabled, none of the computation buffers, device task/publication queues, mapped reuse signals, done records, acknowledgement waits, streams, or kernels are created; the prior forwarding behavior is unchanged.
+With the feature disabled, none of the computation buffers, device task/publication queues, mapped dequeue-tail signals, done records, acknowledgement waits, streams, or kernels are created; the prior forwarding behavior is unchanged.
 
 ## Modified files
 
@@ -44,19 +44,23 @@ the producer and consumer directions reversed:
 - a pinned host staging ring and a matching device-memory `ForwardComputeTask`
   ring;
 - pinned host publication staging and a device-memory published-head counter;
-- 128-byte reuse signals in `cudaHostAllocMapped` memory, written only by the
-  GPU and polled only by the CPU.
+- one 128-byte committed dequeue-tail signal in `cudaHostAllocMapped` memory,
+  written by the GPU and read by the CPU.
 
 The persistent GPU CTAs poll only the device-memory published head. The
 emergency abort flag is also device memory. Consequently, an empty queue does
 not generate repeated mapped-host reads over PCIe. A device-memory
-`dequeue_position` is shared by the CTAs assigned to that queue. Only GPU
-consumers perform CAS on that position, so the protocol does not require
-CPU/GPU atomic RMW on mapped PCIe memory.
+`dequeue_position` is shared by the CTAs assigned to that queue. A separate
+device-memory `dequeue_commit_position` orders completion of descriptor copies
+when multiple CTAs claim concurrently. Only GPU consumers perform atomic RMW
+on these device counters, so the protocol does not require CPU/GPU atomic RMW
+on mapped PCIe memory.
 
-For absolute position `p` and slot `p % capacity`:
+For CPU producer head `h`, compact committed dequeue tail `t`, and absolute
+position `p`:
 
-- The CPU may reuse the slot only when `consumed_sequence == p`.
+- Queue occupancy is `h - t`; available descriptor slots are
+  `capacity - (h - t)`.
 - It writes the complete descriptor into pinned staging memory.
 - A nonblocking publication stream copies one or more contiguous descriptors
   into the device task ring, then advances the device-resident published head
@@ -64,17 +68,26 @@ For absolute position `p` and slot `p % capacity`:
 - A CTA polls the published head in GPU memory. When `p < published_head`, it
   claims `p` using `atomicCAS` on the device dequeue counter. Exactly one CTA
   wins.
-- The winning CTA computes the tile. Only after D is visible does it write `consumed_sequence = p + capacity` with `st.release.sys.global`.
-- The CPU observes reuse with an acquire load.
+- The winning CTA copies the complete descriptor into CTA shared memory. It
+  then waits for `dequeue_commit_position == p`, publishes `dequeued_tail =
+  p + 1` with `st.release.sys.global`, and advances the device commit position.
+- The physical descriptor slot is reusable at this point; the CTA performs the
+  tensor computation afterward using its private shared-memory descriptor.
+- Actual computation completion remains separate and is tracked by device
+  completion statistics plus the ordered exit-task/kernel-termination protocol.
 
-This prevents overwrite both before claim and while a claimed task is still reading A/B or writing D. Positions are 64-bit monotonic values; modulo is used only to select storage. Queues are reset only after the prior persistent kernel terminates, so practical wraparound is bounded by 2^64 operations within one iteration.
+This prevents descriptor overwrite before a CTA has copied it while allowing
+the CPU to recycle slots independently of computation duration. Positions are
+64-bit monotonic values; modulo is used only to select task-ring storage.
+Queues are reset only after the prior persistent kernel terminates, so practical
+wraparound is bounded by 2^64 operations within one iteration.
 
 The two H2D copies use the same CUDA stream, so the published head cannot
 advance before its descriptors reach device memory. Ready-region tasks are
 grouped per queue and copied in contiguous batches, amortizing CUDA submission
 overhead.
-Write-combined host memory is deliberately not used for the CPU-polled reuse
-signals; normal cached mapped memory keeps the host acquire operations
+Write-combined host memory is deliberately not used for the CPU-polled dequeue
+tail; normal cached mapped memory keeps host acquire operations
 well-defined without architecture-specific write-combining flush behavior.
 
 When a queue is full, the notification thread applies bounded backpressure and reports a timeout using `completion_timeout_ms`. It never drops a compute task. Queue-full stall counters are reported at iteration completion. An emergency device-resident abort signal lets every CTA leave its polling loop during partial shutdown; normal shutdown uses exit tasks.
@@ -83,9 +96,9 @@ When a queue is full, the notification thread applies bounded backpressure and r
 
 `nvlink_forward_computation_wave_batching_enabled=false` is the default and retains the original round-robin task distribution plus one publication stream per queue.
 
-When `nvlink_forward_computation_wave_batching_enabled=true`, the receiver publishes each notification in one or more capacity-aware waves. At the start of a wave it counts the consecutive reusable logical positions beginning at each queue's producer position. Tasks are distributed with capped balanced water-filling: queues with fewer reusable positions are filled to that limit, and the remaining tasks are balanced over queues with more space. A physical ring wrap contributes two descriptor ranges but does not require another API call.
+When `nvlink_forward_computation_wave_batching_enabled=true`, the receiver publishes each notification in one or more capacity-aware waves. At the start of a wave it reads one compact dequeue tail per queue and computes available space from the CPU producer head. Tasks are distributed with capped balanced water-filling: queues with fewer reusable positions are filled to that limit, and the remaining tasks are balanced over queues with more space. A physical ring wrap contributes two descriptor ranges but does not require another API call.
 
-All descriptor ranges for a wave are submitted in one `cudaMemcpyBatchAsync` on a shared publication stream. A second `cudaMemcpyBatchAsync` writes one final `published_head` value for every non-empty queue. CUDA stream ordering therefore makes every descriptor visible before any corresponding head can be observed by a persistent CTA. If the aggregate reusable capacity is smaller than the notification's task count, the receiver publishes the available tasks, waits for GPU completion signals to release slots, and repeats with another two-call wave. Exit tasks use the same shared wave publisher while retaining their exact per-queue CTA assignment.
+All descriptor ranges for a wave are submitted in one `cudaMemcpyBatchAsync` on a shared publication stream. A second `cudaMemcpyBatchAsync` writes one final `published_head` value for every non-empty queue. CUDA stream ordering therefore makes every descriptor visible before any corresponding head can be observed by a persistent CTA. If the aggregate reusable capacity is smaller than the notification's task count, the receiver publishes the available tasks, waits for CTAs to dequeue descriptors and advance their compact tails, and repeats with another two-call wave. Exit tasks use the same shared wave publisher while retaining their exact per-queue CTA assignment.
 
 ## Task descriptor
 
@@ -121,7 +134,7 @@ tails use guarded global-to-shared loads. Shared values are consumed only enough
 to prevent compiler dead-code elimination. The kernel performs no WMMA or
 scalar multiply-accumulate operations and writes nothing to D.
 
-Queue claim/completion counters, exit tasks, reuse acknowledgements, and
+Queue claim/completion counters, exit tasks, compact dequeue-tail updates, and
 iteration lifetime protection remain active. Output buffers are still allocated
 and cleared to keep the existing descriptor ABI and buffer lookup unchanged,
 so they remain zero after a load-only iteration. This sub-mode is rejected
@@ -132,8 +145,8 @@ unless `nvlink_forward_computation_enabled=true`.
 Set `nvlink_forward_computation_dequeue_only_enabled=true` to isolate the
 control/task queue path. For every compute task, the assigned CTA polls the
 device-resident publication state, atomically claims the queue position, copies
-the task descriptor into CTA shared state, and performs the normal completion
-accounting and mapped-host slot-reuse acknowledgement. It does not dereference
+the task descriptor into CTA shared state, advances the ordered mapped-host
+dequeue tail, and performs normal completion accounting. It does not dereference
 the A, B, or D tensor pointers, stage tensor operands, execute WMMA/scalar
 matrix operations, or store output tensor values.
 
@@ -218,7 +231,7 @@ The full mode compares all 256x6400 output values for K=4096 against `cublasGemm
 - TMA is not used yet. Hopper's TMA tensor-map setup is awkward for dynamically supplied per-task base addresses and partial tails; the current kernel uses correct system-scope queues plus asynchronous `cp.async`-class pipeline intrinsics and WMMA. A future specialization can prebuild tensor maps for stable buffer IDs.
 - Output conversion/store is synchronous. Loading K tile `i+1` overlaps tensor-core work for K tile `i`, while independent CTAs overlap stores with other tasks.
 - One CTA owns an entire configured output tile. Very large tiles increase per-task latency; 128x128 is the intended starting point.
-- The device-resident publication protocol and mapped reuse-signal visibility
+- The device-resident publication protocol and mapped dequeue-tail visibility
   must be validated on the deployment platform/IOMMU. Initialization rejects
   non-Hopper GPUs; cluster validation is required because the development Mac
   has no CUDA device.
