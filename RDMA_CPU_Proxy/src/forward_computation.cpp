@@ -147,6 +147,14 @@ void check_cuda(cudaError_t status, const char* what) {
 
 #endif
 
+struct PreparedQueuePublication {
+    std::vector<CudaForwardCopy> descriptor_copies;
+    CudaForwardCopy head_copy;
+    uint64_t producer_before{0};
+    uint64_t producer_after{0};
+    std::size_t task_count{0};
+};
+
 class CpuToGpuQueue {
 public:
     CpuToGpuQueue(uint32_t id, uint32_t capacity, bool mock_mode)
@@ -274,6 +282,79 @@ public:
             task_index += batch_size;
         }
     }
+
+    std::size_t consecutive_reusable_slots() const {
+        std::size_t available = 0;
+        while (available < capacity_) {
+            const uint64_t position = producer_position_ + available;
+            const auto& consumed = consumed_host_[position % capacity_].sequence;
+            if (load_acquire(&consumed) != position) break;
+            ++available;
+        }
+        return available;
+    }
+
+    PreparedQueuePublication prepare_wave(const std::vector<ForwardComputeTask>& tasks) {
+        PreparedQueuePublication prepared;
+        if (tasks.empty()) return prepared;
+        if (tasks.size() > capacity_ || tasks.size() > consecutive_reusable_slots()) {
+            throw std::runtime_error(
+                "CPU-to-GPU wave publication exceeds consecutive reusable queue slots queue=" +
+                std::to_string(id_));
+        }
+        if (producer_position_ > std::numeric_limits<uint64_t>::max() - tasks.size()) {
+            throw std::runtime_error("CPU-to-GPU producer position overflow");
+        }
+
+        prepared.producer_before = producer_position_;
+        prepared.producer_after = producer_position_ + tasks.size();
+        prepared.task_count = tasks.size();
+        for (std::size_t i = 0; i < tasks.size(); ++i) {
+            const auto ring_index = static_cast<std::size_t>((producer_position_ + i) % capacity_);
+            auto task = tasks[i];
+            task.queue_id = id_;
+            task.enqueue_timestamp_ns = steady_nanoseconds_now();
+            tasks_host_[ring_index] = task;
+            if (task.type == static_cast<uint32_t>(ForwardTaskType::kCompute)) {
+                generated_.fetch_add(1);
+            }
+        }
+
+        const auto first_ring_index = static_cast<std::size_t>(producer_position_ % capacity_);
+        const auto first_count = std::min<std::size_t>(tasks.size(), capacity_ - first_ring_index);
+        prepared.descriptor_copies.push_back(CudaForwardCopy{
+            tasks_device_ + first_ring_index,
+            tasks_host_ + first_ring_index,
+            sizeof(ForwardComputeTask) * first_count});
+        if (first_count < tasks.size()) {
+            const auto second_count = tasks.size() - first_count;
+            prepared.descriptor_copies.push_back(CudaForwardCopy{
+                tasks_device_,
+                tasks_host_,
+                sizeof(ForwardComputeTask) * second_count});
+        }
+
+        const auto last_ring_index = static_cast<std::size_t>((prepared.producer_after - 1) % capacity_);
+        if (publication_staging_) {
+            publication_staging_[last_ring_index] = prepared.producer_after;
+            prepared.head_copy = CudaForwardCopy{
+                published_head_device_,
+                publication_staging_ + last_ring_index,
+                sizeof(uint64_t)};
+        }
+        return prepared;
+    }
+
+    void commit_wave(const PreparedQueuePublication& prepared) {
+        if (prepared.task_count == 0) return;
+        if (producer_position_ != prepared.producer_before) {
+            throw std::runtime_error("CPU-to-GPU producer position changed during wave publication");
+        }
+        if (mock_mode_) store_release(&mock_published_head_, prepared.producer_after);
+        producer_position_ = prepared.producer_after;
+    }
+
+    void record_full_stall() { full_stalls_.fetch_add(1); }
 
     bool try_claim_mock(ForwardComputeTask* task, uint64_t* position) {
         while (true) {
@@ -508,6 +589,57 @@ std::vector<uint32_t> partition_ctas_across_queues(uint32_t num_ctas, uint32_t n
     return counts;
 }
 
+std::vector<std::size_t> allocate_forward_tasks_for_wave(
+    const std::vector<std::size_t>& available,
+    std::size_t task_count,
+    std::size_t start_queue) {
+    if (available.empty()) {
+        if (task_count != 0) throw std::runtime_error("cannot allocate tasks without CPU-to-GPU queues");
+        return {};
+    }
+    if (start_queue >= available.size()) {
+        throw std::runtime_error("wave allocation start queue is out of range");
+    }
+    std::size_t total_available = 0;
+    for (const auto slots : available) {
+        if (slots > std::numeric_limits<std::size_t>::max() - total_available) {
+            total_available = std::numeric_limits<std::size_t>::max();
+            break;
+        }
+        total_available += slots;
+    }
+    std::size_t remaining = std::min(task_count, total_available);
+    std::vector<std::size_t> allocation(available.size(), 0);
+    while (remaining != 0) {
+        std::size_t active = 0;
+        for (std::size_t q = 0; q < available.size(); ++q) {
+            if (allocation[q] < available[q]) ++active;
+        }
+        if (active == 0) break;
+
+        const auto equal_share = remaining / active;
+        if (equal_share == 0) {
+            for (std::size_t offset = 0; offset < available.size() && remaining != 0; ++offset) {
+                const auto q = (start_queue + offset) % available.size();
+                if (allocation[q] == available[q]) continue;
+                ++allocation[q];
+                --remaining;
+            }
+            continue;
+        }
+
+        for (std::size_t offset = 0; offset < available.size(); ++offset) {
+            const auto q = (start_queue + offset) % available.size();
+            const auto room = available[q] - allocation[q];
+            if (room == 0) continue;
+            const auto assigned = std::min(room, equal_share);
+            allocation[q] += assigned;
+            remaining -= assigned;
+        }
+    }
+    return allocation;
+}
+
 class ForwardComputation::Impl {
 public:
     Impl(ProxyConfig config, CudaBuffers& buffers)
@@ -579,6 +711,10 @@ public:
                    "cudaMalloc persistent abort signal");
         check_cuda(cudaStreamCreateWithFlags(&control_stream_, cudaStreamNonBlocking),
                    "cudaStreamCreateWithFlags persistent control");
+        if (config_.nvlink_forward_computation_wave_batching_enabled) {
+            check_cuda(cudaStreamCreateWithFlags(&wave_publication_stream_, cudaStreamNonBlocking),
+                       "cudaStreamCreateWithFlags wave-batched CPU-to-GPU publication");
+        }
         initialized_ = true;
 #else
         throw std::runtime_error("persistent computation requires a CUDA build or mock_mode=true");
@@ -595,6 +731,9 @@ public:
         next_queue_ = 0;
         abort_requested_.store(false);
         generated_tasks_.store(0);
+        publication_waves_.store(0);
+        descriptor_batch_calls_.store(0);
+        head_batch_calls_.store(0);
         enqueue_nanoseconds_.store(0);
         iteration_start_ = std::chrono::steady_clock::now();
         last_stats_ = {};
@@ -649,6 +788,8 @@ public:
                             config_.nvlink_forward_computation_load_only_enabled ? "true" : "false",
                             " dequeue_only=",
                             config_.nvlink_forward_computation_dequeue_only_enabled ? "true" : "false",
+                            " wave_batching=",
+                            config_.nvlink_forward_computation_wave_batching_enabled ? "true" : "false",
                             " CTAs=", num_ctas_,
                             " queues=", queues_.size(),
                             " dynamic_shared_bytes=", dynamic_shared_bytes_);
@@ -706,13 +847,17 @@ public:
 
         const auto enqueue_start = std::chrono::steady_clock::now();
         const auto deadline = enqueue_start + std::chrono::milliseconds(config_.completion_timeout_ms);
-        std::vector<std::vector<ForwardComputeTask>> tasks_by_queue(queues_.size());
-        for (auto& task : tasks) {
-            tasks_by_queue[next_queue_].push_back(task);
-            next_queue_ = (next_queue_ + 1) % queues_.size();
-        }
-        for (std::size_t q = 0; q < queues_.size(); ++q) {
-            queues_[q]->enqueue_batch(tasks_by_queue[q], deadline, &abort_requested_);
+        if (config_.nvlink_forward_computation_wave_batching_enabled) {
+            enqueue_wave_batched_tasks(tasks, deadline);
+        } else {
+            std::vector<std::vector<ForwardComputeTask>> tasks_by_queue(queues_.size());
+            for (auto& task : tasks) {
+                tasks_by_queue[next_queue_].push_back(task);
+                next_queue_ = (next_queue_ + 1) % queues_.size();
+            }
+            for (std::size_t q = 0; q < queues_.size(); ++q) {
+                queues_[q]->enqueue_batch(tasks_by_queue[q], deadline, &abort_requested_);
+            }
         }
         const auto enqueue_end = std::chrono::steady_clock::now();
         enqueue_nanoseconds_.fetch_add(static_cast<uint64_t>(
@@ -736,6 +881,7 @@ public:
         try {
             const auto deadline = std::chrono::steady_clock::now() +
                 std::chrono::milliseconds(config_.completion_timeout_ms);
+            std::vector<std::vector<ForwardComputeTask>> exits_by_queue(queues_.size());
             for (std::size_t q = 0; q < queues_.size(); ++q) {
                 std::vector<ForwardComputeTask> exits;
                 exits.reserve(ctas_per_queue_[q]);
@@ -746,7 +892,14 @@ public:
                     exit.generation = generation_;
                     exits.push_back(exit);
                 }
-                queues_[q]->enqueue_batch(exits, deadline, &abort_requested_);
+                exits_by_queue[q] = std::move(exits);
+            }
+            if (config_.nvlink_forward_computation_wave_batching_enabled) {
+                enqueue_fixed_wave_batched_tasks(exits_by_queue, deadline);
+            } else {
+                for (std::size_t q = 0; q < queues_.size(); ++q) {
+                    queues_[q]->enqueue_batch(exits_by_queue[q], deadline, &abort_requested_);
+                }
             }
             wait_for_kernel(deadline);
             collect_stats();
@@ -776,6 +929,9 @@ public:
                             " claimed=", last_stats_.tasks_claimed,
                             " completed=", last_stats_.tasks_completed,
                             " exits=", last_stats_.exit_tasks_consumed,
+                            " publication_waves=", last_stats_.publication_waves,
+                            " descriptor_batch_calls=", last_stats_.descriptor_batch_calls,
+                            " head_batch_calls=", last_stats_.head_batch_calls,
                             " queue_full_stalls=", last_stats_.queue_full_stalls,
                             " poll_iterations=", last_stats_.poll_iterations,
                             " elapsed_ms=", last_stats_.iteration_seconds * 1.0e3,
@@ -829,6 +985,13 @@ public:
                 }
             }
         }
+        if (!config_.mock_mode && wave_publication_stream_) {
+            const auto status = cudaStreamSynchronize(wave_publication_stream_);
+            if (status != cudaSuccess) {
+                RDMA_PROXY_LOG_ERROR("wave-batched publication abort synchronization failed: ",
+                                     cudaGetErrorString(status));
+            }
+        }
 #endif
         active_.store(false, std::memory_order_release);
     }
@@ -837,6 +1000,10 @@ public:
         abort_iteration();
 #if RDMA_PROXY_HAVE_CUDA
         if (!config_.mock_mode) {
+            if (wave_publication_stream_) {
+                (void)cudaStreamSynchronize(wave_publication_stream_);
+                (void)cudaStreamDestroy(wave_publication_stream_);
+            }
             if (device_views_) (void)cudaFree(device_views_);
             if (device_sm_ids_) (void)cudaFree(device_sm_ids_);
             if (abort_device_) (void)cudaFree(abort_device_);
@@ -849,6 +1016,7 @@ public:
         abort_device_ = nullptr;
 #if RDMA_PROXY_HAVE_CUDA
         control_stream_ = nullptr;
+        wave_publication_stream_ = nullptr;
         stream_ = nullptr;
 #endif
         queues_.clear();
@@ -876,6 +1044,9 @@ public:
         if (!active_.load(std::memory_order_acquire)) return last_stats_;
         ForwardComputationStats result;
         result.generated_tasks = generated_tasks_.load();
+        result.publication_waves = publication_waves_.load();
+        result.descriptor_batch_calls = descriptor_batch_calls_.load();
+        result.head_batch_calls = head_batch_calls_.load();
         result.ctas_per_queue = ctas_per_queue_;
         for (const auto& queue : queues_) {
             const auto qstats = queue->device_stats();
@@ -895,6 +1066,142 @@ public:
     bool iteration_active() const { return active_.load(std::memory_order_acquire); }
 
 private:
+    void throw_if_wave_wait_expired(std::chrono::steady_clock::time_point deadline) const {
+        if (abort_requested_.load(std::memory_order_acquire)) {
+            throw std::runtime_error("CPU-to-GPU wave publication aborted");
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw std::runtime_error("timed out waiting for CPU-to-GPU wave publication space");
+        }
+    }
+
+    void publish_prepared_wave(
+        const std::vector<std::vector<ForwardComputeTask>>& tasks_by_queue,
+        bool count_computation_wave) {
+        std::vector<PreparedQueuePublication> prepared(queues_.size());
+        std::vector<CudaForwardCopy> descriptor_copies;
+        std::vector<CudaForwardCopy> head_copies;
+        for (std::size_t q = 0; q < queues_.size(); ++q) {
+            prepared[q] = queues_[q]->prepare_wave(tasks_by_queue[q]);
+            descriptor_copies.insert(
+                descriptor_copies.end(),
+                prepared[q].descriptor_copies.begin(),
+                prepared[q].descriptor_copies.end());
+            if (!config_.mock_mode && prepared[q].task_count != 0) {
+                head_copies.push_back(prepared[q].head_copy);
+            }
+        }
+        if (descriptor_copies.empty()) return;
+
+        if (!config_.mock_mode) {
+#if RDMA_PROXY_HAVE_CUDA
+            auto* publication_stream = reinterpret_cast<void*>(wave_publication_stream_);
+            launch_cuda_forward_copy_batch_async(
+                descriptor_copies, publication_stream, true, false);
+            launch_cuda_forward_copy_batch_async(
+                head_copies, publication_stream, true, false);
+#else
+            throw std::runtime_error("wave-batched publication requires CUDA or mock mode");
+#endif
+        }
+        for (std::size_t q = 0; q < queues_.size(); ++q) {
+            queues_[q]->commit_wave(prepared[q]);
+        }
+        if (count_computation_wave) {
+            publication_waves_.fetch_add(1);
+            descriptor_batch_calls_.fetch_add(1);
+            head_batch_calls_.fetch_add(1);
+        }
+    }
+
+    void enqueue_wave_batched_tasks(
+        const std::vector<ForwardComputeTask>& tasks,
+        std::chrono::steady_clock::time_point deadline) {
+        std::size_t task_index = 0;
+        bool stall_recorded = false;
+        while (task_index < tasks.size()) {
+            std::vector<std::size_t> available;
+            available.reserve(queues_.size());
+            std::size_t total_available = 0;
+            for (const auto& queue : queues_) {
+                const auto slots = queue->consecutive_reusable_slots();
+                available.push_back(slots);
+                total_available += slots;
+            }
+            if (total_available == 0) {
+                if (!stall_recorded) {
+                    for (auto& queue : queues_) queue->record_full_stall();
+                    stall_recorded = true;
+                }
+                throw_if_wave_wait_expired(deadline);
+                cpu_relax();
+                continue;
+            }
+            stall_recorded = false;
+
+            const auto allocation = allocate_forward_tasks_for_wave(
+                available, tasks.size() - task_index, next_queue_);
+            std::size_t wave_tasks = 0;
+            for (const auto count : allocation) wave_tasks += count;
+            if (wave_tasks == 0) {
+                throw std::runtime_error("wave allocator made no progress with reusable queue slots");
+            }
+
+            std::vector<std::vector<ForwardComputeTask>> tasks_by_queue(queues_.size());
+            auto remaining_by_queue = allocation;
+            std::size_t cursor = next_queue_;
+            for (std::size_t assigned = 0; assigned < wave_tasks; ++assigned) {
+                bool found = false;
+                for (std::size_t offset = 0; offset < queues_.size(); ++offset) {
+                    const auto q = (cursor + offset) % queues_.size();
+                    if (remaining_by_queue[q] == 0) continue;
+                    tasks_by_queue[q].push_back(tasks[task_index++]);
+                    --remaining_by_queue[q];
+                    cursor = (q + 1) % queues_.size();
+                    found = true;
+                    break;
+                }
+                if (!found) throw std::runtime_error("wave task allocation accounting mismatch");
+            }
+            next_queue_ = cursor;
+            publish_prepared_wave(tasks_by_queue, true);
+        }
+    }
+
+    void enqueue_fixed_wave_batched_tasks(
+        const std::vector<std::vector<ForwardComputeTask>>& tasks_by_queue,
+        std::chrono::steady_clock::time_point deadline) {
+        std::vector<std::size_t> next_task(queues_.size(), 0);
+        while (true) {
+            bool complete = true;
+            std::vector<std::vector<ForwardComputeTask>> wave(queues_.size());
+            for (std::size_t q = 0; q < queues_.size(); ++q) {
+                const auto remaining = tasks_by_queue[q].size() - next_task[q];
+                if (remaining == 0) continue;
+                complete = false;
+                const auto count = std::min(remaining, queues_[q]->consecutive_reusable_slots());
+                wave[q].insert(
+                    wave[q].end(),
+                    tasks_by_queue[q].begin() + static_cast<std::ptrdiff_t>(next_task[q]),
+                    tasks_by_queue[q].begin() + static_cast<std::ptrdiff_t>(next_task[q] + count));
+                next_task[q] += count;
+            }
+            if (complete) return;
+
+            bool progressed = false;
+            for (const auto& queue_tasks : wave) progressed = progressed || !queue_tasks.empty();
+            if (!progressed) {
+                for (std::size_t q = 0; q < queues_.size(); ++q) {
+                    if (next_task[q] < tasks_by_queue[q].size()) queues_[q]->record_full_stall();
+                }
+                throw_if_wave_wait_expired(deadline);
+                cpu_relax();
+                continue;
+            }
+            publish_prepared_wave(wave, false);
+        }
+    }
+
     void execute_mock_task(const ForwardComputeTask& task) {
         const auto dtype = static_cast<DataType>(task.dtype);
         const auto* a = reinterpret_cast<const uint16_t*>(task.a_base);
@@ -1009,6 +1316,9 @@ private:
     void collect_stats() {
         last_stats_ = {};
         last_stats_.generated_tasks = generated_tasks_.load();
+        last_stats_.publication_waves = publication_waves_.load();
+        last_stats_.descriptor_batch_calls = descriptor_batch_calls_.load();
+        last_stats_.head_batch_calls = head_batch_calls_.load();
         last_stats_.enqueue_seconds = static_cast<double>(enqueue_nanoseconds_.load()) / 1.0e9;
         last_stats_.iteration_seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - iteration_start_).count();
@@ -1054,6 +1364,9 @@ private:
     std::atomic<bool> abort_requested_{false};
     bool initialized_{false};
     std::atomic<uint64_t> generated_tasks_{0};
+    std::atomic<uint64_t> publication_waves_{0};
+    std::atomic<uint64_t> descriptor_batch_calls_{0};
+    std::atomic<uint64_t> head_batch_calls_{0};
     std::atomic<uint64_t> enqueue_nanoseconds_{0};
     std::chrono::steady_clock::time_point iteration_start_{};
     ForwardComputationStats last_stats_;
@@ -1062,6 +1375,7 @@ private:
     ForwardQueueSignal* abort_device_{nullptr};
 #if RDMA_PROXY_HAVE_CUDA
     cudaStream_t control_stream_{nullptr};
+    cudaStream_t wave_publication_stream_{nullptr};
     cudaStream_t stream_{nullptr};
 #endif
 };

@@ -84,6 +84,9 @@ struct ForwardDeviceQueueView {
 
 struct ForwardComputationStats {
     uint64_t generated_tasks{0};
+    uint64_t publication_waves{0};
+    uint64_t descriptor_batch_calls{0};
+    uint64_t head_batch_calls{0};
     uint64_t queue_full_stalls{0};
     uint64_t poll_iterations{0};
     uint64_t tasks_claimed{0};
@@ -117,6 +120,10 @@ struct ForwardReadyRegion {
 
 std::vector<ForwardComputeTask> partition_forward_ready_region(const ForwardReadyRegion& region);
 std::vector<uint32_t> partition_ctas_across_queues(uint32_t num_ctas, uint32_t num_queues);
+std::vector<std::size_t> allocate_forward_tasks_for_wave(
+    const std::vector<std::size_t>& available,
+    std::size_t task_count,
+    std::size_t start_queue = 0);
 
 class ForwardComputation {
 public:

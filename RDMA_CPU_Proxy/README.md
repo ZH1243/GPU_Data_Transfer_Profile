@@ -109,6 +109,8 @@ Set `nvlink_forward_notification_log_enabled=true` to record receiver-side notif
 
 Set `nvlink_forward_computation_enabled=true` to translate each received ready-range notification immediately into output-tile tasks for a per-iteration persistent Hopper GEMM kernel. The kernel computes `D=A*B` without waiting for all forwarding to finish. Its CPU-to-GPU control queues keep the task ring, publication state, dequeue position, and abort flag in device memory so persistent CTAs poll HBM rather than mapped host memory; only the GPU-to-CPU slot-reuse acknowledgements use mapped pinned host memory. Ready tasks are staged and published with ordered, batched H2D copies. The kernel uses BF16/FP16 tensor-core fragments with FP32 accumulation, asynchronous double-buffered operand staging, one logical CTA per SM, generation checks, exact per-queue exit distribution, and receiver-completion acknowledgements that protect receive-buffer lifetime across iterations. See [docs/nvlink_forward_computation.md](docs/nvlink_forward_computation.md) for the queue protocol, lifecycle, limitations, validation commands, and the 256x4096x6400 example.
 
+Set `nvlink_forward_computation_wave_batching_enabled=true` to use capacity-aware wave publication. For each ready-range notification, the CPU snapshots the consecutive reusable slots in every computation queue, distributes tasks with capped balanced water-filling, and publishes each wave with one `cudaMemcpyBatchAsync` for all descriptor ranges followed by one `cudaMemcpyBatchAsync` for all non-empty queue heads on a shared stream. Notifications larger than the currently reusable aggregate capacity use additional waves. The default is `false`, which preserves the original round-robin distribution and per-queue publication streams.
+
 Set `nvlink_forward_computation_load_only_enabled=true` to keep the same persistent task lifecycle and global-to-shared staging of both GEMM operands while skipping tensor-core/scalar matrix computation and all output-tensor stores. This special mode requires `nvlink_forward_computation_enabled=true`; output buffers are still allocated and cleared for a consistent task ABI, but remain unchanged after load-only tasks.
 
 Set `nvlink_forward_computation_dequeue_only_enabled=true` to measure the CPU-to-GPU control/task channel with no tensor payload work. Each persistent CTA only polls its device queue, claims and dequeues task descriptors, updates completion accounting, and publishes the existing slot-reuse acknowledgement. It does not load A or B, perform matrix computation, or write D. This mode requires `nvlink_forward_computation_enabled=true` and is mutually exclusive with load-only mode.
@@ -286,6 +288,7 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_computation_tile_n`
 - `nvlink_forward_computation_num_queues`
 - `nvlink_forward_computation_queue_depth`
+- `nvlink_forward_computation_wave_batching_enabled`
 - `nvlink_forward_computation_load_only_enabled`
 - `nvlink_forward_computation_dequeue_only_enabled`
 - `nvlink_forward_computation_log_enabled`

@@ -367,6 +367,10 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "nvlink_forward_computation_queue_depth") {
         config.nvlink_forward_computation_queue_depth = static_cast<std::size_t>(std::stoull(value));
     }
+    else if (key == "nvlink_forward_computation_wave_batching_enabled") {
+        config.nvlink_forward_computation_wave_batching_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "nvlink_forward_computation_load_only_enabled") {
         config.nvlink_forward_computation_load_only_enabled =
             (value == "1" || value == "true" || value == "yes");
@@ -558,6 +562,10 @@ ProxyConfig load_config_file(const std::string& path) {
         object, "nvlink_forward_computation_num_queues", config.nvlink_forward_computation_num_queues);
     config.nvlink_forward_computation_queue_depth = number_as<std::size_t>(
         object, "nvlink_forward_computation_queue_depth", config.nvlink_forward_computation_queue_depth);
+    config.nvlink_forward_computation_wave_batching_enabled = get_bool(
+        object,
+        "nvlink_forward_computation_wave_batching_enabled",
+        config.nvlink_forward_computation_wave_batching_enabled);
     config.nvlink_forward_computation_load_only_enabled = get_bool(
         object,
         "nvlink_forward_computation_load_only_enabled",
@@ -741,6 +749,12 @@ void validate_config(const ProxyConfig& config) {
         !config.nvlink_forward_computation_enabled) {
         throw std::runtime_error(
             "nvlink_forward_computation_load_only_enabled requires "
+            "nvlink_forward_computation_enabled=true");
+    }
+    if (config.nvlink_forward_computation_wave_batching_enabled &&
+        !config.nvlink_forward_computation_enabled) {
+        throw std::runtime_error(
+            "nvlink_forward_computation_wave_batching_enabled requires "
             "nvlink_forward_computation_enabled=true");
     }
     if (config.nvlink_forward_computation_dequeue_only_enabled &&
@@ -979,6 +993,8 @@ std::string config_summary(const ProxyConfig& config) {
         << config.nvlink_forward_computation_num_queues
         << " nvlink_forward_computation_queue_depth="
         << config.nvlink_forward_computation_queue_depth
+        << " nvlink_forward_computation_wave_batching_enabled="
+        << (config.nvlink_forward_computation_wave_batching_enabled ? "true" : "false")
         << " nvlink_forward_computation_load_only_enabled="
         << (config.nvlink_forward_computation_load_only_enabled ? "true" : "false")
         << " nvlink_forward_computation_dequeue_only_enabled="
@@ -1017,6 +1033,7 @@ std::string config_help() {
         "  --nvlink_forward_computation_tile_n=N           output-tile column dimension (multiple of 16)\n"
         "  --nvlink_forward_computation_num_queues=Q       device-resident CPU-to-GPU queue count\n"
         "  --nvlink_forward_computation_queue_depth=D      entries per queue (default 1024)\n"
+        "  --nvlink_forward_computation_wave_batching_enabled=BOOL publish all queue descriptors and heads in two batches per wave\n"
         "  --nvlink_forward_computation_load_only_enabled=BOOL stage A/B in shared memory without GEMM/output stores\n"
         "  --nvlink_forward_computation_dequeue_only_enabled=BOOL poll/dequeue without operand loads or compute\n"
         "  --nvlink_forward_computation_log_enabled=BOOL   enable per-notification/per-queue diagnostics\n"

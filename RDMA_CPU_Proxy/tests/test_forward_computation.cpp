@@ -121,6 +121,26 @@ int main() {
         assert(assignment[1] == 2);
     }
 
+    {
+        const auto balanced = rdma_proxy::allocate_forward_tasks_for_wave(
+            {200, 200, 200, 200, 200, 200, 200, 200}, 1000);
+        assert(balanced == std::vector<std::size_t>({125, 125, 125, 125, 125, 125, 125, 125}));
+
+        const auto capped = rdma_proxy::allocate_forward_tasks_for_wave(
+            {50, 200, 200, 200, 200, 200, 200, 200}, 1000);
+        assert(capped[0] == 50);
+        std::size_t capped_total = 0;
+        for (std::size_t q = 0; q < capped.size(); ++q) {
+            capped_total += capped[q];
+            if (q != 0) assert(capped[q] == 135 || capped[q] == 136);
+        }
+        assert(capped_total == 1000);
+
+        const auto capacity_limited = rdma_proxy::allocate_forward_tasks_for_wave(
+            {100, 100, 100, 100, 100, 100, 100, 100}, 1000);
+        assert(capacity_limited == std::vector<std::size_t>({100, 100, 100, 100, 100, 100, 100, 100}));
+    }
+
     auto config = make_config();
     rdma_proxy::CudaBuffers buffers(config);
     buffers.initialize();
@@ -143,6 +163,9 @@ int main() {
     computation.finish_iteration(0);
     const auto first_stats = computation.stats();
     assert(first_stats.generated_tasks == 10);
+    assert(first_stats.publication_waves == 0);
+    assert(first_stats.descriptor_batch_calls == 0);
+    assert(first_stats.head_batch_calls == 0);
     assert(first_stats.tasks_claimed == 10);
     assert(first_stats.tasks_completed == 10);
     assert(first_stats.exit_tasks_consumed == 4);
@@ -170,6 +193,33 @@ int main() {
     }
 
     computation.shutdown();
+
+    // Opt-in wave batching redistributes each notification according to the
+    // currently reusable slots. Eight tasks cannot fit in the combined four
+    // queue slots, so publication requires at least two descriptor/head waves.
+    auto wave_config = make_config();
+    wave_config.nvlink_forward_computation_output_dim = 64;
+    wave_config.nvlink_forward_computation_wave_batching_enabled = true;
+    rdma_proxy::CudaBuffers wave_buffers(wave_config);
+    wave_buffers.initialize();
+    fill_input(wave_buffers, 1, wave_config);
+    rdma_proxy::ForwardComputation wave_computation(wave_config, wave_buffers);
+    wave_computation.initialize();
+    wave_computation.begin_iteration(10);
+    assert(wave_computation.enqueue_ready_region(10, 1, 0, 0, 32, 0) == 8);
+    const auto active_wave_stats = wave_computation.stats();
+    assert(active_wave_stats.publication_waves >= 2);
+    assert(active_wave_stats.descriptor_batch_calls == active_wave_stats.publication_waves);
+    assert(active_wave_stats.head_batch_calls == active_wave_stats.publication_waves);
+    wave_computation.finish_iteration(10);
+    const auto wave_stats = wave_computation.stats();
+    assert(wave_stats.generated_tasks == 8);
+    assert(wave_stats.tasks_completed == 8);
+    assert(wave_stats.publication_waves >= 2);
+    assert(wave_stats.descriptor_batch_calls == wave_stats.publication_waves);
+    assert(wave_stats.head_batch_calls == wave_stats.publication_waves);
+    validate_output(wave_buffers, 1, wave_config);
+    wave_computation.shutdown();
 
     // Load-only mode preserves task lifecycle and completion accounting but
     // intentionally leaves the cleared output tensor untouched.

@@ -79,6 +79,14 @@ well-defined without architecture-specific write-combining flush behavior.
 
 When a queue is full, the notification thread applies bounded backpressure and reports a timeout using `completion_timeout_ms`. It never drops a compute task. Queue-full stall counters are reported at iteration completion. An emergency device-resident abort signal lets every CTA leave its polling loop during partial shutdown; normal shutdown uses exit tasks.
 
+### Capacity-aware wave batching
+
+`nvlink_forward_computation_wave_batching_enabled=false` is the default and retains the original round-robin task distribution plus one publication stream per queue.
+
+When `nvlink_forward_computation_wave_batching_enabled=true`, the receiver publishes each notification in one or more capacity-aware waves. At the start of a wave it counts the consecutive reusable logical positions beginning at each queue's producer position. Tasks are distributed with capped balanced water-filling: queues with fewer reusable positions are filled to that limit, and the remaining tasks are balanced over queues with more space. A physical ring wrap contributes two descriptor ranges but does not require another API call.
+
+All descriptor ranges for a wave are submitted in one `cudaMemcpyBatchAsync` on a shared publication stream. A second `cudaMemcpyBatchAsync` writes one final `published_head` value for every non-empty queue. CUDA stream ordering therefore makes every descriptor visible before any corresponding head can be observed by a persistent CTA. If the aggregate reusable capacity is smaller than the notification's task count, the receiver publishes the available tasks, waits for GPU completion signals to release slots, and repeats with another two-call wave. Exit tasks use the same shared wave publisher while retaining their exact per-queue CTA assignment.
+
 ## Task descriptor
 
 Each descriptor is immutable and self-contained:
@@ -162,6 +170,7 @@ nvlink_forward_computation_tile_m
 nvlink_forward_computation_tile_n
 nvlink_forward_computation_num_queues
 nvlink_forward_computation_queue_depth
+nvlink_forward_computation_wave_batching_enabled
 nvlink_forward_computation_load_only_enabled
 nvlink_forward_computation_dequeue_only_enabled
 nvlink_forward_computation_log_enabled
