@@ -1057,7 +1057,8 @@ void Proxy::nvlink_forward_notification_dispatch_loop() {
                 mark_forward_notification_senders_done();
                 return;
             }
-            std::this_thread::sleep_for(std::chrono::microseconds(10));
+            // std::this_thread::sleep_for(std::chrono::microseconds(10));
+            cpu_relax();
         }
     } catch (const std::exception& e) {
         set_forwarding_error(e.what());
@@ -1263,7 +1264,8 @@ void Proxy::wait_for_nvlink_forward_computation_notifications(uint64_t iteration
             }
             throw std::runtime_error(out.str());
         }
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        // std::this_thread::sleep_for(std::chrono::microseconds(50));
+        cpu_relax();
     }
 }
 
@@ -1322,7 +1324,8 @@ void Proxy::nvlink_forward_notification_loop() {
                 progressed = progressed || atomic_load_u64(&queue->tail) != before;
             }
             if (!progressed) {
-                std::this_thread::sleep_for(std::chrono::microseconds(10));
+                // std::this_thread::sleep_for(std::chrono::microseconds(10));
+                cpu_relax();
             }
             if (nvlink_forward_notification_receiver_stop_.load()) {
                 if (!stopping) {
@@ -3196,7 +3199,8 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
             }
             throw std::runtime_error(out.str());
         }
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        // std::this_thread::sleep_for(std::chrono::microseconds(100));
+        cpu_relax();
     }
 }
 
