@@ -64,6 +64,7 @@ public:
     PeerGpuBuffers& buffers_for_peer(int peer_rank);
     const PeerGpuBuffers& buffers_for_peer(int peer_rank) const;
     const NvlinkReceiveBuffer& nvlink_receive_buffer_for_source(int source_gpu_index) const;
+    void copy_nvlink_notification_test_payloads_to_gpu();
 
     std::size_t token_buffer_bytes() const;
     std::size_t nvlink_receive_buffer_bytes() const;
@@ -75,6 +76,10 @@ private:
     ProxyConfig config_;
     std::vector<PeerGpuBuffers> buffers_;
     std::vector<NvlinkReceiveBuffer> nvlink_recv_buffers_;
+    GpuBuffer nvlink_notification_test_buffer_1mib_;
+    GpuBuffer nvlink_notification_test_buffer_8b_;
+    std::vector<uint8_t> nvlink_notification_test_payload_1mib_;
+    std::vector<uint8_t> nvlink_notification_test_payload_8b_;
 };
 
 void launch_copy_tokens(void* dst, const void* src, std::size_t bytes, bool mock_mode);

@@ -1277,6 +1277,9 @@ void Proxy::drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQue
         } else if (config_.nvlink_forward_expert_routing_notifications_enabled) {
             throw std::runtime_error("NVLink notification is missing its expert routing payload flag");
         }
+        if (config_.nvlink_forward_expert_routing_notifications_enabled) {
+            cuda_buffers_.copy_nvlink_notification_test_payloads_to_gpu();
+        }
         atomic_store_u64(&queue->tail, tail + 1);
         const auto dequeue_timestamp_ns = unix_epoch_nanoseconds_now();
         nvlink_forward_notifications_received_.fetch_add(1);
