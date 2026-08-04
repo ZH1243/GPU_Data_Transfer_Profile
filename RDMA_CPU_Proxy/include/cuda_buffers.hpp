@@ -84,9 +84,9 @@ private:
     ProxyConfig config_;
     std::vector<PeerGpuBuffers> buffers_;
     std::vector<NvlinkReceiveBuffer> nvlink_recv_buffers_;
-    GpuBuffer nvlink_notification_test_buffer_1mib_;
+    GpuBuffer nvlink_notification_test_buffer_16kib_;
     GpuBuffer nvlink_notification_test_buffer_8b_;
-    HostStagingBuffer nvlink_notification_test_payload_1mib_;
+    HostStagingBuffer nvlink_notification_test_payload_16kib_;
     HostStagingBuffer nvlink_notification_test_payload_8b_;
     void* nvlink_notification_copy_stream_{nullptr};
 };

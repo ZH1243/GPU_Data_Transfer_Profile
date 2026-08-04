@@ -15,7 +15,7 @@
 namespace rdma_proxy {
 namespace {
 
-constexpr std::size_t kNvlinkNotificationTestPayloadLargeBytes = 1024 * 1024;
+constexpr std::size_t kNvlinkNotificationTestPayloadLargeBytes = 16 * 1024;
 constexpr std::size_t kNvlinkNotificationTestPayloadSmallBytes = 8;
 
 #if RDMA_PROXY_HAVE_CUDA
@@ -88,9 +88,9 @@ CudaBuffers::~CudaBuffers() {
     for (auto& entry : nvlink_recv_buffers_) {
         free_buffer(entry.recv);
     }
-    free_buffer(nvlink_notification_test_buffer_1mib_);
+    free_buffer(nvlink_notification_test_buffer_16kib_);
     free_buffer(nvlink_notification_test_buffer_8b_);
-    free_host_staging_buffer(nvlink_notification_test_payload_1mib_);
+    free_host_staging_buffer(nvlink_notification_test_payload_16kib_);
     free_host_staging_buffer(nvlink_notification_test_payload_8b_);
 }
 
@@ -136,13 +136,13 @@ void CudaBuffers::initialize() {
 
     if (config_.nvlink_forward_expert_routing_notifications_enabled) {
         allocate_buffer(
-            nvlink_notification_test_buffer_1mib_,
+            nvlink_notification_test_buffer_16kib_,
             kNvlinkNotificationTestPayloadLargeBytes);
         allocate_buffer(
             nvlink_notification_test_buffer_8b_,
             kNvlinkNotificationTestPayloadSmallBytes);
         allocate_host_staging_buffer(
-            nvlink_notification_test_payload_1mib_,
+            nvlink_notification_test_payload_16kib_,
             kNvlinkNotificationTestPayloadLargeBytes,
             uint8_t{1});
         allocate_host_staging_buffer(
@@ -156,7 +156,7 @@ void CudaBuffers::initialize() {
         RDMA_PROXY_LOG_INFO(
             "allocated NVLink notification test GPU buffers local_gpu=",
             config_.local_gpu_index,
-            " large_bytes=", nvlink_notification_test_buffer_1mib_.bytes,
+            " large_bytes=", nvlink_notification_test_buffer_16kib_.bytes,
             " small_bytes=", nvlink_notification_test_buffer_8b_.bytes);
     }
 }
@@ -301,19 +301,19 @@ const NvlinkReceiveBuffer& CudaBuffers::nvlink_receive_buffer_for_source(int sou
 
 void CudaBuffers::copy_nvlink_notification_test_payloads_to_gpu() {
     if (!config_.nvlink_forward_expert_routing_notifications_enabled) return;
-    if (!nvlink_notification_test_buffer_1mib_.ptr ||
+    if (!nvlink_notification_test_buffer_16kib_.ptr ||
         !nvlink_notification_test_buffer_8b_.ptr ||
-        !nvlink_notification_test_payload_1mib_.ptr ||
+        !nvlink_notification_test_payload_16kib_.ptr ||
         !nvlink_notification_test_payload_8b_.ptr ||
-        nvlink_notification_test_payload_1mib_.bytes != nvlink_notification_test_buffer_1mib_.bytes ||
+        nvlink_notification_test_payload_16kib_.bytes != nvlink_notification_test_buffer_16kib_.bytes ||
         nvlink_notification_test_payload_8b_.bytes != nvlink_notification_test_buffer_8b_.bytes) {
         throw std::runtime_error("NVLink notification test copy buffers are not initialized");
     }
     if (config_.mock_mode) {
         std::memcpy(
-            nvlink_notification_test_buffer_1mib_.ptr,
-            nvlink_notification_test_payload_1mib_.ptr,
-            nvlink_notification_test_payload_1mib_.bytes);
+            nvlink_notification_test_buffer_16kib_.ptr,
+            nvlink_notification_test_payload_16kib_.ptr,
+            nvlink_notification_test_payload_16kib_.bytes);
         std::memcpy(
             nvlink_notification_test_buffer_8b_.ptr,
             nvlink_notification_test_payload_8b_.ptr,
@@ -326,12 +326,12 @@ void CudaBuffers::copy_nvlink_notification_test_payloads_to_gpu() {
     if (!stream) throw std::runtime_error("NVLink notification copy stream is not initialized");
     check_cuda(
         cudaMemcpyAsync(
-            nvlink_notification_test_buffer_1mib_.ptr,
-            nvlink_notification_test_payload_1mib_.ptr,
-            nvlink_notification_test_payload_1mib_.bytes,
+            nvlink_notification_test_buffer_16kib_.ptr,
+            nvlink_notification_test_payload_16kib_.ptr,
+            nvlink_notification_test_payload_16kib_.bytes,
             cudaMemcpyHostToDevice,
             stream),
-        "cudaMemcpyAsync H2D 1 MiB NVLink notification test payload");
+        "cudaMemcpyAsync H2D 16 KiB NVLink notification test payload");
     check_cuda(
         cudaMemcpyAsync(
             nvlink_notification_test_buffer_8b_.ptr,
