@@ -41,6 +41,7 @@ int main(int argc, char** argv) {
     assert(config.nvlink_forward_stream_nonblocking);
     assert(!config.nvlink_forward_synchronize_batches);
     assert(!config.nvlink_forward_completion_notifications_enabled);
+    assert(!config.nvlink_forward_expert_routing_notifications_enabled);
     assert(config.nvlink_forward_notification_queue_depth == 1024);
     assert(!config.nvlink_forward_notification_log_enabled);
     assert(config.nvlink_forward_notification_log_dir == "/tmp/rdma_cpu_proxy_nvlink_notifications");
@@ -51,6 +52,8 @@ int main(int argc, char** argv) {
     assert(!config.log_marker_wait_reports);
     assert(!config.nvlink_forward_use_round_robin);
     assert(config.nvlink_routing_probability == 0.5);
+    assert(config.num_of_experts_per_GPU == 8);
+    assert(config.expert_routing_probability == 0.5);
     assert(config.nvlink_routing_seed == 1);
     assert(config.nvlink_forward_exchange_dir == "/tmp/rdma_cpu_proxy_nvlink");
     assert(!config.local_iteration_sync_enabled);
@@ -145,9 +148,12 @@ int main(int argc, char** argv) {
         "--nvlink_forward_min_threshold_chunks=2",
         "--nvlink_forward_max_threshold_chunks=6",
         "--nvlink_forward_out_of_order_chunks_enabled=true",
+        "--nvlink_forward_expert_routing_notifications_enabled=false",
+        "--num_of_experts_per_GPU=32",
+        "--expert_routing_probability=0.625",
         "--cpu_affinity=0-95,192-287",
     };
-    const auto peer_port_config = rdma_proxy::load_config(20, const_cast<char**>(peer_port_args));
+    const auto peer_port_config = rdma_proxy::load_config(23, const_cast<char**>(peer_port_args));
     for (const auto& peer : peer_port_config.peers) {
         assert(peer.port == 18521);
     }
@@ -165,6 +171,9 @@ int main(int argc, char** argv) {
     assert(peer_port_config.nvlink_forward_min_threshold_chunks == 2);
     assert(peer_port_config.nvlink_forward_max_threshold_chunks == 6);
     assert(peer_port_config.nvlink_forward_out_of_order_chunks_enabled);
+    assert(!peer_port_config.nvlink_forward_expert_routing_notifications_enabled);
+    assert(peer_port_config.num_of_experts_per_GPU == 32);
+    assert(peer_port_config.expert_routing_probability == 0.625);
     assert(peer_port_config.cpu_affinity == "0-95,192-287");
 
     const char* signal_interval_args[] = {
@@ -226,6 +235,7 @@ int main(int argc, char** argv) {
   "nvlink_forward_stream_nonblocking": true,
   "nvlink_forward_synchronize_batches": false,
   "nvlink_forward_completion_notifications_enabled": false,
+  "nvlink_forward_expert_routing_notifications_enabled": false,
   "nvlink_forward_notification_queue_depth": 256,
   "nvlink_forward_notification_log_enabled": false,
   "nvlink_forward_notification_log_dir": "/tmp/rdma_cpu_proxy_test_notifications",
@@ -236,6 +246,8 @@ int main(int argc, char** argv) {
   "log_marker_wait_reports": true,
   "nvlink_forward_use_round_robin": true,
   "nvlink_routing_probability": 0.25,
+  "num_of_experts_per_GPU": 24,
+  "expert_routing_probability": 0.75,
   "nvlink_routing_seed": 1234,
   "nvlink_forward_destinations": [
     {"gpu_index": 1, "cuda_device_id": 1, "buffer_addr": "0x100000", "buffer_bytes": 9600},
@@ -263,6 +275,7 @@ int main(int argc, char** argv) {
     assert(!rdma_proxy::nvlink_forward_dynamic_threshold_enabled(nvlink_config));
     assert(rdma_proxy::effective_nvlink_forward_threshold_tokens(nvlink_config) == 300);
     assert(!nvlink_config.nvlink_forward_completion_notifications_enabled);
+    assert(!nvlink_config.nvlink_forward_expert_routing_notifications_enabled);
     assert(nvlink_config.nvlink_forward_notification_queue_depth == 256);
     assert(!nvlink_config.nvlink_forward_notification_log_enabled);
     assert(nvlink_config.nvlink_forward_notification_log_dir == "/tmp/rdma_cpu_proxy_test_notifications");
@@ -270,6 +283,8 @@ int main(int argc, char** argv) {
     assert(nvlink_config.log_marker_wait_reports);
     assert(nvlink_config.nvlink_forward_use_round_robin);
     assert(nvlink_config.nvlink_routing_probability == 0.25);
+    assert(nvlink_config.num_of_experts_per_GPU == 24);
+    assert(nvlink_config.expert_routing_probability == 0.75);
     assert(nvlink_config.nvlink_routing_seed == 1234);
     assert(nvlink_config.nvlink_forward_destinations.size() == 3);
     assert(nvlink_config.nvlink_forward_destinations[0].buffer_addr == 0x100000ULL);
@@ -316,6 +331,53 @@ int main(int argc, char** argv) {
     valid_notification_config.nvlink_forward_synchronize_batches = true;
     valid_notification_config.nvlink_forward_notification_queue_depth = 8;
     rdma_proxy::validate_config(valid_notification_config);
+
+    auto valid_expert_notification_config = valid_notification_config;
+    valid_expert_notification_config.nvlink_forward_use_round_robin = false;
+    valid_expert_notification_config.nvlink_forward_expert_routing_notifications_enabled = true;
+    valid_expert_notification_config.num_of_experts_per_GPU = 64;
+    valid_expert_notification_config.expert_routing_probability = 0.25;
+    rdma_proxy::validate_config(valid_expert_notification_config);
+
+    auto invalid_expert_without_notifications = valid_expert_notification_config;
+    invalid_expert_without_notifications.nvlink_forward_completion_notifications_enabled = false;
+    bool rejected_expert_without_notifications = false;
+    try {
+        rdma_proxy::validate_config(invalid_expert_without_notifications);
+    } catch (const std::runtime_error&) {
+        rejected_expert_without_notifications = true;
+    }
+    assert(rejected_expert_without_notifications);
+
+    auto invalid_expert_round_robin = valid_expert_notification_config;
+    invalid_expert_round_robin.nvlink_forward_use_round_robin = true;
+    bool rejected_expert_round_robin = false;
+    try {
+        rdma_proxy::validate_config(invalid_expert_round_robin);
+    } catch (const std::runtime_error&) {
+        rejected_expert_round_robin = true;
+    }
+    assert(rejected_expert_round_robin);
+
+    auto invalid_expert_count = valid_expert_notification_config;
+    invalid_expert_count.num_of_experts_per_GPU = 48;
+    bool rejected_expert_count = false;
+    try {
+        rdma_proxy::validate_config(invalid_expert_count);
+    } catch (const std::runtime_error&) {
+        rejected_expert_count = true;
+    }
+    assert(rejected_expert_count);
+
+    auto invalid_expert_probability = valid_expert_notification_config;
+    invalid_expert_probability.expert_routing_probability = 1.01;
+    bool rejected_expert_probability = false;
+    try {
+        rdma_proxy::validate_config(invalid_expert_probability);
+    } catch (const std::runtime_error&) {
+        rejected_expert_probability = true;
+    }
+    assert(rejected_expert_probability);
 
     auto invalid_notification_log_config = nvlink_config;
     invalid_notification_log_config.nvlink_forward_notification_log_enabled = true;

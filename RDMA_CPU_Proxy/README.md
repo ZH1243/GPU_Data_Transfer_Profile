@@ -62,6 +62,10 @@ Each peer-node RDMA receive buffer has a CPU-side routing table with one `uint8_
 
 Column 7 is stored as the least significant bit. In an 8-GPU layout, columns 0 through 6 cover the seven peer GPUs and column 7 is ignored. In a 4-GPU layout, columns 0 through 2 cover the three peer GPUs and columns 3 through 7 are ignored. Routing rows are generated randomly on the CPU using `nvlink_routing_probability`, sorted in descending unsigned-byte order, and then interpreted as matching the token order in the RDMA receive buffer.
 
+Set `nvlink_forward_expert_routing_notifications_enabled=true` to generate expert-level routing for the sorted GPU routing rows and attach it to completion notifications. This option is disabled by default and requires `nvlink_forward_completion_notifications_enabled=true` and `nvlink_forward_use_round_robin=false`. `num_of_experts_per_GPU` must be one of `8`, `16`, `24`, `32`, or `64`; `expert_routing_probability` is the independent probability that an expert bit is set. The expert RNG is deterministic and uses a stream derived from `nvlink_routing_seed`.
+
+For each token and active GPU routing column, the expert routing table stores one mask `x`. If the GPU routing bit is zero, `x` is zero. Otherwise, each of its `num_of_experts_per_GPU` low-order bits is sampled independently with `expert_routing_probability`. Expert 0 is bit 0. Masks occupy exactly `num_of_experts_per_GPU / 8` bytes in notification shared memory.
+
 For a forwarding batch, each destination scans the routing rows for that batch, gathers the matching token source addresses, and copies them into a continuous destination span with one batched copy call. Because tokens may route to multiple destinations, the total forwarded byte count can exceed the batch's source byte count.
 
 The routing-table implementation requires:
@@ -104,6 +108,8 @@ When `nvlink_forward_synchronize_batches=true`, each forwarding batch is timed f
 Set `nvlink_forward_completion_notifications_enabled=true` to let a source GPU proxy notify destination GPU proxies after synchronized forwarding batches complete. This feature requires both `nvlink_forwarding_enabled=true` and `nvlink_forward_synchronize_batches=true`. Each receiver GPU proxy creates one POSIX shared-memory segment with one single-producer/single-consumer queue for every other local source GPU. With 8 GPUs per node, the GPU-0 proxy owns 7 inbound notification queues, one each for source GPUs 1 through 7. After the sender's `cudaStreamSynchronize()` returns for a forwarding batch, the forwarding thread enqueues notification records into an in-process handoff queue and can continue to later forwarding batches. A sender-side notification dispatch thread polls that handoff queue and pushes notifications into the receiver queues for the GPUs that received forwarded bytes. A receiver-side polling thread dequeues notifications from the queue tail.
 
 Each notification includes the source GPU, destination GPU, remote peer rank/slot, iteration, batch index, destination `start_token`, `num_tokens`, byte offset, and byte length. The `start_token` and `num_tokens` identify the continuous ready span inside the receiver's NVLink receive buffer for that source GPU and peer-node slot. Use `nvlink_forward_notification_queue_depth` to size each per-source queue.
+
+When expert routing notifications are enabled, the notification also contains a list `y` with one expert mask for each forwarded token. `y[token_idx]` uses the same compacted token order as the continuous destination span, so `y.size() == num_tokens`. Notification queue entries become variable-stride records sized for the largest configured forwarding batch; when the option is disabled, the original notification version, fixed 128-byte record, shared-memory size, and behavior are retained. Notification logs append `expert_mask_bytes` and `expert_masks=[...]` only in the enabled mode.
 
 Set `nvlink_forward_notification_log_enabled=true` to record receiver-side notification dequeue events to files. This mode requires `nvlink_forward_completion_notifications_enabled=true`. When the receiver notification thread dequeues an entry, it formats the notification into a single text line with `dequeue_timestamp_ns` and appends that line to an in-process log queue. During shutdown, each GPU proxy drains its log queue and writes one file under `nvlink_forward_notification_log_dir`, named `nvlink_forward_notifications_rank_<rank>_gpu_<gpu>.log`.
 
@@ -270,6 +276,11 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_use_batch_api`
 - `nvlink_forward_stream_nonblocking`
 - `nvlink_forward_synchronize_batches`
+- `nvlink_forward_completion_notifications_enabled`
+- `nvlink_forward_expert_routing_notifications_enabled`
+- `nvlink_forward_notification_queue_depth`
+- `nvlink_forward_notification_log_enabled`
+- `nvlink_forward_notification_log_dir`
 - `nvlink_forward_local_batch_sync_enabled`
 - `nvlink_forward_synchronize_iteration`
 - `nvlink_forward_log_batches`
@@ -281,6 +292,8 @@ Required parameters are represented in `config/example_config.json`:
 - `log_marker_wait_reports`
 - `nvlink_forward_use_round_robin`
 - `nvlink_routing_probability`
+- `num_of_experts_per_GPU`
+- `expert_routing_probability`
 - `nvlink_routing_seed`
 - `nvlink_forward_exchange_dir`
 - `nvlink_forward_destinations`

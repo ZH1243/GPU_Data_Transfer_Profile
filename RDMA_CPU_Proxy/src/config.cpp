@@ -339,6 +339,10 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
         config.nvlink_forward_completion_notifications_enabled =
             (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "nvlink_forward_expert_routing_notifications_enabled") {
+        config.nvlink_forward_expert_routing_notifications_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "nvlink_forward_notification_queue_depth") {
         config.nvlink_forward_notification_queue_depth = static_cast<std::size_t>(std::stoull(value));
     }
@@ -369,6 +373,12 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     }
     else if (key == "nvlink_routing_probability") {
         config.nvlink_routing_probability = std::stod(value);
+    }
+    else if (key == "num_of_experts_per_GPU") {
+        config.num_of_experts_per_GPU = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "expert_routing_probability") {
+        config.expert_routing_probability = std::stod(value);
     }
     else if (key == "nvlink_routing_seed") {
         config.nvlink_routing_seed = static_cast<uint64_t>(std::stoull(value));
@@ -505,6 +515,10 @@ ProxyConfig load_config_file(const std::string& path) {
         object,
         "nvlink_forward_completion_notifications_enabled",
         config.nvlink_forward_completion_notifications_enabled);
+    config.nvlink_forward_expert_routing_notifications_enabled = get_bool(
+        object,
+        "nvlink_forward_expert_routing_notifications_enabled",
+        config.nvlink_forward_expert_routing_notifications_enabled);
     config.nvlink_forward_notification_queue_depth = number_as<std::size_t>(
         object,
         "nvlink_forward_notification_queue_depth",
@@ -530,6 +544,10 @@ ProxyConfig load_config_file(const std::string& path) {
         object, "nvlink_forward_use_round_robin", config.nvlink_forward_use_round_robin);
     config.nvlink_routing_probability = get_number(
         object, "nvlink_routing_probability", config.nvlink_routing_probability);
+    config.num_of_experts_per_GPU = number_as<std::size_t>(
+        object, "num_of_experts_per_GPU", config.num_of_experts_per_GPU);
+    config.expert_routing_probability = get_number(
+        object, "expert_routing_probability", config.expert_routing_probability);
     config.nvlink_routing_seed = number_as<uint64_t>(
         object, "nvlink_routing_seed", config.nvlink_routing_seed);
     config.nvlink_forward_exchange_dir = get_string(
@@ -686,6 +704,28 @@ void validate_config(const ProxyConfig& config) {
                 "nvlink_forward_notification_log_dir must be non-empty when notification logging is enabled");
         }
     }
+    if (config.nvlink_forward_expert_routing_notifications_enabled) {
+        if (!config.nvlink_forward_completion_notifications_enabled) {
+            throw std::runtime_error(
+                "nvlink_forward_expert_routing_notifications_enabled requires "
+                "nvlink_forward_completion_notifications_enabled=true");
+        }
+        if (config.nvlink_forward_use_round_robin) {
+            throw std::runtime_error(
+                "nvlink_forward_expert_routing_notifications_enabled requires "
+                "nvlink_forward_use_round_robin=false");
+        }
+    }
+    if (config.num_of_experts_per_GPU != 8 &&
+        config.num_of_experts_per_GPU != 16 &&
+        config.num_of_experts_per_GPU != 24 &&
+        config.num_of_experts_per_GPU != 32 &&
+        config.num_of_experts_per_GPU != 64) {
+        throw std::runtime_error("num_of_experts_per_GPU must be one of 8, 16, 24, 32, or 64");
+    }
+    if (config.expert_routing_probability < 0.0 || config.expert_routing_probability > 1.0) {
+        throw std::runtime_error("expert_routing_probability must be in [0, 1]");
+    }
     if (config.nvlink_forwarding_enabled) {
         const auto dynamic_threshold = nvlink_forward_dynamic_threshold_enabled(config);
         const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config);
@@ -822,6 +862,8 @@ std::string config_summary(const ProxyConfig& config) {
         << (config.nvlink_forward_synchronize_batches ? "true" : "false")
         << " nvlink_forward_completion_notifications_enabled="
         << (config.nvlink_forward_completion_notifications_enabled ? "true" : "false")
+        << " nvlink_forward_expert_routing_notifications_enabled="
+        << (config.nvlink_forward_expert_routing_notifications_enabled ? "true" : "false")
         << " nvlink_forward_notification_queue_depth="
         << config.nvlink_forward_notification_queue_depth
         << " nvlink_forward_notification_log_enabled="
@@ -837,6 +879,8 @@ std::string config_summary(const ProxyConfig& config) {
         << " log_marker_wait_reports=" << (config.log_marker_wait_reports ? "true" : "false")
         << " nvlink_forward_use_round_robin=" << (config.nvlink_forward_use_round_robin ? "true" : "false")
         << " nvlink_routing_probability=" << config.nvlink_routing_probability
+        << " num_of_experts_per_GPU=" << config.num_of_experts_per_GPU
+        << " expert_routing_probability=" << config.expert_routing_probability
         << " nvlink_routing_seed=" << config.nvlink_routing_seed
         << " nvlink_forward_exchange_dir=" << config.nvlink_forward_exchange_dir
         << " local_iteration_sync_enabled=" << (config.local_iteration_sync_enabled ? "true" : "false")
