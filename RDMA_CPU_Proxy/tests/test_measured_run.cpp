@@ -248,8 +248,15 @@ int main() {
         const std::string notification_text(
             (std::istreambuf_iterator<char>(notification_log)),
             std::istreambuf_iterator<char>());
+        std::size_t full_expert_mask_count = 0;
+        for (std::size_t pos = 0;
+             (pos = notification_text.find("0xffff", pos)) != std::string::npos;
+             pos += 6) {
+            ++full_expert_mask_count;
+        }
         if (notification_text.find("expert_mask_bytes=2") == std::string::npos ||
-            notification_text.find("expert_masks=[0xffff") == std::string::npos) {
+            notification_text.find("expert_masks=[0xffff") == std::string::npos ||
+            full_expert_mask_count != config0.num_tokens) {
             std::cerr << "NVLink notification log did not contain the expected expert masks\n";
             return 1;
         }

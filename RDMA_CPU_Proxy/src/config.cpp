@@ -715,6 +715,10 @@ void validate_config(const ProxyConfig& config) {
                 "nvlink_forward_expert_routing_notifications_enabled requires "
                 "nvlink_forward_use_round_robin=false");
         }
+        if (config.num_tokens > static_cast<std::size_t>(std::numeric_limits<uint32_t>::max())) {
+            throw std::runtime_error(
+                "nvlink_forward_expert_routing_notifications_enabled supports at most uint32 token indices");
+        }
     }
     if (config.num_of_experts_per_GPU != 8 &&
         config.num_of_experts_per_GPU != 16 &&

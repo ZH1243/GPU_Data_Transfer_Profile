@@ -115,7 +115,7 @@ private:
     void prepare_forwarding_notification_destinations();
     void initialize_nvlink_forward_notification_dispatch();
     void enqueue_forward_completion_notifications(
-        const std::vector<PendingNvlinkForwardNotification>& notifications);
+        std::vector<PendingNvlinkForwardNotification>&& notifications);
     void publish_forward_completion_notification(const PendingNvlinkForwardNotification& notification);
     void mark_forward_notification_senders_done();
     bool nvlink_forward_notification_queues_complete() const;
@@ -236,7 +236,10 @@ private:
     std::size_t forwarding_ready_peer_count_{0};
     std::vector<ForwardingOutOfOrderPeerState> forwarding_out_of_order_peer_states_;
     std::vector<std::vector<uint8_t>> forwarding_routing_tables_by_peer_;
-    std::vector<std::vector<std::array<uint64_t, 8>>> forwarding_expert_routing_tables_by_peer_;
+    // [peer slot][destination GPU] -> tightly packed expert masks in routed-token order.
+    std::vector<std::array<std::vector<uint8_t>, 8>> forwarding_expert_routing_tables_by_peer_;
+    // [peer slot][token boundary][destination GPU] -> compressed expert-mask index.
+    std::vector<std::vector<std::array<uint32_t, 8>>> forwarding_expert_routing_prefix_by_peer_;
     std::vector<ForwardDestinationState> forwarding_destinations_;
     std::vector<ForwardNotificationDestinationState> forwarding_notification_destinations_;
     std::vector<ForwardingIterationStats> forwarding_iteration_stats_;
