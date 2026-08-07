@@ -7,7 +7,7 @@ expert `e` belongs to GPU `e // n`.
 The result is a ragged array represented by:
 
 - `expert_token_indices`: `T * topK` packed `int32` values.
-- `expert_offsets`: `K + 1` offsets.  Expert `e` owns
+- `expert_offsets`: `num_experts + 1` offsets.  Expert `e` owns
   `expert_token_indices[expert_offsets[e]:expert_offsets[e + 1]]`.
 
 Each value is the token's position in the ordered sequence of tokens routed to
@@ -23,6 +23,36 @@ for Hopper (`sm_90`) by default.
 python run.py --tokens 16384 --top-k 8 --experts 256 \
   --experts-per-gpu 32 --check --warmup 20 --iters 200
 ```
+
+## Eight-GPU node mask ordering
+
+Pass `--node-mask-sort` to enable the node-aware mode:
+
+```bash
+python run.py --tokens 16384 --top-k 8 --experts 256 \
+  --experts-per-gpu 16 --node-mask-sort --check
+```
+
+This mode fixes the node size at eight GPUs.  With 16 experts per GPU,
+experts 0--127 belong to node 0 and experts 128--255 belong to node 1.  For
+each token and destination node, an 8-bit mask records the GPUs in that node
+selected by the token (`bit g` represents node-local GPU `g`).  Tokens sent to
+each node are stably sorted by the mask's unsigned numeric value in descending
+order; equal masks retain input-token order.
+
+The additional output is another packed ragged array:
+
+- `node_token_indices` is `x3`, containing original token IDs in sender-buffer
+  order.
+- `node_offsets` has `num_nodes + 1` entries.  Node `i` owns
+  `node_token_indices[node_offsets[i]:node_offsets[i + 1]]`.
+
+The temporary `x1` and `x2` arrays are never materialized.  The CUDA code uses
+per-chunk `(node, mask)` histograms and a stable 8-bit counting-sort scatter to
+write `x3` directly.  It then computes the per-GPU filtered ranks in `x3`
+order and rebuilds `expert_token_indices`, so each value matches the token's
+new arrival position at its destination GPU.  Output and scratch allocation
+remain outside the measured interval.
 
 The Python driver allocates `R` in GPU HBM, invokes the CUDA input generator,
 runs one correctness check against a CPU implementation, and reports average
