@@ -6,6 +6,7 @@
 #include "qp_worker.hpp"
 #include "rdma_connection.hpp"
 #include "rdma_context.hpp"
+#include "router_routing.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -38,6 +39,7 @@ private:
         MemoryRegionInfo local_send_mr;
         MemoryRegionInfo local_recv_mr;
         MemoryRegionInfo remote_recv_mr;
+        std::vector<ChunkDescriptor> receive_chunks;
         std::vector<std::unique_ptr<RdmaQueuePair>> qps;
         std::vector<std::unique_ptr<QPWorker>> workers;
     };
@@ -93,6 +95,8 @@ private:
 
     PeerConnectionInfo make_local_peer_info(const PeerState& peer) const;
     void setup_peer(PeerGpuBuffers& buffers);
+    std::vector<ChunkDescriptor> exchange_router_receive_chunks(
+        const PeerAddress& peer_addr) const;
     void synchronize_peer_ready(const PeerAddress& peer_addr, const PeerState& peer) const;
     void initialize_local_iteration_sync();
     void release_local_iteration_sync();
@@ -136,7 +140,7 @@ private:
     void synchronize_local_iteration_phase(const std::string& phase, uint64_t iteration) const;
     void fill_iteration_send_buffers(uint64_t iteration);
     std::vector<std::size_t> sequential_peer_order() const;
-    std::vector<ChunkDescriptor> make_chunks() const;
+    std::vector<ChunkDescriptor> make_chunks(int peer_rank = -1) const;
     std::vector<QPCompletionBaseline> capture_baselines(
         const PeerState& peer,
         const std::vector<ChunkDescriptor>& chunks) const;
@@ -195,7 +199,7 @@ private:
         uint64_t iteration,
         std::chrono::steady_clock::time_point start,
         double seconds,
-        std::size_t bytes_per_peer,
+        std::size_t total_bytes,
         const std::vector<std::vector<QPCompletionBaseline>>& baselines,
         const std::vector<IterationAssignment>& assignments,
         std::size_t verification_errors,
@@ -203,6 +207,7 @@ private:
 
     ProxyConfig config_;
     CudaBuffers cuda_buffers_;
+    RouterRouting router_routing_;
     RdmaContext rdma_context_;
     ConnectionManager connection_manager_;
     std::vector<PeerState> peers_;

@@ -1,0 +1,36 @@
+#pragma once
+
+#include "config.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+namespace rdma_proxy {
+
+class RouterRouting {
+public:
+    explicit RouterRouting(ProxyConfig config);
+    ~RouterRouting();
+
+    RouterRouting(const RouterRouting&) = delete;
+    RouterRouting& operator=(const RouterRouting&) = delete;
+
+    void initialize();
+    const std::vector<std::size_t>& token_indices_for_node(int node_rank) const;
+    int experts_per_gpu() const;
+
+private:
+    void initialize_mock();
+    void initialize_cuda();
+    void release_cuda() noexcept;
+
+    ProxyConfig config_;
+    std::vector<std::vector<std::size_t>> token_indices_by_node_;
+    std::vector<void*> device_allocations_;
+    int32_t* pinned_x3_{nullptr};
+    int32_t* pinned_node_offsets_{nullptr};
+    bool initialized_{false};
+};
+
+}  // namespace rdma_proxy

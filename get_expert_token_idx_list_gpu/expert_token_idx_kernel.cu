@@ -1,8 +1,10 @@
+#ifndef EXPERT_TOKEN_IDX_STANDALONE
 #include <torch/extension.h>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
+#endif
 
 #include <cub/block/block_radix_sort.cuh>
 #include <cuda_runtime.h>
@@ -10,6 +12,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
+#include <string>
 
 namespace {
 
@@ -908,6 +912,7 @@ __global__ void scatter_reordered_by_expert_fallback_kernel(
   }
 }
 
+#ifndef EXPERT_TOKEN_IDX_STANDALONE
 void check_cuda_int32(const torch::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
   TORCH_CHECK(
@@ -916,7 +921,19 @@ void check_cuda_int32(const torch::Tensor& tensor, const char* name) {
       " must have dtype torch.int32");
   TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
 }
+#endif
 
+void check_cuda_status(cudaError_t status, const char* what) {
+#ifdef EXPERT_TOKEN_IDX_STANDALONE
+  if (status != cudaSuccess) {
+    throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
+  }
+#else
+  C10_CUDA_CHECK(status);
+#endif
+}
+
+#ifndef EXPERT_TOKEN_IDX_STANDALONE
 void check_cuda_uint8(const torch::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
   TORCH_CHECK(
@@ -935,6 +952,7 @@ void check_same_device(
       name,
       " must be on the same CUDA device as R");
 }
+#endif
 
 int radix_end_bit_for(int sentinel) {
   int bits = 0;
@@ -960,10 +978,10 @@ void launch_scatter_specialized(
     int32_t* expert_token_indices,
     size_t dynamic_smem,
     cudaStream_t stream) {
-  C10_CUDA_CHECK(cudaFuncSetAttribute(
+  check_cuda_status(cudaFuncSetAttribute(
       scatter_chunks_kernel<TOP_K>,
       cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(dynamic_smem)));
+      static_cast<int>(dynamic_smem)), "cudaFuncSetAttribute scatter_chunks_kernel");
   scatter_chunks_kernel<TOP_K><<<
       num_chunks, kBlockThreads, dynamic_smem, stream>>>(
       r,
@@ -1032,10 +1050,10 @@ void launch_scatter_reordered_specialized(
     int32_t* expert_token_indices,
     size_t dynamic_smem,
     cudaStream_t stream) {
-  C10_CUDA_CHECK(cudaFuncSetAttribute(
+  check_cuda_status(cudaFuncSetAttribute(
       scatter_reordered_chunks_kernel<TOP_K>,
       cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(dynamic_smem)));
+      static_cast<int>(dynamic_smem)), "cudaFuncSetAttribute scatter_reordered_chunks_kernel");
   dim3 grid(num_chunks_per_node, num_nodes);
   scatter_reordered_chunks_kernel<TOP_K><<<
       grid, kBlockThreads, dynamic_smem, stream>>>(
@@ -1055,6 +1073,89 @@ void launch_scatter_reordered_specialized(
 }
 
 }  // namespace
+
+void generate_r_cuda_raw(
+    int32_t* r,
+    int num_tokens,
+    int top_k,
+    int num_experts,
+    uint64_t seed,
+    void* stream_arg) {
+  auto stream = reinterpret_cast<cudaStream_t>(stream_arg);
+  int blocks = (num_tokens + kBlockThreads - 1) / kBlockThreads;
+  generate_r_kernel<<<blocks, kBlockThreads, 0, stream>>>(
+      r, num_tokens, top_k, num_experts, seed);
+  check_cuda_status(cudaGetLastError(), "generate_r_kernel launch");
+}
+
+void get_expert_token_idx_node_mask_x3_cuda_raw(
+    const int32_t* r,
+    int num_tokens,
+    int top_k,
+    int num_experts,
+    int experts_per_gpu,
+    int gpus_per_node,
+    int local_gpu_id,
+    int32_t* expert_offsets,
+    int32_t* node_token_indices,
+    uint8_t* node_token_masks,
+    int32_t* node_offsets,
+    int32_t* input_chunk_counts,
+    int32_t* input_chunk_prefixes,
+    int32_t* node_mask_offsets,
+    void* stream_arg) {
+  auto stream = reinterpret_cast<cudaStream_t>(stream_arg);
+  const int num_masks = 1 << gpus_per_node;
+  const int experts_per_node = experts_per_gpu * gpus_per_node;
+  const int num_nodes = num_experts / experts_per_node;
+  const int num_input_chunks = (num_tokens + kBlockThreads - 1) / kBlockThreads;
+  const int input_num_bins = num_experts + num_nodes * num_masks;
+  const size_t input_count_smem =
+      static_cast<size_t>(input_num_bins) * sizeof(int32_t);
+
+  check_cuda_status(cudaFuncSetAttribute(
+      count_node_input_chunks_kernel,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(input_count_smem)),
+      "cudaFuncSetAttribute count_node_input_chunks_kernel");
+  count_node_input_chunks_kernel<<<
+      num_input_chunks, kBlockThreads, input_count_smem, stream>>>(
+      r, num_tokens, top_k, num_experts, experts_per_gpu, experts_per_node,
+      num_nodes, gpus_per_node, local_gpu_id, num_masks, input_chunk_counts);
+  check_cuda_status(cudaGetLastError(), "count_node_input_chunks_kernel launch");
+
+  scan_node_input_counts_kernel<<<1, kBlockThreads, 0, stream>>>(
+      input_chunk_counts, input_chunk_prefixes, expert_offsets, node_offsets,
+      node_mask_offsets, num_input_chunks, num_experts, num_nodes, num_masks);
+  check_cuda_status(cudaGetLastError(), "scan_node_input_counts_kernel launch");
+
+  const int node_radix_end_bit = radix_end_bit_for(num_nodes * num_masks);
+#define LAUNCH_RAW_NODE_BUILD(TOP_K_VALUE)                                  \
+  launch_build_node_token_indices_specialized<TOP_K_VALUE>(                 \
+      r, num_tokens, num_experts, experts_per_gpu, experts_per_node,         \
+      num_nodes, gpus_per_node, local_gpu_id, num_masks, num_input_chunks,   \
+      node_radix_end_bit, input_chunk_prefixes, node_mask_offsets,           \
+      node_token_indices, node_token_masks, stream)
+
+  switch (top_k) {
+    case 1: LAUNCH_RAW_NODE_BUILD(1); break;
+    case 2: LAUNCH_RAW_NODE_BUILD(2); break;
+    case 4: LAUNCH_RAW_NODE_BUILD(4); break;
+    case 8: LAUNCH_RAW_NODE_BUILD(8); break;
+    case 16: LAUNCH_RAW_NODE_BUILD(16); break;
+    default:
+      build_node_token_indices_fallback_kernel<<<
+          num_nodes * (num_masks - 1), kBlockThreads, 0, stream>>>(
+          r, num_tokens, top_k, experts_per_gpu, experts_per_node,
+          gpus_per_node, local_gpu_id, num_masks, node_mask_offsets,
+          node_token_indices, node_token_masks);
+      break;
+  }
+#undef LAUNCH_RAW_NODE_BUILD
+  check_cuda_status(cudaGetLastError(), "build_node_token_indices kernel launch");
+}
+
+#ifndef EXPERT_TOKEN_IDX_STANDALONE
 
 void generate_r_cuda(
     torch::Tensor r,
@@ -1470,3 +1571,4 @@ void get_expert_token_idx_node_mask_cuda(
 #undef LAUNCH_NODE_SCATTER
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+#endif

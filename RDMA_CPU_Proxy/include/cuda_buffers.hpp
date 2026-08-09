@@ -44,6 +44,7 @@ public:
     void initialize();
     void copy_tokens_to_send_buffer(int peer_rank, const void* src_device_or_host, std::size_t bytes);
     void fill_test_pattern(int peer_rank, int source_rank, int destination_rank, uint64_t iteration);
+    void fill_router_test_pattern(int source_rank, uint64_t iteration);
     bool validate_recv_pattern(
         int peer_rank,
         int source_rank,
@@ -73,6 +74,7 @@ private:
     void free_buffer(GpuBuffer& buffer);
 
     ProxyConfig config_;
+    GpuBuffer router_send_buffer_;
     std::vector<PeerGpuBuffers> buffers_;
     std::vector<NvlinkReceiveBuffer> nvlink_recv_buffers_;
 };

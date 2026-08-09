@@ -21,6 +21,10 @@ int main(int argc, char** argv) {
     assert(config.max_in_flight_chunks_per_qp == 4);
     assert(!config.rdma_chunk_per_token_sge_enabled);
     assert(!config.rdma_discontinuous_token_payload_enabled);
+    assert(!config.router_routing_enabled);
+    assert(config.router_num_experts == 256);
+    assert(config.router_top_k == 8);
+    assert(config.router_seed == 1234);
     assert(config.num_iterations == 1);
     assert(config.completion_timeout_ms == 30000);
     assert(config.dtype == rdma_proxy::DataType::kBF16);
@@ -191,6 +195,36 @@ int main(int argc, char** argv) {
         rejected_discontinuous_without_sge = true;
     }
     assert(rejected_discontinuous_without_sge);
+
+    auto router_config = signal_interval_config;
+    router_config.router_routing_enabled = true;
+    router_config.router_num_experts = 256;
+    router_config.router_top_k = 8;
+    router_config.rdma_chunk_per_token_sge_enabled = false;
+    router_config.rdma_discontinuous_token_payload_enabled = false;
+    rdma_proxy::validate_config(router_config);
+    assert(rdma_proxy::effective_rdma_chunk_per_token_sge_enabled(router_config));
+    assert(rdma_proxy::effective_rdma_discontinuous_token_payload_enabled(router_config));
+
+    auto invalid_router_nvlink_config = router_config;
+    invalid_router_nvlink_config.nvlink_forwarding_enabled = true;
+    bool rejected_router_nvlink = false;
+    try {
+        rdma_proxy::validate_config(invalid_router_nvlink_config);
+    } catch (const std::runtime_error&) {
+        rejected_router_nvlink = true;
+    }
+    assert(rejected_router_nvlink);
+
+    auto invalid_router_experts_config = router_config;
+    invalid_router_experts_config.router_num_experts = 255;
+    bool rejected_router_experts = false;
+    try {
+        rdma_proxy::validate_config(invalid_router_experts_config);
+    } catch (const std::runtime_error&) {
+        rejected_router_experts = true;
+    }
+    assert(rejected_router_experts);
 
     const char* nvlink_config_path = "nvlink_forward_config.json";
     {

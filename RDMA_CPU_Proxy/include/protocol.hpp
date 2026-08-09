@@ -40,6 +40,21 @@ struct ChunkDescriptor {
     std::vector<std::size_t> source_token_indices;
 };
 
+struct RouterX3Metadata {
+    int source_node_rank{-1};
+    int destination_node_rank{-1};
+    int local_gpu_index{-1};
+    int num_nodes{0};
+    int num_gpus_per_node{0};
+    int num_experts{0};
+    int top_k{0};
+    std::size_t num_tokens{0};
+    std::size_t token_dimension{0};
+    std::size_t element_bytes{0};
+    std::size_t tokens_per_chunk{0};
+    std::vector<std::size_t> token_indices;
+};
+
 uint32_t encode_immediate(std::size_t chunk_index);
 std::size_t decode_immediate(uint32_t imm_data);
 uint32_t encode_marker_immediate();
@@ -52,6 +67,18 @@ std::vector<ChunkDescriptor> compute_chunks(
     std::size_t tokens_per_chunk,
     int num_qps_per_peer,
     bool discontinuous_token_payload = false);
+
+std::vector<ChunkDescriptor> compute_chunks_from_token_indices(
+    const std::vector<std::size_t>& source_token_indices,
+    std::size_t token_dimension,
+    std::size_t dtype_size,
+    std::size_t tokens_per_chunk,
+    int num_qps_per_peer);
+
+std::string serialize_router_x3_metadata(const RouterX3Metadata& metadata);
+RouterX3Metadata deserialize_router_x3_metadata(
+    const std::string& payload,
+    std::size_t maximum_num_tokens);
 
 std::string serialize_peer_info(const PeerConnectionInfo& info);
 PeerConnectionInfo deserialize_peer_info(const std::string& payload);

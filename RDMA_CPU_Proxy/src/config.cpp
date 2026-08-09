@@ -293,6 +293,18 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "rdma_discontinuous_token_payload_enabled") {
         config.rdma_discontinuous_token_payload_enabled = (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "router_routing_enabled") {
+        config.router_routing_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "num_experts" || key == "router_num_experts") {
+        config.router_num_experts = std::stoi(value);
+    }
+    else if (key == "top_k" || key == "router_top_k") {
+        config.router_top_k = std::stoi(value);
+    }
+    else if (key == "router_seed") {
+        config.router_seed = static_cast<uint64_t>(std::stoull(value));
+    }
     else if (key == "send_queue_depth") config.send_queue_depth = std::stoi(value);
     else if (key == "recv_queue_depth") config.recv_queue_depth = std::stoi(value);
     else if (key == "cq_depth") config.cq_depth = std::stoi(value);
@@ -435,6 +447,14 @@ std::size_t effective_nvlink_forward_threshold_tokens(const ProxyConfig& config)
     return config.nvlink_forward_threshold_chunks * config.tokens_per_chunk;
 }
 
+bool effective_rdma_chunk_per_token_sge_enabled(const ProxyConfig& config) {
+    return config.rdma_chunk_per_token_sge_enabled || config.router_routing_enabled;
+}
+
+bool effective_rdma_discontinuous_token_payload_enabled(const ProxyConfig& config) {
+    return config.rdma_discontinuous_token_payload_enabled || config.router_routing_enabled;
+}
+
 ProxyConfig load_config_file(const std::string& path) {
     std::ifstream input(path);
     if (!input) throw std::runtime_error("failed to open config file: " + path);
@@ -467,6 +487,13 @@ ProxyConfig load_config_file(const std::string& path) {
         object, "rdma_chunk_per_token_sge_enabled", config.rdma_chunk_per_token_sge_enabled);
     config.rdma_discontinuous_token_payload_enabled = get_bool(
         object, "rdma_discontinuous_token_payload_enabled", config.rdma_discontinuous_token_payload_enabled);
+    config.router_routing_enabled = get_bool(
+        object, "router_routing_enabled", config.router_routing_enabled);
+    config.router_num_experts = number_as<int>(
+        object, "num_experts", number_as<int>(object, "router_num_experts", config.router_num_experts));
+    config.router_top_k = number_as<int>(
+        object, "top_k", number_as<int>(object, "router_top_k", config.router_top_k));
+    config.router_seed = number_as<uint64_t>(object, "router_seed", config.router_seed);
     config.send_queue_depth = number_as<int>(object, "send_queue_depth", config.send_queue_depth);
     config.recv_queue_depth = number_as<int>(object, "recv_queue_depth", config.recv_queue_depth);
     config.cq_depth = number_as<int>(object, "cq_depth", config.cq_depth);
@@ -617,7 +644,7 @@ void validate_config(const ProxyConfig& config) {
     if (config.max_in_flight_chunks_per_qp <= 0) {
         throw std::runtime_error("max_in_flight_chunks_per_qp must be > 0");
     }
-    if (config.rdma_chunk_per_token_sge_enabled &&
+    if (effective_rdma_chunk_per_token_sge_enabled(config) &&
         config.tokens_per_chunk > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("tokens_per_chunk exceeds verbs num_sge range for per-token SGE mode");
     }
@@ -628,6 +655,31 @@ void validate_config(const ProxyConfig& config) {
     if (config.rdma_discontinuous_token_payload_enabled && config.nvlink_forwarding_enabled) {
         throw std::runtime_error(
             "rdma_discontinuous_token_payload_enabled is only supported when NVLink forwarding is disabled");
+    }
+    if (config.router_routing_enabled) {
+        if (config.nvlink_forwarding_enabled) {
+            throw std::runtime_error(
+                "router_routing_enabled is currently RDMA-only and requires nvlink_forwarding_enabled=false");
+        }
+        if (config.num_gpus_per_node < 2 || config.num_gpus_per_node > 8) {
+            throw std::runtime_error("router_routing_enabled requires num_gpus_per_node in [2, 8]");
+        }
+        if (config.router_num_experts <= 0 || config.router_num_experts > 1024) {
+            throw std::runtime_error("num_experts must be in [1, 1024] when router routing is enabled");
+        }
+        if (config.router_top_k <= 0 || config.router_top_k > config.router_num_experts) {
+            throw std::runtime_error("top_k must be in [1, num_experts] when router routing is enabled");
+        }
+        const auto total_gpus = static_cast<int64_t>(config.num_nodes) * config.num_gpus_per_node;
+        if (config.router_num_experts % total_gpus != 0) {
+            throw std::runtime_error(
+                "num_experts must be divisible by num_nodes * num_gpus_per_node in router mode");
+        }
+        if (config.num_tokens > static_cast<std::size_t>(std::numeric_limits<int32_t>::max()) ||
+            config.num_tokens > static_cast<std::size_t>(
+                std::numeric_limits<int32_t>::max() / config.router_top_k)) {
+            throw std::runtime_error("num_tokens * top_k must fit in int32 in router mode");
+        }
     }
     if (config.send_queue_depth <= 0 || config.recv_queue_depth <= 0 || config.cq_depth <= 0) {
         throw std::runtime_error("queue and CQ depths must be > 0");
@@ -804,6 +856,10 @@ std::string config_summary(const ProxyConfig& config) {
         << (config.rdma_chunk_per_token_sge_enabled ? "true" : "false")
         << " rdma_discontinuous_token_payload_enabled="
         << (config.rdma_discontinuous_token_payload_enabled ? "true" : "false")
+        << " router_routing_enabled=" << (config.router_routing_enabled ? "true" : "false")
+        << " num_experts=" << config.router_num_experts
+        << " top_k=" << config.router_top_k
+        << " router_seed=" << config.router_seed
         << " iterations=" << config.num_iterations
         << " dtype=" << to_string(config.dtype)
         << " sequential_peer_transfers=" << (config.sequential_peer_transfers ? "true" : "false")

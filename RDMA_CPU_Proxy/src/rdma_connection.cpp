@@ -231,7 +231,7 @@ RdmaQueuePair::RdmaQueuePair(RdmaContext& context, const ProxyConfig& config, in
     qp_attr.qp_type = IBV_QPT_RC;
     qp_attr.cap.max_send_wr = static_cast<uint32_t>(config_.send_queue_depth);
     qp_attr.cap.max_recv_wr = static_cast<uint32_t>(config_.recv_queue_depth);
-    const auto requested_send_sge = config_.rdma_chunk_per_token_sge_enabled
+    const auto requested_send_sge = effective_rdma_chunk_per_token_sge_enabled(config_)
         ? config_.tokens_per_chunk
         : std::size_t{1};
     if (requested_send_sge > std::numeric_limits<uint32_t>::max()) {
@@ -387,7 +387,7 @@ void RdmaQueuePair::post_write_with_immediate(
     bool signaled,
     const std::vector<std::size_t>& source_token_indices) {
     if (config_.mock_mode) {
-        if (config_.rdma_chunk_per_token_sge_enabled) {
+        if (effective_rdma_chunk_per_token_sge_enabled(config_)) {
             (void)per_token_sge_count(config_, length);
         }
         if (!source_token_indices.empty()) {
@@ -417,7 +417,7 @@ void RdmaQueuePair::post_write_with_immediate(
 #if RDMA_PROXY_HAVE_VERBS
     ibv_sge sge{};
     std::vector<ibv_sge> sges;
-    if (length > 0 && config_.rdma_chunk_per_token_sge_enabled) {
+    if (length > 0 && effective_rdma_chunk_per_token_sge_enabled(config_)) {
         const auto token_bytes = rdma_token_bytes(config_);
         if (token_bytes > std::numeric_limits<uint32_t>::max()) {
             throw std::runtime_error("single token byte size exceeds verbs SGE length range");
@@ -446,10 +446,10 @@ void RdmaQueuePair::post_write_with_immediate(
 
     ibv_send_wr wr{};
     wr.wr_id = wr_id;
-    wr.sg_list = config_.rdma_chunk_per_token_sge_enabled
+    wr.sg_list = effective_rdma_chunk_per_token_sge_enabled(config_)
         ? (sges.empty() ? nullptr : sges.data())
         : (length > 0 ? &sge : nullptr);
-    wr.num_sge = config_.rdma_chunk_per_token_sge_enabled
+    wr.num_sge = effective_rdma_chunk_per_token_sge_enabled(config_)
         ? static_cast<int>(sges.size())
         : (length > 0 ? 1 : 0);
     wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;

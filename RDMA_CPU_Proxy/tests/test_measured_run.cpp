@@ -77,6 +77,21 @@ int main() {
 
     {
         auto config = make_config();
+        config.num_gpus_per_node = 2;
+        config.router_routing_enabled = true;
+        config.router_num_experts = 8;
+        config.router_top_k = 2;
+        config.router_seed = 9876;
+        validate_config(config);
+
+        Proxy proxy(config);
+        proxy.initialize();
+        proxy.run();
+        proxy.shutdown();
+    }
+
+    {
+        auto config = make_config();
         config.num_nodes = 4;
         config.num_iterations = 1;
         config.sequential_peer_transfers = true;

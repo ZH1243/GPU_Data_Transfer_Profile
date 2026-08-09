@@ -6,6 +6,7 @@
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 
 namespace rdma_proxy {
 
@@ -70,6 +71,105 @@ std::vector<ChunkDescriptor> compute_chunks(
         chunks.push_back(desc);
     }
     return chunks;
+}
+
+std::vector<ChunkDescriptor> compute_chunks_from_token_indices(
+    const std::vector<std::size_t>& source_token_indices,
+    std::size_t token_dimension,
+    std::size_t dtype_size,
+    std::size_t tokens_per_chunk,
+    int num_qps_per_peer) {
+    if (tokens_per_chunk == 0) throw std::runtime_error("tokens_per_chunk must be > 0");
+    if (num_qps_per_peer <= 0) throw std::runtime_error("num_qps_per_peer must be > 0");
+
+    const std::size_t token_bytes = token_dimension * dtype_size;
+    const std::size_t num_chunks =
+        (source_token_indices.size() + tokens_per_chunk - 1) / tokens_per_chunk;
+    std::vector<ChunkDescriptor> chunks;
+    chunks.reserve(num_chunks);
+    for (std::size_t chunk = 0; chunk < num_chunks; ++chunk) {
+        const std::size_t start = chunk * tokens_per_chunk;
+        const std::size_t count =
+            std::min(tokens_per_chunk, source_token_indices.size() - start);
+        ChunkDescriptor desc;
+        desc.chunk_index = chunk;
+        desc.start_token = start;
+        desc.num_tokens = count;
+        desc.src_offset_bytes = 0;
+        desc.dst_offset_bytes = start * token_bytes;
+        desc.length_bytes = count * token_bytes;
+        desc.qp_index = -1;
+        desc.imm_data = encode_immediate(chunk);
+        desc.source_token_indices.assign(
+            source_token_indices.begin() + static_cast<std::ptrdiff_t>(start),
+            source_token_indices.begin() + static_cast<std::ptrdiff_t>(start + count));
+        chunks.push_back(std::move(desc));
+    }
+    return chunks;
+}
+
+std::string serialize_router_x3_metadata(const RouterX3Metadata& metadata) {
+    std::ostringstream out;
+    out << "router_x3_v1 "
+        << metadata.source_node_rank << ' '
+        << metadata.destination_node_rank << ' '
+        << metadata.local_gpu_index << ' '
+        << metadata.num_nodes << ' '
+        << metadata.num_gpus_per_node << ' '
+        << metadata.num_experts << ' '
+        << metadata.top_k << ' '
+        << metadata.num_tokens << ' '
+        << metadata.token_dimension << ' '
+        << metadata.element_bytes << ' '
+        << metadata.tokens_per_chunk << ' '
+        << metadata.token_indices.size();
+    for (const auto token : metadata.token_indices) out << ' ' << token;
+    return out.str();
+}
+
+RouterX3Metadata deserialize_router_x3_metadata(
+    const std::string& payload,
+    std::size_t maximum_num_tokens) {
+    std::istringstream in(payload);
+    std::string version;
+    RouterX3Metadata metadata;
+    std::size_t count = 0;
+    in >> version
+       >> metadata.source_node_rank
+       >> metadata.destination_node_rank
+       >> metadata.local_gpu_index
+       >> metadata.num_nodes
+       >> metadata.num_gpus_per_node
+       >> metadata.num_experts
+       >> metadata.top_k
+       >> metadata.num_tokens
+       >> metadata.token_dimension
+       >> metadata.element_bytes
+       >> metadata.tokens_per_chunk
+       >> count;
+    if (!in || version != "router_x3_v1") {
+        throw std::runtime_error("failed to parse router x3 metadata header");
+    }
+    if (metadata.num_tokens > maximum_num_tokens || count > metadata.num_tokens) {
+        throw std::runtime_error("router x3 metadata token count exceeds configured capacity");
+    }
+    metadata.token_indices.resize(count);
+    std::vector<bool> seen(metadata.num_tokens, false);
+    for (auto& token : metadata.token_indices) {
+        in >> token;
+        if (!in || token >= metadata.num_tokens) {
+            throw std::runtime_error("router x3 metadata contains an invalid token index");
+        }
+        if (seen[token]) {
+            throw std::runtime_error("router x3 metadata contains a duplicate token index");
+        }
+        seen[token] = true;
+    }
+    std::string trailing;
+    if (in >> trailing) {
+        throw std::runtime_error("router x3 metadata contains trailing fields");
+    }
+    return metadata;
 }
 
 std::string serialize_peer_info(const PeerConnectionInfo& info) {

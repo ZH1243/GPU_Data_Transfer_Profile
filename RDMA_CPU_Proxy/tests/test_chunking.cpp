@@ -59,6 +59,40 @@ int main() {
         differs_from_contiguous = differs_from_contiguous || assigned[i] != i;
     }
     assert(differs_from_contiguous);
+
+    const std::vector<std::size_t> router_order{3, 1, 4, 9, 10, 45};
+    const auto router_chunks = compute_chunks_from_token_indices(
+        router_order,
+        /*token_dimension=*/4,
+        /*dtype_size=*/2,
+        /*tokens_per_chunk=*/3,
+        /*num_qps_per_peer=*/2);
+    assert(router_chunks.size() == 2);
+    assert((router_chunks[0].source_token_indices == std::vector<std::size_t>{3, 1, 4}));
+    assert((router_chunks[1].source_token_indices == std::vector<std::size_t>{9, 10, 45}));
+    assert(router_chunks[0].dst_offset_bytes == 0);
+    assert(router_chunks[1].dst_offset_bytes == 3 * 4 * 2);
+    assert(router_chunks[0].length_bytes == 3 * 4 * 2);
+
+    RouterX3Metadata metadata;
+    metadata.source_node_rank = 2;
+    metadata.destination_node_rank = 0;
+    metadata.local_gpu_index = 3;
+    metadata.num_nodes = 4;
+    metadata.num_gpus_per_node = 8;
+    metadata.num_experts = 256;
+    metadata.top_k = 8;
+    metadata.num_tokens = 64;
+    metadata.token_dimension = 4;
+    metadata.element_bytes = 2;
+    metadata.tokens_per_chunk = 3;
+    metadata.token_indices = router_order;
+    const auto decoded_metadata = deserialize_router_x3_metadata(
+        serialize_router_x3_metadata(metadata), metadata.num_tokens);
+    assert(decoded_metadata.source_node_rank == metadata.source_node_rank);
+    assert(decoded_metadata.destination_node_rank == metadata.destination_node_rank);
+    assert(decoded_metadata.local_gpu_index == metadata.local_gpu_index);
+    assert(decoded_metadata.token_indices == router_order);
     assert(decode_immediate(encode_immediate(1234)) == 1234);
 
     PeerConnectionInfo info;

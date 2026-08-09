@@ -59,9 +59,10 @@ CudaBuffers::CudaBuffers(ProxyConfig config) : config_(std::move(config)) {}
 
 CudaBuffers::~CudaBuffers() {
     for (auto& entry : buffers_) {
-        free_buffer(entry.send);
+        if (!config_.router_routing_enabled) free_buffer(entry.send);
         free_buffer(entry.recv);
     }
+    free_buffer(router_send_buffer_);
     for (auto& entry : nvlink_recv_buffers_) {
         free_buffer(entry.recv);
     }
@@ -82,10 +83,18 @@ void CudaBuffers::initialize() {
 
     buffers_.clear();
     buffers_.reserve(config_.peers.size());
+    if (config_.router_routing_enabled) {
+        allocate_buffer(router_send_buffer_, bytes);
+        RDMA_PROXY_LOG_INFO("allocated shared router RDMA send buffer bytes=", bytes);
+    }
     for (const auto& peer : config_.peers) {
         PeerGpuBuffers entry;
         entry.peer_rank = peer.node_rank;
-        allocate_buffer(entry.send, bytes);
+        if (config_.router_routing_enabled) {
+            entry.send = router_send_buffer_;
+        } else {
+            allocate_buffer(entry.send, bytes);
+        }
         allocate_buffer(entry.recv, bytes);
         buffers_.push_back(entry);
         RDMA_PROXY_LOG_INFO("allocated GPU buffers for peer ", peer.node_rank, " bytes=", bytes);
@@ -128,6 +137,25 @@ void CudaBuffers::fill_test_pattern(int peer_rank, int source_rank, int destinat
     check_cuda(cudaMemcpy(peer.send.ptr, pattern.data(), pattern.size(), cudaMemcpyHostToDevice), "cudaMemcpy H2D test pattern");
 #else
     throw std::runtime_error("CUDA test-pattern fill requested but CUDA support was not built");
+#endif
+}
+
+void CudaBuffers::fill_router_test_pattern(int source_rank, uint64_t iteration) {
+    if (!config_.router_routing_enabled || !router_send_buffer_.ptr) {
+        throw std::runtime_error("router send buffer is not initialized");
+    }
+    const auto pattern = make_test_pattern(
+        router_send_buffer_.bytes, source_rank, -1, config_.local_gpu_index, iteration);
+    if (config_.mock_mode) {
+        std::memcpy(router_send_buffer_.ptr, pattern.data(), pattern.size());
+        return;
+    }
+#if RDMA_PROXY_HAVE_CUDA
+    check_cuda(cudaMemcpy(
+        router_send_buffer_.ptr, pattern.data(), pattern.size(), cudaMemcpyHostToDevice),
+        "cudaMemcpy H2D router test pattern");
+#else
+    throw std::runtime_error("CUDA router test-pattern fill requested but CUDA support was not built");
 #endif
 }
 

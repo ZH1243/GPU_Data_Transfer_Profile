@@ -276,6 +276,7 @@ uint64_t unix_epoch_nanoseconds_now() {
 Proxy::Proxy(ProxyConfig config)
     : config_(std::move(config)),
       cuda_buffers_(config_),
+      router_routing_(config_),
       rdma_context_(config_),
       connection_manager_(config_) {}
 
@@ -289,6 +290,7 @@ void Proxy::initialize() {
 
     rdma_iteration_bandwidth_gbps_.clear();
     initialize_local_iteration_sync();
+    router_routing_.initialize();
     cuda_buffers_.initialize();
     rdma_context_.initialize();
 
@@ -367,6 +369,8 @@ void Proxy::setup_peer(PeerGpuBuffers& buffers) {
     }
     peer.remote_recv_mr = remote_info.recv_buffer;
     peer.remote_gpu_index = remote_info.gpu_index;
+    peer.receive_chunks = config_.router_routing_enabled ?
+        exchange_router_receive_chunks(peer_addr) : make_chunks();
 
     for (std::size_t q = 0; q < peer.qps.size(); ++q) {
         peer.qps[q]->connect(remote_info.qps[q]);
@@ -374,7 +378,7 @@ void Proxy::setup_peer(PeerGpuBuffers& buffers) {
             *peer.qps[q],
             config_.completion_poll_batch_size,
             config_.max_in_flight_chunks_per_qp);
-        worker->configure_expected_chunks(make_chunks().size());
+        worker->configure_expected_chunks(peer.receive_chunks.size());
         if (config_.nvlink_forward_out_of_order_chunks_enabled) {
             const auto peer_index = peers_.size();
             worker->set_receive_immediate_callback(
@@ -390,6 +394,57 @@ void Proxy::setup_peer(PeerGpuBuffers& buffers) {
     synchronize_peer_ready(peer_addr, peer);
     RDMA_PROXY_LOG_INFO("peer ", buffers.peer_rank, " initialized with ", peer.qps.size(), " RC QPs");
     peers_.push_back(std::move(peer));
+}
+
+std::vector<ChunkDescriptor> Proxy::exchange_router_receive_chunks(
+    const PeerAddress& peer_addr) const {
+    RouterX3Metadata local;
+    local.source_node_rank = config_.node_rank;
+    local.destination_node_rank = peer_addr.node_rank;
+    local.local_gpu_index = config_.local_gpu_index;
+    local.num_nodes = config_.num_nodes;
+    local.num_gpus_per_node = config_.num_gpus_per_node;
+    local.num_experts = config_.router_num_experts;
+    local.top_k = config_.router_top_k;
+    local.num_tokens = config_.num_tokens;
+    local.token_dimension = config_.token_dimension;
+    local.element_bytes = dtype_size(config_.dtype);
+    local.tokens_per_chunk = config_.tokens_per_chunk;
+    local.token_indices = router_routing_.token_indices_for_node(peer_addr.node_rank);
+
+    const auto remote_payload = connection_manager_.exchange_control_message(
+        peer_addr,
+        serialize_router_x3_metadata(local),
+        config_.completion_timeout_ms);
+    const auto remote = deserialize_router_x3_metadata(remote_payload, config_.num_tokens);
+    const int expected_source = config_.mock_mode ? config_.node_rank : peer_addr.node_rank;
+    const int expected_destination = config_.mock_mode ? peer_addr.node_rank : config_.node_rank;
+    if (remote.source_node_rank != expected_source ||
+        remote.destination_node_rank != expected_destination ||
+        remote.local_gpu_index != config_.local_gpu_index) {
+        throw std::runtime_error("router x3 TCP metadata rank/GPU mismatch");
+    }
+    if (remote.num_nodes != config_.num_nodes ||
+        remote.num_gpus_per_node != config_.num_gpus_per_node ||
+        remote.num_experts != config_.router_num_experts ||
+        remote.top_k != config_.router_top_k ||
+        remote.num_tokens != config_.num_tokens ||
+        remote.token_dimension != config_.token_dimension ||
+        remote.element_bytes != dtype_size(config_.dtype) ||
+        remote.tokens_per_chunk != config_.tokens_per_chunk) {
+        throw std::runtime_error("router x3 TCP metadata tensor/chunk configuration mismatch");
+    }
+    RDMA_PROXY_LOG_INFO(
+        "received router x3 metadata peer=", peer_addr.node_rank,
+        " routed_tokens=", remote.token_indices.size(),
+        " chunks=", (remote.token_indices.size() + config_.tokens_per_chunk - 1) /
+            config_.tokens_per_chunk);
+    return compute_chunks_from_token_indices(
+        remote.token_indices,
+        config_.token_dimension,
+        dtype_size(config_.dtype),
+        config_.tokens_per_chunk,
+        config_.num_qps_per_peer);
 }
 
 void Proxy::synchronize_peer_ready(const PeerAddress& peer_addr, const PeerState& peer) const {
@@ -1212,15 +1267,21 @@ void Proxy::nvlink_forward_notification_loop() {
 }
 
 void Proxy::run_iteration(uint64_t iteration) {
-    const auto chunks = make_chunks();
-    const auto bytes_per_peer = cuda_buffers_.token_buffer_bytes();
+    std::vector<std::vector<ChunkDescriptor>> chunks_by_peer;
+    chunks_by_peer.reserve(peers_.size());
+    std::size_t total_bytes = 0;
+    for (const auto& peer : peers_) {
+        chunks_by_peer.push_back(make_chunks(peer.peer_rank));
+        for (const auto& chunk : chunks_by_peer.back()) total_bytes += chunk.length_bytes;
+    }
 
     fill_iteration_send_buffers(iteration);
 
     std::vector<std::vector<QPCompletionBaseline>> baselines;
     baselines.reserve(peers_.size());
-    for (const auto& peer : peers_) {
-        baselines.push_back(capture_baselines(peer, chunks));
+    for (std::size_t peer_index = 0; peer_index < peers_.size(); ++peer_index) {
+        baselines.push_back(capture_baselines(
+            peers_[peer_index], peers_[peer_index].receive_chunks));
     }
     synchronize_iteration_start(iteration);
 
@@ -1230,7 +1291,7 @@ void Proxy::run_iteration(uint64_t iteration) {
         const auto order = sequential_peer_order();
         for (const auto peer_index : order) {
             dispatchers[peer_index] = enqueue_chunks(
-                peers_[peer_index], cuda_buffers_.peer_buffers()[peer_index], chunks);
+                peers_[peer_index], cuda_buffers_.peer_buffers()[peer_index], chunks_by_peer[peer_index]);
             wait_for_outgoing_transfer(peers_[peer_index], baselines[peer_index], dispatchers[peer_index]);
         }
         for (std::size_t i = 0; i < peers_.size(); ++i) {
@@ -1238,7 +1299,8 @@ void Proxy::run_iteration(uint64_t iteration) {
         }
     } else {
         for (std::size_t i = 0; i < peers_.size(); ++i) {
-            dispatchers[i] = enqueue_chunks(peers_[i], cuda_buffers_.peer_buffers()[i], chunks);
+            dispatchers[i] = enqueue_chunks(
+                peers_[i], cuda_buffers_.peer_buffers()[i], chunks_by_peer[i]);
         }
         for (std::size_t i = 0; i < peers_.size(); ++i) {
             wait_for_iteration(peers_[i], baselines[i], dispatchers[i]);
@@ -1257,12 +1319,13 @@ void Proxy::run_iteration(uint64_t iteration) {
 
     std::size_t verification_errors = 0;
     for (std::size_t i = 0; i < peers_.size(); ++i) {
-        verification_errors += verify_immediates(peers_[i], chunks, baselines[i], assignments[i], iteration);
+        verification_errors += verify_immediates(
+            peers_[i], peers_[i].receive_chunks, baselines[i], assignments[i], iteration);
     }
     const auto validation_errors = validate_received_data(iteration);
 
     report_iteration(
-        iteration, start, seconds, bytes_per_peer, baselines, assignments,
+        iteration, start, seconds, total_bytes, baselines, assignments,
         verification_errors, validation_errors);
     if (verification_errors != 0) {
         RDMA_PROXY_LOG_WARN("iteration=", iteration,
@@ -1278,6 +1341,10 @@ void Proxy::run_iteration(uint64_t iteration) {
 
 void Proxy::fill_iteration_send_buffers(uint64_t iteration) {
     if (!config_.fill_test_data) return;
+    if (config_.router_routing_enabled) {
+        cuda_buffers_.fill_router_test_pattern(config_.node_rank, iteration);
+        return;
+    }
     for (const auto& buffers : cuda_buffers_.peer_buffers()) {
         cuda_buffers_.fill_test_pattern(buffers.peer_rank, config_.node_rank, buffers.peer_rank, iteration);
     }
@@ -1563,14 +1630,25 @@ std::size_t Proxy::synchronize_local_nvlink_forward_batch_start(
     }
 }
 
-std::vector<ChunkDescriptor> Proxy::make_chunks() const {
+std::vector<ChunkDescriptor> Proxy::make_chunks(int peer_rank) const {
+    if (config_.router_routing_enabled) {
+        if (peer_rank < 0) {
+            throw std::runtime_error("router chunk construction requires a peer node rank");
+        }
+        return compute_chunks_from_token_indices(
+            router_routing_.token_indices_for_node(peer_rank),
+            config_.token_dimension,
+            dtype_size(config_.dtype),
+            config_.tokens_per_chunk,
+            config_.num_qps_per_peer);
+    }
     return compute_chunks(
         config_.num_tokens,
         config_.token_dimension,
         dtype_size(config_.dtype),
         config_.tokens_per_chunk,
         config_.num_qps_per_peer,
-        config_.rdma_discontinuous_token_payload_enabled);
+        effective_rdma_discontinuous_token_payload_enabled(config_));
 }
 
 std::vector<std::size_t> Proxy::sequential_peer_order() const {
@@ -3075,14 +3153,16 @@ std::size_t Proxy::verify_immediates(
 
 std::size_t Proxy::validate_received_data(uint64_t iteration) const {
     if (!config_.validate_data) return 0;
-    const auto chunks = config_.rdma_discontinuous_token_payload_enabled ?
-        make_chunks() : std::vector<ChunkDescriptor>{};
     std::size_t errors = 0;
-    for (const auto& buffers : cuda_buffers_.peer_buffers()) {
+    for (std::size_t peer_index = 0; peer_index < peers_.size(); ++peer_index) {
+        const auto& peer = peers_[peer_index];
+        const auto& buffers = cuda_buffers_.peer_buffers()[peer_index];
+        const auto& chunks = peer.receive_chunks;
         std::string error;
         const int expected_source = config_.mock_mode ? config_.node_rank : buffers.peer_rank;
-        const int expected_destination = config_.mock_mode ? buffers.peer_rank : config_.node_rank;
-        const bool valid = config_.rdma_discontinuous_token_payload_enabled ?
+        const int expected_destination = config_.router_routing_enabled ? -1 :
+            (config_.mock_mode ? buffers.peer_rank : config_.node_rank);
+        const bool valid = effective_rdma_discontinuous_token_payload_enabled(config_) ?
             cuda_buffers_.validate_recv_pattern(
                 buffers.peer_rank, expected_source, expected_destination, iteration, chunks, &error) :
             cuda_buffers_.validate_recv_pattern(
@@ -3183,12 +3263,11 @@ void Proxy::report_iteration(
     uint64_t iteration,
     std::chrono::steady_clock::time_point start,
     double seconds,
-    std::size_t bytes_per_peer,
+    std::size_t total_bytes,
     const std::vector<std::vector<QPCompletionBaseline>>& baselines,
     const std::vector<IterationAssignment>& assignments,
     std::size_t verification_errors,
     std::size_t validation_errors) {
-    const auto total_bytes = bytes_per_peer * peers_.size();
     const double gbps = seconds > 0.0 ? (static_cast<double>(total_bytes) * 8.0 / seconds / 1.0e9) : 0.0;
     const double latency_us = seconds * 1.0e6;
     rdma_iteration_bandwidth_gbps_.push_back(gbps);

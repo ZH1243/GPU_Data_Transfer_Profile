@@ -48,6 +48,10 @@ struct ProxyConfig {
     int max_in_flight_chunks_per_qp{1};
     bool rdma_chunk_per_token_sge_enabled{false};
     bool rdma_discontinuous_token_payload_enabled{false};
+    bool router_routing_enabled{false};
+    int router_num_experts{0};
+    int router_top_k{0};
+    uint64_t router_seed{1234};
     int send_queue_depth{128};
     int recv_queue_depth{128};
     int cq_depth{256};
@@ -97,6 +101,8 @@ std::string to_string(DataType dtype);
 DataType dtype_from_string(const std::string& value);
 bool nvlink_forward_dynamic_threshold_enabled(const ProxyConfig& config);
 std::size_t effective_nvlink_forward_threshold_tokens(const ProxyConfig& config);
+bool effective_rdma_chunk_per_token_sge_enabled(const ProxyConfig& config);
+bool effective_rdma_discontinuous_token_payload_enabled(const ProxyConfig& config);
 
 ProxyConfig load_config_file(const std::string& path);
 ProxyConfig load_config(int argc, char** argv);

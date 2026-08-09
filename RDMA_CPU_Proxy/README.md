@@ -33,7 +33,7 @@ Each token buffer is contiguous row-major memory with shape:
 (num_tokens, token_dimension)
 ```
 
-The default element type is BF16, represented as two bytes per element. For each peer, the proxy allocates:
+The default element type is BF16, represented as two bytes per element. In the legacy mode, for each peer the proxy allocates:
 
 - one GPU send token buffer
 - one GPU receive token buffer
@@ -45,6 +45,41 @@ num_tokens * token_dimension * sizeof(dtype)
 ```
 
 The CUDA path uses `cudaMalloc` and host-to-device copies for generated test payloads. In mock mode, host memory is allocated instead. When `fill_test_data` is enabled, every iteration fills each peer send buffer with deterministic byte data keyed by source rank, destination rank, GPU index, iteration, and byte offset. When `validate_data` is enabled, the receive buffer is copied back and checked after all expected immediate completions arrive.
+
+## Router-Driven RDMA Mode
+
+Set `router_routing_enabled=true` to select the RDMA-only router mode. Configure the global expert count and top-k with `num_experts` and `top_k`; `experts_per_gpu` is derived as:
+
+```text
+num_experts / (num_nodes * num_gpus_per_node)
+```
+
+This mode requires `num_experts` to divide evenly across all GPUs, `num_gpus_per_node` to be in `[2, 8]`, and `num_experts <= 1024`. It is rejected when `nvlink_forwarding_enabled=true` because `x4`-driven forwarding is not implemented yet. `router_seed` controls the test routing-table generator. Different proxies may use different seeds or actual router contents; only the tensor dimensions and chunk configuration must match.
+
+At initialization the proxy:
+
+- allocates one `[num_tokens, top_k]` int32 routing table `R` in HBM;
+- launches the same random router-table and node-mask-sort kernels used by `get_expert_token_idx_list_gpu` with `local_gpu_index` as `local-gpu-id`;
+- leaves `x3` and `x4` in HBM, copies the node offsets and `x3` through CUDA into pinned CPU memory, and retains the per-node `x3` lists;
+- exchanges each destination-specific `x3` list and its tensor/chunk metadata with that peer over the existing TCP control channel;
+- ignores `x3[local_node]` for outgoing RDMA and builds a different chunk list for every remote peer node.
+
+Router mode allocates one shared RDMA send buffer on the local GPU instead of one send buffer per peer. Every `x3[peer_node]` list is divided into `tokens_per_chunk` entries. For example, `[3, 1, 4, 9, 10, 45]` with `tokens_per_chunk=3` produces chunks `[3, 1, 4]` and `[9, 10, 45]`. Each chunk uses one SGE per token to gather those discontinuous rows from the shared send buffer and writes them contiguously to the peer receive buffer. Router mode enables the effective behavior of both `rdma_chunk_per_token_sge_enabled` and `rdma_discontinuous_token_payload_enabled`; those two legacy test flags do not also need to be set.
+
+Because every sender may have different router contents, outgoing completion and byte accounting use the local `x3[peer_node]`, while incoming completion and validation expectations use the actual remote `x3` received over TCP. The receiver therefore observes and validates the exact sender-side `x3` order without assuming identical routing tables.
+
+Example overrides:
+
+```bash
+./RDMA_CPU_Proxy/build/rdma_cpu_proxy \
+  --config RDMA_CPU_Proxy/config/example_config.json \
+  --router_routing_enabled=true \
+  --num_experts=256 \
+  --top_k=8 \
+  --router_seed=1234 \
+  --nvlink_forwarding_enabled=false \
+  --mock_mode=false
+```
 
 ## Intra-Node NVLink Forwarding
 
