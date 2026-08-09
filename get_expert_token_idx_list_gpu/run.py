@@ -16,8 +16,6 @@ from torch.utils.cpp_extension import load
 
 
 BLOCK_TOKENS = 256
-GPUS_PER_NODE = 8
-NUM_NODE_MASKS = 1 << GPUS_PER_NODE
 _extension = None
 
 
@@ -58,14 +56,18 @@ def allocate_outputs(
 
 
 def allocate_node_mask_outputs(
-    r: torch.Tensor, num_experts: int, experts_per_gpu: int
+    r: torch.Tensor,
+    num_experts: int,
+    experts_per_gpu: int,
+    gpus_per_node: int,
 ):
     num_tokens, top_k = r.shape
-    experts_per_node = experts_per_gpu * GPUS_PER_NODE
+    experts_per_node = experts_per_gpu * gpus_per_node
     num_nodes = num_experts // experts_per_node
+    num_node_masks = 1 << gpus_per_node
     num_input_chunks = (num_tokens + BLOCK_TOKENS - 1) // BLOCK_TOKENS
-    input_num_bins = num_experts + num_nodes * NUM_NODE_MASKS
-    reordered_num_bins = experts_per_node + GPUS_PER_NODE
+    input_num_bins = num_experts + num_nodes * num_node_masks
+    reordered_num_bins = experts_per_node + gpus_per_node
 
     values = torch.empty(r.numel(), dtype=torch.int32, device=r.device)
     offsets = torch.empty(num_experts + 1, dtype=torch.int32, device=r.device)
@@ -79,7 +81,7 @@ def allocate_node_mask_outputs(
     )
     input_prefixes = torch.empty_like(input_counts)
     node_mask_offsets = torch.empty(
-        (num_nodes, NUM_NODE_MASKS), dtype=torch.int32, device=r.device
+        (num_nodes, num_node_masks), dtype=torch.int32, device=r.device
     )
     reordered_counts = torch.empty(
         (num_nodes, num_input_chunks, reordered_num_bins),
@@ -141,10 +143,13 @@ def check_result(
 
 
 def cpu_node_mask_reference(
-    r: torch.Tensor, num_experts: int, experts_per_gpu: int
+    r: torch.Tensor,
+    num_experts: int,
+    experts_per_gpu: int,
+    gpus_per_node: int,
 ) -> Tuple[List[List[int]], List[List[int]]]:
     routes = r.cpu().tolist()
-    experts_per_node = experts_per_gpu * GPUS_PER_NODE
+    experts_per_node = experts_per_gpu * gpus_per_node
     num_nodes = num_experts // experts_per_node
     node_entries: List[List[Tuple[int, int]]] = [[] for _ in range(num_nodes)]
 
@@ -152,7 +157,7 @@ def cpu_node_mask_reference(
         masks = {}
         for expert in row:
             node = expert // experts_per_node
-            local_gpu = (expert // experts_per_gpu) % GPUS_PER_NODE
+            local_gpu = (expert // experts_per_gpu) % gpus_per_node
             masks[node] = masks.get(node, 0) | (1 << local_gpu)
         for node, mask in masks.items():
             node_entries[node].append((mask, token))
@@ -164,13 +169,13 @@ def cpu_node_mask_reference(
 
     expert_lists: List[List[int]] = [[] for _ in range(num_experts)]
     for node, entries in enumerate(node_entries):
-        gpu_positions = [0] * GPUS_PER_NODE
+        gpu_positions = [0] * gpus_per_node
         for mask, token in entries:
             for expert in routes[token]:
                 if expert // experts_per_node == node:
-                    local_gpu = (expert // experts_per_gpu) % GPUS_PER_NODE
+                    local_gpu = (expert // experts_per_gpu) % gpus_per_node
                     expert_lists[expert].append(gpu_positions[local_gpu])
-            for gpu in range(GPUS_PER_NODE):
+            for gpu in range(gpus_per_node):
                 if mask & (1 << gpu):
                     gpu_positions[gpu] += 1
     return expert_lists, [
@@ -186,9 +191,10 @@ def check_node_mask_result(
     node_offsets: torch.Tensor,
     num_experts: int,
     experts_per_gpu: int,
+    gpus_per_node: int,
 ) -> None:
     expected_experts, expected_nodes = cpu_node_mask_reference(
-        r, num_experts, experts_per_gpu
+        r, num_experts, experts_per_gpu, gpus_per_node
     )
     host_values = values.cpu()
     host_offsets = offsets.cpu().tolist()
@@ -228,7 +234,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--node-mask-sort",
         action="store_true",
-        help="reorder each 8-GPU node's sender tokens by descending GPU mask",
+        help="reorder each node's sender tokens by descending GPU mask",
+    )
+    parser.add_argument(
+        "--gpus-per-node",
+        type=int,
+        choices=range(2, 9),
+        default=8,
+        metavar="N",
+        help="GPUs per node for --node-mask-sort (2-8; default: 8)",
     )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--warmup", type=int, default=20)
@@ -252,11 +266,11 @@ def main() -> None:
     if args.experts_per_gpu <= 0 or args.experts % args.experts_per_gpu:
         raise ValueError("experts-per-gpu must be positive and divide experts")
     if args.node_mask_sort and args.experts % (
-        args.experts_per_gpu * GPUS_PER_NODE
+        args.experts_per_gpu * args.gpus_per_node
     ):
         raise ValueError(
             "node-mask mode requires experts to be divisible by "
-            "experts-per-gpu * 8"
+            "experts-per-gpu * gpus-per-node"
         )
     if args.warmup < 0 or args.iters <= 0:
         raise ValueError("warmup must be non-negative and iters must be positive")
@@ -289,13 +303,16 @@ def main() -> None:
             node_mask_offsets,
             reordered_counts,
             reordered_prefixes,
-        ) = allocate_node_mask_outputs(r, args.experts, args.experts_per_gpu)
+        ) = allocate_node_mask_outputs(
+            r, args.experts, args.experts_per_gpu, args.gpus_per_node
+        )
 
         def launch() -> None:
             extension.get_expert_token_idx_node_mask(
                 r,
                 args.experts,
                 args.experts_per_gpu,
+                args.gpus_per_node,
                 values,
                 offsets,
                 node_token_indices,
@@ -335,6 +352,7 @@ def main() -> None:
                 node_offsets,
                 args.experts,
                 args.experts_per_gpu,
+                args.gpus_per_node,
             )
         else:
             check_result(
@@ -356,7 +374,7 @@ def main() -> None:
     latency_us = elapsed_ms * 1000.0 / args.iters
 
     mode_details = (
-        "mode=node-mask-sort GPUs_per_node=8"
+        f"mode=node-mask-sort GPUs_per_node={args.gpus_per_node}"
         if args.node_mask_sort
         else "mode=gpu"
     )

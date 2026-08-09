@@ -24,21 +24,23 @@ python run.py --tokens 16384 --top-k 8 --experts 256 \
   --experts-per-gpu 32 --check --warmup 20 --iters 200
 ```
 
-## Eight-GPU node mask ordering
+## Node mask ordering
 
 Pass `--node-mask-sort` to enable the node-aware mode:
 
 ```bash
 python run.py --tokens 16384 --top-k 8 --experts 256 \
-  --experts-per-gpu 16 --node-mask-sort --check
+  --experts-per-gpu 16 --node-mask-sort --gpus-per-node 4 --check
 ```
 
-This mode fixes the node size at eight GPUs.  With 16 experts per GPU,
-experts 0--127 belong to node 0 and experts 128--255 belong to node 1.  For
-each token and destination node, an 8-bit mask records the GPUs in that node
-selected by the token (`bit g` represents node-local GPU `g`).  Tokens sent to
-each node are stably sorted by the mask's unsigned numeric value in descending
-order; equal masks retain input-token order.
+The node size is configured with `--gpus-per-node N`, where `N` can be any
+integer from 2 through 8 and defaults to 8. With 16 experts per GPU and
+`--gpus-per-node 4`, experts 0--63 belong to node 0, experts 64--127 to node 1,
+and so on. For each token and destination node, an N-bit mask records the GPUs
+in that node selected by the token (`bit g` represents node-local GPU `g`).
+Tokens sent to each node are stably sorted by the mask's unsigned numeric value
+in descending order; equal masks retain input-token order. The number of mask
+bins and all scratch-buffer sizes are derived from `N`.
 
 The additional output is another packed ragged array:
 
@@ -48,7 +50,7 @@ The additional output is another packed ragged array:
   `node_token_indices[node_offsets[i]:node_offsets[i + 1]]`.
 
 The temporary `x1` and `x2` arrays are never materialized.  The CUDA code uses
-per-chunk `(node, mask)` histograms and a stable 8-bit counting-sort scatter to
+per-chunk `(node, mask)` histograms and a stable counting-sort scatter to
 write `x3` directly.  It then computes the per-GPU filtered ranks in `x3`
 order and rebuilds `expert_token_indices`, so each value matches the token's
 new arrival position at its destination GPU.  Output and scratch allocation

@@ -16,8 +16,8 @@ namespace {
 constexpr int kBlockThreads = 256;
 constexpr int kWarps = kBlockThreads / 32;
 constexpr int kMaxExperts = 1024;
-constexpr int kGpusPerNode = 8;
-constexpr int kNumMasks = 1 << kGpusPerNode;
+constexpr int kMinGpusPerNode = 2;
+constexpr int kMaxGpusPerNode = 8;
 
 __device__ __forceinline__ uint64_t splitmix64(uint64_t x) {
   x += 0x9e3779b97f4a7c15ULL;
@@ -192,9 +192,9 @@ __global__ __launch_bounds__(kBlockThreads) void scatter_chunks_kernel(
     local_indices[route] = 0;
   }
 
-  // Count the tokens for every destination GPU in each warp.  Looping GPUs
-  // (normally only 8 on an 8-GPU node) makes the rank stable by token number,
-  // even when two rows list their routes in different orders.
+  // Count the tokens for every destination GPU in each warp. Looping GPUs
+  // makes the rank stable by token number, even when two rows list their
+  // routes in different orders.
   for (int gpu = 0; gpu < num_gpus; ++gpu) {
     bool routed_to_gpu = false;
 #pragma unroll
@@ -338,7 +338,7 @@ __global__ void scatter_by_expert_fallback_kernel(
 }
 
 // Node-mask mode, pass 1: count expert routes and stable counting-sort bins.
-// There is one bin for every (destination node, 8-bit destination-GPU mask).
+// There is one bin for every (destination node, destination-GPU mask).
 __global__ void count_node_input_chunks_kernel(
     const int32_t* __restrict__ r,
     int num_tokens,
@@ -347,9 +347,11 @@ __global__ void count_node_input_chunks_kernel(
     int experts_per_gpu,
     int experts_per_node,
     int num_nodes,
+    int gpus_per_node,
+    int num_masks,
     int32_t* __restrict__ chunk_counts) {
   extern __shared__ int32_t counts[];
-  int num_node_mask_bins = num_nodes * kNumMasks;
+  int num_node_mask_bins = num_nodes * num_masks;
   int num_bins = num_experts + num_node_mask_bins;
   for (int bin = threadIdx.x; bin < num_bins; bin += blockDim.x) {
     counts[bin] = 0;
@@ -381,12 +383,12 @@ __global__ void count_node_input_chunks_kernel(
       for (int other = route; other < top_k; ++other) {
         int other_expert = r[row + other];
         if (other_expert / experts_per_node == node) {
-          int local_gpu = (other_expert / experts_per_gpu) % kGpusPerNode;
+          int local_gpu = (other_expert / experts_per_gpu) % gpus_per_node;
           mask |= 1 << local_gpu;
         }
       }
       atomicAdd(
-          &counts[num_experts + node * kNumMasks + mask], 1);
+          &counts[num_experts + node * num_masks + mask], 1);
     }
   }
   __syncthreads();
@@ -408,8 +410,9 @@ __global__ void scan_node_input_counts_kernel(
     int32_t* __restrict__ node_mask_offsets,
     int num_chunks,
     int num_experts,
-    int num_nodes) {
-  int num_node_mask_bins = num_nodes * kNumMasks;
+    int num_nodes,
+    int num_masks) {
+  int num_node_mask_bins = num_nodes * num_masks;
   int num_bins = num_experts + num_node_mask_bins;
   for (int bin = threadIdx.x; bin < num_bins; bin += blockDim.x) {
     int32_t running = 0;
@@ -438,8 +441,8 @@ __global__ void scan_node_input_counts_kernel(
     int32_t token_running = 0;
     node_offsets[0] = 0;
     for (int node = 0; node < num_nodes; ++node) {
-      int base = node * kNumMasks;
-      for (int mask = kNumMasks - 1; mask >= 1; --mask) {
+      int base = node * num_masks;
+      for (int mask = num_masks - 1; mask >= 1; --mask) {
         int32_t count = node_mask_offsets[base + mask];
         node_mask_offsets[base + mask] = token_running;
         token_running += count;
@@ -460,6 +463,8 @@ __global__ __launch_bounds__(kBlockThreads) void build_node_token_indices_kernel
     int experts_per_gpu,
     int experts_per_node,
     int num_nodes,
+    int gpus_per_node,
+    int num_masks,
     int radix_end_bit,
     const int32_t* __restrict__ chunk_prefixes,
     const int32_t* __restrict__ node_mask_offsets,
@@ -474,7 +479,7 @@ __global__ __launch_bounds__(kBlockThreads) void build_node_token_indices_kernel
 
   int token = blockIdx.x * blockDim.x + threadIdx.x;
   bool valid_token = token < num_tokens;
-  int sentinel = num_nodes * kNumMasks;
+  int sentinel = num_nodes * num_masks;
   int32_t keys[ITEMS_PER_THREAD];
   int32_t values[ITEMS_PER_THREAD];
 
@@ -503,12 +508,12 @@ __global__ __launch_bounds__(kBlockThreads) void build_node_token_indices_kernel
     for (int other = 0; other < ITEMS_PER_THREAD; ++other) {
       int other_expert = r[row + other];
       if (other_expert / experts_per_node == node) {
-        int local_gpu = (other_expert / experts_per_gpu) % kGpusPerNode;
+        int local_gpu = (other_expert / experts_per_gpu) % gpus_per_node;
         mask |= 1 << local_gpu;
       }
     }
     // Ascending encoded keys mean node-major, descending-mask order.
-    keys[route] = node * kNumMasks + (kNumMasks - 1 - mask);
+    keys[route] = node * num_masks + (num_masks - 1 - mask);
   }
 
   BlockSort(storage.sort).Sort(keys, values, 0, radix_end_bit);
@@ -521,7 +526,7 @@ __global__ __launch_bounds__(kBlockThreads) void build_node_token_indices_kernel
   }
   __syncthreads();
 
-  int num_bins = num_experts + num_nodes * kNumMasks;
+  int num_bins = num_experts + num_nodes * num_masks;
   int64_t chunk_row = static_cast<int64_t>(blockIdx.x) * num_bins;
 #pragma unroll
   for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
@@ -542,9 +547,9 @@ __global__ __launch_bounds__(kBlockThreads) void build_node_token_indices_kernel
     }
     int position = threadIdx.x * ITEMS_PER_THREAD + item;
     int in_chunk_rank = position - low;
-    int node = key / kNumMasks;
-    int mask = kNumMasks - 1 - key % kNumMasks;
-    int group = node * kNumMasks + mask;
+    int node = key / num_masks;
+    int mask = num_masks - 1 - key % num_masks;
+    int group = node * num_masks + mask;
     int32_t destination = node_mask_offsets[group] +
         chunk_prefixes[chunk_row + num_experts + group] + in_chunk_rank;
     node_token_indices[destination] = values[item];
@@ -559,12 +564,14 @@ __global__ void build_node_token_indices_fallback_kernel(
     int top_k,
     int experts_per_gpu,
     int experts_per_node,
+    int gpus_per_node,
+    int num_masks,
     const int32_t* __restrict__ node_mask_offsets,
     int32_t* __restrict__ node_token_indices) {
   __shared__ int32_t warp_counts[kWarps];
   __shared__ int32_t group_base;
-  int node = blockIdx.x / (kNumMasks - 1);
-  int mask = kNumMasks - 1 - blockIdx.x % (kNumMasks - 1);
+  int node = blockIdx.x / (num_masks - 1);
+  int mask = num_masks - 1 - blockIdx.x % (num_masks - 1);
   int lane = threadIdx.x & 31;
   int warp = threadIdx.x >> 5;
   if (threadIdx.x == 0) {
@@ -580,7 +587,7 @@ __global__ void build_node_token_indices_fallback_kernel(
       for (int route = 0; route < top_k; ++route) {
         int expert = r[row + route];
         if (expert / experts_per_node == node) {
-          int local_gpu = (expert / experts_per_gpu) % kGpusPerNode;
+          int local_gpu = (expert / experts_per_gpu) % gpus_per_node;
           token_mask |= 1 << local_gpu;
         }
       }
@@ -598,7 +605,7 @@ __global__ void build_node_token_indices_fallback_kernel(
     }
     rank += __popc(selected_mask & ((1u << lane) - 1u));
     if (selected) {
-      int group = node * kNumMasks + mask;
+      int group = node * num_masks + mask;
       node_token_indices[node_mask_offsets[group] + rank] = token;
     }
     __syncthreads();
@@ -618,12 +625,13 @@ __global__ void count_reordered_node_chunks_kernel(
     int top_k,
     int experts_per_gpu,
     int experts_per_node,
+    int gpus_per_node,
     int num_chunks_per_node,
     const int32_t* __restrict__ node_token_indices,
     const int32_t* __restrict__ node_offsets,
     int32_t* __restrict__ chunk_counts) {
   extern __shared__ int32_t counts[];
-  int num_bins = experts_per_node + kGpusPerNode;
+  int num_bins = experts_per_node + gpus_per_node;
   for (int bin = threadIdx.x; bin < num_bins; bin += blockDim.x) {
     counts[bin] = 0;
   }
@@ -646,7 +654,7 @@ __global__ void count_reordered_node_chunks_kernel(
         mask |= 1 << local_gpu;
       }
     }
-    for (int gpu = 0; gpu < kGpusPerNode; ++gpu) {
+    for (int gpu = 0; gpu < gpus_per_node; ++gpu) {
       if (mask & (1 << gpu)) {
         atomicAdd(&counts[experts_per_node + gpu], 1);
       }
@@ -667,8 +675,9 @@ __global__ void scan_reordered_node_counts_kernel(
     int32_t* __restrict__ chunk_prefixes,
     int num_chunks_per_node,
     int experts_per_node,
-    int num_nodes) {
-  int num_bins = experts_per_node + kGpusPerNode;
+    int num_nodes,
+    int gpus_per_node) {
+  int num_bins = experts_per_node + gpus_per_node;
   int total_bins = num_nodes * num_bins;
   for (int global_bin = threadIdx.x;
        global_bin < total_bins;
@@ -692,6 +701,7 @@ __global__ __launch_bounds__(kBlockThreads) void scatter_reordered_chunks_kernel
     int top_k,
     int experts_per_gpu,
     int experts_per_node,
+    int gpus_per_node,
     int num_chunks_per_node,
     int radix_end_bit,
     const int32_t* __restrict__ node_token_indices,
@@ -730,11 +740,11 @@ __global__ __launch_bounds__(kBlockThreads) void scatter_reordered_chunks_kernel
     local_indices[route] = 0;
   }
 
-  int num_bins = experts_per_node + kGpusPerNode;
+  int num_bins = experts_per_node + gpus_per_node;
   int64_t chunk_row =
       (static_cast<int64_t>(node) * num_chunks_per_node + blockIdx.x) *
       num_bins;
-  for (int gpu = 0; gpu < kGpusPerNode; ++gpu) {
+  for (int gpu = 0; gpu < gpus_per_node; ++gpu) {
     bool routed_to_gpu = false;
 #pragma unroll
     for (int route = 0; route < ITEMS_PER_THREAD; ++route) {
@@ -748,7 +758,7 @@ __global__ __launch_bounds__(kBlockThreads) void scatter_reordered_chunks_kernel
   }
   __syncthreads();
 
-  for (int gpu = 0; gpu < kGpusPerNode; ++gpu) {
+  for (int gpu = 0; gpu < gpus_per_node; ++gpu) {
     bool routed_to_gpu = false;
 #pragma unroll
     for (int route = 0; route < ITEMS_PER_THREAD; ++route) {
@@ -943,6 +953,8 @@ void launch_build_node_token_indices_specialized(
     int experts_per_gpu,
     int experts_per_node,
     int num_nodes,
+    int gpus_per_node,
+    int num_masks,
     int num_chunks,
     int radix_end_bit,
     const int32_t* chunk_prefixes,
@@ -957,6 +969,8 @@ void launch_build_node_token_indices_specialized(
       experts_per_gpu,
       experts_per_node,
       num_nodes,
+      gpus_per_node,
+      num_masks,
       radix_end_bit,
       chunk_prefixes,
       node_mask_offsets,
@@ -969,6 +983,7 @@ void launch_scatter_reordered_specialized(
     int top_k,
     int experts_per_gpu,
     int experts_per_node,
+    int gpus_per_node,
     int num_chunks_per_node,
     int num_nodes,
     int radix_end_bit,
@@ -991,6 +1006,7 @@ void launch_scatter_reordered_specialized(
       top_k,
       experts_per_gpu,
       experts_per_node,
+      gpus_per_node,
       num_chunks_per_node,
       radix_end_bit,
       node_token_indices,
@@ -1152,6 +1168,7 @@ void get_expert_token_idx_node_mask_cuda(
     torch::Tensor r,
     int64_t num_experts_arg,
     int64_t experts_per_gpu_arg,
+    int64_t gpus_per_node_arg,
     torch::Tensor expert_token_indices,
     torch::Tensor expert_offsets,
     torch::Tensor node_token_indices,
@@ -1180,9 +1197,13 @@ void get_expert_token_idx_node_mask_cuda(
       experts_per_gpu_arg > 0 && num_experts_arg % experts_per_gpu_arg == 0,
       "experts_per_gpu must be positive and divide num_experts");
   TORCH_CHECK(
-      num_experts_arg % (experts_per_gpu_arg * kGpusPerNode) == 0,
-      "node-mask mode requires exactly ", kGpusPerNode,
-      " GPUs per node and a whole number of nodes");
+      gpus_per_node_arg >= kMinGpusPerNode &&
+          gpus_per_node_arg <= kMaxGpusPerNode,
+      "gpus_per_node must be in [", kMinGpusPerNode, ", ",
+      kMaxGpusPerNode, "]");
+  TORCH_CHECK(
+      num_experts_arg % (experts_per_gpu_arg * gpus_per_node_arg) == 0,
+      "node-mask mode requires a whole number of nodes");
   TORCH_CHECK(r.size(1) <= num_experts_arg, "top_k cannot exceed num_experts");
   TORCH_CHECK(
       r.numel() <= std::numeric_limits<int32_t>::max(),
@@ -1202,12 +1223,14 @@ void get_expert_token_idx_node_mask_cuda(
   int top_k = static_cast<int>(r.size(1));
   int num_experts = static_cast<int>(num_experts_arg);
   int experts_per_gpu = static_cast<int>(experts_per_gpu_arg);
-  int experts_per_node = experts_per_gpu * kGpusPerNode;
+  int gpus_per_node = static_cast<int>(gpus_per_node_arg);
+  int num_masks = 1 << gpus_per_node;
+  int experts_per_node = experts_per_gpu * gpus_per_node;
   int num_nodes = num_experts / experts_per_node;
   int num_input_chunks = (num_tokens + kBlockThreads - 1) / kBlockThreads;
   int num_chunks_per_node = num_input_chunks;
-  int input_num_bins = num_experts + num_nodes * kNumMasks;
-  int reordered_num_bins = experts_per_node + kGpusPerNode;
+  int input_num_bins = num_experts + num_nodes * num_masks;
+  int reordered_num_bins = experts_per_node + gpus_per_node;
   int64_t input_scratch_elements =
       static_cast<int64_t>(num_input_chunks) * input_num_bins;
   int64_t reordered_scratch_elements =
@@ -1237,8 +1260,8 @@ void get_expert_token_idx_node_mask_cuda(
       "input_chunk_prefixes is too small; expected at least ",
       input_scratch_elements);
   TORCH_CHECK(
-      node_mask_offsets.numel() >= num_nodes * kNumMasks,
-      "node_mask_offsets needs num_nodes * 256 entries");
+      node_mask_offsets.numel() >= num_nodes * num_masks,
+      "node_mask_offsets needs num_nodes * (1 << gpus_per_node) entries");
   TORCH_CHECK(
       reordered_chunk_counts.numel() >= reordered_scratch_elements,
       "reordered_chunk_counts is too small; expected at least ",
@@ -1268,6 +1291,8 @@ void get_expert_token_idx_node_mask_cuda(
       experts_per_gpu,
       experts_per_node,
       num_nodes,
+      gpus_per_node,
+      num_masks,
       input_chunk_counts.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
@@ -1279,10 +1304,11 @@ void get_expert_token_idx_node_mask_cuda(
       node_mask_offsets.data_ptr<int32_t>(),
       num_input_chunks,
       num_experts,
-      num_nodes);
+      num_nodes,
+      num_masks);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  int node_radix_end_bit = radix_end_bit_for(num_nodes * kNumMasks);
+  int node_radix_end_bit = radix_end_bit_for(num_nodes * num_masks);
   const int32_t* input = r.data_ptr<int32_t>();
   const int32_t* input_prefixes = input_chunk_prefixes.data_ptr<int32_t>();
   const int32_t* mask_offsets = node_mask_offsets.data_ptr<int32_t>();
@@ -1291,8 +1317,8 @@ void get_expert_token_idx_node_mask_cuda(
 #define LAUNCH_NODE_BUILD(TOP_K_VALUE)                                      \
   launch_build_node_token_indices_specialized<TOP_K_VALUE>(                 \
       input, num_tokens, num_experts, experts_per_gpu, experts_per_node,     \
-      num_nodes, num_input_chunks, node_radix_end_bit, input_prefixes,       \
-      mask_offsets, x3, stream)
+      num_nodes, gpus_per_node, num_masks, num_input_chunks,                 \
+      node_radix_end_bit, input_prefixes, mask_offsets, x3, stream)
 
   bool specialized_top_k = true;
   switch (top_k) {
@@ -1304,12 +1330,14 @@ void get_expert_token_idx_node_mask_cuda(
     default:
       specialized_top_k = false;
       build_node_token_indices_fallback_kernel<<<
-          num_nodes * (kNumMasks - 1), kBlockThreads, 0, stream>>>(
+          num_nodes * (num_masks - 1), kBlockThreads, 0, stream>>>(
           input,
           num_tokens,
           top_k,
           experts_per_gpu,
           experts_per_node,
+          gpus_per_node,
+          num_masks,
           mask_offsets,
           x3);
       break;
@@ -1341,6 +1369,7 @@ void get_expert_token_idx_node_mask_cuda(
       top_k,
       experts_per_gpu,
       experts_per_node,
+      gpus_per_node,
       num_chunks_per_node,
       x3,
       node_offsets.data_ptr<int32_t>(),
@@ -1352,12 +1381,13 @@ void get_expert_token_idx_node_mask_cuda(
       reordered_chunk_prefixes.data_ptr<int32_t>(),
       num_chunks_per_node,
       experts_per_node,
-      num_nodes);
+      num_nodes,
+      gpus_per_node);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   int expert_radix_end_bit = radix_end_bit_for(experts_per_node);
   size_t scatter_smem = static_cast<size_t>(
-      experts_per_node + 1 + kGpusPerNode * kWarps) * sizeof(int32_t);
+      experts_per_node + 1 + gpus_per_node * kWarps) * sizeof(int32_t);
   const int32_t* reordered_counts =
       reordered_chunk_counts.data_ptr<int32_t>();
   const int32_t* reordered_prefixes =
@@ -1367,7 +1397,7 @@ void get_expert_token_idx_node_mask_cuda(
 
 #define LAUNCH_NODE_SCATTER(TOP_K_VALUE)                                    \
   launch_scatter_reordered_specialized<TOP_K_VALUE>(                        \
-      input, top_k, experts_per_gpu, experts_per_node,                      \
+      input, top_k, experts_per_gpu, experts_per_node, gpus_per_node,       \
       num_chunks_per_node, num_nodes, expert_radix_end_bit, x3,             \
       node_offsets.data_ptr<int32_t>(), reordered_counts,                    \
       reordered_prefixes, output_offsets, output, scatter_smem, stream)
