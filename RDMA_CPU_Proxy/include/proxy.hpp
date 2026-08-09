@@ -8,7 +8,6 @@
 #include "rdma_context.hpp"
 
 #include <atomic>
-#include <array>
 #include <chrono>
 #include <deque>
 #include <memory>
@@ -82,7 +81,6 @@ private:
     struct LocalIterationSyncHeader;
     struct LocalIterationSyncSlot;
     struct NvlinkForwardNotification;
-    struct PendingNvlinkForwardNotification;
     struct NvlinkForwardNotificationHeader;
     struct NvlinkForwardNotificationQueue;
     struct NvlinkForwardNotificationDispatchState;
@@ -110,13 +108,11 @@ private:
         NvlinkForwardNotificationHeader* header,
         NvlinkForwardNotificationQueue* queue,
         uint64_t position) const;
-    unsigned char* nvlink_forward_notification_expert_masks(
-        NvlinkForwardNotification* notification) const;
     void prepare_forwarding_notification_destinations();
     void initialize_nvlink_forward_notification_dispatch();
     void enqueue_forward_completion_notifications(
-        std::vector<PendingNvlinkForwardNotification>&& notifications);
-    void publish_forward_completion_notification(const PendingNvlinkForwardNotification& notification);
+        std::vector<NvlinkForwardNotification>&& notifications);
+    void publish_forward_completion_notification(const NvlinkForwardNotification& notification);
     void mark_forward_notification_senders_done();
     bool nvlink_forward_notification_queues_complete() const;
     void nvlink_forward_notification_dispatch_loop();
@@ -124,11 +120,9 @@ private:
     void drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQueue* queue);
     std::string format_nvlink_forward_notification_log(
         const NvlinkForwardNotification& notification,
-        const std::vector<uint64_t>& expert_masks,
         uint64_t dequeue_timestamp_ns) const;
     void enqueue_nvlink_forward_notification_log(
         const NvlinkForwardNotification& notification,
-        const std::vector<uint64_t>& expert_masks,
         uint64_t dequeue_timestamp_ns);
     void flush_nvlink_forward_notification_log_queue();
     std::size_t synchronize_local_nvlink_forward_batch_start(
@@ -236,10 +230,6 @@ private:
     std::size_t forwarding_ready_peer_count_{0};
     std::vector<ForwardingOutOfOrderPeerState> forwarding_out_of_order_peer_states_;
     std::vector<std::vector<uint8_t>> forwarding_routing_tables_by_peer_;
-    // [peer slot][destination GPU] -> tightly packed expert masks in routed-token order.
-    std::vector<std::array<std::vector<uint8_t>, 8>> forwarding_expert_routing_tables_by_peer_;
-    // [peer slot][token boundary][destination GPU] -> compressed expert-mask index.
-    std::vector<std::vector<std::array<uint32_t, 8>>> forwarding_expert_routing_prefix_by_peer_;
     std::vector<ForwardDestinationState> forwarding_destinations_;
     std::vector<ForwardNotificationDestinationState> forwarding_notification_destinations_;
     std::vector<ForwardingIterationStats> forwarding_iteration_stats_;

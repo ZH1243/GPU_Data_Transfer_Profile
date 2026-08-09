@@ -13,7 +13,6 @@
 #include <filesystem>
 #include <functional>
 #include <fstream>
-#include <iomanip>
 #include <limits>
 #include <map>
 #include <random>
@@ -70,12 +69,6 @@ struct alignas(64) Proxy::NvlinkForwardNotification {
     char padding[12]{};
 };
 
-struct Proxy::PendingNvlinkForwardNotification {
-    NvlinkForwardNotification notification;
-    uint64_t expert_mask_start_index{0};
-    uint64_t expert_mask_end_index{0};  // Exclusive.
-};
-
 struct alignas(64) Proxy::NvlinkForwardNotificationQueue {
     int32_t source_gpu{-1};
     uint32_t capacity{0};
@@ -100,12 +93,12 @@ struct alignas(64) Proxy::NvlinkForwardNotificationHeader {
     uint32_t queue_bytes{0};
     uint32_t notification_bytes{0};
     uint32_t entry_bytes{0};
-    uint32_t expert_mask_bytes{0};
+    uint32_t reserved{0};
 };
 
 struct Proxy::NvlinkForwardNotificationDispatchState {
     std::mutex mutex;
-    std::deque<PendingNvlinkForwardNotification> pending;
+    std::deque<NvlinkForwardNotification> pending;
 };
 
 namespace {
@@ -114,9 +107,7 @@ constexpr uint64_t kLocalIterationSyncMagic = 0x52444d415053594eULL;  // "RDMAPS
 constexpr uint32_t kLocalIterationSyncVersion = 3;
 constexpr uint64_t kNvlinkForwardNotificationMagic = 0x52444d414e464e51ULL;  // "RDMANFNQ"
 constexpr uint32_t kNvlinkForwardNotificationVersion = 2;
-constexpr uint32_t kNvlinkForwardExpertNotificationVersion = 3;
 constexpr uint32_t kNvlinkForwardRoundRobinFlag = 1U;
-constexpr uint32_t kNvlinkForwardExpertRoutingFlag = 2U;
 
 std::size_t checked_add(std::size_t a, std::size_t b, const char* description) {
     if (b > std::numeric_limits<std::size_t>::max() - a) {
@@ -130,46 +121,6 @@ std::size_t checked_multiply(std::size_t a, std::size_t b, const char* descripti
         throw std::runtime_error(std::string(description) + " overflows size_t");
     }
     return a * b;
-}
-
-std::size_t align_up(std::size_t value, std::size_t alignment) {
-    const auto remainder = value % alignment;
-    return remainder == 0 ? value : checked_add(value, alignment - remainder, "aligned size");
-}
-
-std::size_t max_nvlink_forward_notification_tokens(const ProxyConfig& config) {
-    if (!config.nvlink_forward_expert_routing_notifications_enabled) return 0;
-    if (nvlink_forward_dynamic_threshold_enabled(config)) {
-        const auto max_tokens = checked_multiply(
-            config.nvlink_forward_max_threshold_chunks,
-            config.tokens_per_chunk,
-            "maximum NVLink forwarding notification token count");
-        return std::min(config.num_tokens, max_tokens);
-    }
-    return effective_nvlink_forward_threshold_tokens(config);
-}
-
-std::size_t nvlink_forward_notification_entry_bytes(
-    const ProxyConfig& config,
-    std::size_t notification_bytes,
-    std::size_t notification_alignment) {
-    if (!config.nvlink_forward_expert_routing_notifications_enabled) {
-        return notification_bytes;
-    }
-    const auto mask_bytes = config.num_of_experts_per_GPU / 8;
-    const auto payload_bytes = checked_multiply(
-        max_nvlink_forward_notification_tokens(config),
-        mask_bytes,
-        "NVLink forwarding expert notification payload size");
-    return align_up(
-        checked_add(notification_bytes, payload_bytes,
-                    "NVLink forwarding notification entry size"),
-        notification_alignment);
-}
-
-uint32_t nvlink_forward_notification_version(const ProxyConfig& config) {
-    return config.nvlink_forward_expert_routing_notifications_enabled ?
-        kNvlinkForwardExpertNotificationVersion : kNvlinkForwardNotificationVersion;
 }
 
 uint32_t atomic_load_u32(const uint32_t* ptr) {
@@ -690,11 +641,6 @@ Proxy::NvlinkForwardNotification* Proxy::nvlink_forward_notification_entry(
     return reinterpret_cast<NvlinkForwardNotification*>(base + entries_offset + entry_offset);
 }
 
-unsigned char* Proxy::nvlink_forward_notification_expert_masks(
-    NvlinkForwardNotification* notification) const {
-    return reinterpret_cast<unsigned char*>(notification) + sizeof(NvlinkForwardNotification);
-}
-
 void Proxy::initialize_nvlink_forward_notifications() {
     if (!config_.nvlink_forward_completion_notifications_enabled || config_.num_gpus_per_node <= 1) return;
     if (nvlink_forward_notification_header_) return;
@@ -702,8 +648,7 @@ void Proxy::initialize_nvlink_forward_notifications() {
 #if defined(__unix__) || defined(__APPLE__)
     const auto queue_count = static_cast<std::size_t>(config_.num_gpus_per_node - 1);
     const auto queue_capacity = config_.nvlink_forward_notification_queue_depth;
-    const auto entry_bytes = nvlink_forward_notification_entry_bytes(
-        config_, sizeof(NvlinkForwardNotification), alignof(NvlinkForwardNotification));
+    const auto entry_bytes = sizeof(NvlinkForwardNotification);
     if (entry_bytes > static_cast<std::size_t>(std::numeric_limits<uint32_t>::max())) {
         throw std::runtime_error("NVLink notification entry size exceeds uint32 range");
     }
@@ -740,7 +685,7 @@ void Proxy::initialize_nvlink_forward_notifications() {
                     auto* stale_header = reinterpret_cast<NvlinkForwardNotificationHeader*>(stale_mapping);
                     const bool same_segment =
                         stale_header->magic == kNvlinkForwardNotificationMagic &&
-                        stale_header->version == nvlink_forward_notification_version(config_) &&
+                        stale_header->version == kNvlinkForwardNotificationVersion &&
                         stale_header->node_rank == config_.node_rank &&
                         stale_header->gpu_index == config_.local_gpu_index;
                     const bool live_owner = same_segment && process_is_alive(atomic_load_i32(&stale_header->pid));
@@ -790,7 +735,7 @@ void Proxy::initialize_nvlink_forward_notifications() {
     std::memset(mapping, 0, nvlink_forward_notification_size_);
     auto* header = reinterpret_cast<NvlinkForwardNotificationHeader*>(mapping);
     header->magic = kNvlinkForwardNotificationMagic;
-    header->version = nvlink_forward_notification_version(config_);
+    header->version = kNvlinkForwardNotificationVersion;
     header->node_rank = config_.node_rank;
     header->gpu_index = config_.local_gpu_index;
     header->num_gpus_per_node = static_cast<uint32_t>(config_.num_gpus_per_node);
@@ -800,8 +745,7 @@ void Proxy::initialize_nvlink_forward_notifications() {
     header->queue_bytes = static_cast<uint32_t>(sizeof(NvlinkForwardNotificationQueue));
     header->notification_bytes = static_cast<uint32_t>(sizeof(NvlinkForwardNotification));
     header->entry_bytes = static_cast<uint32_t>(entry_bytes);
-    header->expert_mask_bytes = config_.nvlink_forward_expert_routing_notifications_enabled ?
-        static_cast<uint32_t>(config_.num_of_experts_per_GPU / 8) : 0;
+    header->reserved = 0;
 
     auto* queues = reinterpret_cast<NvlinkForwardNotificationQueue*>(
         reinterpret_cast<char*>(mapping) + sizeof(NvlinkForwardNotificationHeader));
@@ -882,13 +826,10 @@ void Proxy::prepare_forwarding_notification_destinations() {
     forwarding_notification_destinations_.clear();
     forwarding_notification_destinations_.reserve(forwarding_destinations_.size());
     const auto queue_count = static_cast<std::size_t>(config_.num_gpus_per_node - 1);
-    const auto entry_bytes = nvlink_forward_notification_entry_bytes(
-        config_, sizeof(NvlinkForwardNotification), alignof(NvlinkForwardNotification));
+    const auto entry_bytes = sizeof(NvlinkForwardNotification);
     if (entry_bytes > static_cast<std::size_t>(std::numeric_limits<uint32_t>::max())) {
         throw std::runtime_error("NVLink notification entry size exceeds uint32 range");
     }
-    const auto expert_mask_bytes = config_.nvlink_forward_expert_routing_notifications_enabled ?
-        config_.num_of_experts_per_GPU / 8 : 0;
     const auto queue_header_bytes = checked_multiply(
         queue_count, sizeof(NvlinkForwardNotificationQueue), "NVLink notification queue headers");
     const auto queue_entry_bytes = checked_multiply(
@@ -938,7 +879,7 @@ void Proxy::prepare_forwarding_notification_destinations() {
             auto* header = reinterpret_cast<NvlinkForwardNotificationHeader*>(mapping);
             if (atomic_load_u32(&header->initialized) != 1 ||
                 header->magic != kNvlinkForwardNotificationMagic ||
-                header->version != nvlink_forward_notification_version(config_) ||
+                header->version != kNvlinkForwardNotificationVersion ||
                 header->node_rank != config_.node_rank ||
                 header->gpu_index != dst.gpu_index ||
                 header->num_gpus_per_node != static_cast<uint32_t>(config_.num_gpus_per_node) ||
@@ -948,7 +889,7 @@ void Proxy::prepare_forwarding_notification_destinations() {
                 header->queue_bytes != sizeof(NvlinkForwardNotificationQueue) ||
                 header->notification_bytes != sizeof(NvlinkForwardNotification) ||
                 header->entry_bytes != entry_bytes ||
-                header->expert_mask_bytes != expert_mask_bytes) {
+                header->reserved != 0) {
                 last_wait_reason = "metadata incomplete or mismatched";
                 munmap(mapping, expected_size);
                 close(fd);
@@ -992,7 +933,7 @@ void Proxy::initialize_nvlink_forward_notification_dispatch() {
 }
 
 void Proxy::enqueue_forward_completion_notifications(
-    std::vector<PendingNvlinkForwardNotification>&& notifications) {
+    std::vector<NvlinkForwardNotification>&& notifications) {
     if (!config_.nvlink_forward_completion_notifications_enabled || notifications.empty()) return;
     if (!nvlink_forward_notification_dispatch_) {
         throw std::runtime_error("NVLink completion notification dispatch queue is not initialized");
@@ -1012,9 +953,8 @@ void Proxy::enqueue_forward_completion_notifications(
 }
 
 void Proxy::publish_forward_completion_notification(
-    const PendingNvlinkForwardNotification& pending_notification) {
+    const NvlinkForwardNotification& notification) {
     if (!config_.nvlink_forward_completion_notifications_enabled) return;
-    const auto& notification = pending_notification.notification;
     const auto dst_it = std::find_if(
         forwarding_notification_destinations_.begin(),
         forwarding_notification_destinations_.end(),
@@ -1037,46 +977,6 @@ void Proxy::publish_forward_completion_notification(
             entry.sequence = head + 1;
             auto* wire_entry = nvlink_forward_notification_entry(dst_it->header, queue, head);
             *wire_entry = entry;
-            if (config_.nvlink_forward_expert_routing_notifications_enabled) {
-                if (pending_notification.expert_mask_end_index <
-                    pending_notification.expert_mask_start_index) {
-                    throw std::runtime_error(
-                        "NVLink expert notification mask range is invalid");
-                }
-                const auto expert_mask_count = pending_notification.expert_mask_end_index -
-                    pending_notification.expert_mask_start_index;
-                if (expert_mask_count != entry.num_tokens) {
-                    throw std::runtime_error(
-                        "NVLink expert notification mask range does not match forwarded token count");
-                }
-                const auto max_masks = max_nvlink_forward_notification_tokens(config_);
-                if (expert_mask_count > max_masks) {
-                    throw std::runtime_error("NVLink expert notification exceeds configured entry capacity");
-                }
-                if (entry.peer_slot >= forwarding_expert_routing_tables_by_peer_.size() ||
-                    entry.destination_gpu < 0 || entry.destination_gpu >= config_.num_gpus_per_node) {
-                    throw std::runtime_error("NVLink expert notification routing table index is invalid");
-                }
-                const auto& packed_masks = forwarding_expert_routing_tables_by_peer_[entry.peer_slot]
-                    [static_cast<std::size_t>(entry.destination_gpu)];
-                auto* payload = nvlink_forward_notification_expert_masks(wire_entry);
-                const auto mask_bytes = dst_it->header->expert_mask_bytes;
-                const auto source_offset = checked_multiply(
-                    static_cast<std::size_t>(pending_notification.expert_mask_start_index),
-                    mask_bytes,
-                    "NVLink expert notification source offset");
-                const auto payload_bytes = checked_multiply(
-                    static_cast<std::size_t>(expert_mask_count),
-                    mask_bytes,
-                    "NVLink expert notification payload bytes");
-                if (source_offset > packed_masks.size() ||
-                    payload_bytes > packed_masks.size() - source_offset) {
-                    throw std::runtime_error("NVLink expert notification mask range exceeds routing table");
-                }
-                if (payload_bytes != 0) {
-                    std::memcpy(payload, packed_masks.data() + source_offset, payload_bytes);
-                }
-            }
             atomic_thread_fence_release();
             atomic_store_u64(&queue->head, head + 1);
             nvlink_forward_notifications_sent_.fetch_add(1);
@@ -1146,7 +1046,7 @@ void Proxy::nvlink_forward_notification_dispatch_loop() {
     try {
         if (!nvlink_forward_notification_dispatch_) return;
         while (true) {
-            PendingNvlinkForwardNotification notification;
+            NvlinkForwardNotification notification;
             bool have_notification = false;
             {
                 std::lock_guard<std::mutex> lock(nvlink_forward_notification_dispatch_->mutex);
@@ -1175,7 +1075,6 @@ void Proxy::nvlink_forward_notification_dispatch_loop() {
 
 std::string Proxy::format_nvlink_forward_notification_log(
     const NvlinkForwardNotification& notification,
-    const std::vector<uint64_t>& expert_masks,
     uint64_t dequeue_timestamp_ns) const {
     std::ostringstream out;
     out << "nvlink_forward_notification"
@@ -1194,27 +1093,16 @@ std::string Proxy::format_nvlink_forward_notification_log(
         << " bytes=" << notification.bytes
         << " sequence=" << notification.sequence
         << " flags=" << notification.flags;
-    if (config_.nvlink_forward_expert_routing_notifications_enabled) {
-        out << " expert_mask_bytes=" << (config_.num_of_experts_per_GPU / 8)
-            << " expert_masks=[";
-        for (std::size_t i = 0; i < expert_masks.size(); ++i) {
-            if (i != 0) out << ',';
-            out << "0x" << std::hex << std::setw(static_cast<int>(config_.num_of_experts_per_GPU / 4))
-                << std::setfill('0') << expert_masks[i] << std::dec;
-        }
-        out << ']';
-    }
     return out.str();
 }
 
 void Proxy::enqueue_nvlink_forward_notification_log(
     const NvlinkForwardNotification& notification,
-    const std::vector<uint64_t>& expert_masks,
     uint64_t dequeue_timestamp_ns) {
     if (!config_.nvlink_forward_notification_log_enabled) return;
     std::lock_guard<std::mutex> lock(nvlink_forward_notification_log_mutex_);
     nvlink_forward_notification_log_queue_.push_back(
-        format_nvlink_forward_notification_log(notification, expert_masks, dequeue_timestamp_ns));
+        format_nvlink_forward_notification_log(notification, dequeue_timestamp_ns));
 }
 
 void Proxy::flush_nvlink_forward_notification_log_queue() {
@@ -1262,29 +1150,10 @@ void Proxy::drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQue
         auto* wire_entry = nvlink_forward_notification_entry(
             nvlink_forward_notification_header_, queue, tail);
         const auto notification = *wire_entry;
-        std::vector<uint64_t> expert_masks;
-        if ((notification.flags & kNvlinkForwardExpertRoutingFlag) != 0) {
-            if (!config_.nvlink_forward_expert_routing_notifications_enabled ||
-                nvlink_forward_notification_header_->expert_mask_bytes == 0 ||
-                notification.num_tokens > max_nvlink_forward_notification_tokens(config_)) {
-                throw std::runtime_error("invalid NVLink expert routing notification payload metadata");
-            }
-            expert_masks.resize(static_cast<std::size_t>(notification.num_tokens));
-            const auto* payload = nvlink_forward_notification_expert_masks(wire_entry);
-            const auto mask_bytes = nvlink_forward_notification_header_->expert_mask_bytes;
-            for (std::size_t i = 0; i < expert_masks.size(); ++i) {
-                std::memcpy(&expert_masks[i], payload + i * mask_bytes, mask_bytes);
-            }
-        } else if (config_.nvlink_forward_expert_routing_notifications_enabled) {
-            throw std::runtime_error("NVLink notification is missing its expert routing payload flag");
-        }
-        if (config_.nvlink_forward_expert_routing_notifications_enabled) {
-            cuda_buffers_.copy_nvlink_notification_test_payloads_to_gpu();
-        }
         atomic_store_u64(&queue->tail, tail + 1);
         const auto dequeue_timestamp_ns = unix_epoch_nanoseconds_now();
         nvlink_forward_notifications_received_.fetch_add(1);
-        enqueue_nvlink_forward_notification_log(notification, expert_masks, dequeue_timestamp_ns);
+        enqueue_nvlink_forward_notification_log(notification, dequeue_timestamp_ns);
         if (config_.nvlink_forward_log_batches) {
             RDMA_PROXY_LOG_INFO("nvlink_forward_notification_received iteration=", notification.iteration,
                                 " dequeue_timestamp_ns=", dequeue_timestamp_ns,
@@ -1297,8 +1166,7 @@ void Proxy::drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQue
                                 " tokens=", notification.num_tokens,
                                 " byte_offset=", notification.byte_offset,
                                 " bytes=", notification.bytes,
-                                " sequence=", notification.sequence,
-                                " expert_masks=", expert_masks.size());
+                                " sequence=", notification.sequence);
         }
     }
 }
@@ -2030,8 +1898,6 @@ void Proxy::stop_forwarding_thread() {
     forwarding_out_of_order_issued_chunks_by_peer_.reset();
     forwarding_ready_peer_count_ = 0;
     forwarding_out_of_order_peer_states_.clear();
-    forwarding_expert_routing_tables_by_peer_.clear();
-    forwarding_expert_routing_prefix_by_peer_.clear();
     nvlink_forward_notification_dispatch_.reset();
     release_nvlink_forward_notifications();
     destroy_cuda_stream(forwarding_stream_, config_.mock_mode);
@@ -2041,8 +1907,6 @@ void Proxy::stop_forwarding_thread() {
 void Proxy::prepare_forwarding_routing_tables() {
     forwarding_routing_tables_by_peer_.clear();
     forwarding_routing_tables_by_peer_.reserve(peers_.size());
-    forwarding_expert_routing_tables_by_peer_.clear();
-    forwarding_expert_routing_prefix_by_peer_.clear();
     std::mt19937_64 rng(config_.nvlink_routing_seed);
     std::bernoulli_distribution route(config_.nvlink_routing_probability);
 
@@ -2066,70 +1930,6 @@ void Proxy::prepare_forwarding_routing_tables() {
                             " seed=", config_.nvlink_routing_seed);
     }
 
-    if (!config_.nvlink_forward_expert_routing_notifications_enabled) return;
-
-    forwarding_expert_routing_tables_by_peer_.reserve(peers_.size());
-    forwarding_expert_routing_prefix_by_peer_.reserve(peers_.size());
-    std::mt19937_64 expert_rng(config_.nvlink_routing_seed ^ 0x9e3779b97f4a7c15ULL);
-    std::bernoulli_distribution route_expert(config_.expert_routing_probability);
-    const auto mask_bytes = config_.num_of_experts_per_GPU / 8;
-    for (std::size_t peer_slot = 0; peer_slot < peers_.size(); ++peer_slot) {
-        const auto& gpu_table = forwarding_routing_tables_by_peer_[peer_slot];
-        std::vector<std::array<uint32_t, 8>> prefix(config_.num_tokens + 1);
-        prefix.front().fill(0);
-        for (std::size_t token_index = 0; token_index < gpu_table.size(); ++token_index) {
-            prefix[token_index + 1] = prefix[token_index];
-            for (std::size_t column = 0;
-                 column < active_routing_columns(config_.num_gpus_per_node);
-                 ++column) {
-                if ((gpu_table[token_index] & routing_column_mask(column)) == 0) continue;
-                const auto destination_gpu = static_cast<std::size_t>(routing_column_to_gpu(
-                    config_.local_gpu_index, column, config_.num_gpus_per_node));
-                ++prefix[token_index + 1][destination_gpu];
-            }
-        }
-
-        std::array<std::vector<uint8_t>, 8> expert_table;
-        std::array<std::size_t, 8> next_mask_index{};
-        for (std::size_t destination_gpu = 0;
-             destination_gpu < static_cast<std::size_t>(config_.num_gpus_per_node);
-             ++destination_gpu) {
-            const auto mask_count = prefix.back()[destination_gpu];
-            expert_table[destination_gpu].resize(checked_multiply(
-                static_cast<std::size_t>(mask_count),
-                mask_bytes,
-                "packed NVLink expert routing table size"));
-        }
-
-        for (std::size_t token_index = 0; token_index < gpu_table.size(); ++token_index) {
-            for (std::size_t column = 0;
-                 column < active_routing_columns(config_.num_gpus_per_node);
-                 ++column) {
-                if ((gpu_table[token_index] & routing_column_mask(column)) == 0) continue;
-                const auto destination_gpu = static_cast<std::size_t>(routing_column_to_gpu(
-                    config_.local_gpu_index, column, config_.num_gpus_per_node));
-                uint64_t expert_mask = 0;
-                for (std::size_t expert = 0; expert < config_.num_of_experts_per_GPU; ++expert) {
-                    if (route_expert(expert_rng)) {
-                        expert_mask |= uint64_t{1} << expert;
-                    }
-                }
-                auto& packed_masks = expert_table[destination_gpu];
-                const auto byte_offset = next_mask_index[destination_gpu] * mask_bytes;
-                std::memcpy(packed_masks.data() + byte_offset, &expert_mask, mask_bytes);
-                ++next_mask_index[destination_gpu];
-            }
-        }
-        forwarding_expert_routing_tables_by_peer_.push_back(std::move(expert_table));
-        forwarding_expert_routing_prefix_by_peer_.push_back(std::move(prefix));
-        RDMA_PROXY_LOG_INFO(
-            "generated NVLink expert routing table peer_rank=", peers_[peer_slot].peer_rank,
-            " rows=", config_.num_tokens,
-            " experts_per_gpu=", config_.num_of_experts_per_GPU,
-            " mask_bytes=", mask_bytes,
-            " probability=", config_.expert_routing_probability,
-            " seed=", (config_.nvlink_routing_seed ^ 0x9e3779b97f4a7c15ULL));
-    }
 }
 
 std::string Proxy::nvlink_exchange_file(int gpu_index) const {
@@ -2352,7 +2152,7 @@ void Proxy::issue_forwarding_batch(
     const auto token_bytes = config_.token_dimension * dtype_size(config_.dtype);
     const auto batch_timing_start = std::chrono::steady_clock::now();
     std::size_t batch_bytes = 0;
-    std::vector<PendingNvlinkForwardNotification> completed_notifications;
+    std::vector<NvlinkForwardNotification> completed_notifications;
     if (batch_start_token + batch_tokens > config_.num_tokens) {
         throw std::runtime_error("NVLink forwarding batch exceeds token range");
     }
@@ -2418,8 +2218,7 @@ void Proxy::issue_forwarding_batch(
                 config_.nvlink_forward_use_batch_api,
                 config_.mock_mode);
             if (config_.nvlink_forward_completion_notifications_enabled) {
-                PendingNvlinkForwardNotification pending;
-                auto& notification = pending.notification;
+                NvlinkForwardNotification notification;
                 notification.iteration = iteration;
                 notification.batch_index = batch_index_in_iteration;
                 notification.peer_slot = peer_slot;
@@ -2431,7 +2230,7 @@ void Proxy::issue_forwarding_batch(
                 notification.destination_gpu = dst_gpu;
                 notification.peer_rank = peer.peer_rank;
                 notification.flags = kNvlinkForwardRoundRobinFlag;
-                completed_notifications.push_back(std::move(pending));
+                completed_notifications.push_back(notification);
             }
         }
     } else {
@@ -2440,14 +2239,6 @@ void Proxy::issue_forwarding_batch(
         }
 
         const auto& routing_table = forwarding_routing_tables_by_peer_[peer_slot];
-        const std::vector<std::array<uint32_t, 8>>* expert_routing_prefix = nullptr;
-        if (config_.nvlink_forward_expert_routing_notifications_enabled) {
-            if (peer_slot >= forwarding_expert_routing_tables_by_peer_.size() ||
-                peer_slot >= forwarding_expert_routing_prefix_by_peer_.size()) {
-                throw std::runtime_error("missing NVLink expert routing metadata for peer buffer slot");
-            }
-            expert_routing_prefix = &forwarding_expert_routing_prefix_by_peer_[peer_slot];
-        }
 
         // Each routing row is one uint8_t for one received token. Columns
         // 0..num_gpus_per_node-2 map to local destination GPUs via
@@ -2539,8 +2330,7 @@ void Proxy::issue_forwarding_batch(
                 config_.nvlink_forward_use_batch_api,
                 config_.mock_mode);
             if (config_.nvlink_forward_completion_notifications_enabled) {
-                PendingNvlinkForwardNotification pending;
-                auto& notification = pending.notification;
+                NvlinkForwardNotification notification;
                 notification.iteration = iteration;
                 notification.batch_index = batch_index_in_iteration;
                 notification.peer_slot = peer_slot;
@@ -2551,19 +2341,8 @@ void Proxy::issue_forwarding_batch(
                 notification.source_gpu = config_.local_gpu_index;
                 notification.destination_gpu = dst.gpu_index;
                 notification.peer_rank = peer.peer_rank;
-                notification.flags = expert_routing_prefix ? kNvlinkForwardExpertRoutingFlag : 0;
-                if (expert_routing_prefix) {
-                    const auto destination_gpu = static_cast<std::size_t>(dst.gpu_index);
-                    pending.expert_mask_start_index =
-                        (*expert_routing_prefix)[batch_start_token][destination_gpu];
-                    pending.expert_mask_end_index =
-                        (*expert_routing_prefix)[batch_start_token + batch_tokens][destination_gpu];
-                    if (pending.expert_mask_end_index - pending.expert_mask_start_index != routed_tokens) {
-                        throw std::runtime_error(
-                            "NVLink expert routing compressed range does not match routed token count");
-                    }
-                }
-                completed_notifications.push_back(std::move(pending));
+                notification.flags = 0;
+                completed_notifications.push_back(notification);
             }
         }
     }

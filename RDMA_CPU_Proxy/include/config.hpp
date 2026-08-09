@@ -70,7 +70,6 @@ struct ProxyConfig {
     bool nvlink_forward_stream_nonblocking{true};
     bool nvlink_forward_synchronize_batches{false};
     bool nvlink_forward_completion_notifications_enabled{false};
-    bool nvlink_forward_expert_routing_notifications_enabled{false};
     std::size_t nvlink_forward_notification_queue_depth{1024};
     bool nvlink_forward_notification_log_enabled{false};
     std::string nvlink_forward_notification_log_dir{"/tmp/rdma_cpu_proxy_nvlink_notifications"};
@@ -81,8 +80,6 @@ struct ProxyConfig {
     bool log_marker_wait_reports{false};
     bool nvlink_forward_use_round_robin{false};
     double nvlink_routing_probability{0.5};
-    std::size_t num_of_experts_per_GPU{8};
-    double expert_routing_probability{0.5};
     uint64_t nvlink_routing_seed{1};
     std::string nvlink_forward_exchange_dir{"/tmp/rdma_cpu_proxy_nvlink"};
     bool local_iteration_sync_enabled{false};

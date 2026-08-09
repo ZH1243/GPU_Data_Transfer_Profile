@@ -15,9 +15,6 @@
 namespace rdma_proxy {
 namespace {
 
-constexpr std::size_t kNvlinkNotificationTestPayloadLargeBytes = 16 * 1024;
-constexpr std::size_t kNvlinkNotificationTestPayloadSmallBytes = 8;
-
 #if RDMA_PROXY_HAVE_CUDA
 void check_cuda(cudaError_t status, const char* what) {
     if (status != cudaSuccess) {
@@ -61,26 +58,6 @@ void launch_copy_tokens_kernel(void* dst, const void* src, std::size_t bytes);
 CudaBuffers::CudaBuffers(ProxyConfig config) : config_(std::move(config)) {}
 
 CudaBuffers::~CudaBuffers() {
-#if RDMA_PROXY_HAVE_CUDA
-    if (!config_.mock_mode && nvlink_notification_copy_stream_) {
-        const auto set_device_status = cudaSetDevice(config_.cuda_device_id);
-        if (set_device_status != cudaSuccess) {
-            RDMA_PROXY_LOG_WARN(
-                "cudaSetDevice failed before NVLink notification stream cleanup: ",
-                cudaGetErrorString(set_device_status));
-        } else {
-            const auto synchronize_status = cudaStreamSynchronize(
-                reinterpret_cast<cudaStream_t>(nvlink_notification_copy_stream_));
-            if (synchronize_status != cudaSuccess) {
-                RDMA_PROXY_LOG_WARN(
-                    "cudaStreamSynchronize failed during NVLink notification stream cleanup: ",
-                    cudaGetErrorString(synchronize_status));
-            }
-        }
-    }
-#endif
-    destroy_cuda_stream(nvlink_notification_copy_stream_, config_.mock_mode);
-    nvlink_notification_copy_stream_ = nullptr;
     for (auto& entry : buffers_) {
         free_buffer(entry.send);
         free_buffer(entry.recv);
@@ -88,10 +65,6 @@ CudaBuffers::~CudaBuffers() {
     for (auto& entry : nvlink_recv_buffers_) {
         free_buffer(entry.recv);
     }
-    free_buffer(nvlink_notification_test_buffer_16kib_);
-    free_buffer(nvlink_notification_test_buffer_8b_);
-    free_host_staging_buffer(nvlink_notification_test_payload_16kib_);
-    free_host_staging_buffer(nvlink_notification_test_payload_8b_);
 }
 
 void CudaBuffers::initialize() {
@@ -134,31 +107,6 @@ void CudaBuffers::initialize() {
         }
     }
 
-    if (config_.nvlink_forward_expert_routing_notifications_enabled) {
-        allocate_buffer(
-            nvlink_notification_test_buffer_16kib_,
-            kNvlinkNotificationTestPayloadLargeBytes);
-        allocate_buffer(
-            nvlink_notification_test_buffer_8b_,
-            kNvlinkNotificationTestPayloadSmallBytes);
-        allocate_host_staging_buffer(
-            nvlink_notification_test_payload_16kib_,
-            kNvlinkNotificationTestPayloadLargeBytes,
-            uint8_t{1});
-        allocate_host_staging_buffer(
-            nvlink_notification_test_payload_8b_,
-            kNvlinkNotificationTestPayloadSmallBytes,
-            uint8_t{1});
-        nvlink_notification_copy_stream_ = create_cuda_stream(
-            config_.cuda_device_id,
-            true,
-            config_.mock_mode);
-        RDMA_PROXY_LOG_INFO(
-            "allocated NVLink notification test GPU buffers local_gpu=",
-            config_.local_gpu_index,
-            " large_bytes=", nvlink_notification_test_buffer_16kib_.bytes,
-            " small_bytes=", nvlink_notification_test_buffer_8b_.bytes);
-    }
 }
 
 void CudaBuffers::copy_tokens_to_send_buffer(int peer_rank, const void* src_device_or_host, std::size_t bytes) {
@@ -299,52 +247,6 @@ const NvlinkReceiveBuffer& CudaBuffers::nvlink_receive_buffer_for_source(int sou
     return *it;
 }
 
-void CudaBuffers::copy_nvlink_notification_test_payloads_to_gpu() {
-    if (!config_.nvlink_forward_expert_routing_notifications_enabled) return;
-    if (!nvlink_notification_test_buffer_16kib_.ptr ||
-        !nvlink_notification_test_buffer_8b_.ptr ||
-        !nvlink_notification_test_payload_16kib_.ptr ||
-        !nvlink_notification_test_payload_8b_.ptr ||
-        nvlink_notification_test_payload_16kib_.bytes != nvlink_notification_test_buffer_16kib_.bytes ||
-        nvlink_notification_test_payload_8b_.bytes != nvlink_notification_test_buffer_8b_.bytes) {
-        throw std::runtime_error("NVLink notification test copy buffers are not initialized");
-    }
-    if (config_.mock_mode) {
-        std::memcpy(
-            nvlink_notification_test_buffer_16kib_.ptr,
-            nvlink_notification_test_payload_16kib_.ptr,
-            nvlink_notification_test_payload_16kib_.bytes);
-        std::memcpy(
-            nvlink_notification_test_buffer_8b_.ptr,
-            nvlink_notification_test_payload_8b_.ptr,
-            nvlink_notification_test_payload_8b_.bytes);
-        return;
-    }
-#if RDMA_PROXY_HAVE_CUDA
-    check_cuda(cudaSetDevice(config_.cuda_device_id), "cudaSetDevice before NVLink notification test copies");
-    auto stream = reinterpret_cast<cudaStream_t>(nvlink_notification_copy_stream_);
-    if (!stream) throw std::runtime_error("NVLink notification copy stream is not initialized");
-    check_cuda(
-        cudaMemcpyAsync(
-            nvlink_notification_test_buffer_16kib_.ptr,
-            nvlink_notification_test_payload_16kib_.ptr,
-            nvlink_notification_test_payload_16kib_.bytes,
-            cudaMemcpyHostToDevice,
-            stream),
-        "cudaMemcpyAsync H2D 16 KiB NVLink notification test payload");
-    check_cuda(
-        cudaMemcpyAsync(
-            nvlink_notification_test_buffer_8b_.ptr,
-            nvlink_notification_test_payload_8b_.ptr,
-            nvlink_notification_test_payload_8b_.bytes,
-            cudaMemcpyHostToDevice,
-            stream),
-        "cudaMemcpyAsync H2D 8-byte NVLink notification test payload");
-#else
-    throw std::runtime_error("NVLink notification test copies require CUDA support or mock_mode=true");
-#endif
-}
-
 std::size_t CudaBuffers::token_buffer_bytes() const {
     return config_.num_tokens * config_.token_dimension * dtype_size(config_.dtype);
 }
@@ -383,43 +285,6 @@ void CudaBuffers::free_buffer(GpuBuffer& buffer) {
     }
     buffer.ptr = nullptr;
     buffer.bytes = 0;
-}
-
-void CudaBuffers::allocate_host_staging_buffer(
-    HostStagingBuffer& buffer,
-    std::size_t bytes,
-    uint8_t value) {
-    buffer.bytes = bytes;
-    buffer.is_cuda_pinned = !config_.mock_mode;
-    if (config_.mock_mode) {
-        buffer.ptr = ::operator new(bytes);
-    } else {
-#if RDMA_PROXY_HAVE_CUDA
-        check_cuda(cudaMallocHost(&buffer.ptr, bytes), "cudaMallocHost NVLink notification payload");
-#else
-        throw std::runtime_error("pinned NVLink notification payload allocation requires CUDA support");
-#endif
-    }
-    std::memset(buffer.ptr, value, bytes);
-}
-
-void CudaBuffers::free_host_staging_buffer(HostStagingBuffer& buffer) {
-    if (!buffer.ptr) return;
-    if (buffer.is_cuda_pinned) {
-#if RDMA_PROXY_HAVE_CUDA
-        const auto status = cudaFreeHost(buffer.ptr);
-        if (status != cudaSuccess) {
-            RDMA_PROXY_LOG_WARN(
-                "cudaFreeHost failed during NVLink notification payload cleanup: ",
-                cudaGetErrorString(status));
-        }
-#endif
-    } else {
-        ::operator delete(buffer.ptr);
-    }
-    buffer.ptr = nullptr;
-    buffer.bytes = 0;
-    buffer.is_cuda_pinned = false;
 }
 
 void launch_copy_tokens(void* dst, const void* src, std::size_t bytes, bool mock_mode) {

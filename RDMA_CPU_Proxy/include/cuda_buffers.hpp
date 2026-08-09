@@ -16,12 +16,6 @@ struct GpuBuffer {
     bool is_mock_host_memory{false};
 };
 
-struct HostStagingBuffer {
-    void* ptr{nullptr};
-    std::size_t bytes{0};
-    bool is_cuda_pinned{false};
-};
-
 struct PeerGpuBuffers {
     int peer_rank{-1};
     GpuBuffer send;
@@ -70,7 +64,6 @@ public:
     PeerGpuBuffers& buffers_for_peer(int peer_rank);
     const PeerGpuBuffers& buffers_for_peer(int peer_rank) const;
     const NvlinkReceiveBuffer& nvlink_receive_buffer_for_source(int source_gpu_index) const;
-    void copy_nvlink_notification_test_payloads_to_gpu();
 
     std::size_t token_buffer_bytes() const;
     std::size_t nvlink_receive_buffer_bytes() const;
@@ -78,17 +71,10 @@ public:
 private:
     void allocate_buffer(GpuBuffer& buffer, std::size_t bytes);
     void free_buffer(GpuBuffer& buffer);
-    void allocate_host_staging_buffer(HostStagingBuffer& buffer, std::size_t bytes, uint8_t value);
-    void free_host_staging_buffer(HostStagingBuffer& buffer);
 
     ProxyConfig config_;
     std::vector<PeerGpuBuffers> buffers_;
     std::vector<NvlinkReceiveBuffer> nvlink_recv_buffers_;
-    GpuBuffer nvlink_notification_test_buffer_16kib_;
-    GpuBuffer nvlink_notification_test_buffer_8b_;
-    HostStagingBuffer nvlink_notification_test_payload_16kib_;
-    HostStagingBuffer nvlink_notification_test_payload_8b_;
-    void* nvlink_notification_copy_stream_{nullptr};
 };
 
 void launch_copy_tokens(void* dst, const void* src, std::size_t bytes, bool mock_mode);

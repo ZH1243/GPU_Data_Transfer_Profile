@@ -165,14 +165,11 @@ int main() {
         config0.nvlink_forward_chunk_tokens = 32;
         config0.nvlink_forward_synchronize_batches = true;
         config0.nvlink_forward_completion_notifications_enabled = true;
-        config0.nvlink_forward_expert_routing_notifications_enabled = true;
         config0.nvlink_forward_notification_queue_depth = 8;
         config0.nvlink_forward_notification_log_enabled = true;
         config0.nvlink_forward_notification_log_dir = "/tmp/rdma_cpu_proxy_test_notification_logs";
         config0.nvlink_forward_local_batch_sync_enabled = true;
         config0.nvlink_routing_probability = 1.0;
-        config0.num_of_experts_per_GPU = 16;
-        config0.expert_routing_probability = 1.0;
         config0.local_iteration_sync_run_id = "test_measured_run_nvlink_batch_sync";
         config0.local_gpu_index = 0;
         config0.cuda_device_id = 0;
@@ -248,16 +245,9 @@ int main() {
         const std::string notification_text(
             (std::istreambuf_iterator<char>(notification_log)),
             std::istreambuf_iterator<char>());
-        std::size_t full_expert_mask_count = 0;
-        for (std::size_t pos = 0;
-             (pos = notification_text.find("0xffff", pos)) != std::string::npos;
-             pos += 6) {
-            ++full_expert_mask_count;
-        }
-        if (notification_text.find("expert_mask_bytes=2") == std::string::npos ||
-            notification_text.find("expert_masks=[0xffff") == std::string::npos ||
-            full_expert_mask_count != config0.num_tokens) {
-            std::cerr << "NVLink notification log did not contain the expected expert masks\n";
+        if (notification_text.find("nvlink_forward_notification") == std::string::npos ||
+            notification_text.find("num_tokens=32") == std::string::npos) {
+            std::cerr << "NVLink notification log did not contain the expected completion records\n";
             return 1;
         }
     }
