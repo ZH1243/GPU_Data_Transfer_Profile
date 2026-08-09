@@ -54,12 +54,22 @@ The additional output is another packed ragged array:
 
 - `node_token_indices` is `x3`, containing original token IDs in sender-buffer
   order.
+- `node_token_masks` is `x4`, a `torch.uint8` array aligned one-to-one with
+  `x3`. Each value is the unsigned GPU mask used to order that token. A
+  receiver can inspect it to determine which node-local GPUs should receive
+  the corresponding arriving token.
 - `node_offsets` has `num_nodes + 1` entries.  Node `i` owns
-  `node_token_indices[node_offsets[i]:node_offsets[i + 1]]`.
+  the same slice in both `node_token_indices` and `node_token_masks`:
+  `[node_offsets[i]:node_offsets[i + 1]]`.
+
+Only the low `N` bits of each `x4` byte are meaningful, where
+`N = --gpus-per-node`; the upper `8 - N` bits are zero. The bit-to-GPU mapping
+is controlled by `--local-gpu-id` as described above.
 
 The temporary `x1` and `x2` arrays are never materialized.  The CUDA code uses
 per-chunk `(node, mask)` histograms and a stable counting-sort scatter to
-write `x3` directly.  It then computes the per-GPU filtered ranks in `x3`
+write aligned `x3` and `x4` entries directly. It then computes the per-GPU
+filtered ranks in `x3`
 order and rebuilds `expert_token_indices`, so each value matches the token's
 new arrival position at its destination GPU.  Output and scratch allocation
 remain outside the measured interval.
@@ -70,10 +80,11 @@ CUDA-event latency.  Output and scratch buffers are allocated once and reused,
 so allocation time is excluded.
 
 In node-mask mode, `latency` is the end-to-end algorithm latency and
-`x3_latency` measures only the first three phases needed to materialize
-`node_token_indices`: input-chunk counting, prefix/offset scanning, and the
-stable node/mask scatter. Both averages use `--iters`; the normal full-path
-warmups also warm these three kernels before either measurement.
+`x3_latency` measures only the first three phases needed to materialize the
+aligned `node_token_indices`/`node_token_masks` (`x3`/`x4`) outputs:
+input-chunk counting, prefix/offset scanning, and the stable node/mask scatter.
+Both averages use `--iters`; the normal full-path warmups also warm these three
+kernels before either measurement.
 
 ## Kernel structure
 

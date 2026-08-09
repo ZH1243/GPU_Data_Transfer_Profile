@@ -26,6 +26,7 @@ void get_expert_token_idx_node_mask_cuda(
     torch::Tensor expert_token_indices,
     torch::Tensor expert_offsets,
     torch::Tensor node_token_indices,
+    torch::Tensor node_token_masks,
     torch::Tensor node_offsets,
     torch::Tensor input_chunk_counts,
     torch::Tensor input_chunk_prefixes,
@@ -45,5 +46,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "get_expert_token_idx_node_mask",
       &get_expert_token_idx_node_mask_cuda,
-      "Build node-mask-reordered sender and per-expert index lists");
+      "Build node-mask-reordered sender masks and per-expert index lists");
 }

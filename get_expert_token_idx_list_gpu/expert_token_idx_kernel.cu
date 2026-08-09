@@ -483,7 +483,8 @@ __global__ __launch_bounds__(kBlockThreads) void build_node_token_indices_kernel
     int radix_end_bit,
     const int32_t* __restrict__ chunk_prefixes,
     const int32_t* __restrict__ node_mask_offsets,
-    int32_t* __restrict__ node_token_indices) {
+    int32_t* __restrict__ node_token_indices,
+    uint8_t* __restrict__ node_token_masks) {
   using BlockSort = cub::BlockRadixSort<
       int32_t, kBlockThreads, ITEMS_PER_THREAD, int32_t>;
   union SharedStorage {
@@ -568,11 +569,13 @@ __global__ __launch_bounds__(kBlockThreads) void build_node_token_indices_kernel
     int32_t destination = node_mask_offsets[group] +
         chunk_prefixes[chunk_row + num_experts + group] + in_chunk_rank;
     node_token_indices[destination] = values[item];
+    node_token_masks[destination] = static_cast<uint8_t>(mask);
   }
 }
 
-// General-top-k x3 fallback: each CTA owns one nonzero node/mask bin and scans
-// tokens in order.  Common MoE top-k values take the radix-sort path above.
+// General-top-k x3/x4 fallback: each CTA owns one nonzero node/mask bin and
+// scans tokens in order. Common MoE top-k values take the radix-sort path
+// above.
 __global__ void build_node_token_indices_fallback_kernel(
     const int32_t* __restrict__ r,
     int num_tokens,
@@ -583,7 +586,8 @@ __global__ void build_node_token_indices_fallback_kernel(
     int local_gpu_id,
     int num_masks,
     const int32_t* __restrict__ node_mask_offsets,
-    int32_t* __restrict__ node_token_indices) {
+    int32_t* __restrict__ node_token_indices,
+    uint8_t* __restrict__ node_token_masks) {
   __shared__ int32_t warp_counts[kWarps];
   __shared__ int32_t group_base;
   int node = blockIdx.x / (num_masks - 1);
@@ -623,7 +627,9 @@ __global__ void build_node_token_indices_fallback_kernel(
     rank += __popc(selected_mask & ((1u << lane) - 1u));
     if (selected) {
       int group = node * num_masks + mask;
-      node_token_indices[node_mask_offsets[group] + rank] = token;
+      int32_t destination = node_mask_offsets[group] + rank;
+      node_token_indices[destination] = token;
+      node_token_masks[destination] = static_cast<uint8_t>(mask);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -911,6 +917,15 @@ void check_cuda_int32(const torch::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
 }
 
+void check_cuda_uint8(const torch::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
+  TORCH_CHECK(
+      tensor.scalar_type() == torch::kUInt8,
+      name,
+      " must have dtype torch.uint8");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
 void check_same_device(
     const torch::Tensor& tensor,
     const torch::Tensor& reference,
@@ -979,6 +994,7 @@ void launch_build_node_token_indices_specialized(
     const int32_t* chunk_prefixes,
     const int32_t* node_mask_offsets,
     int32_t* node_token_indices,
+    uint8_t* node_token_masks,
     cudaStream_t stream) {
   build_node_token_indices_kernel<TOP_K><<<
       num_chunks, kBlockThreads, 0, stream>>>(
@@ -994,7 +1010,8 @@ void launch_build_node_token_indices_specialized(
       radix_end_bit,
       chunk_prefixes,
       node_mask_offsets,
-      node_token_indices);
+      node_token_indices,
+      node_token_masks);
 }
 
 template <int TOP_K>
@@ -1194,6 +1211,7 @@ void get_expert_token_idx_node_mask_cuda(
     torch::Tensor expert_token_indices,
     torch::Tensor expert_offsets,
     torch::Tensor node_token_indices,
+    torch::Tensor node_token_masks,
     torch::Tensor node_offsets,
     torch::Tensor input_chunk_counts,
     torch::Tensor input_chunk_prefixes,
@@ -1204,6 +1222,7 @@ void get_expert_token_idx_node_mask_cuda(
   check_cuda_int32(expert_token_indices, "expert_token_indices");
   check_cuda_int32(expert_offsets, "expert_offsets");
   check_cuda_int32(node_token_indices, "node_token_indices");
+  check_cuda_uint8(node_token_masks, "node_token_masks");
   check_cuda_int32(node_offsets, "node_offsets");
   check_cuda_int32(input_chunk_counts, "input_chunk_counts");
   check_cuda_int32(input_chunk_prefixes, "input_chunk_prefixes");
@@ -1237,6 +1256,7 @@ void get_expert_token_idx_node_mask_cuda(
   check_same_device(expert_token_indices, r, "expert_token_indices");
   check_same_device(expert_offsets, r, "expert_offsets");
   check_same_device(node_token_indices, r, "node_token_indices");
+  check_same_device(node_token_masks, r, "node_token_masks");
   check_same_device(node_offsets, r, "node_offsets");
   check_same_device(input_chunk_counts, r, "input_chunk_counts");
   check_same_device(input_chunk_prefixes, r, "input_chunk_prefixes");
@@ -1274,6 +1294,9 @@ void get_expert_token_idx_node_mask_cuda(
   TORCH_CHECK(
       node_token_indices.numel() >= max_node_tokens,
       "node_token_indices needs at least T * min(top_k, num_nodes) entries");
+  TORCH_CHECK(
+      node_token_masks.numel() >= max_node_tokens,
+      "node_token_masks needs at least T * min(top_k, num_nodes) entries");
   TORCH_CHECK(
       node_offsets.numel() >= num_nodes + 1,
       "node_offsets needs num_nodes + 1 entries");
@@ -1340,12 +1363,13 @@ void get_expert_token_idx_node_mask_cuda(
   const int32_t* input_prefixes = input_chunk_prefixes.data_ptr<int32_t>();
   const int32_t* mask_offsets = node_mask_offsets.data_ptr<int32_t>();
   int32_t* x3 = node_token_indices.data_ptr<int32_t>();
+  uint8_t* x4 = node_token_masks.data_ptr<uint8_t>();
 
 #define LAUNCH_NODE_BUILD(TOP_K_VALUE)                                      \
   launch_build_node_token_indices_specialized<TOP_K_VALUE>(                 \
       input, num_tokens, num_experts, experts_per_gpu, experts_per_node,     \
       num_nodes, gpus_per_node, local_gpu_id, num_masks, num_input_chunks,   \
-      node_radix_end_bit, input_prefixes, mask_offsets, x3, stream)
+      node_radix_end_bit, input_prefixes, mask_offsets, x3, x4, stream)
 
   bool specialized_top_k = true;
   switch (top_k) {
@@ -1367,7 +1391,8 @@ void get_expert_token_idx_node_mask_cuda(
           local_gpu_id,
           num_masks,
           mask_offsets,
-          x3);
+          x3,
+          x4);
       break;
   }
 #undef LAUNCH_NODE_BUILD

@@ -75,6 +75,9 @@ def allocate_node_mask_outputs(
     node_token_indices = torch.empty(
         max_node_tokens, dtype=torch.int32, device=r.device
     )
+    node_token_masks = torch.empty(
+        max_node_tokens, dtype=torch.uint8, device=r.device
+    )
     node_offsets = torch.empty(num_nodes + 1, dtype=torch.int32, device=r.device)
     input_counts = torch.empty(
         (num_input_chunks, input_num_bins), dtype=torch.int32, device=r.device
@@ -93,6 +96,7 @@ def allocate_node_mask_outputs(
         values,
         offsets,
         node_token_indices,
+        node_token_masks,
         node_offsets,
         input_counts,
         input_prefixes,
@@ -148,7 +152,7 @@ def cpu_node_mask_reference(
     experts_per_gpu: int,
     gpus_per_node: int,
     local_gpu_id: int,
-) -> Tuple[List[List[int]], List[List[int]]]:
+) -> Tuple[List[List[int]], List[List[int]], List[List[int]]]:
     routes = r.cpu().tolist()
     experts_per_node = experts_per_gpu * gpus_per_node
     num_nodes = num_experts // experts_per_node
@@ -181,9 +185,11 @@ def cpu_node_mask_reference(
                 bit = (local_gpu_id - gpu) % gpus_per_node
                 if mask & (1 << bit):
                     gpu_positions[gpu] += 1
-    return expert_lists, [
-        [token for _, token in entries] for entries in node_entries
-    ]
+    return (
+        expert_lists,
+        [[token for _, token in entries] for entries in node_entries],
+        [[mask for mask, _ in entries] for entries in node_entries],
+    )
 
 
 def check_node_mask_result(
@@ -191,18 +197,20 @@ def check_node_mask_result(
     values: torch.Tensor,
     offsets: torch.Tensor,
     node_token_indices: torch.Tensor,
+    node_token_masks: torch.Tensor,
     node_offsets: torch.Tensor,
     num_experts: int,
     experts_per_gpu: int,
     gpus_per_node: int,
     local_gpu_id: int,
 ) -> None:
-    expected_experts, expected_nodes = cpu_node_mask_reference(
+    expected_experts, expected_nodes, expected_masks = cpu_node_mask_reference(
         r, num_experts, experts_per_gpu, gpus_per_node, local_gpu_id
     )
     host_values = values.cpu()
     host_offsets = offsets.cpu().tolist()
     host_node_values = node_token_indices.cpu()
+    host_node_masks = node_token_masks.cpu()
     host_node_offsets = node_offsets.cpu().tolist()
     if host_offsets[0] != 0 or host_offsets[-1] != r.numel():
         raise AssertionError(
@@ -218,6 +226,14 @@ def check_node_mask_result(
             raise AssertionError(
                 f"node {node} x3 mismatch: expected {expected[:16]}, "
                 f"got {actual[:16]} (lengths {len(expected)} vs {len(actual)})"
+            )
+        expected_node_masks = expected_masks[node]
+        actual_masks = host_node_masks[begin:end].tolist()
+        if actual_masks != expected_node_masks:
+            raise AssertionError(
+                f"node {node} x4 mismatch: expected {expected_node_masks[:16]}, "
+                f"got {actual_masks[:16]} "
+                f"(lengths {len(expected_node_masks)} vs {len(actual_masks)})"
             )
     for expert, expected in enumerate(expected_experts):
         begin, end = host_offsets[expert], host_offsets[expert + 1]
@@ -309,6 +325,7 @@ def main() -> None:
             values,
             offsets,
             node_token_indices,
+            node_token_masks,
             node_offsets,
             input_counts,
             input_prefixes,
@@ -330,6 +347,7 @@ def main() -> None:
                 values,
                 offsets,
                 node_token_indices,
+                node_token_masks,
                 node_offsets,
                 input_counts,
                 input_prefixes,
@@ -349,6 +367,7 @@ def main() -> None:
                 values,
                 offsets,
                 node_token_indices,
+                node_token_masks,
                 node_offsets,
                 input_counts,
                 input_prefixes,
@@ -382,6 +401,7 @@ def main() -> None:
                 values,
                 offsets,
                 node_token_indices,
+                node_token_masks,
                 node_offsets,
                 args.experts,
                 args.experts_per_gpu,
