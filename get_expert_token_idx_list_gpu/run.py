@@ -147,6 +147,7 @@ def cpu_node_mask_reference(
     num_experts: int,
     experts_per_gpu: int,
     gpus_per_node: int,
+    local_gpu_id: int,
 ) -> Tuple[List[List[int]], List[List[int]]]:
     routes = r.cpu().tolist()
     experts_per_node = experts_per_gpu * gpus_per_node
@@ -158,7 +159,8 @@ def cpu_node_mask_reference(
         for expert in row:
             node = expert // experts_per_node
             local_gpu = (expert // experts_per_gpu) % gpus_per_node
-            masks[node] = masks.get(node, 0) | (1 << local_gpu)
+            bit = (local_gpu_id - local_gpu) % gpus_per_node
+            masks[node] = masks.get(node, 0) | (1 << bit)
         for node, mask in masks.items():
             node_entries[node].append((mask, token))
 
@@ -176,7 +178,8 @@ def cpu_node_mask_reference(
                     local_gpu = (expert // experts_per_gpu) % gpus_per_node
                     expert_lists[expert].append(gpu_positions[local_gpu])
             for gpu in range(gpus_per_node):
-                if mask & (1 << gpu):
+                bit = (local_gpu_id - gpu) % gpus_per_node
+                if mask & (1 << bit):
                     gpu_positions[gpu] += 1
     return expert_lists, [
         [token for _, token in entries] for entries in node_entries
@@ -192,9 +195,10 @@ def check_node_mask_result(
     num_experts: int,
     experts_per_gpu: int,
     gpus_per_node: int,
+    local_gpu_id: int,
 ) -> None:
     expected_experts, expected_nodes = cpu_node_mask_reference(
-        r, num_experts, experts_per_gpu, gpus_per_node
+        r, num_experts, experts_per_gpu, gpus_per_node, local_gpu_id
     )
     host_values = values.cpu()
     host_offsets = offsets.cpu().tolist()
@@ -244,6 +248,12 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help="GPUs per node for --node-mask-sort (2-8; default: 8)",
     )
+    parser.add_argument(
+        "--local-gpu-id",
+        type=int,
+        default=0,
+        help="node-local GPU running the algorithm (default: 0)",
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=200)
@@ -265,6 +275,8 @@ def main() -> None:
         raise ValueError("tokens * top-k must fit in int32")
     if args.experts_per_gpu <= 0 or args.experts % args.experts_per_gpu:
         raise ValueError("experts-per-gpu must be positive and divide experts")
+    if not 0 <= args.local_gpu_id < args.gpus_per_node:
+        raise ValueError("local-gpu-id must be in [0, gpus-per-node - 1]")
     if args.node_mask_sort and args.experts % (
         args.experts_per_gpu * args.gpus_per_node
     ):
@@ -313,6 +325,7 @@ def main() -> None:
                 args.experts,
                 args.experts_per_gpu,
                 args.gpus_per_node,
+                args.local_gpu_id,
                 values,
                 offsets,
                 node_token_indices,
@@ -353,6 +366,7 @@ def main() -> None:
                 args.experts,
                 args.experts_per_gpu,
                 args.gpus_per_node,
+                args.local_gpu_id,
             )
         else:
             check_result(
@@ -374,7 +388,8 @@ def main() -> None:
     latency_us = elapsed_ms * 1000.0 / args.iters
 
     mode_details = (
-        f"mode=node-mask-sort GPUs_per_node={args.gpus_per_node}"
+        f"mode=node-mask-sort GPUs_per_node={args.gpus_per_node} "
+        f"local_gpu_id={args.local_gpu_id}"
         if args.node_mask_sort
         else "mode=gpu"
     )

@@ -30,7 +30,8 @@ Pass `--node-mask-sort` to enable the node-aware mode:
 
 ```bash
 python run.py --tokens 16384 --top-k 8 --experts 256 \
-  --experts-per-gpu 16 --node-mask-sort --gpus-per-node 4 --check
+  --experts-per-gpu 16 --node-mask-sort --gpus-per-node 4 \
+  --local-gpu-id 0 --check
 ```
 
 The node size is configured with `--gpus-per-node N`, where `N` can be any
@@ -41,6 +42,13 @@ in that node selected by the token (`bit g` represents node-local GPU `g`).
 Tokens sent to each node are stably sorted by the mask's unsigned numeric value
 in descending order; equal masks retain input-token order. The number of mask
 bins and all scratch-buffer sizes are derived from `N`.
+
+`--local-gpu-id x` selects the node-local GPU on which the algorithm runs and
+controls bit significance. Local GPU `(x + 1) % N` maps to the most significant
+meaningful bit, `(x + 2) % N` maps to the next bit, and so on; local GPU `x`
+maps to the least significant bit. Equivalently, local GPU `g` maps to bit
+`(x - g) % N`. The default local GPU ID is 0, and valid values are 0 through
+`N - 1`.
 
 The additional output is another packed ragged array:
 

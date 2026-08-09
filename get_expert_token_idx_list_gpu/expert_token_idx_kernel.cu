@@ -35,6 +35,19 @@ __device__ __forceinline__ int device_gcd(int a, int b) {
   return a;
 }
 
+__device__ __forceinline__ int node_mask_bit(
+    int local_gpu,
+    int gpus_per_node,
+    int local_gpu_id) {
+  // The local successor has the most significant meaningful bit, while the
+  // GPU running this algorithm has bit zero.
+  int bit = local_gpu_id - local_gpu;
+  if (bit < 0) {
+    bit += gpus_per_node;
+  }
+  return 1 << bit;
+}
+
 // Each row is an affine permutation prefix.  A stride coprime to K guarantees
 // that the top-k expert IDs in a row are distinct without a rejection loop.
 __global__ void generate_r_kernel(
@@ -348,6 +361,7 @@ __global__ void count_node_input_chunks_kernel(
     int experts_per_node,
     int num_nodes,
     int gpus_per_node,
+    int local_gpu_id,
     int num_masks,
     int32_t* __restrict__ chunk_counts) {
   extern __shared__ int32_t counts[];
@@ -384,7 +398,7 @@ __global__ void count_node_input_chunks_kernel(
         int other_expert = r[row + other];
         if (other_expert / experts_per_node == node) {
           int local_gpu = (other_expert / experts_per_gpu) % gpus_per_node;
-          mask |= 1 << local_gpu;
+          mask |= node_mask_bit(local_gpu, gpus_per_node, local_gpu_id);
         }
       }
       atomicAdd(
@@ -464,6 +478,7 @@ __global__ __launch_bounds__(kBlockThreads) void build_node_token_indices_kernel
     int experts_per_node,
     int num_nodes,
     int gpus_per_node,
+    int local_gpu_id,
     int num_masks,
     int radix_end_bit,
     const int32_t* __restrict__ chunk_prefixes,
@@ -509,7 +524,7 @@ __global__ __launch_bounds__(kBlockThreads) void build_node_token_indices_kernel
       int other_expert = r[row + other];
       if (other_expert / experts_per_node == node) {
         int local_gpu = (other_expert / experts_per_gpu) % gpus_per_node;
-        mask |= 1 << local_gpu;
+        mask |= node_mask_bit(local_gpu, gpus_per_node, local_gpu_id);
       }
     }
     // Ascending encoded keys mean node-major, descending-mask order.
@@ -565,6 +580,7 @@ __global__ void build_node_token_indices_fallback_kernel(
     int experts_per_gpu,
     int experts_per_node,
     int gpus_per_node,
+    int local_gpu_id,
     int num_masks,
     const int32_t* __restrict__ node_mask_offsets,
     int32_t* __restrict__ node_token_indices) {
@@ -588,7 +604,8 @@ __global__ void build_node_token_indices_fallback_kernel(
         int expert = r[row + route];
         if (expert / experts_per_node == node) {
           int local_gpu = (expert / experts_per_gpu) % gpus_per_node;
-          token_mask |= 1 << local_gpu;
+          token_mask |= node_mask_bit(
+              local_gpu, gpus_per_node, local_gpu_id);
         }
       }
     }
@@ -626,6 +643,7 @@ __global__ void count_reordered_node_chunks_kernel(
     int experts_per_gpu,
     int experts_per_node,
     int gpus_per_node,
+    int local_gpu_id,
     int num_chunks_per_node,
     const int32_t* __restrict__ node_token_indices,
     const int32_t* __restrict__ node_offsets,
@@ -651,11 +669,11 @@ __global__ void count_reordered_node_chunks_kernel(
         int local_expert = expert - node * experts_per_node;
         atomicAdd(&counts[local_expert], 1);
         int local_gpu = local_expert / experts_per_gpu;
-        mask |= 1 << local_gpu;
+        mask |= node_mask_bit(local_gpu, gpus_per_node, local_gpu_id);
       }
     }
     for (int gpu = 0; gpu < gpus_per_node; ++gpu) {
-      if (mask & (1 << gpu)) {
+      if (mask & node_mask_bit(gpu, gpus_per_node, local_gpu_id)) {
         atomicAdd(&counts[experts_per_node + gpu], 1);
       }
     }
@@ -954,6 +972,7 @@ void launch_build_node_token_indices_specialized(
     int experts_per_node,
     int num_nodes,
     int gpus_per_node,
+    int local_gpu_id,
     int num_masks,
     int num_chunks,
     int radix_end_bit,
@@ -970,6 +989,7 @@ void launch_build_node_token_indices_specialized(
       experts_per_node,
       num_nodes,
       gpus_per_node,
+      local_gpu_id,
       num_masks,
       radix_end_bit,
       chunk_prefixes,
@@ -1169,6 +1189,7 @@ void get_expert_token_idx_node_mask_cuda(
     int64_t num_experts_arg,
     int64_t experts_per_gpu_arg,
     int64_t gpus_per_node_arg,
+    int64_t local_gpu_id_arg,
     torch::Tensor expert_token_indices,
     torch::Tensor expert_offsets,
     torch::Tensor node_token_indices,
@@ -1202,6 +1223,9 @@ void get_expert_token_idx_node_mask_cuda(
       "gpus_per_node must be in [", kMinGpusPerNode, ", ",
       kMaxGpusPerNode, "]");
   TORCH_CHECK(
+      local_gpu_id_arg >= 0 && local_gpu_id_arg < gpus_per_node_arg,
+      "local_gpu_id must be in [0, gpus_per_node - 1]");
+  TORCH_CHECK(
       num_experts_arg % (experts_per_gpu_arg * gpus_per_node_arg) == 0,
       "node-mask mode requires a whole number of nodes");
   TORCH_CHECK(r.size(1) <= num_experts_arg, "top_k cannot exceed num_experts");
@@ -1224,6 +1248,7 @@ void get_expert_token_idx_node_mask_cuda(
   int num_experts = static_cast<int>(num_experts_arg);
   int experts_per_gpu = static_cast<int>(experts_per_gpu_arg);
   int gpus_per_node = static_cast<int>(gpus_per_node_arg);
+  int local_gpu_id = static_cast<int>(local_gpu_id_arg);
   int num_masks = 1 << gpus_per_node;
   int experts_per_node = experts_per_gpu * gpus_per_node;
   int num_nodes = num_experts / experts_per_node;
@@ -1292,6 +1317,7 @@ void get_expert_token_idx_node_mask_cuda(
       experts_per_node,
       num_nodes,
       gpus_per_node,
+      local_gpu_id,
       num_masks,
       input_chunk_counts.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1317,7 +1343,7 @@ void get_expert_token_idx_node_mask_cuda(
 #define LAUNCH_NODE_BUILD(TOP_K_VALUE)                                      \
   launch_build_node_token_indices_specialized<TOP_K_VALUE>(                 \
       input, num_tokens, num_experts, experts_per_gpu, experts_per_node,     \
-      num_nodes, gpus_per_node, num_masks, num_input_chunks,                 \
+      num_nodes, gpus_per_node, local_gpu_id, num_masks, num_input_chunks,   \
       node_radix_end_bit, input_prefixes, mask_offsets, x3, stream)
 
   bool specialized_top_k = true;
@@ -1337,6 +1363,7 @@ void get_expert_token_idx_node_mask_cuda(
           experts_per_gpu,
           experts_per_node,
           gpus_per_node,
+          local_gpu_id,
           num_masks,
           mask_offsets,
           x3);
@@ -1370,6 +1397,7 @@ void get_expert_token_idx_node_mask_cuda(
       experts_per_gpu,
       experts_per_node,
       gpus_per_node,
+      local_gpu_id,
       num_chunks_per_node,
       x3,
       node_offsets.data_ptr<int32_t>(),
