@@ -40,14 +40,23 @@ set(RDMA_PROXY_SOURCES
   src/qp_worker.cpp
   src/rdma_connection.cpp
   src/rdma_context.cpp
+  src/router_routing.cpp
 )
 
 if(RDMA_PROXY_HAVE_CUDA)
-  list(APPEND RDMA_PROXY_SOURCES src/cuda_kernels.cu)
+  set(EXPERT_TOKEN_IDX_KERNEL_SOURCE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../get_expert_token_idx_list_gpu/expert_token_idx_kernel.cu)
+  set_source_files_properties(${EXPERT_TOKEN_IDX_KERNEL_SOURCE}
+    PROPERTIES COMPILE_DEFINITIONS EXPERT_TOKEN_IDX_STANDALONE=1)
+  list(APPEND RDMA_PROXY_SOURCES src/cuda_kernels.cu ${EXPERT_TOKEN_IDX_KERNEL_SOURCE})
 endif()
 
 add_library(rdma_cpu_proxy_lib ${RDMA_PROXY_SOURCES})
 target_include_directories(rdma_cpu_proxy_lib PUBLIC include)
+if(RDMA_PROXY_HAVE_CUDA)
+  target_include_directories(rdma_cpu_proxy_lib PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../get_expert_token_idx_list_gpu)
+endif()
 target_compile_definitions(rdma_cpu_proxy_lib
   PUBLIC
     RDMA_PROXY_HAVE_CUDA=$<BOOL:${RDMA_PROXY_HAVE_CUDA}>
@@ -84,6 +93,10 @@ if(RDMA_PROXY_BUILD_TESTS)
   add_executable(test_measured_run tests/test_measured_run.cpp)
   target_link_libraries(test_measured_run PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_measured_run COMMAND test_measured_run)
+
+  add_executable(test_router_routing tests/test_router_routing.cpp)
+  target_link_libraries(test_router_routing PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_router_routing COMMAND test_router_routing)
 endif()
 
 message(STATUS "RDMA_PROXY_HAVE_CUDA=${RDMA_PROXY_HAVE_CUDA}")
