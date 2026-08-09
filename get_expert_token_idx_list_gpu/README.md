@@ -83,8 +83,20 @@ In node-mask mode, `latency` is the end-to-end algorithm latency and
 `x3_latency` measures only the first three phases needed to materialize the
 aligned `node_token_indices`/`node_token_masks` (`x3`/`x4`) outputs:
 input-chunk counting, prefix/offset scanning, and the stable node/mask scatter.
-Both averages use `--iters`; the normal full-path warmups also warm these three
-kernels before either measurement.
+Both averages use `--iters`; the full path and the standalone x3/x4 path each
+use `--warmup` before their respective measurements.
+
+Pass `--x3-x4-to-cpu` with `--node-mask-sort` to copy the valid x3 and x4
+slices into the pinned CPU tensors `host_node_token_indices` and
+`host_node_token_masks`. The `num_nodes + 1` offsets are also copied to the
+pinned CPU tensor `host_node_offsets`, allowing node `i` to use the slice
+`[host_node_offsets[i]:host_node_offsets[i + 1]]` in both packed arrays. In
+this mode, the copies are enqueued directly after the x3/x4 kernels, and the
+ending CUDA event is recorded after all three copies. Consequently,
+`x3_latency` includes x3/x4 generation and all D2H transfers; event
+synchronization guarantees the CPU buffers are ready. The terminal reports
+`x3_x4_output=cpu node_offsets_output=cpu` instead of the corresponding `gpu`
+values.
 
 ## Kernel structure
 

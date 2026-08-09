@@ -270,6 +270,11 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="node-local GPU running the algorithm (default: 0)",
     )
+    parser.add_argument(
+        "--x3-x4-to-cpu",
+        action="store_true",
+        help="copy x3/x4 and node offsets to pinned CPU buffers",
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=200)
@@ -293,6 +298,8 @@ def main() -> None:
         raise ValueError("experts-per-gpu must be positive and divide experts")
     if not 0 <= args.local_gpu_id < args.gpus_per_node:
         raise ValueError("local-gpu-id must be in [0, gpus-per-node - 1]")
+    if args.x3_x4_to_cpu and not args.node_mask_sort:
+        raise ValueError("x3-x4-to-cpu requires --node-mask-sort")
     if args.node_mask_sort and args.experts % (
         args.experts_per_gpu * args.gpus_per_node
     ):
@@ -394,6 +401,38 @@ def main() -> None:
 
     launch()
     torch.cuda.synchronize()
+    num_node_tokens = (
+        node_offsets[-1].item() if args.node_mask_sort else None
+    )
+    host_node_token_indices = None
+    host_node_token_masks = None
+    host_node_offsets = None
+    if args.x3_x4_to_cpu:
+        num_nodes = args.experts // (
+            args.experts_per_gpu * args.gpus_per_node
+        )
+        host_node_token_indices = torch.empty(
+            num_node_tokens, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        host_node_token_masks = torch.empty(
+            num_node_tokens, dtype=torch.uint8, device="cpu", pin_memory=True
+        )
+        host_node_offsets = torch.empty(
+            num_nodes + 1, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+
+    if args.node_mask_sort:
+        def launch_x3_output() -> None:
+            launch_x3()
+            if args.x3_x4_to_cpu:
+                host_node_token_indices.copy_(
+                    node_token_indices[:num_node_tokens], non_blocking=True
+                )
+                host_node_token_masks.copy_(
+                    node_token_masks[:num_node_tokens], non_blocking=True
+                )
+                host_node_offsets.copy_(node_offsets, non_blocking=True)
+
     if args.check:
         if args.node_mask_sort:
             check_node_mask_result(
@@ -429,15 +468,32 @@ def main() -> None:
 
     x3_latency_us = None
     if args.node_mask_sort:
+        for _ in range(args.warmup):
+            launch_x3_output()
+        torch.cuda.synchronize()
+
         x3_start = torch.cuda.Event(enable_timing=True)
         x3_end = torch.cuda.Event(enable_timing=True)
         x3_start.record()
         for _ in range(args.iters):
-            launch_x3()
+            launch_x3_output()
         x3_end.record()
         x3_end.synchronize()
         x3_elapsed_ms = x3_start.elapsed_time(x3_end)
         x3_latency_us = x3_elapsed_ms * 1000.0 / args.iters
+        if args.x3_x4_to_cpu and args.check:
+            check_node_mask_result(
+                r,
+                values,
+                offsets,
+                host_node_token_indices,
+                host_node_token_masks,
+                host_node_offsets,
+                args.experts,
+                args.experts_per_gpu,
+                args.gpus_per_node,
+                args.local_gpu_id,
+            )
 
     mode_details = (
         f"mode=node-mask-sort GPUs_per_node={args.gpus_per_node} "
@@ -446,7 +502,10 @@ def main() -> None:
         else "mode=gpu"
     )
     if args.node_mask_sort:
-        mode_details += f" x3_tokens={node_offsets[-1].item()}"
+        output_location = "cpu" if args.x3_x4_to_cpu else "gpu"
+        mode_details += f" x3_tokens={num_node_tokens}"
+        mode_details += f" x3_x4_output={output_location}"
+        mode_details += f" node_offsets_output={output_location}"
         mode_details += f" x3_latency={x3_latency_us:.3f} us"
     print(
         f"device={props.name} sm={props.major}.{props.minor} "
