@@ -1190,6 +1190,7 @@ void get_expert_token_idx_node_mask_cuda(
     int64_t experts_per_gpu_arg,
     int64_t gpus_per_node_arg,
     int64_t local_gpu_id_arg,
+    bool x3_only,
     torch::Tensor expert_token_indices,
     torch::Tensor expert_offsets,
     torch::Tensor node_token_indices,
@@ -1371,6 +1372,10 @@ void get_expert_token_idx_node_mask_cuda(
   }
 #undef LAUNCH_NODE_BUILD
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  if (x3_only) {
+    return;
+  }
 
   if (!specialized_top_k) {
     scatter_reordered_by_expert_fallback_kernel<<<

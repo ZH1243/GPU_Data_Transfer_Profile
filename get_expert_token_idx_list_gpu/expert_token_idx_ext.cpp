@@ -22,6 +22,7 @@ void get_expert_token_idx_node_mask_cuda(
     int64_t experts_per_gpu,
     int64_t gpus_per_node,
     int64_t local_gpu_id,
+    bool x3_only,
     torch::Tensor expert_token_indices,
     torch::Tensor expert_offsets,
     torch::Tensor node_token_indices,

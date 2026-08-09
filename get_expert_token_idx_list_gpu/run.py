@@ -326,6 +326,26 @@ def main() -> None:
                 args.experts_per_gpu,
                 args.gpus_per_node,
                 args.local_gpu_id,
+                False,
+                values,
+                offsets,
+                node_token_indices,
+                node_offsets,
+                input_counts,
+                input_prefixes,
+                node_mask_offsets,
+                reordered_counts,
+                reordered_prefixes,
+            )
+
+        def launch_x3() -> None:
+            extension.get_expert_token_idx_node_mask(
+                r,
+                args.experts,
+                args.experts_per_gpu,
+                args.gpus_per_node,
+                args.local_gpu_id,
+                True,
                 values,
                 offsets,
                 node_token_indices,
@@ -387,6 +407,18 @@ def main() -> None:
     elapsed_ms = start.elapsed_time(end)
     latency_us = elapsed_ms * 1000.0 / args.iters
 
+    x3_latency_us = None
+    if args.node_mask_sort:
+        x3_start = torch.cuda.Event(enable_timing=True)
+        x3_end = torch.cuda.Event(enable_timing=True)
+        x3_start.record()
+        for _ in range(args.iters):
+            launch_x3()
+        x3_end.record()
+        x3_end.synchronize()
+        x3_elapsed_ms = x3_start.elapsed_time(x3_end)
+        x3_latency_us = x3_elapsed_ms * 1000.0 / args.iters
+
     mode_details = (
         f"mode=node-mask-sort GPUs_per_node={args.gpus_per_node} "
         f"local_gpu_id={args.local_gpu_id}"
@@ -395,6 +427,7 @@ def main() -> None:
     )
     if args.node_mask_sort:
         mode_details += f" x3_tokens={node_offsets[-1].item()}"
+        mode_details += f" x3_latency={x3_latency_us:.3f} us"
     print(
         f"device={props.name} sm={props.major}.{props.minor} "
         f"T={args.tokens} topK={args.top_k} K={args.experts} "

@@ -69,6 +69,12 @@ runs one correctness check against a CPU implementation, and reports average
 CUDA-event latency.  Output and scratch buffers are allocated once and reused,
 so allocation time is excluded.
 
+In node-mask mode, `latency` is the end-to-end algorithm latency and
+`x3_latency` measures only the first three phases needed to materialize
+`node_token_indices`: input-chunk counting, prefix/offset scanning, and the
+stable node/mask scatter. Both averages use `--iters`; the normal full-path
+warmups also warm these three kernels before either measurement.
+
 ## Kernel structure
 
 The fast path uses three stream-ordered kernels:
