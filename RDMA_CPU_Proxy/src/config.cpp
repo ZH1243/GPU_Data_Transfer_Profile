@@ -752,6 +752,11 @@ void validate_config(const ProxyConfig& config) {
                 "router-driven NVLink forwarding does not support local batch synchronization because "
                 "x3/x4 lengths may differ across local GPU proxies");
         }
+        if (config.router_routing_enabled && config.nvlink_forward_out_of_order_chunks_enabled) {
+            throw std::runtime_error(
+                "router-driven NVLink forwarding requires ordered chunks and does not support "
+                "nvlink_forward_out_of_order_chunks_enabled=true");
+        }
         if (dynamic_threshold) {
             if (config.nvlink_forward_min_threshold_chunks == 0 ||
                 config.nvlink_forward_max_threshold_chunks == 0) {

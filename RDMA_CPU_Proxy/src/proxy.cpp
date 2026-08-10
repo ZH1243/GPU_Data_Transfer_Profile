@@ -1845,6 +1845,11 @@ void Proxy::start_forwarding_thread() {
         std::lock_guard<std::mutex> lock(forwarding_mutex_);
         forwarding_next_batch_by_peer_.assign(peers_.size(), 0);
         forwarding_next_chunk_by_peer_.assign(peers_.size(), 0);
+        forwarding_compaction_iteration_by_peer_.assign(
+            peers_.size(), std::numeric_limits<uint64_t>::max());
+        forwarding_compaction_next_source_token_by_peer_.assign(peers_.size(), 0);
+        forwarding_compaction_next_destination_token_by_peer_.assign(
+            peers_.size(), std::vector<std::size_t>(forwarding_destinations_.size(), 0));
         forwarding_out_of_order_next_batch_by_peer_.assign(peers_.size(), 0);
         forwarding_iteration_stats_.clear();
         forwarding_error_.clear();
@@ -1982,6 +1987,9 @@ void Proxy::stop_forwarding_thread() {
     forwarding_out_of_order_command_ack_by_peer_.reset();
     forwarding_out_of_order_issued_chunks_by_peer_.reset();
     forwarding_ready_peer_count_ = 0;
+    forwarding_compaction_iteration_by_peer_.clear();
+    forwarding_compaction_next_source_token_by_peer_.clear();
+    forwarding_compaction_next_destination_token_by_peer_.clear();
     forwarding_out_of_order_peer_states_.clear();
     nvlink_forward_notification_dispatch_.reset();
     release_nvlink_forward_notifications();
@@ -2365,6 +2373,33 @@ void Proxy::issue_forwarding_batch(
     const auto peer_slot = static_cast<std::size_t>(
         std::distance(cuda_buffers_.peer_buffers().cbegin(), peer_buffer_it));
     const auto legacy_peer_slot_offset = cuda_buffers_.token_buffer_bytes() * peer_slot;
+    const bool compact_router_destinations =
+        config_.router_routing_enabled && !config_.nvlink_forward_use_round_robin;
+    if (compact_router_destinations) {
+        if (peer_slot >= forwarding_compaction_iteration_by_peer_.size() ||
+            peer_slot >= forwarding_compaction_next_source_token_by_peer_.size() ||
+            peer_slot >= forwarding_compaction_next_destination_token_by_peer_.size() ||
+            forwarding_compaction_next_destination_token_by_peer_[peer_slot].size() !=
+                forwarding_destinations_.size()) {
+            throw std::runtime_error("missing router NVLink destination compaction state");
+        }
+        auto& cursor_iteration = forwarding_compaction_iteration_by_peer_[peer_slot];
+        if (cursor_iteration != iteration) {
+            cursor_iteration = iteration;
+            forwarding_compaction_next_source_token_by_peer_[peer_slot] = 0;
+            std::fill(
+                forwarding_compaction_next_destination_token_by_peer_[peer_slot].begin(),
+                forwarding_compaction_next_destination_token_by_peer_[peer_slot].end(),
+                std::size_t{0});
+        }
+        if (batch_start_token != forwarding_compaction_next_source_token_by_peer_[peer_slot]) {
+            throw std::runtime_error(
+                "router NVLink forwarding batch is out of order for peer " +
+                std::to_string(peer.peer_rank) + ": expected source token " +
+                std::to_string(forwarding_compaction_next_source_token_by_peer_[peer_slot]) +
+                ", got " + std::to_string(batch_start_token));
+        }
+    }
 
     if (config_.nvlink_forward_use_round_robin) {
         for (std::size_t chunk_index = 0;
@@ -2443,7 +2478,10 @@ void Proxy::issue_forwarding_batch(
         // (local_gpu + 1 + column) % num_gpus_per_node. The remaining columns
         // are still generated and included in sorting, but are ignored for
         // forwarding because they do not represent unique peer GPUs.
-        for (const auto& dst : forwarding_destinations_) {
+        for (std::size_t destination_index = 0;
+             destination_index < forwarding_destinations_.size();
+             ++destination_index) {
+            const auto& dst = forwarding_destinations_[destination_index];
             const auto& destination_buffer = forward_destination_buffer(dst, peer.peer_rank);
             // Exact source-node buffers are private to one global source GPU.
             // A manual wildcard destination retains the legacy peer-slot layout.
@@ -2459,8 +2497,11 @@ void Proxy::issue_forwarding_batch(
 
             std::vector<CudaForwardCopy> copies;
             copies.reserve(batch_tokens);
+            const auto destination_start_token = compact_router_destinations ?
+                forwarding_compaction_next_destination_token_by_peer_[peer_slot][destination_index] :
+                batch_start_token;
             const auto destination_base_offset =
-                destination_slot_offset + batch_start_token * token_bytes;
+                destination_slot_offset + destination_start_token * token_bytes;
             std::size_t routed_tokens = 0;
             std::size_t run_start_token = 0;
             std::size_t run_tokens = 0;
@@ -2497,6 +2538,11 @@ void Proxy::issue_forwarding_batch(
             }
             flush_run();
 
+            if (compact_router_destinations) {
+                forwarding_compaction_next_destination_token_by_peer_[peer_slot][destination_index] +=
+                    routed_tokens;
+            }
+
             if (copies.empty()) {
                 if (config_.nvlink_forward_log_batches) {
                     RDMA_PROXY_LOG_INFO("nvlink_forward_route_empty iteration=", iteration,
@@ -2521,6 +2567,7 @@ void Proxy::issue_forwarding_batch(
                                     " batch=", batch_index_in_iteration,
                                     " route_column=", route_column,
                                     " batch_start_token=", batch_start_token,
+                                    " destination_start_token=", destination_start_token,
                                     " routed_tokens=", routed_tokens,
                                     " batch_entries=", copies.size(),
                                     " peer_slot_offset=", destination_slot_offset,
@@ -2538,7 +2585,7 @@ void Proxy::issue_forwarding_batch(
                 notification.iteration = iteration;
                 notification.batch_index = batch_index_in_iteration;
                 notification.peer_slot = peer_slot;
-                notification.start_token = batch_start_token;
+                notification.start_token = destination_start_token;
                 notification.num_tokens = routed_tokens;
                 notification.byte_offset = destination_base_offset;
                 notification.bytes = bytes;
@@ -2548,6 +2595,9 @@ void Proxy::issue_forwarding_batch(
                 notification.flags = 0;
                 completed_notifications.push_back(notification);
             }
+        }
+        if (compact_router_destinations) {
+            forwarding_compaction_next_source_token_by_peer_[peer_slot] += batch_tokens;
         }
     }
     if (config_.nvlink_forward_synchronize_batches) {

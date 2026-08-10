@@ -222,6 +222,19 @@ int main(int argc, char** argv) {
     }
     assert(rejected_router_round_robin);
 
+    auto invalid_router_out_of_order_config = router_nvlink_config;
+    invalid_router_out_of_order_config.nvlink_forward_threshold_tokens = 0;
+    invalid_router_out_of_order_config.nvlink_forward_min_threshold_chunks = 1;
+    invalid_router_out_of_order_config.nvlink_forward_max_threshold_chunks = 4;
+    invalid_router_out_of_order_config.nvlink_forward_out_of_order_chunks_enabled = true;
+    bool rejected_router_out_of_order = false;
+    try {
+        rdma_proxy::validate_config(invalid_router_out_of_order_config);
+    } catch (const std::runtime_error&) {
+        rejected_router_out_of_order = true;
+    }
+    assert(rejected_router_out_of_order);
+
     auto invalid_router_experts_config = router_config;
     invalid_router_experts_config.router_num_experts = 255;
     bool rejected_router_experts = false;

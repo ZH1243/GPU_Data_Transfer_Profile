@@ -229,6 +229,13 @@ private:
     mutable std::mutex forwarding_mutex_;
     std::vector<std::size_t> forwarding_next_batch_by_peer_;
     std::vector<std::size_t> forwarding_next_chunk_by_peer_;
+    // Router-driven forwarding compacts each destination independently. These
+    // cursors are owned by the forwarding thread and reset at iteration
+    // boundaries; keeping the source cursor as well makes ordered forwarding
+    // an explicit invariant instead of an assumption of the copy layout.
+    std::vector<uint64_t> forwarding_compaction_iteration_by_peer_;
+    std::vector<std::size_t> forwarding_compaction_next_source_token_by_peer_;
+    std::vector<std::vector<std::size_t>> forwarding_compaction_next_destination_token_by_peer_;
     std::vector<uint64_t> forwarding_out_of_order_next_batch_by_peer_;
     std::unique_ptr<std::atomic<std::size_t>[]> forwarding_ready_batches_by_peer_;
     std::unique_ptr<std::atomic<std::size_t>[]> forwarding_ready_chunks_by_peer_;

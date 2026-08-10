@@ -11,6 +11,51 @@
 #include <thread>
 #include <vector>
 
+namespace {
+
+uint8_t router_test_pattern_byte(
+    const rdma_proxy::ProxyConfig& config,
+    uint64_t iteration,
+    std::size_t offset) {
+    uint64_t x = static_cast<uint64_t>(offset);
+    x ^= (iteration + 1) * 0x9e3779b97f4a7c15ULL;
+    x ^= (static_cast<uint64_t>(config.node_rank + 1) << 48);
+    // Router test data uses destination rank -1, whose encoded +1 field is 0.
+    x ^= (static_cast<uint64_t>(config.local_gpu_index + 1) << 16);
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    return static_cast<uint8_t>(x & 0xffU);
+}
+
+std::vector<uint8_t> expected_compact_router_destination(
+    const rdma_proxy::ProxyConfig& config,
+    const rdma_proxy::RouterRouting& routing,
+    int peer_rank,
+    int destination_gpu,
+    uint64_t iteration) {
+    const auto& source_tokens = routing.token_indices_for_node(peer_rank);
+    const auto& masks = routing.token_masks_for_node(peer_rank);
+    const auto token_bytes =
+        config.token_dimension * rdma_proxy::dtype_size(config.dtype);
+    int bit = config.local_gpu_index - destination_gpu;
+    if (bit < 0) bit += config.num_gpus_per_node;
+    const auto destination_mask = static_cast<uint8_t>(1U << bit);
+
+    std::vector<uint8_t> expected;
+    for (std::size_t position = 0; position < source_tokens.size(); ++position) {
+        if ((masks[position] & destination_mask) == 0) continue;
+        const auto source_byte_offset = source_tokens[position] * token_bytes;
+        for (std::size_t byte = 0; byte < token_bytes; ++byte) {
+            expected.push_back(router_test_pattern_byte(
+                config, iteration, source_byte_offset + byte));
+        }
+    }
+    return expected;
+}
+
+}  // namespace
+
 int main() {
     using namespace rdma_proxy;
 
@@ -88,6 +133,76 @@ int main() {
         proxy.initialize();
         proxy.run();
         proxy.shutdown();
+    }
+
+    {
+        auto config = make_config();
+        config.num_gpus_per_node = 3;
+        config.num_tokens = 97;
+        config.tokens_per_chunk = 7;
+        config.num_iterations = 2;
+        config.router_routing_enabled = true;
+        config.router_num_experts = 12;
+        config.router_top_k = 4;
+        config.router_seed = 9876;
+        config.nvlink_forwarding_enabled = true;
+        config.nvlink_forward_threshold_tokens = 11;
+        config.nvlink_forward_chunk_tokens = 1;
+
+        const auto destination_bytes =
+            config.num_tokens * config.token_dimension * dtype_size(config.dtype);
+        std::vector<uint8_t> destination_gpu1(destination_bytes, 0);
+        std::vector<uint8_t> destination_gpu2(destination_bytes, 0);
+        config.nvlink_forward_destinations = {
+            NvlinkForwardDestination{
+                1,
+                1,
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(destination_gpu1.data())),
+                destination_gpu1.size()},
+            NvlinkForwardDestination{
+                2,
+                2,
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(destination_gpu2.data())),
+                destination_gpu2.size()},
+        };
+        validate_config(config);
+
+        RouterRouting expected_routing(config);
+        expected_routing.initialize();
+        const auto expected_gpu1 = expected_compact_router_destination(
+            config, expected_routing, 1, 1, config.num_iterations - 1);
+        const auto expected_gpu2 = expected_compact_router_destination(
+            config, expected_routing, 1, 2, config.num_iterations - 1);
+        if (expected_gpu1.empty() || expected_gpu2.empty()) {
+            std::cerr << "router compaction test did not route tokens to both destinations\n";
+            return 1;
+        }
+
+        Proxy proxy(config);
+        proxy.initialize();
+        proxy.run();
+        proxy.shutdown();
+
+        auto check_compact_destination = [](
+            const std::vector<uint8_t>& actual,
+            const std::vector<uint8_t>& expected,
+            const char* name) {
+            if (!std::equal(expected.begin(), expected.end(), actual.begin())) {
+                std::cerr << name << " router destination is not compact or has incorrect token order\n";
+                return false;
+            }
+            if (std::any_of(actual.begin() + static_cast<std::ptrdiff_t>(expected.size()),
+                            actual.end(),
+                            [](uint8_t byte) { return byte != 0; })) {
+                std::cerr << name << " router destination has data after its compact token span\n";
+                return false;
+            }
+            return true;
+        };
+        if (!check_compact_destination(destination_gpu1, expected_gpu1, "GPU 1") ||
+            !check_compact_destination(destination_gpu2, expected_gpu2, "GPU 2")) {
+            return 1;
+        }
     }
 
     {
