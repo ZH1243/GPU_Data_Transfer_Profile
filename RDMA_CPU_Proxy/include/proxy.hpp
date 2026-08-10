@@ -57,12 +57,17 @@ private:
         std::vector<uint64_t> immediate_counts;
     };
 
-    struct ForwardDestinationState {
-        int gpu_index{-1};
-        int cuda_device_id{-1};
+    struct ForwardDestinationBufferState {
+        int source_node_rank{-1};
         void* ptr{nullptr};
         std::size_t bytes{0};
         bool imported_cuda_ipc{false};
+    };
+
+    struct ForwardDestinationState {
+        int gpu_index{-1};
+        int cuda_device_id{-1};
+        std::vector<ForwardDestinationBufferState> source_buffers;
     };
 
     struct ForwardingIterationStats {
@@ -164,6 +169,9 @@ private:
     void prepare_forwarding_destinations();
     void publish_local_nvlink_receive_buffers() const;
     ForwardDestinationState load_forward_destination(int dst_gpu) const;
+    const ForwardDestinationBufferState& forward_destination_buffer(
+        const ForwardDestinationState& destination,
+        int source_node_rank) const;
     std::string nvlink_exchange_file(int gpu_index) const;
     void forwarding_loop();
     std::vector<std::size_t> nvlink_forward_peer_order() const;

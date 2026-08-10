@@ -1959,11 +1959,13 @@ void Proxy::stop_forwarding_thread() {
     check_forwarding_error();
     flush_nvlink_forward_notification_log_queue();
     for (auto& dst : forwarding_destinations_) {
-        if (dst.imported_cuda_ipc) {
-            close_cuda_ipc_memory_handle(dst.ptr, config_.mock_mode);
+        for (auto& source_buffer : dst.source_buffers) {
+            if (source_buffer.imported_cuda_ipc) {
+                close_cuda_ipc_memory_handle(source_buffer.ptr, config_.mock_mode);
+            }
+            source_buffer.ptr = nullptr;
+            source_buffer.imported_cuda_ipc = false;
         }
-        dst.ptr = nullptr;
-        dst.imported_cuda_ipc = false;
     }
     forwarding_destinations_.clear();
     forwarding_ready_batches_by_peer_.reset();
@@ -2054,6 +2056,9 @@ void Proxy::publish_local_nvlink_receive_buffers() const {
         << "cuda_device_id " << config_.cuda_device_id << '\n'
         << "buffer_bytes " << cuda_buffers_.nvlink_receive_buffer_bytes() << '\n';
     for (const auto& entry : cuda_buffers_.nvlink_receive_buffers()) {
+        if (entry.source_node_rank >= 0) {
+            out << "source_node " << entry.source_node_rank << ' ';
+        }
         out << "source_gpu " << entry.source_gpu_index
             << " mock_addr " << reinterpret_cast<uintptr_t>(entry.recv.ptr)
             << " ipc_handle " << export_cuda_ipc_memory_handle(entry.recv.ptr, config_.mock_mode)
@@ -2078,13 +2083,23 @@ Proxy::ForwardDestinationState Proxy::load_forward_destination(int dst_gpu) cons
         if (it == config_.nvlink_forward_destinations.end()) {
             throw std::runtime_error("missing manual NVLink forwarding destination for GPU " + std::to_string(dst_gpu));
         }
-        return ForwardDestinationState{
-            it->gpu_index,
-            it->cuda_device_id,
+        ForwardDestinationState destination;
+        destination.gpu_index = it->gpu_index;
+        destination.cuda_device_id = it->cuda_device_id;
+        destination.source_buffers.push_back(ForwardDestinationBufferState{
+            -1,
             reinterpret_cast<void*>(static_cast<uintptr_t>(it->buffer_addr)),
             it->buffer_bytes,
-            false};
+            false});
+        return destination;
     }
+
+    struct PublishedBuffer {
+        int source_node_rank{-1};
+        int source_gpu_index{-1};
+        uint64_t mock_addr{0};
+        std::string ipc_handle;
+    };
 
     const auto path = nvlink_exchange_file(dst_gpu);
     const auto deadline = std::chrono::steady_clock::now() +
@@ -2108,10 +2123,8 @@ Proxy::ForwardDestinationState Proxy::load_forward_destination(int dst_gpu) cons
         int exporter_pid = -1;
         int cuda_device_id = -1;
         std::size_t buffer_bytes = 0;
-        uint64_t mock_addr = 0;
-        std::string ipc_handle;
+        std::vector<PublishedBuffer> published_buffers;
         std::string key;
-        bool found_source_buffer = false;
         while (in >> key) {
             if (key == "node_rank") {
                 in >> node_rank;
@@ -2123,21 +2136,31 @@ Proxy::ForwardDestinationState Proxy::load_forward_destination(int dst_gpu) cons
                 in >> cuda_device_id;
             } else if (key == "buffer_bytes") {
                 in >> buffer_bytes;
-            } else if (key == "source_gpu") {
-                int source_gpu = -1;
+            } else if (key == "source_node") {
+                PublishedBuffer entry;
+                std::string source_gpu_key;
                 std::string mock_key;
                 std::string handle_key;
-                uint64_t entry_mock_addr = 0;
-                std::string entry_handle;
-                in >> source_gpu >> mock_key >> entry_mock_addr >> handle_key >> entry_handle;
+                in >> entry.source_node_rank
+                   >> source_gpu_key >> entry.source_gpu_index
+                   >> mock_key >> entry.mock_addr
+                   >> handle_key >> entry.ipc_handle;
+                if (!in || source_gpu_key != "source_gpu" ||
+                    mock_key != "mock_addr" || handle_key != "ipc_handle") {
+                    throw std::runtime_error("malformed node-aware NVLink source buffer entry in " + path);
+                }
+                published_buffers.push_back(std::move(entry));
+            } else if (key == "source_gpu") {
+                PublishedBuffer entry;
+                std::string mock_key;
+                std::string handle_key;
+                in >> entry.source_gpu_index
+                   >> mock_key >> entry.mock_addr
+                   >> handle_key >> entry.ipc_handle;
                 if (!in || mock_key != "mock_addr" || handle_key != "ipc_handle") {
                     throw std::runtime_error("malformed NVLink source buffer entry in " + path);
                 }
-                if (source_gpu == config_.local_gpu_index) {
-                    mock_addr = entry_mock_addr;
-                    ipc_handle = entry_handle;
-                    found_source_buffer = true;
-                }
+                published_buffers.push_back(std::move(entry));
             } else {
                 throw std::runtime_error("unknown key in NVLink exchange file " + path + ": " + key);
             }
@@ -2148,27 +2171,100 @@ Proxy::ForwardDestinationState Proxy::load_forward_destination(int dst_gpu) cons
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
+        std::vector<const PublishedBuffer*> selected_buffers;
+        if (config_.router_routing_enabled) {
+            selected_buffers.reserve(config_.peers.size());
+            for (const auto& peer : config_.peers) {
+                const auto entry = std::find_if(
+                    published_buffers.begin(),
+                    published_buffers.end(),
+                    [&](const PublishedBuffer& candidate) {
+                        return candidate.source_node_rank == peer.node_rank &&
+                            candidate.source_gpu_index == config_.local_gpu_index;
+                    });
+                if (entry != published_buffers.end()) selected_buffers.push_back(&*entry);
+            }
+        } else {
+            const auto entry = std::find_if(
+                published_buffers.begin(),
+                published_buffers.end(),
+                [&](const PublishedBuffer& candidate) {
+                    return candidate.source_node_rank < 0 &&
+                        candidate.source_gpu_index == config_.local_gpu_index;
+                });
+            if (entry != published_buffers.end()) selected_buffers.push_back(&*entry);
+        }
+        const auto expected_buffer_count = config_.router_routing_enabled ?
+            config_.peers.size() : std::size_t{1};
         if (node_rank != config_.node_rank || gpu_index != dst_gpu || cuda_device_id < 0 ||
-            buffer_bytes == 0 || !found_source_buffer) {
+            buffer_bytes == 0 || selected_buffers.size() != expected_buffer_count) {
             last_wait_reason = "metadata incomplete or mismatched";
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
 
-        void* ptr = open_cuda_ipc_memory_handle(ipc_handle, mock_addr, config_.mock_mode);
-        RDMA_PROXY_LOG_INFO("imported NVLink receive buffer local_rank=", config_.node_rank,
-                            " src_gpu=", config_.local_gpu_index,
-                            " dst_gpu=", dst_gpu,
-                            " exporter_pid=", exporter_pid,
-                            " cuda_device_id=", cuda_device_id,
-                            " bytes=", buffer_bytes,
-                            " ptr=", reinterpret_cast<uintptr_t>(ptr),
-                            " path=", path);
-        return ForwardDestinationState{dst_gpu, cuda_device_id, ptr, buffer_bytes, true};
+        ForwardDestinationState destination;
+        destination.gpu_index = dst_gpu;
+        destination.cuda_device_id = cuda_device_id;
+        destination.source_buffers.reserve(selected_buffers.size());
+        try {
+            for (const auto* published : selected_buffers) {
+                void* ptr = open_cuda_ipc_memory_handle(
+                    published->ipc_handle, published->mock_addr, config_.mock_mode);
+                destination.source_buffers.push_back(ForwardDestinationBufferState{
+                    published->source_node_rank,
+                    ptr,
+                    buffer_bytes,
+                    true});
+                RDMA_PROXY_LOG_INFO(
+                    "imported NVLink receive buffer local_rank=", config_.node_rank,
+                    " source_node=", published->source_node_rank,
+                    " src_gpu=", config_.local_gpu_index,
+                    " dst_gpu=", dst_gpu,
+                    " exporter_pid=", exporter_pid,
+                    " cuda_device_id=", cuda_device_id,
+                    " bytes=", buffer_bytes,
+                    " ptr=", reinterpret_cast<uintptr_t>(ptr),
+                    " path=", path);
+            }
+        } catch (...) {
+            for (auto& source_buffer : destination.source_buffers) {
+                if (source_buffer.imported_cuda_ipc) {
+                    close_cuda_ipc_memory_handle(source_buffer.ptr, config_.mock_mode);
+                }
+            }
+            throw;
+        }
+        return destination;
     }
 
     throw std::runtime_error("timed out waiting for live NVLink exchange file: " + path +
                              " reason=" + last_wait_reason);
+}
+
+const Proxy::ForwardDestinationBufferState& Proxy::forward_destination_buffer(
+    const ForwardDestinationState& destination,
+    int source_node_rank) const {
+    const auto exact = std::find_if(
+        destination.source_buffers.begin(),
+        destination.source_buffers.end(),
+        [&](const ForwardDestinationBufferState& buffer) {
+            return buffer.source_node_rank == source_node_rank;
+        });
+    if (exact != destination.source_buffers.end()) return *exact;
+
+    const auto wildcard = std::find_if(
+        destination.source_buffers.begin(),
+        destination.source_buffers.end(),
+        [](const ForwardDestinationBufferState& buffer) {
+            return buffer.source_node_rank < 0;
+        });
+    if (wildcard != destination.source_buffers.end()) return *wildcard;
+
+    throw std::runtime_error(
+        "missing NVLink forwarding destination buffer for source node " +
+        std::to_string(source_node_rank) + " and destination GPU " +
+        std::to_string(destination.gpu_index));
 }
 
 void Proxy::prepare_forwarding_destinations() {
@@ -2268,7 +2364,7 @@ void Proxy::issue_forwarding_batch(
     }
     const auto peer_slot = static_cast<std::size_t>(
         std::distance(cuda_buffers_.peer_buffers().cbegin(), peer_buffer_it));
-    const auto peer_slot_offset = cuda_buffers_.token_buffer_bytes() * peer_slot;
+    const auto legacy_peer_slot_offset = cuda_buffers_.token_buffer_bytes() * peer_slot;
 
     if (config_.nvlink_forward_use_round_robin) {
         for (std::size_t chunk_index = 0;
@@ -2283,19 +2379,20 @@ void Proxy::issue_forwarding_batch(
             if (dst_it == forwarding_destinations_.end()) {
                 throw std::runtime_error("missing NVLink forwarding destination for GPU " + std::to_string(dst_gpu));
             }
+            const auto& destination_buffer = forward_destination_buffer(*dst_it, peer.peer_rank);
 
             const auto token_offset = batch_start_token + chunk_index * config_.nvlink_forward_chunk_tokens;
             const auto source_byte_offset = token_offset * token_bytes;
-            const auto destination_byte_offset = peer_slot_offset + source_byte_offset;
+            const auto destination_byte_offset = legacy_peer_slot_offset + source_byte_offset;
             const auto bytes = config_.nvlink_forward_chunk_tokens * token_bytes;
             if (source_byte_offset + bytes > buffers.recv.bytes ||
-                destination_byte_offset + bytes > dst_it->bytes) {
+                destination_byte_offset + bytes > destination_buffer.bytes) {
                 throw std::runtime_error("NVLink forwarding copy exceeds source or destination buffer size");
             }
 
             CudaForwardCopy copy;
             copy.src = static_cast<const char*>(buffers.recv.ptr) + source_byte_offset;
-            copy.dst = static_cast<char*>(dst_it->ptr) + destination_byte_offset;
+            copy.dst = static_cast<char*>(destination_buffer.ptr) + destination_byte_offset;
             copy.bytes = bytes;
             batch_bytes += bytes;
 
@@ -2309,7 +2406,7 @@ void Proxy::issue_forwarding_batch(
                                     " chunk=", chunk_index,
                                     " token_offset=", token_offset,
                                     " token_count=", config_.nvlink_forward_chunk_tokens,
-                                    " peer_slot_offset=", peer_slot_offset,
+                                    " peer_slot_offset=", legacy_peer_slot_offset,
                                     " bytes=", bytes,
                                     " src_addr=", reinterpret_cast<uintptr_t>(copy.src),
                                     " dst_addr=", reinterpret_cast<uintptr_t>(copy.dst));
@@ -2347,6 +2444,11 @@ void Proxy::issue_forwarding_batch(
         // are still generated and included in sorting, but are ignored for
         // forwarding because they do not represent unique peer GPUs.
         for (const auto& dst : forwarding_destinations_) {
+            const auto& destination_buffer = forward_destination_buffer(dst, peer.peer_rank);
+            // Exact source-node buffers are private to one global source GPU.
+            // A manual wildcard destination retains the legacy peer-slot layout.
+            const auto destination_slot_offset = destination_buffer.source_node_rank >= 0 ?
+                std::size_t{0} : legacy_peer_slot_offset;
             const auto route_column =
                 routing_column_for_gpu(config_.local_gpu_index, dst.gpu_index, config_.num_gpus_per_node);
             const int mapped_gpu =
@@ -2357,7 +2459,8 @@ void Proxy::issue_forwarding_batch(
 
             std::vector<CudaForwardCopy> copies;
             copies.reserve(batch_tokens);
-            const auto destination_base_offset = peer_slot_offset + batch_start_token * token_bytes;
+            const auto destination_base_offset =
+                destination_slot_offset + batch_start_token * token_bytes;
             std::size_t routed_tokens = 0;
             std::size_t run_start_token = 0;
             std::size_t run_tokens = 0;
@@ -2367,13 +2470,13 @@ void Proxy::issue_forwarding_batch(
                 const auto destination_byte_offset = destination_base_offset + routed_tokens * token_bytes;
                 const auto bytes = run_tokens * token_bytes;
                 if (source_byte_offset + bytes > buffers.recv.bytes ||
-                    destination_byte_offset + bytes > dst.bytes) {
+                    destination_byte_offset + bytes > destination_buffer.bytes) {
                     throw std::runtime_error("NVLink forwarding copy exceeds source or destination buffer size");
                 }
 
                 CudaForwardCopy copy;
                 copy.src = static_cast<const char*>(buffers.recv.ptr) + source_byte_offset;
-                copy.dst = static_cast<char*>(dst.ptr) + destination_byte_offset;
+                copy.dst = static_cast<char*>(destination_buffer.ptr) + destination_byte_offset;
                 copy.bytes = bytes;
                 copies.push_back(copy);
                 routed_tokens += run_tokens;
@@ -2420,7 +2523,7 @@ void Proxy::issue_forwarding_batch(
                                     " batch_start_token=", batch_start_token,
                                     " routed_tokens=", routed_tokens,
                                     " batch_entries=", copies.size(),
-                                    " peer_slot_offset=", peer_slot_offset,
+                                    " peer_slot_offset=", destination_slot_offset,
                                     " bytes=", bytes,
                                     " first_src_addr=", reinterpret_cast<uintptr_t>(copies.front().src),
                                     " first_dst_addr=", reinterpret_cast<uintptr_t>(copies.front().dst));

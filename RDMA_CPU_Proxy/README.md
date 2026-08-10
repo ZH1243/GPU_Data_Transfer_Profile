@@ -77,6 +77,8 @@ When both `router_routing_enabled=true` and `nvlink_forwarding_enabled=true`, th
 
 Router-driven forwarding supports fixed, dynamic, and out-of-order chunk thresholds. A fixed threshold may produce a smaller final batch because a peer's `x3` length is data-dependent. Router mode does not support `nvlink_forward_use_round_robin=true` or `nvlink_forward_local_batch_sync_enabled=true`; local proxies can have different `x3`/`x4` lengths, so a shared batch-count barrier is not well-defined.
 
+In this combined router/NVLink mode, every destination GPU allocates one separate inbound buffer for every global `(source_node_rank, source_gpu_index)` pair, including currently unused pairs. The number of allocations per destination GPU is therefore `num_nodes * num_gpus_per_node`; a 4-node, 8-GPU deployment allocates 32 buffers. The current forwarding path uses the `(num_nodes - 1) * (num_gpus_per_node - 1)` remote-node/other-local-GPU pairs (21 in that deployment). Each allocation is `token_buffer_bytes`, because one global source GPU can contribute at most `num_tokens` token rows. Because the source node is part of the allocation identity, router forwarding writes at the token offset within the selected buffer instead of adding the legacy peer-node slot offset.
+
 Example overrides:
 
 ```bash
@@ -93,7 +95,7 @@ Example overrides:
 
 ## Intra-Node NVLink Forwarding
 
-NVLink forwarding is disabled by default and does not change RDMA-only behavior. When enabled, each proxy allocates one inbound NVLink receive buffer on its local GPU for every other local source GPU. With 8 GPUs per node, each proxy allocates 7 such buffers. Each buffer is sized for all remote-node streams, so with 4 nodes it has 3 peer-node slots.
+NVLink forwarding is disabled by default and does not change RDMA-only behavior. In non-router mode, each proxy allocates one inbound NVLink receive buffer on its local GPU for every other local source GPU. With 8 GPUs per node, each proxy allocates 7 such buffers. Each buffer is sized for all remote-node streams, so with 4 nodes it has 3 peer-node slots. The combined router/NVLink mode instead uses the global-source allocation layout described above.
 
 The proxy publishes these local inbound buffers through `nvlink_forward_exchange_dir` using CUDA IPC handles. Other local GPU proxies import the specific buffer assigned to their source GPU and forward from their per-peer RDMA receive buffer to that imported destination buffer using the CUDA copy engine. Each destination GPU receives at most one `cudaMemcpyBatchAsync` call per forwarding batch, and all destination calls for one batch are enqueued sequentially into the same CUDA stream.
 

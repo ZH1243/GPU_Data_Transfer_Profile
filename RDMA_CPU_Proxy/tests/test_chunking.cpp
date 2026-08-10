@@ -1,3 +1,4 @@
+#include "cuda_buffers.hpp"
 #include "protocol.hpp"
 #include "qp_worker.hpp"
 
@@ -5,6 +6,7 @@
 #include <cassert>
 #include <cstddef>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -126,6 +128,41 @@ int main() {
     assert(decoded.recv_buffer.rkey == info.recv_buffer.rkey);
     assert(decoded.qps.size() == 1);
     assert(decoded.qps[0].gid[15] == 42);
+
+    ProxyConfig router_nvlink_config;
+    router_nvlink_config.mock_mode = true;
+    router_nvlink_config.router_routing_enabled = true;
+    router_nvlink_config.nvlink_forwarding_enabled = true;
+    router_nvlink_config.node_rank = 0;
+    router_nvlink_config.num_nodes = 4;
+    router_nvlink_config.local_gpu_index = 3;
+    router_nvlink_config.num_gpus_per_node = 8;
+    router_nvlink_config.num_tokens = 4;
+    router_nvlink_config.token_dimension = 2;
+    router_nvlink_config.dtype = DataType::kFP16;
+    router_nvlink_config.peers = {
+        PeerAddress{1, "peer-1", 1},
+        PeerAddress{2, "peer-2", 1},
+        PeerAddress{3, "peer-3", 1},
+    };
+    CudaBuffers router_nvlink_buffers(router_nvlink_config);
+    router_nvlink_buffers.initialize();
+    assert(router_nvlink_buffers.nvlink_receive_buffers().size() == 32);
+    const auto expected_forwarding_buffer_bytes = router_nvlink_buffers.token_buffer_bytes();
+    assert(router_nvlink_buffers.nvlink_receive_buffer_bytes() == expected_forwarding_buffer_bytes);
+    std::set<void*> distinct_router_nvlink_allocations;
+    for (int source_node = 0; source_node < router_nvlink_config.num_nodes; ++source_node) {
+        for (int source_gpu = 0; source_gpu < router_nvlink_config.num_gpus_per_node; ++source_gpu) {
+            const auto& buffer = router_nvlink_buffers.nvlink_receive_buffer_for_source(
+                source_node, source_gpu);
+            assert(buffer.source_node_rank == source_node);
+            assert(buffer.source_gpu_index == source_gpu);
+            assert(buffer.recv.ptr != nullptr);
+            assert(buffer.recv.bytes == expected_forwarding_buffer_bytes);
+            distinct_router_nvlink_allocations.insert(buffer.recv.ptr);
+        }
+    }
+    assert(distinct_router_nvlink_allocations.size() == 32);
 
     DynamicChunkDistributor distributor(
         chunks,

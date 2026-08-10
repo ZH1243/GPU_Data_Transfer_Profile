@@ -103,16 +103,36 @@ void CudaBuffers::initialize() {
     nvlink_recv_buffers_.clear();
     if (config_.nvlink_forwarding_enabled) {
         const auto forwarding_bytes = nvlink_receive_buffer_bytes();
-        nvlink_recv_buffers_.reserve(static_cast<std::size_t>(config_.num_gpus_per_node - 1));
-        for (int source_gpu = 0; source_gpu < config_.num_gpus_per_node; ++source_gpu) {
-            if (source_gpu == config_.local_gpu_index) continue;
-            NvlinkReceiveBuffer entry;
-            entry.source_gpu_index = source_gpu;
-            allocate_buffer(entry.recv, forwarding_bytes);
-            nvlink_recv_buffers_.push_back(entry);
-            RDMA_PROXY_LOG_INFO("allocated NVLink receive buffer local_gpu=", config_.local_gpu_index,
-                                " source_gpu=", source_gpu,
-                                " bytes=", forwarding_bytes);
+        if (config_.router_routing_enabled) {
+            const auto global_gpu_count = static_cast<std::size_t>(config_.num_nodes) *
+                static_cast<std::size_t>(config_.num_gpus_per_node);
+            nvlink_recv_buffers_.reserve(global_gpu_count);
+            for (int source_node = 0; source_node < config_.num_nodes; ++source_node) {
+                for (int source_gpu = 0; source_gpu < config_.num_gpus_per_node; ++source_gpu) {
+                    NvlinkReceiveBuffer entry;
+                    entry.source_node_rank = source_node;
+                    entry.source_gpu_index = source_gpu;
+                    allocate_buffer(entry.recv, forwarding_bytes);
+                    nvlink_recv_buffers_.push_back(entry);
+                    RDMA_PROXY_LOG_INFO(
+                        "allocated router NVLink receive buffer local_gpu=", config_.local_gpu_index,
+                        " source_node=", source_node,
+                        " source_gpu=", source_gpu,
+                        " bytes=", forwarding_bytes);
+                }
+            }
+        } else {
+            nvlink_recv_buffers_.reserve(static_cast<std::size_t>(config_.num_gpus_per_node - 1));
+            for (int source_gpu = 0; source_gpu < config_.num_gpus_per_node; ++source_gpu) {
+                if (source_gpu == config_.local_gpu_index) continue;
+                NvlinkReceiveBuffer entry;
+                entry.source_gpu_index = source_gpu;
+                allocate_buffer(entry.recv, forwarding_bytes);
+                nvlink_recv_buffers_.push_back(entry);
+                RDMA_PROXY_LOG_INFO("allocated NVLink receive buffer local_gpu=", config_.local_gpu_index,
+                                    " source_gpu=", source_gpu,
+                                    " bytes=", forwarding_bytes);
+            }
         }
     }
 
@@ -267,11 +287,16 @@ const PeerGpuBuffers& CudaBuffers::buffers_for_peer(int peer_rank) const {
     return *it;
 }
 
-const NvlinkReceiveBuffer& CudaBuffers::nvlink_receive_buffer_for_source(int source_gpu_index) const {
+const NvlinkReceiveBuffer& CudaBuffers::nvlink_receive_buffer_for_source(
+    int source_node_rank,
+    int source_gpu_index) const {
     auto it = std::find_if(nvlink_recv_buffers_.begin(), nvlink_recv_buffers_.end(), [&](const auto& entry) {
-        return entry.source_gpu_index == source_gpu_index;
+        return entry.source_node_rank == source_node_rank &&
+            entry.source_gpu_index == source_gpu_index;
     });
-    if (it == nvlink_recv_buffers_.end()) throw std::runtime_error("unknown NVLink source GPU");
+    if (it == nvlink_recv_buffers_.end()) {
+        throw std::runtime_error("unknown NVLink source node/GPU");
+    }
     return *it;
 }
 
@@ -280,6 +305,9 @@ std::size_t CudaBuffers::token_buffer_bytes() const {
 }
 
 std::size_t CudaBuffers::nvlink_receive_buffer_bytes() const {
+    if (config_.router_routing_enabled) {
+        return token_buffer_bytes();
+    }
     return token_buffer_bytes() * config_.peers.size();
 }
 

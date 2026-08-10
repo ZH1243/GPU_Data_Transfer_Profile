@@ -23,6 +23,7 @@ struct PeerGpuBuffers {
 };
 
 struct NvlinkReceiveBuffer {
+    int source_node_rank{-1};
     int source_gpu_index{-1};
     GpuBuffer recv;
 };
@@ -64,7 +65,9 @@ public:
     const std::vector<NvlinkReceiveBuffer>& nvlink_receive_buffers() const { return nvlink_recv_buffers_; }
     PeerGpuBuffers& buffers_for_peer(int peer_rank);
     const PeerGpuBuffers& buffers_for_peer(int peer_rank) const;
-    const NvlinkReceiveBuffer& nvlink_receive_buffer_for_source(int source_gpu_index) const;
+    const NvlinkReceiveBuffer& nvlink_receive_buffer_for_source(
+        int source_node_rank,
+        int source_gpu_index) const;
 
     std::size_t token_buffer_bytes() const;
     std::size_t nvlink_receive_buffer_bytes() const;
