@@ -369,8 +369,18 @@ void Proxy::setup_peer(PeerGpuBuffers& buffers) {
     }
     peer.remote_recv_mr = remote_info.recv_buffer;
     peer.remote_gpu_index = remote_info.gpu_index;
-    peer.receive_chunks = config_.router_routing_enabled ?
-        exchange_router_receive_chunks(peer_addr) : make_chunks();
+    if (config_.router_routing_enabled) {
+        auto remote_router = exchange_router_receive_metadata(peer_addr);
+        peer.receive_chunks = compute_chunks_from_token_indices(
+            remote_router.token_indices,
+            config_.token_dimension,
+            dtype_size(config_.dtype),
+            config_.tokens_per_chunk,
+            config_.num_qps_per_peer);
+        peer.router_x4 = std::move(remote_router.token_masks);
+    } else {
+        peer.receive_chunks = make_chunks();
+    }
 
     for (std::size_t q = 0; q < peer.qps.size(); ++q) {
         peer.qps[q]->connect(remote_info.qps[q]);
@@ -396,7 +406,7 @@ void Proxy::setup_peer(PeerGpuBuffers& buffers) {
     peers_.push_back(std::move(peer));
 }
 
-std::vector<ChunkDescriptor> Proxy::exchange_router_receive_chunks(
+RouterX3Metadata Proxy::exchange_router_receive_metadata(
     const PeerAddress& peer_addr) const {
     RouterX3Metadata local;
     local.source_node_rank = config_.node_rank;
@@ -411,6 +421,7 @@ std::vector<ChunkDescriptor> Proxy::exchange_router_receive_chunks(
     local.element_bytes = dtype_size(config_.dtype);
     local.tokens_per_chunk = config_.tokens_per_chunk;
     local.token_indices = router_routing_.token_indices_for_node(peer_addr.node_rank);
+    local.token_masks = router_routing_.token_masks_for_node(peer_addr.node_rank);
 
     const auto remote_payload = connection_manager_.exchange_control_message(
         peer_addr,
@@ -422,7 +433,7 @@ std::vector<ChunkDescriptor> Proxy::exchange_router_receive_chunks(
     if (remote.source_node_rank != expected_source ||
         remote.destination_node_rank != expected_destination ||
         remote.local_gpu_index != config_.local_gpu_index) {
-        throw std::runtime_error("router x3 TCP metadata rank/GPU mismatch");
+        throw std::runtime_error("router x3/x4 TCP metadata rank/GPU mismatch");
     }
     if (remote.num_nodes != config_.num_nodes ||
         remote.num_gpus_per_node != config_.num_gpus_per_node ||
@@ -432,19 +443,14 @@ std::vector<ChunkDescriptor> Proxy::exchange_router_receive_chunks(
         remote.token_dimension != config_.token_dimension ||
         remote.element_bytes != dtype_size(config_.dtype) ||
         remote.tokens_per_chunk != config_.tokens_per_chunk) {
-        throw std::runtime_error("router x3 TCP metadata tensor/chunk configuration mismatch");
+        throw std::runtime_error("router x3/x4 TCP metadata tensor/chunk configuration mismatch");
     }
     RDMA_PROXY_LOG_INFO(
-        "received router x3 metadata peer=", peer_addr.node_rank,
+        "received router x3/x4 metadata peer=", peer_addr.node_rank,
         " routed_tokens=", remote.token_indices.size(),
         " chunks=", (remote.token_indices.size() + config_.tokens_per_chunk - 1) /
             config_.tokens_per_chunk);
-    return compute_chunks_from_token_indices(
-        remote.token_indices,
-        config_.token_dimension,
-        dtype_size(config_.dtype),
-        config_.tokens_per_chunk,
-        config_.num_qps_per_peer);
+    return remote;
 }
 
 void Proxy::synchronize_peer_ready(const PeerAddress& peer_addr, const PeerState& peer) const {
@@ -1896,11 +1902,11 @@ void Proxy::start_forwarding_thread() {
     }
     forwarding_out_of_order_peer_states_.clear();
     if (out_of_order_chunks) {
-        const auto chunks = make_chunks();
-        const auto chunks_per_iteration = chunks.size();
-        const auto total_chunks = config_.num_iterations * chunks_per_iteration;
         forwarding_out_of_order_peer_states_.resize(peers_.size());
-        for (auto& state : forwarding_out_of_order_peer_states_) {
+        for (std::size_t peer_index = 0; peer_index < peers_.size(); ++peer_index) {
+            auto& state = forwarding_out_of_order_peer_states_[peer_index];
+            const auto chunks_per_iteration = peers_[peer_index].receive_chunks.size();
+            const auto total_chunks = config_.num_iterations * chunks_per_iteration;
             state.total_chunks = total_chunks;
             state.chunks_per_iteration = chunks_per_iteration;
             state.chunk_status.reset(new std::atomic<int8_t>[total_chunks]);
@@ -1960,7 +1966,6 @@ void Proxy::stop_forwarding_thread() {
         dst.imported_cuda_ipc = false;
     }
     forwarding_destinations_.clear();
-    forwarding_routing_tables_by_peer_.clear();
     forwarding_ready_batches_by_peer_.reset();
     forwarding_ready_chunks_by_peer_.reset();
     forwarding_out_of_order_current_start_by_peer_.reset();
@@ -1983,12 +1988,22 @@ void Proxy::stop_forwarding_thread() {
 }
 
 void Proxy::prepare_forwarding_routing_tables() {
-    forwarding_routing_tables_by_peer_.clear();
-    forwarding_routing_tables_by_peer_.reserve(peers_.size());
     std::mt19937_64 rng(config_.nvlink_routing_seed);
     std::bernoulli_distribution route(config_.nvlink_routing_probability);
 
-    for (const auto& peer : peers_) {
+    for (auto& peer : peers_) {
+        if (config_.router_routing_enabled) {
+            if (peer.router_x4.size() != forwarding_tokens_for_peer(peer)) {
+                throw std::runtime_error("router x4 length does not match received x3 token count");
+            }
+            peer.forwarding_routing_table = normalize_router_x4_for_nvlink(
+                peer.router_x4, config_.num_gpus_per_node);
+            RDMA_PROXY_LOG_INFO("installed router x4 NVLink forwarding table peer_rank=", peer.peer_rank,
+                                " rows=", peer.forwarding_routing_table.size(),
+                                " active_columns=", active_routing_columns(config_.num_gpus_per_node));
+            continue;
+        }
+
         std::vector<uint8_t> table(config_.num_tokens, 0);
         for (auto& row : table) {
             for (std::size_t column = 0; column < 8; ++column) {
@@ -1999,7 +2014,7 @@ void Proxy::prepare_forwarding_routing_tables() {
         }
 
         std::sort(table.begin(), table.end(), std::greater<uint8_t>());
-        forwarding_routing_tables_by_peer_.push_back(std::move(table));
+        peer.forwarding_routing_table = std::move(table);
         RDMA_PROXY_LOG_INFO("generated NVLink routing table peer_rank=", peer.peer_rank,
                             " rows=", config_.num_tokens,
                             " active_columns=", active_routing_columns(config_.num_gpus_per_node),
@@ -2008,6 +2023,15 @@ void Proxy::prepare_forwarding_routing_tables() {
                             " seed=", config_.nvlink_routing_seed);
     }
 
+}
+
+std::size_t Proxy::forwarding_tokens_for_peer(const PeerState& peer) const {
+    if (config_.router_routing_enabled) {
+        if (peer.receive_chunks.empty()) return 0;
+        const auto& last = peer.receive_chunks.back();
+        return last.start_token + last.num_tokens;
+    }
+    return config_.num_tokens;
 }
 
 std::string Proxy::nvlink_exchange_file(int gpu_index) const {
@@ -2231,7 +2255,7 @@ void Proxy::issue_forwarding_batch(
     const auto batch_timing_start = std::chrono::steady_clock::now();
     std::size_t batch_bytes = 0;
     std::vector<NvlinkForwardNotification> completed_notifications;
-    if (batch_start_token + batch_tokens > config_.num_tokens) {
+    if (batch_start_token + batch_tokens > forwarding_tokens_for_peer(peer)) {
         throw std::runtime_error("NVLink forwarding batch exceeds token range");
     }
 
@@ -2312,11 +2336,10 @@ void Proxy::issue_forwarding_batch(
             }
         }
     } else {
-        if (peer_slot >= forwarding_routing_tables_by_peer_.size()) {
-            throw std::runtime_error("missing NVLink routing table for peer buffer slot");
+        const auto& routing_table = peer.forwarding_routing_table;
+        if (routing_table.size() != forwarding_tokens_for_peer(peer)) {
+            throw std::runtime_error("missing or mis-sized NVLink routing table for peer");
         }
-
-        const auto& routing_table = forwarding_routing_tables_by_peer_[peer_slot];
 
         // Each routing row is one uint8_t for one received token. Columns
         // 0..num_gpus_per_node-2 map to local destination GPUs via
@@ -2463,16 +2486,10 @@ void Proxy::issue_forwarding_batch(
 
 void Proxy::forwarding_ready_loop() {
     try {
-        const auto chunks = make_chunks();
         const auto peer_order = nvlink_forward_peer_order();
         const bool dynamic_threshold = nvlink_forward_dynamic_threshold_enabled(config_);
         const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config_);
-        const auto batches_per_iteration =
-            dynamic_threshold ? std::size_t{0} : config_.num_tokens / forward_threshold_tokens;
-        const auto chunks_per_iteration = chunks.size();
         const bool finite_iterations = config_.num_iterations != 0;
-        const auto total_batches = finite_iterations ? config_.num_iterations * batches_per_iteration : 0;
-        const auto total_chunks = finite_iterations ? config_.num_iterations * chunks_per_iteration : 0;
 
         while (!forwarding_stop_.load()) {
             check_forwarding_error();
@@ -2483,6 +2500,17 @@ void Proxy::forwarding_ready_loop() {
                 }
 
                 const auto& peer = peers_[peer_index];
+                const auto& chunks = peer.receive_chunks;
+                const auto chunks_per_iteration = chunks.size();
+                const auto forwarding_tokens = forwarding_tokens_for_peer(peer);
+                const auto batches_per_iteration = dynamic_threshold || forwarding_tokens == 0 ?
+                    std::size_t{0} :
+                    (forwarding_tokens + forward_threshold_tokens - 1) / forward_threshold_tokens;
+                const auto total_batches = finite_iterations ?
+                    config_.num_iterations * batches_per_iteration : std::size_t{0};
+                const auto total_chunks = finite_iterations ?
+                    config_.num_iterations * chunks_per_iteration : std::size_t{0};
+                if (chunks.empty()) continue;
 
                 if (dynamic_threshold && config_.nvlink_forward_out_of_order_chunks_enabled) {
                     if (peer_index >= forwarding_out_of_order_peer_states_.size()) {
@@ -2639,6 +2667,8 @@ void Proxy::forwarding_ready_loop() {
                     const auto batch_in_iteration = next_batch % batches_per_iteration;
                     const auto batch_start_token =
                         batch_in_iteration * forward_threshold_tokens;
+                    const auto batch_tokens =
+                        std::min(forward_threshold_tokens, forwarding_tokens - batch_start_token);
                     const auto required_count = iteration + 1;
 
                     const auto availability_start = std::chrono::steady_clock::now();
@@ -2646,7 +2676,7 @@ void Proxy::forwarding_ready_loop() {
                         peer,
                         chunks,
                         batch_start_token,
-                        forward_threshold_tokens,
+                        batch_tokens,
                         required_count);
                     const auto availability_elapsed_ns =
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2700,16 +2730,10 @@ void Proxy::record_out_of_order_forwarding_arrival(
 
 void Proxy::forwarding_loop() {
     try {
-        const auto chunks = make_chunks();
         const auto peer_order = nvlink_forward_peer_order();
         const bool dynamic_threshold = nvlink_forward_dynamic_threshold_enabled(config_);
         const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config_);
-        const auto batches_per_iteration =
-            dynamic_threshold ? std::size_t{0} : config_.num_tokens / forward_threshold_tokens;
-        const auto chunks_per_iteration = chunks.size();
         const bool finite_iterations = config_.num_iterations != 0;
-        const auto total_batches = finite_iterations ? config_.num_iterations * batches_per_iteration : 0;
-        const auto total_chunks = finite_iterations ? config_.num_iterations * chunks_per_iteration : 0;
         uint64_t local_batch_sync_sequence = 0;
 
         while (!forwarding_stop_.load()) {
@@ -2720,6 +2744,17 @@ void Proxy::forwarding_loop() {
                     throw std::runtime_error("NVLink forwarding ready peer index out of range");
                 }
                 const auto& peer = peers_[peer_index];
+                const auto& chunks = peer.receive_chunks;
+                const auto chunks_per_iteration = chunks.size();
+                const auto forwarding_tokens = forwarding_tokens_for_peer(peer);
+                const auto batches_per_iteration = dynamic_threshold || forwarding_tokens == 0 ?
+                    std::size_t{0} :
+                    (forwarding_tokens + forward_threshold_tokens - 1) / forward_threshold_tokens;
+                const auto total_batches = finite_iterations ?
+                    config_.num_iterations * batches_per_iteration : std::size_t{0};
+                const auto total_chunks = finite_iterations ?
+                    config_.num_iterations * chunks_per_iteration : std::size_t{0};
+                if (chunks.empty()) continue;
 
                 if (dynamic_threshold && config_.nvlink_forward_out_of_order_chunks_enabled) {
                     uint64_t next_batch = 0;
@@ -2937,6 +2972,8 @@ void Proxy::forwarding_loop() {
                     const auto batch_in_iteration = next_batch % batches_per_iteration;
                     const auto batch_start_token =
                         batch_in_iteration * forward_threshold_tokens;
+                    const auto batch_tokens =
+                        std::min(forward_threshold_tokens, forwarding_tokens - batch_start_token);
                     const auto ready_batches =
                         forwarding_ready_batches_by_peer_[peer_index].load();
                     if (next_batch >= ready_batches) {
@@ -2950,7 +2987,7 @@ void Proxy::forwarding_loop() {
                                             " peer_rank=", peer.peer_rank,
                                             " batch=", batch_in_iteration,
                                             " batch_start_token=", batch_start_token,
-                                            " batch_tokens=", forward_threshold_tokens);
+                                            " batch_tokens=", batch_tokens);
                     }
                     if (config_.nvlink_forward_local_batch_sync_enabled) {
                         ++local_batch_sync_sequence;
@@ -2966,7 +3003,7 @@ void Proxy::forwarding_loop() {
                         iteration,
                         batch_in_iteration,
                         batch_start_token,
-                        forward_threshold_tokens);
+                        batch_tokens);
                     {
                         std::lock_guard<std::mutex> lock(forwarding_mutex_);
                         forwarding_next_batch_by_peer_.at(peer_index) = next_batch + 1;
@@ -2986,18 +3023,15 @@ void Proxy::forwarding_loop() {
 
 void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
     if (!config_.nvlink_forwarding_enabled) return;
-    const auto chunks = make_chunks();
     const bool dynamic_threshold = nvlink_forward_dynamic_threshold_enabled(config_);
     const bool out_of_order_chunks =
         dynamic_threshold && config_.nvlink_forward_out_of_order_chunks_enabled;
     const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config_);
     const auto batches_per_iteration =
-        dynamic_threshold ? std::size_t{0} : config_.num_tokens / forward_threshold_tokens;
-    const auto required_batches = dynamic_threshold ?
-        std::size_t{0} : static_cast<std::size_t>(iteration + 1) * batches_per_iteration;
-    const auto chunks_per_iteration = chunks.size();
-    const auto required_chunks = dynamic_threshold ?
-        static_cast<std::size_t>(iteration + 1) * chunks_per_iteration : std::size_t{0};
+        dynamic_threshold ? std::size_t{0} :
+        (config_.num_tokens + forward_threshold_tokens - 1) / forward_threshold_tokens;
+    const auto chunks_per_iteration = peers_.empty() ?
+        std::size_t{0} : peers_.front().receive_chunks.size();
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(config_.completion_timeout_ms);
     while (true) {
@@ -3007,21 +3041,30 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
             std::lock_guard<std::mutex> lock(forwarding_mutex_);
             if (out_of_order_chunks) {
                 for (std::size_t i = 0; i < forwarding_ready_peer_count_; ++i) {
+                    const auto required_chunks = static_cast<std::size_t>(iteration + 1) *
+                        peers_[i].receive_chunks.size();
                     if (forwarding_out_of_order_issued_chunks_by_peer_[i].load() < required_chunks) {
                         complete = false;
                         break;
                     }
                 }
             } else if (dynamic_threshold) {
-                for (const auto next_chunk : forwarding_next_chunk_by_peer_) {
-                    if (next_chunk < required_chunks) {
+                for (std::size_t i = 0; i < forwarding_next_chunk_by_peer_.size(); ++i) {
+                    const auto required_chunks = static_cast<std::size_t>(iteration + 1) *
+                        peers_[i].receive_chunks.size();
+                    if (forwarding_next_chunk_by_peer_[i] < required_chunks) {
                         complete = false;
                         break;
                     }
                 }
             } else {
-                for (const auto next_batch : forwarding_next_batch_by_peer_) {
-                    if (next_batch < required_batches) {
+                for (std::size_t i = 0; i < forwarding_next_batch_by_peer_.size(); ++i) {
+                    const auto forwarding_tokens = forwarding_tokens_for_peer(peers_[i]);
+                    const auto peer_batches = forwarding_tokens == 0 ? std::size_t{0} :
+                        (forwarding_tokens + forward_threshold_tokens - 1) / forward_threshold_tokens;
+                    const auto required_batches =
+                        static_cast<std::size_t>(iteration + 1) * peer_batches;
+                    if (forwarding_next_batch_by_peer_[i] < required_batches) {
                         complete = false;
                         break;
                     }
@@ -3083,24 +3126,34 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
             std::ostringstream out;
             out << "timed out waiting for NVLink forwarding iteration=" << iteration
                 << " local_rank=" << config_.node_rank
-                << " local_gpu=" << config_.local_gpu_index
-                << " required_batches_per_peer=" << required_batches
-                << " required_chunks_per_peer=" << required_chunks;
+                << " local_gpu=" << config_.local_gpu_index;
             std::lock_guard<std::mutex> lock(forwarding_mutex_);
             if (out_of_order_chunks) {
                 for (std::size_t i = 0; i < forwarding_ready_peer_count_; ++i) {
+                    const auto required_chunks = static_cast<std::size_t>(iteration + 1) *
+                        peers_[i].receive_chunks.size();
                     out << " peer" << peers_[i].peer_rank
-                        << "_issued_chunks=" << forwarding_out_of_order_issued_chunks_by_peer_[i].load();
+                        << "_issued_chunks=" << forwarding_out_of_order_issued_chunks_by_peer_[i].load()
+                        << "/" << required_chunks;
                 }
             } else if (dynamic_threshold) {
                 for (std::size_t i = 0; i < forwarding_next_chunk_by_peer_.size(); ++i) {
+                    const auto required_chunks = static_cast<std::size_t>(iteration + 1) *
+                        peers_[i].receive_chunks.size();
                     out << " peer" << peers_[i].peer_rank
-                        << "_chunks=" << forwarding_next_chunk_by_peer_[i];
+                        << "_chunks=" << forwarding_next_chunk_by_peer_[i]
+                        << "/" << required_chunks;
                 }
             } else {
                 for (std::size_t i = 0; i < forwarding_next_batch_by_peer_.size(); ++i) {
+                    const auto forwarding_tokens = forwarding_tokens_for_peer(peers_[i]);
+                    const auto peer_batches = forwarding_tokens == 0 ? std::size_t{0} :
+                        (forwarding_tokens + forward_threshold_tokens - 1) / forward_threshold_tokens;
+                    const auto required_batches =
+                        static_cast<std::size_t>(iteration + 1) * peer_batches;
                     out << " peer" << peers_[i].peer_rank
-                        << "_batches=" << forwarding_next_batch_by_peer_[i];
+                        << "_batches=" << forwarding_next_batch_by_peer_[i]
+                        << "/" << required_batches;
                 }
             }
             throw std::runtime_error(out.str());

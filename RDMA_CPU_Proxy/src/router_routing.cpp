@@ -65,6 +65,7 @@ int RouterRouting::experts_per_gpu() const {
 void RouterRouting::initialize() {
     if (initialized_ || !config_.router_routing_enabled) return;
     token_indices_by_node_.assign(static_cast<std::size_t>(config_.num_nodes), {});
+    token_masks_by_node_.assign(static_cast<std::size_t>(config_.num_nodes), {});
     if (config_.mock_mode) {
         initialize_mock();
     } else {
@@ -73,7 +74,7 @@ void RouterRouting::initialize() {
     initialized_ = true;
     for (int node = 0; node < config_.num_nodes; ++node) {
         RDMA_PROXY_LOG_INFO(
-            "router x3 ready node=", node,
+            "router x3/x4 ready node=", node,
             " tokens=", token_indices_by_node_[static_cast<std::size_t>(node)].size(),
             node == config_.node_rank ? " (local node ignored for RDMA)" : "");
     }
@@ -85,6 +86,14 @@ const std::vector<std::size_t>& RouterRouting::token_indices_for_node(int node_r
         throw std::runtime_error("router node rank out of range");
     }
     return token_indices_by_node_[static_cast<std::size_t>(node_rank)];
+}
+
+const std::vector<uint8_t>& RouterRouting::token_masks_for_node(int node_rank) const {
+    if (!initialized_) throw std::runtime_error("router routing is not initialized");
+    if (node_rank < 0 || node_rank >= config_.num_nodes) {
+        throw std::runtime_error("router node rank out of range");
+    }
+    return token_masks_by_node_[static_cast<std::size_t>(node_rank)];
 }
 
 void RouterRouting::initialize_mock() {
@@ -127,8 +136,13 @@ void RouterRouting::initialize_mock() {
             return lhs.first > rhs.first;
         });
         auto& output = token_indices_by_node_[static_cast<std::size_t>(node)];
+        auto& masks = token_masks_by_node_[static_cast<std::size_t>(node)];
         output.reserve(node_entries.size());
-        for (const auto& entry : node_entries) output.push_back(entry.second);
+        masks.reserve(node_entries.size());
+        for (const auto& entry : node_entries) {
+            masks.push_back(static_cast<uint8_t>(entry.first));
+            output.push_back(entry.second);
+        }
     }
 }
 
@@ -178,6 +192,9 @@ void RouterRouting::initialize_cuda() {
     check_cuda(cudaMallocHost(
         reinterpret_cast<void**>(&pinned_x3_),
         max_node_tokens * sizeof(int32_t)), "cudaMallocHost x3");
+    check_cuda(cudaMallocHost(
+        reinterpret_cast<void**>(&pinned_x4_),
+        max_node_tokens * sizeof(uint8_t)), "cudaMallocHost x4");
 
     generate_r_cuda_raw(
         r, static_cast<int>(num_tokens), config_.router_top_k,
@@ -198,6 +215,9 @@ void RouterRouting::initialize_cuda() {
     check_cuda(cudaMemcpy(
         pinned_x3_, x3, static_cast<std::size_t>(total_x3) * sizeof(int32_t),
         cudaMemcpyDeviceToHost), "cudaMemcpy D2H router x3 to pinned memory");
+    check_cuda(cudaMemcpy(
+        pinned_x4_, x4, static_cast<std::size_t>(total_x3) * sizeof(uint8_t),
+        cudaMemcpyDeviceToHost), "cudaMemcpy D2H router x4 to pinned memory");
 
     for (std::size_t node = 0; node < num_nodes; ++node) {
         const int32_t begin = pinned_node_offsets_[node];
@@ -206,13 +226,22 @@ void RouterRouting::initialize_cuda() {
             throw std::runtime_error("router kernel returned invalid per-node x3 offsets");
         }
         auto& output = token_indices_by_node_[node];
+        auto& masks = token_masks_by_node_[node];
         output.reserve(static_cast<std::size_t>(end - begin));
+        masks.reserve(static_cast<std::size_t>(end - begin));
         for (int32_t position = begin; position < end; ++position) {
             const int32_t token = pinned_x3_[position];
             if (token < 0 || static_cast<std::size_t>(token) >= num_tokens) {
                 throw std::runtime_error("router kernel returned an out-of-range token index");
             }
             output.push_back(static_cast<std::size_t>(token));
+            const auto mask = pinned_x4_[position];
+            const unsigned meaningful_mask = config_.num_gpus_per_node == 8 ?
+                0xffU : ((1U << config_.num_gpus_per_node) - 1U);
+            if (mask == 0 || (static_cast<unsigned>(mask) & ~meaningful_mask) != 0) {
+                throw std::runtime_error("router kernel returned an invalid x4 GPU mask");
+            }
+            masks.push_back(mask);
         }
     }
 #else
@@ -223,8 +252,10 @@ void RouterRouting::initialize_cuda() {
 void RouterRouting::release_cuda() noexcept {
 #if RDMA_PROXY_HAVE_CUDA
     if (pinned_x3_) cudaFreeHost(pinned_x3_);
+    if (pinned_x4_) cudaFreeHost(pinned_x4_);
     if (pinned_node_offsets_) cudaFreeHost(pinned_node_offsets_);
     pinned_x3_ = nullptr;
+    pinned_x4_ = nullptr;
     pinned_node_offsets_ = nullptr;
     for (auto it = device_allocations_.rbegin(); it != device_allocations_.rend(); ++it) {
         cudaFree(*it);

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <functional>
 #include <iostream>
 #include <vector>
 
@@ -25,12 +26,17 @@ int main() {
     same_routing.initialize();
     for (int node = 0; node < config.num_nodes; ++node) {
         const auto& indices = routing.token_indices_for_node(node);
+        const auto& masks = routing.token_masks_for_node(node);
         assert(indices == same_routing.token_indices_for_node(node));
+        assert(masks == same_routing.token_masks_for_node(node));
+        assert(masks.size() == indices.size());
+        assert(std::is_sorted(masks.begin(), masks.end(), std::greater<uint8_t>()));
         assert(indices.size() <= config.num_tokens);
         auto sorted = indices;
         std::sort(sorted.begin(), sorted.end());
         assert(std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end());
         for (const auto token : indices) assert(token < config.num_tokens);
+        for (const auto mask : masks) assert(mask != 0 && (mask & ~0x3U) == 0);
     }
 
     auto different_config = config;

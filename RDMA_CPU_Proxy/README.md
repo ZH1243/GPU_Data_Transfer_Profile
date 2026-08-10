@@ -46,27 +46,36 @@ num_tokens * token_dimension * sizeof(dtype)
 
 The CUDA path uses `cudaMalloc` and host-to-device copies for generated test payloads. In mock mode, host memory is allocated instead. When `fill_test_data` is enabled, every iteration fills each peer send buffer with deterministic byte data keyed by source rank, destination rank, GPU index, iteration, and byte offset. When `validate_data` is enabled, the receive buffer is copied back and checked after all expected immediate completions arrive.
 
-## Router-Driven RDMA Mode
+## Router-Driven RDMA and NVLink Mode
 
-Set `router_routing_enabled=true` to select the RDMA-only router mode. Configure the global expert count and top-k with `num_experts` and `top_k`; `experts_per_gpu` is derived as:
+Set `router_routing_enabled=true` to select router-driven RDMA. Configure the global expert count and top-k with `num_experts` and `top_k`; `experts_per_gpu` is derived as:
 
 ```text
 num_experts / (num_nodes * num_gpus_per_node)
 ```
 
-This mode requires `num_experts` to divide evenly across all GPUs, `num_gpus_per_node` to be in `[2, 8]`, and `num_experts <= 1024`. It is rejected when `nvlink_forwarding_enabled=true` because `x4`-driven forwarding is not implemented yet. `router_seed` controls the test routing-table generator. Different proxies may use different seeds or actual router contents; only the tensor dimensions and chunk configuration must match.
+This mode requires `num_experts` to divide evenly across all GPUs, `num_gpus_per_node` to be in `[2, 8]`, and `num_experts <= 1024`. `router_seed` controls the test routing-table generator. Different proxies may use different seeds or actual router contents; only the tensor dimensions and chunk configuration must match.
 
 At initialization the proxy:
 
 - allocates one `[num_tokens, top_k]` int32 routing table `R` in HBM;
 - launches the same random router-table and node-mask-sort kernels used by `get_expert_token_idx_list_gpu` with `local_gpu_index` as `local-gpu-id`;
-- leaves `x3` and `x4` in HBM, copies the node offsets and `x3` through CUDA into pinned CPU memory, and retains the per-node `x3` lists;
-- exchanges each destination-specific `x3` list and its tensor/chunk metadata with that peer over the existing TCP control channel;
+- leaves `x3` and `x4` in HBM, copies the node offsets and both aligned arrays through CUDA into pinned CPU memory, and retains their per-node slices;
+- exchanges each destination-specific `x3`/`x4` pair and its tensor/chunk metadata with that peer over the existing TCP control channel;
 - ignores `x3[local_node]` for outgoing RDMA and builds a different chunk list for every remote peer node.
 
 Router mode allocates one shared RDMA send buffer on the local GPU instead of one send buffer per peer. Every `x3[peer_node]` list is divided into `tokens_per_chunk` entries. For example, `[3, 1, 4, 9, 10, 45]` with `tokens_per_chunk=3` produces chunks `[3, 1, 4]` and `[9, 10, 45]`. Each chunk uses one SGE per token to gather those discontinuous rows from the shared send buffer and writes them contiguously to the peer receive buffer. Router mode enables the effective behavior of both `rdma_chunk_per_token_sge_enabled` and `rdma_discontinuous_token_payload_enabled`; those two legacy test flags do not also need to be set.
 
-Because every sender may have different router contents, outgoing completion and byte accounting use the local `x3[peer_node]`, while incoming completion and validation expectations use the actual remote `x3` received over TCP. The receiver therefore observes and validates the exact sender-side `x3` order without assuming identical routing tables.
+Because every sender may have different router contents, outgoing completion and byte accounting use the local `x3[peer_node]`, while incoming completion, validation, and optional NVLink forwarding use the actual aligned `x3`/`x4` received over TCP. The receiver therefore observes the exact sender-side ordering without assuming identical routing tables.
+
+When both `router_routing_enabled=true` and `nvlink_forwarding_enabled=true`, the remote `x4` slice becomes the receive buffer's NVLink forwarding table. Its low-`N` bit encoding is normalized to the legacy forwarding-table column layout, so the copy path remains the same and visits destination GPUs in this order for every batch:
+
+```text
+(local_gpu_index + 1) % N, (local_gpu_index + 2) % N, ...,
+(local_gpu_index - 1) % N
+```
+
+Router-driven forwarding supports fixed, dynamic, and out-of-order chunk thresholds. A fixed threshold may produce a smaller final batch because a peer's `x3` length is data-dependent. Router mode does not support `nvlink_forward_use_round_robin=true` or `nvlink_forward_local_batch_sync_enabled=true`; local proxies can have different `x3`/`x4` lengths, so a shared batch-count barrier is not well-defined.
 
 Example overrides:
 
@@ -77,7 +86,8 @@ Example overrides:
   --num_experts=256 \
   --top_k=8 \
   --router_seed=1234 \
-  --nvlink_forwarding_enabled=false \
+  --nvlink_forwarding_enabled=true \
+  --nvlink_forward_threshold_tokens=700 \
   --mock_mode=false
 ```
 
@@ -99,12 +109,14 @@ Column 7 is stored as the least significant bit. In an 8-GPU layout, columns 0 t
 
 For a forwarding batch, each destination scans the routing rows for that batch, gathers the matching token source addresses, and copies them into a continuous destination span with one batched copy call. Because tokens may route to multiple destinations, the total forwarded byte count can exceed the batch's source byte count.
 
-The routing-table implementation requires:
+The legacy randomly generated routing-table implementation requires:
 
 ```text
 num_gpus_per_node <= 8
 num_tokens must be a multiple of the effective NVLink forwarding threshold
 ```
+
+The exact-multiple requirement does not apply to router-driven `x4` tables; their final forwarding batch may be smaller than the configured threshold.
 
 Set `nvlink_forward_threshold_tokens` to choose the forwarding batch size directly in tokens. Alternatively, set `nvlink_forward_threshold_chunks` to choose the batch size in RDMA chunks; the effective token count becomes:
 

@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstddef>
 #include <iostream>
+#include <stdexcept>
 #include <vector>
 
 int main() {
@@ -87,12 +88,24 @@ int main() {
     metadata.element_bytes = 2;
     metadata.tokens_per_chunk = 3;
     metadata.token_indices = router_order;
+    metadata.token_masks = {0x81, 0x42, 0x24, 0x18, 0x08, 0x01};
     const auto decoded_metadata = deserialize_router_x3_metadata(
         serialize_router_x3_metadata(metadata), metadata.num_tokens);
     assert(decoded_metadata.source_node_rank == metadata.source_node_rank);
     assert(decoded_metadata.destination_node_rank == metadata.destination_node_rank);
     assert(decoded_metadata.local_gpu_index == metadata.local_gpu_index);
     assert(decoded_metadata.token_indices == router_order);
+    assert(decoded_metadata.token_masks == metadata.token_masks);
+    const auto normalized_x4 = normalize_router_x4_for_nvlink(
+        std::vector<uint8_t>{0x9, 0x6, 0x1}, 4);
+    assert((normalized_x4 == std::vector<uint8_t>{0x90, 0x60, 0x10}));
+    bool rejected_invalid_x4 = false;
+    try {
+        (void)normalize_router_x4_for_nvlink(std::vector<uint8_t>{0x10}, 4);
+    } catch (const std::runtime_error&) {
+        rejected_invalid_x4 = true;
+    }
+    assert(rejected_invalid_x4);
     assert(decode_immediate(encode_immediate(1234)) == 1234);
 
     PeerConnectionInfo info;

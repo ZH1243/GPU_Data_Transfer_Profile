@@ -40,6 +40,8 @@ private:
         MemoryRegionInfo local_recv_mr;
         MemoryRegionInfo remote_recv_mr;
         std::vector<ChunkDescriptor> receive_chunks;
+        std::vector<uint8_t> router_x4;
+        std::vector<uint8_t> forwarding_routing_table;
         std::vector<std::unique_ptr<RdmaQueuePair>> qps;
         std::vector<std::unique_ptr<QPWorker>> workers;
     };
@@ -95,7 +97,7 @@ private:
 
     PeerConnectionInfo make_local_peer_info(const PeerState& peer) const;
     void setup_peer(PeerGpuBuffers& buffers);
-    std::vector<ChunkDescriptor> exchange_router_receive_chunks(
+    RouterX3Metadata exchange_router_receive_metadata(
         const PeerAddress& peer_addr) const;
     void synchronize_peer_ready(const PeerAddress& peer_addr, const PeerState& peer) const;
     void initialize_local_iteration_sync();
@@ -165,6 +167,7 @@ private:
     std::string nvlink_exchange_file(int gpu_index) const;
     void forwarding_loop();
     std::vector<std::size_t> nvlink_forward_peer_order() const;
+    std::size_t forwarding_tokens_for_peer(const PeerState& peer) const;
     bool forwarding_batch_available(
         const PeerState& peer,
         const std::vector<ChunkDescriptor>& chunks,
@@ -234,7 +237,6 @@ private:
     std::unique_ptr<std::atomic<std::size_t>[]> forwarding_out_of_order_issued_chunks_by_peer_;
     std::size_t forwarding_ready_peer_count_{0};
     std::vector<ForwardingOutOfOrderPeerState> forwarding_out_of_order_peer_states_;
-    std::vector<std::vector<uint8_t>> forwarding_routing_tables_by_peer_;
     std::vector<ForwardDestinationState> forwarding_destinations_;
     std::vector<ForwardNotificationDestinationState> forwarding_notification_destinations_;
     std::vector<ForwardingIterationStats> forwarding_iteration_stats_;

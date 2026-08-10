@@ -206,15 +206,21 @@ int main(int argc, char** argv) {
     assert(rdma_proxy::effective_rdma_chunk_per_token_sge_enabled(router_config));
     assert(rdma_proxy::effective_rdma_discontinuous_token_payload_enabled(router_config));
 
-    auto invalid_router_nvlink_config = router_config;
-    invalid_router_nvlink_config.nvlink_forwarding_enabled = true;
-    bool rejected_router_nvlink = false;
+    auto router_nvlink_config = router_config;
+    router_nvlink_config.nvlink_forwarding_enabled = true;
+    router_nvlink_config.nvlink_forward_threshold_tokens = 700;
+    router_nvlink_config.nvlink_forward_chunk_tokens = 100;
+    rdma_proxy::validate_config(router_nvlink_config);
+
+    auto invalid_router_round_robin_config = router_nvlink_config;
+    invalid_router_round_robin_config.nvlink_forward_use_round_robin = true;
+    bool rejected_router_round_robin = false;
     try {
-        rdma_proxy::validate_config(invalid_router_nvlink_config);
+        rdma_proxy::validate_config(invalid_router_round_robin_config);
     } catch (const std::runtime_error&) {
-        rejected_router_nvlink = true;
+        rejected_router_round_robin = true;
     }
-    assert(rejected_router_nvlink);
+    assert(rejected_router_round_robin);
 
     auto invalid_router_experts_config = router_config;
     invalid_router_experts_config.router_num_experts = 255;

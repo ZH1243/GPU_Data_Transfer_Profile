@@ -657,10 +657,6 @@ void validate_config(const ProxyConfig& config) {
             "rdma_discontinuous_token_payload_enabled is only supported when NVLink forwarding is disabled");
     }
     if (config.router_routing_enabled) {
-        if (config.nvlink_forwarding_enabled) {
-            throw std::runtime_error(
-                "router_routing_enabled is currently RDMA-only and requires nvlink_forwarding_enabled=false");
-        }
         if (config.num_gpus_per_node < 2 || config.num_gpus_per_node > 8) {
             throw std::runtime_error("router_routing_enabled requires num_gpus_per_node in [2, 8]");
         }
@@ -747,6 +743,15 @@ void validate_config(const ProxyConfig& config) {
         if (config.num_gpus_per_node > 8) {
             throw std::runtime_error("nvlink_forwarding_enabled supports at most 8 local GPUs");
         }
+        if (config.router_routing_enabled && config.nvlink_forward_use_round_robin) {
+            throw std::runtime_error(
+                "router-driven NVLink forwarding uses x4 and does not support round-robin forwarding");
+        }
+        if (config.router_routing_enabled && config.nvlink_forward_local_batch_sync_enabled) {
+            throw std::runtime_error(
+                "router-driven NVLink forwarding does not support local batch synchronization because "
+                "x3/x4 lengths may differ across local GPU proxies");
+        }
         if (dynamic_threshold) {
             if (config.nvlink_forward_min_threshold_chunks == 0 ||
                 config.nvlink_forward_max_threshold_chunks == 0) {
@@ -799,7 +804,8 @@ void validate_config(const ProxyConfig& config) {
             throw std::runtime_error(
                 "effective NVLink forwarding threshold must be <= num_tokens when NVLink forwarding is enabled");
         }
-        if (!dynamic_threshold && config.num_tokens % forward_threshold_tokens != 0) {
+        if (!dynamic_threshold && !config.router_routing_enabled &&
+            config.num_tokens % forward_threshold_tokens != 0) {
             throw std::runtime_error(
                 "unsupported NVLink forwarding configuration: num_tokens must be an exact multiple of "
                 "the effective NVLink forwarding threshold");

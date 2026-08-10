@@ -53,6 +53,7 @@ struct RouterX3Metadata {
     std::size_t element_bytes{0};
     std::size_t tokens_per_chunk{0};
     std::vector<std::size_t> token_indices;
+    std::vector<uint8_t> token_masks;
 };
 
 uint32_t encode_immediate(std::size_t chunk_index);
@@ -79,6 +80,10 @@ std::string serialize_router_x3_metadata(const RouterX3Metadata& metadata);
 RouterX3Metadata deserialize_router_x3_metadata(
     const std::string& payload,
     std::size_t maximum_num_tokens);
+
+std::vector<uint8_t> normalize_router_x4_for_nvlink(
+    const std::vector<uint8_t>& token_masks,
+    int num_gpus_per_node);
 
 std::string serialize_peer_info(const PeerConnectionInfo& info);
 PeerConnectionInfo deserialize_peer_info(const std::string& payload);

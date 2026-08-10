@@ -109,8 +109,11 @@ std::vector<ChunkDescriptor> compute_chunks_from_token_indices(
 }
 
 std::string serialize_router_x3_metadata(const RouterX3Metadata& metadata) {
+    if (metadata.token_masks.size() != metadata.token_indices.size()) {
+        throw std::runtime_error("router x3/x4 metadata lengths do not match");
+    }
     std::ostringstream out;
-    out << "router_x3_v1 "
+    out << "router_x3_x4_v2 "
         << metadata.source_node_rank << ' '
         << metadata.destination_node_rank << ' '
         << metadata.local_gpu_index << ' '
@@ -124,6 +127,9 @@ std::string serialize_router_x3_metadata(const RouterX3Metadata& metadata) {
         << metadata.tokens_per_chunk << ' '
         << metadata.token_indices.size();
     for (const auto token : metadata.token_indices) out << ' ' << token;
+    for (const auto mask : metadata.token_masks) {
+        out << ' ' << static_cast<unsigned>(mask);
+    }
     return out.str();
 }
 
@@ -147,11 +153,14 @@ RouterX3Metadata deserialize_router_x3_metadata(
        >> metadata.element_bytes
        >> metadata.tokens_per_chunk
        >> count;
-    if (!in || version != "router_x3_v1") {
-        throw std::runtime_error("failed to parse router x3 metadata header");
+    if (!in || version != "router_x3_x4_v2") {
+        throw std::runtime_error("failed to parse router x3/x4 metadata header");
     }
     if (metadata.num_tokens > maximum_num_tokens || count > metadata.num_tokens) {
-        throw std::runtime_error("router x3 metadata token count exceeds configured capacity");
+        throw std::runtime_error("router x3/x4 metadata token count exceeds configured capacity");
+    }
+    if (metadata.num_gpus_per_node < 2 || metadata.num_gpus_per_node > 8) {
+        throw std::runtime_error("router x3/x4 metadata GPU count is out of range");
     }
     metadata.token_indices.resize(count);
     std::vector<bool> seen(metadata.num_tokens, false);
@@ -165,11 +174,43 @@ RouterX3Metadata deserialize_router_x3_metadata(
         }
         seen[token] = true;
     }
+    metadata.token_masks.resize(count);
+    const unsigned meaningful_mask = metadata.num_gpus_per_node == 8 ?
+        0xffU : ((1U << metadata.num_gpus_per_node) - 1U);
+    for (auto& mask : metadata.token_masks) {
+        unsigned value = 0;
+        in >> value;
+        if (!in || value == 0 || value > 0xffU || (value & ~meaningful_mask) != 0) {
+            throw std::runtime_error("router x4 metadata contains an invalid GPU mask");
+        }
+        mask = static_cast<uint8_t>(value);
+    }
     std::string trailing;
     if (in >> trailing) {
-        throw std::runtime_error("router x3 metadata contains trailing fields");
+        throw std::runtime_error("router x3/x4 metadata contains trailing fields");
     }
     return metadata;
+}
+
+std::vector<uint8_t> normalize_router_x4_for_nvlink(
+    const std::vector<uint8_t>& token_masks,
+    int num_gpus_per_node) {
+    if (num_gpus_per_node < 2 || num_gpus_per_node > 8) {
+        throw std::runtime_error("router x4 normalization requires num_gpus_per_node in [2, 8]");
+    }
+    const unsigned meaningful_mask = num_gpus_per_node == 8 ?
+        0xffU : ((1U << num_gpus_per_node) - 1U);
+    const unsigned shift = static_cast<unsigned>(8 - num_gpus_per_node);
+    std::vector<uint8_t> normalized;
+    normalized.reserve(token_masks.size());
+    for (const auto raw_mask : token_masks) {
+        const unsigned value = raw_mask;
+        if (value == 0 || (value & ~meaningful_mask) != 0) {
+            throw std::runtime_error("router x4 contains an invalid GPU mask");
+        }
+        normalized.push_back(static_cast<uint8_t>(value << shift));
+    }
+    return normalized;
 }
 
 std::string serialize_peer_info(const PeerConnectionInfo& info) {
