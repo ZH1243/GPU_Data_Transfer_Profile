@@ -70,7 +70,9 @@ endif()
 
 if(RDMA_PROXY_HAVE_CUDA)
   set_target_properties(rdma_cpu_proxy_lib PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
-  target_link_libraries(rdma_cpu_proxy_lib PRIVATE CUDA::cudart)
+  # rdma_cpu_proxy_lib is static, so CUDA symbols referenced by its objects
+  # must also be present on every consuming executable's final link line.
+  target_link_libraries(rdma_cpu_proxy_lib PUBLIC CUDA::cudart CUDA::cuda_driver)
 endif()
 
 find_package(Threads REQUIRED)
