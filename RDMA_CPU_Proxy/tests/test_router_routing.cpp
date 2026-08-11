@@ -22,6 +22,46 @@ int main() {
     routing.initialize();
     assert(routing.experts_per_gpu() == 4);
 
+    std::size_t total_expert_routes = 0;
+    for (int node = 0; node < config.num_nodes; ++node) {
+        const auto& masks = routing.token_masks_for_node(node);
+        for (int gpu = 0; gpu < config.num_gpus_per_node; ++gpu) {
+            const auto& metadata = routing.expert_metadata_for_gpu(node, gpu);
+            assert(metadata.source_node_rank == config.node_rank);
+            assert(metadata.source_gpu_index == config.local_gpu_index);
+            assert(metadata.destination_node_rank == node);
+            assert(metadata.destination_gpu_index == gpu);
+            assert(metadata.experts_per_gpu == routing.experts_per_gpu());
+            assert(metadata.expert_offsets.size() ==
+                   static_cast<std::size_t>(routing.experts_per_gpu() + 1));
+            assert(metadata.expert_offsets.front() == 0);
+            assert(static_cast<std::size_t>(metadata.expert_offsets.back()) ==
+                   metadata.expert_token_indices.size());
+            assert(std::is_sorted(
+                metadata.expert_offsets.begin(), metadata.expert_offsets.end()));
+
+            int bit = config.local_gpu_index - gpu;
+            if (bit < 0) bit += config.num_gpus_per_node;
+            const auto gpu_mask = static_cast<uint8_t>(1U << bit);
+            const auto destination_token_count = static_cast<int32_t>(std::count_if(
+                masks.begin(), masks.end(),
+                [&](uint8_t mask) { return (mask & gpu_mask) != 0; }));
+            for (const auto index : metadata.expert_token_indices) {
+                assert(index >= 0 && index < destination_token_count);
+            }
+            for (int expert = 0; expert < routing.experts_per_gpu(); ++expert) {
+                const auto begin = metadata.expert_offsets[static_cast<std::size_t>(expert)];
+                const auto end = metadata.expert_offsets[static_cast<std::size_t>(expert + 1)];
+                assert(std::is_sorted(
+                    metadata.expert_token_indices.begin() + begin,
+                    metadata.expert_token_indices.begin() + end));
+            }
+            total_expert_routes += metadata.expert_token_indices.size();
+        }
+    }
+    assert(total_expert_routes ==
+           config.num_tokens * static_cast<std::size_t>(config.router_top_k));
+
     rdma_proxy::RouterRouting same_routing(config);
     same_routing.initialize();
     for (int node = 0; node < config.num_nodes; ++node) {

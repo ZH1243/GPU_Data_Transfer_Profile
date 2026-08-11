@@ -25,6 +25,7 @@ int main(int argc, char** argv) {
     assert(config.router_num_experts == 256);
     assert(config.router_top_k == 8);
     assert(config.router_seed == 1234);
+    assert(config.router_metadata_port_base == 19515);
     assert(config.num_iterations == 1);
     assert(config.completion_timeout_ms == 30000);
     assert(config.dtype == rdma_proxy::DataType::kBF16);

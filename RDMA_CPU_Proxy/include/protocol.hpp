@@ -56,6 +56,24 @@ struct RouterX3Metadata {
     std::vector<uint8_t> token_masks;
 };
 
+// Source-specific expert lookup table for one destination GPU. Offsets are
+// normalized to the packed expert_token_indices vector and describe exactly
+// experts_per_gpu consecutive experts starting at first_global_expert.
+struct RouterExpertMetadata {
+    int source_node_rank{-1};
+    int source_gpu_index{-1};
+    int destination_node_rank{-1};
+    int destination_gpu_index{-1};
+    int num_nodes{0};
+    int num_gpus_per_node{0};
+    int num_experts{0};
+    int experts_per_gpu{0};
+    int first_global_expert{0};
+    std::size_t num_tokens{0};
+    std::vector<int32_t> expert_token_indices;
+    std::vector<int32_t> expert_offsets;
+};
+
 uint32_t encode_immediate(std::size_t chunk_index);
 std::size_t decode_immediate(uint32_t imm_data);
 uint32_t encode_marker_immediate();
@@ -80,6 +98,13 @@ std::string serialize_router_x3_metadata(const RouterX3Metadata& metadata);
 RouterX3Metadata deserialize_router_x3_metadata(
     const std::string& payload,
     std::size_t maximum_num_tokens);
+
+std::string serialize_router_expert_metadata(
+    const RouterExpertMetadata& metadata);
+RouterExpertMetadata deserialize_router_expert_metadata(
+    const std::string& payload,
+    std::size_t maximum_num_tokens,
+    std::size_t maximum_index_count);
 
 std::vector<uint8_t> normalize_router_x4_for_nvlink(
     const std::vector<uint8_t>& token_masks,

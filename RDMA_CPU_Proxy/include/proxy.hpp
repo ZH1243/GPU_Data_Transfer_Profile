@@ -31,6 +31,9 @@ public:
     void run();
     void run_once();
     void shutdown();
+    const RouterExpertMetadata& router_expert_metadata_for_source(
+        int source_node_rank,
+        int source_gpu_index) const;
 
 private:
     struct PeerState {
@@ -104,6 +107,7 @@ private:
     void setup_peer(PeerGpuBuffers& buffers);
     RouterX3Metadata exchange_router_receive_metadata(
         const PeerAddress& peer_addr) const;
+    void exchange_router_expert_metadata_all_to_all();
     void synchronize_peer_ready(const PeerAddress& peer_addr, const PeerState& peer) const;
     void initialize_local_iteration_sync();
     void release_local_iteration_sync();

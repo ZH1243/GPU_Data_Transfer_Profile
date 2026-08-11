@@ -59,9 +59,10 @@ This mode requires `num_experts` to divide evenly across all GPUs, `num_gpus_per
 At initialization the proxy:
 
 - allocates one `[num_tokens, top_k]` int32 routing table `R` in HBM;
-- launches the same random router-table and node-mask-sort kernels used by `get_expert_token_idx_list_gpu` with `local_gpu_index` as `local-gpu-id`;
+- launches the same random router-table and full node-mask-sort kernels used by `get_expert_token_idx_list_gpu` with `local_gpu_index` as `local-gpu-id`, producing x3/x4 plus `expert_token_indices` and `expert_offsets`;
 - leaves `x3` and `x4` in HBM, copies the node offsets and both aligned arrays through CUDA into pinned CPU memory, and retains their per-node slices;
 - exchanges each destination-specific `x3`/`x4` pair and its tensor/chunk metadata with that peer over the existing TCP control channel;
+- directly exchanges destination-specific expert metadata with every other GPU proxy, including proxies on the same node;
 - ignores `x3[local_node]` for outgoing RDMA and builds a different chunk list for every remote peer node.
 
 Router mode allocates one shared RDMA send buffer on the local GPU instead of one send buffer per peer. Every `x3[peer_node]` list is divided into `tokens_per_chunk` entries. For example, `[3, 1, 4, 9, 10, 45]` with `tokens_per_chunk=3` produces chunks `[3, 1, 4]` and `[9, 10, 45]`. Each chunk uses one SGE per token to gather those discontinuous rows from the shared send buffer and writes them contiguously to the peer receive buffer. Router mode enables the effective behavior of both `rdma_chunk_per_token_sge_enabled` and `rdma_discontinuous_token_payload_enabled`; those two legacy test flags do not also need to be set.
@@ -79,6 +80,10 @@ Router-driven forwarding supports fixed and dynamic chunk thresholds, but always
 
 In this combined router/NVLink mode, every destination GPU allocates one separate inbound buffer for every global `(source_node_rank, source_gpu_index)` pair, including currently unused pairs. The number of allocations per destination GPU is therefore `num_nodes * num_gpus_per_node`; a 4-node, 8-GPU deployment allocates 32 buffers. The forwarding path uses the `(num_nodes - 1) * (num_gpus_per_node - 1)` remote-node/other-local-GPU pairs (21 in that deployment). Each allocation is `token_buffer_bytes`, because one global source GPU can contribute at most `num_tokens` token rows. Within an iteration, every source/destination pair maintains an independent destination cursor: tokens selected by consecutive forwarding batches are appended with no gaps. The cursor resets to token zero at the next iteration. Because the source node is part of the allocation identity, exact router buffers do not add the legacy peer-node slot offset.
 
+Each source-specific inbound buffer also owns a `RouterExpertMetadata` table for the experts living on the destination GPU. Its `expert_offsets` has `experts_per_gpu + 1` entries and is normalized to zero; local expert `e` owns `expert_token_indices[expert_offsets[e]:expert_offsets[e + 1]]`. Those indices address rows in that particular source-specific compact buffer. `first_global_expert` identifies the global ID of local expert zero. Code using a `Proxy` can retrieve the table with `router_expert_metadata_for_source(source_node_rank, source_gpu_index)`.
+
+The expert tables use a direct TCP all-to-all. Global proxy rank is `node_rank * num_gpus_per_node + local_gpu_index`; every rank exchanges one destination-specific table with every other rank and installs its own table locally. Connections use `router_metadata_port_base + local_gpu_index`. Remote node hosts are taken from `peers`, while same-node exchanges use IPv6 loopback. Configure the same unused `router_metadata_port_base` on every proxy in a run.
+
 Example overrides:
 
 ```bash
@@ -88,6 +93,7 @@ Example overrides:
   --num_experts=256 \
   --top_k=8 \
   --router_seed=1234 \
+  --router_metadata_port_base=19515 \
   --nvlink_forwarding_enabled=true \
   --nvlink_forward_threshold_tokens=700 \
   --mock_mode=false

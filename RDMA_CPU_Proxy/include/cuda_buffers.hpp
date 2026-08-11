@@ -26,6 +26,8 @@ struct NvlinkReceiveBuffer {
     int source_node_rank{-1};
     int source_gpu_index{-1};
     GpuBuffer recv;
+    RouterExpertMetadata expert_metadata;
+    bool expert_metadata_ready{false};
 };
 
 struct CudaForwardCopy {
@@ -68,6 +70,7 @@ public:
     const NvlinkReceiveBuffer& nvlink_receive_buffer_for_source(
         int source_node_rank,
         int source_gpu_index) const;
+    void install_expert_metadata(RouterExpertMetadata metadata);
 
     std::size_t token_buffer_bytes() const;
     std::size_t nvlink_receive_buffer_bytes() const;

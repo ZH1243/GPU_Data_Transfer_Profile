@@ -73,6 +73,12 @@ public:
         const PeerAddress& peer,
         const std::string& local_payload,
         uint64_t timeout_ms) const;
+    std::string exchange_global_control_message(
+        const PeerAddress& peer,
+        int peer_gpu_index,
+        uint16_t local_listen_port,
+        const std::string& local_payload,
+        uint64_t timeout_ms) const;
 
 private:
     ProxyConfig config_;

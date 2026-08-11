@@ -300,6 +300,68 @@ const NvlinkReceiveBuffer& CudaBuffers::nvlink_receive_buffer_for_source(
     return *it;
 }
 
+void CudaBuffers::install_expert_metadata(RouterExpertMetadata metadata) {
+    if (!config_.router_routing_enabled || !config_.nvlink_forwarding_enabled) {
+        throw std::runtime_error(
+            "expert metadata requires combined router/NVLink mode");
+    }
+    if (metadata.destination_node_rank != config_.node_rank ||
+        metadata.destination_gpu_index != config_.local_gpu_index) {
+        throw std::runtime_error("expert metadata destination does not match this proxy");
+    }
+    const int expected_experts_per_gpu = config_.router_num_experts /
+        (config_.num_nodes * config_.num_gpus_per_node);
+    const int expected_first_expert =
+        (config_.node_rank * config_.num_gpus_per_node + config_.local_gpu_index) *
+        expected_experts_per_gpu;
+    if (metadata.num_nodes != config_.num_nodes ||
+        metadata.num_gpus_per_node != config_.num_gpus_per_node ||
+        metadata.num_experts != config_.router_num_experts ||
+        metadata.experts_per_gpu != expected_experts_per_gpu ||
+        metadata.first_global_expert != expected_first_expert ||
+        metadata.num_tokens != config_.num_tokens) {
+        throw std::runtime_error("expert metadata dimensions do not match this proxy");
+    }
+    if (metadata.expert_offsets.size() !=
+            static_cast<std::size_t>(expected_experts_per_gpu + 1) ||
+        metadata.expert_offsets.front() != 0 ||
+        metadata.expert_offsets.back() < 0 ||
+        static_cast<std::size_t>(metadata.expert_offsets.back()) !=
+            metadata.expert_token_indices.size() ||
+        !std::is_sorted(metadata.expert_offsets.begin(), metadata.expert_offsets.end())) {
+        throw std::runtime_error("expert metadata offsets are invalid");
+    }
+    if (std::any_of(
+            metadata.expert_token_indices.begin(),
+            metadata.expert_token_indices.end(),
+            [&](int32_t index) {
+                return index < 0 ||
+                    static_cast<std::size_t>(index) >= config_.num_tokens;
+            })) {
+        throw std::runtime_error("expert metadata contains an invalid token index");
+    }
+    if (metadata.source_node_rank < 0 ||
+        metadata.source_node_rank >= config_.num_nodes ||
+        metadata.source_gpu_index < 0 ||
+        metadata.source_gpu_index >= config_.num_gpus_per_node) {
+        throw std::runtime_error("expert metadata source is out of range");
+    }
+    auto it = std::find_if(
+        nvlink_recv_buffers_.begin(), nvlink_recv_buffers_.end(),
+        [&](const auto& entry) {
+            return entry.source_node_rank == metadata.source_node_rank &&
+                entry.source_gpu_index == metadata.source_gpu_index;
+        });
+    if (it == nvlink_recv_buffers_.end()) {
+        throw std::runtime_error("missing source-specific NVLink receive buffer");
+    }
+    if (it->expert_metadata_ready) {
+        throw std::runtime_error("duplicate expert metadata for source GPU");
+    }
+    it->expert_metadata = std::move(metadata);
+    it->expert_metadata_ready = true;
+}
+
 std::size_t CudaBuffers::token_buffer_bytes() const {
     return config_.num_tokens * config_.token_dimension * dtype_size(config_.dtype);
 }

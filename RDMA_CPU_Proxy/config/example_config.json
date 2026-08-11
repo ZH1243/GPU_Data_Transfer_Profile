@@ -22,6 +22,7 @@
   "num_experts": 256,
   "top_k": 8,
   "router_seed": 1234,
+  "router_metadata_port_base": 19515,
   "send_queue_depth": 256,
   "recv_queue_depth": 256,
   "cq_depth": 512,

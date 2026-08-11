@@ -1155,6 +1155,88 @@ void get_expert_token_idx_node_mask_x3_cuda_raw(
   check_cuda_status(cudaGetLastError(), "build_node_token_indices kernel launch");
 }
 
+void get_expert_token_idx_node_mask_cuda_raw(
+    const int32_t* r,
+    int num_tokens,
+    int top_k,
+    int num_experts,
+    int experts_per_gpu,
+    int gpus_per_node,
+    int local_gpu_id,
+    int32_t* expert_token_indices,
+    int32_t* expert_offsets,
+    int32_t* node_token_indices,
+    uint8_t* node_token_masks,
+    int32_t* node_offsets,
+    int32_t* input_chunk_counts,
+    int32_t* input_chunk_prefixes,
+    int32_t* node_mask_offsets,
+    int32_t* reordered_chunk_counts,
+    int32_t* reordered_chunk_prefixes,
+    void* stream_arg) {
+  auto stream = reinterpret_cast<cudaStream_t>(stream_arg);
+  get_expert_token_idx_node_mask_x3_cuda_raw(
+      r, num_tokens, top_k, num_experts, experts_per_gpu, gpus_per_node,
+      local_gpu_id, expert_offsets, node_token_indices, node_token_masks,
+      node_offsets, input_chunk_counts, input_chunk_prefixes,
+      node_mask_offsets, stream_arg);
+
+  const int experts_per_node = experts_per_gpu * gpus_per_node;
+  const int num_nodes = num_experts / experts_per_node;
+  const int num_chunks_per_node =
+      (num_tokens + kBlockThreads - 1) / kBlockThreads;
+
+  const bool specialized_top_k =
+      top_k == 1 || top_k == 2 || top_k == 4 || top_k == 8 || top_k == 16;
+  if (!specialized_top_k) {
+    scatter_reordered_by_expert_fallback_kernel<<<
+        num_experts, kBlockThreads, 0, stream>>>(
+        r, top_k, experts_per_gpu, experts_per_node, node_token_indices,
+        node_offsets, expert_offsets, expert_token_indices);
+    check_cuda_status(
+        cudaGetLastError(), "scatter_reordered_by_expert_fallback_kernel launch");
+    return;
+  }
+
+  const int reordered_num_bins = experts_per_node + gpus_per_node;
+  const size_t reordered_count_smem =
+      static_cast<size_t>(reordered_num_bins) * sizeof(int32_t);
+  dim3 reordered_grid(num_chunks_per_node, num_nodes);
+  count_reordered_node_chunks_kernel<<<
+      reordered_grid, kBlockThreads, reordered_count_smem, stream>>>(
+      r, top_k, experts_per_gpu, experts_per_node, gpus_per_node,
+      local_gpu_id, num_chunks_per_node, node_token_indices, node_offsets,
+      reordered_chunk_counts);
+  check_cuda_status(cudaGetLastError(), "count_reordered_node_chunks_kernel launch");
+
+  scan_reordered_node_counts_kernel<<<1, kBlockThreads, 0, stream>>>(
+      reordered_chunk_counts, reordered_chunk_prefixes, num_chunks_per_node,
+      experts_per_node, num_nodes, gpus_per_node);
+  check_cuda_status(cudaGetLastError(), "scan_reordered_node_counts_kernel launch");
+
+  const int expert_radix_end_bit = radix_end_bit_for(experts_per_node);
+  const size_t scatter_smem = static_cast<size_t>(
+      experts_per_node + 1 + gpus_per_node * kWarps) * sizeof(int32_t);
+
+#define LAUNCH_RAW_NODE_SCATTER(TOP_K_VALUE)                                \
+  launch_scatter_reordered_specialized<TOP_K_VALUE>(                        \
+      r, top_k, experts_per_gpu, experts_per_node, gpus_per_node,            \
+      num_chunks_per_node, num_nodes, expert_radix_end_bit,                  \
+      node_token_indices, node_offsets, reordered_chunk_counts,              \
+      reordered_chunk_prefixes, expert_offsets, expert_token_indices,        \
+      scatter_smem, stream)
+
+  switch (top_k) {
+    case 1: LAUNCH_RAW_NODE_SCATTER(1); break;
+    case 2: LAUNCH_RAW_NODE_SCATTER(2); break;
+    case 4: LAUNCH_RAW_NODE_SCATTER(4); break;
+    case 8: LAUNCH_RAW_NODE_SCATTER(8); break;
+    case 16: LAUNCH_RAW_NODE_SCATTER(16); break;
+  }
+#undef LAUNCH_RAW_NODE_SCATTER
+  check_cuda_status(cudaGetLastError(), "scatter_reordered_chunks_kernel launch");
+}
+
 #ifndef EXPERT_TOKEN_IDX_STANDALONE
 
 void generate_r_cuda(

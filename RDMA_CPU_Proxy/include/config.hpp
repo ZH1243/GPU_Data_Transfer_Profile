@@ -52,6 +52,7 @@ struct ProxyConfig {
     int router_num_experts{0};
     int router_top_k{0};
     uint64_t router_seed{1234};
+    uint16_t router_metadata_port_base{19515};
     int send_queue_depth{128};
     int recv_queue_depth{128};
     int cq_depth{256};

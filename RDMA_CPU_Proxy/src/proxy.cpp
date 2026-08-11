@@ -292,6 +292,7 @@ void Proxy::initialize() {
     initialize_local_iteration_sync();
     router_routing_.initialize();
     cuda_buffers_.initialize();
+    exchange_router_expert_metadata_all_to_all();
     rdma_context_.initialize();
 
     for (auto& peer_buffers : cuda_buffers_.peer_buffers()) {
@@ -299,6 +300,17 @@ void Proxy::initialize() {
     }
     start_forwarding_thread();
     initialized_ = true;
+}
+
+const RouterExpertMetadata& Proxy::router_expert_metadata_for_source(
+    int source_node_rank,
+    int source_gpu_index) const {
+    const auto& buffer = cuda_buffers_.nvlink_receive_buffer_for_source(
+        source_node_rank, source_gpu_index);
+    if (!buffer.expert_metadata_ready) {
+        throw std::runtime_error("router expert metadata is not ready for source GPU");
+    }
+    return buffer.expert_metadata;
 }
 
 void Proxy::run_once() {
@@ -451,6 +463,109 @@ RouterX3Metadata Proxy::exchange_router_receive_metadata(
         " chunks=", (remote.token_indices.size() + config_.tokens_per_chunk - 1) /
             config_.tokens_per_chunk);
     return remote;
+}
+
+void Proxy::exchange_router_expert_metadata_all_to_all() {
+    if (!config_.router_routing_enabled || !config_.nvlink_forwarding_enabled) return;
+
+    const auto maximum_index_count = config_.num_tokens *
+        static_cast<std::size_t>(config_.router_top_k);
+    const auto install = [&](RouterExpertMetadata metadata) {
+        if (metadata.destination_node_rank != config_.node_rank ||
+            metadata.destination_gpu_index != config_.local_gpu_index ||
+            metadata.num_nodes != config_.num_nodes ||
+            metadata.num_gpus_per_node != config_.num_gpus_per_node ||
+            metadata.num_experts != config_.router_num_experts ||
+            metadata.experts_per_gpu != router_routing_.experts_per_gpu() ||
+            metadata.num_tokens != config_.num_tokens) {
+            throw std::runtime_error(
+                "received router expert metadata does not match local topology");
+        }
+        cuda_buffers_.install_expert_metadata(std::move(metadata));
+    };
+
+    if (config_.mock_mode) {
+        // A one-process mock run has no remote proxies. Recreate their
+        // deterministic router state so every source-specific buffer still
+        // receives semantically valid expert metadata.
+        for (int source_node = 0; source_node < config_.num_nodes; ++source_node) {
+            for (int source_gpu = 0; source_gpu < config_.num_gpus_per_node; ++source_gpu) {
+                if (source_node == config_.node_rank &&
+                    source_gpu == config_.local_gpu_index) {
+                    install(router_routing_.expert_metadata_for_gpu(
+                        config_.node_rank, config_.local_gpu_index));
+                    continue;
+                }
+                auto source_config = config_;
+                source_config.node_rank = source_node;
+                source_config.local_gpu_index = source_gpu;
+                RouterRouting source_routing(std::move(source_config));
+                source_routing.initialize();
+                install(source_routing.expert_metadata_for_gpu(
+                    config_.node_rank, config_.local_gpu_index));
+            }
+        }
+        return;
+    }
+
+    const uint16_t local_metadata_port = static_cast<uint16_t>(
+        static_cast<unsigned>(config_.router_metadata_port_base) +
+        static_cast<unsigned>(config_.local_gpu_index));
+    for (int peer_node = 0; peer_node < config_.num_nodes; ++peer_node) {
+        std::string peer_host = "::1";
+        if (peer_node != config_.node_rank) {
+            const auto node_peer = std::find_if(
+                config_.peers.begin(), config_.peers.end(),
+                [&](const PeerAddress& candidate) {
+                    return candidate.node_rank == peer_node;
+                });
+            if (node_peer == config_.peers.end()) {
+                throw std::runtime_error(
+                    "missing node host for router expert metadata exchange");
+            }
+            peer_host = node_peer->host;
+        }
+        for (int peer_gpu = 0; peer_gpu < config_.num_gpus_per_node; ++peer_gpu) {
+            if (peer_node == config_.node_rank &&
+                peer_gpu == config_.local_gpu_index) {
+                install(router_routing_.expert_metadata_for_gpu(
+                    config_.node_rank, config_.local_gpu_index));
+                continue;
+            }
+
+            PeerAddress endpoint;
+            endpoint.node_rank = peer_node;
+            endpoint.host = peer_host;
+            endpoint.port = static_cast<uint16_t>(
+                static_cast<unsigned>(config_.router_metadata_port_base) +
+                static_cast<unsigned>(peer_gpu));
+            const auto local_payload = serialize_router_expert_metadata(
+                router_routing_.expert_metadata_for_gpu(peer_node, peer_gpu));
+            const auto remote_payload = connection_manager_.exchange_global_control_message(
+                endpoint,
+                peer_gpu,
+                local_metadata_port,
+                local_payload,
+                config_.completion_timeout_ms);
+            auto remote = deserialize_router_expert_metadata(
+                remote_payload, config_.num_tokens, maximum_index_count);
+            if (remote.source_node_rank != peer_node ||
+                remote.source_gpu_index != peer_gpu ||
+                remote.destination_node_rank != config_.node_rank ||
+                remote.destination_gpu_index != config_.local_gpu_index) {
+                throw std::runtime_error(
+                    "router expert metadata source/destination identity mismatch");
+            }
+            RDMA_PROXY_LOG_INFO(
+                "received router expert metadata source_node=", peer_node,
+                " source_gpu=", peer_gpu,
+                " destination_node=", config_.node_rank,
+                " destination_gpu=", config_.local_gpu_index,
+                " experts=", remote.experts_per_gpu,
+                " indices=", remote.expert_token_indices.size());
+            install(std::move(remote));
+        }
+    }
 }
 
 void Proxy::synchronize_peer_ready(const PeerAddress& peer_addr, const PeerState& peer) const {

@@ -108,6 +108,31 @@ int main() {
         rejected_invalid_x4 = true;
     }
     assert(rejected_invalid_x4);
+
+    RouterExpertMetadata expert_metadata;
+    expert_metadata.source_node_rank = 2;
+    expert_metadata.source_gpu_index = 3;
+    expert_metadata.destination_node_rank = 0;
+    expert_metadata.destination_gpu_index = 1;
+    expert_metadata.num_nodes = 4;
+    expert_metadata.num_gpus_per_node = 8;
+    expert_metadata.num_experts = 256;
+    expert_metadata.experts_per_gpu = 8;
+    expert_metadata.first_global_expert = 8;
+    expert_metadata.num_tokens = 64;
+    expert_metadata.expert_token_indices = {0, 3, 1, 4, 7};
+    expert_metadata.expert_offsets = {0, 2, 2, 3, 3, 5, 5, 5, 5};
+    const auto decoded_expert_metadata = deserialize_router_expert_metadata(
+        serialize_router_expert_metadata(expert_metadata),
+        expert_metadata.num_tokens,
+        metadata.num_tokens * static_cast<std::size_t>(metadata.top_k));
+    assert(decoded_expert_metadata.source_node_rank == 2);
+    assert(decoded_expert_metadata.source_gpu_index == 3);
+    assert(decoded_expert_metadata.destination_gpu_index == 1);
+    assert(decoded_expert_metadata.first_global_expert == 8);
+    assert(decoded_expert_metadata.expert_token_indices ==
+           expert_metadata.expert_token_indices);
+    assert(decoded_expert_metadata.expert_offsets == expert_metadata.expert_offsets);
     assert(decode_immediate(encode_immediate(1234)) == 1234);
 
     PeerConnectionInfo info;
@@ -133,6 +158,8 @@ int main() {
     router_nvlink_config.mock_mode = true;
     router_nvlink_config.router_routing_enabled = true;
     router_nvlink_config.nvlink_forwarding_enabled = true;
+    router_nvlink_config.router_num_experts = 256;
+    router_nvlink_config.router_top_k = 8;
     router_nvlink_config.node_rank = 0;
     router_nvlink_config.num_nodes = 4;
     router_nvlink_config.local_gpu_index = 3;
@@ -159,10 +186,28 @@ int main() {
             assert(buffer.source_gpu_index == source_gpu);
             assert(buffer.recv.ptr != nullptr);
             assert(buffer.recv.bytes == expected_forwarding_buffer_bytes);
+            assert(!buffer.expert_metadata_ready);
             distinct_router_nvlink_allocations.insert(buffer.recv.ptr);
         }
     }
     assert(distinct_router_nvlink_allocations.size() == 32);
+
+    auto local_expert_metadata = expert_metadata;
+    local_expert_metadata.source_node_rank = 2;
+    local_expert_metadata.source_gpu_index = 3;
+    local_expert_metadata.destination_node_rank = router_nvlink_config.node_rank;
+    local_expert_metadata.destination_gpu_index = router_nvlink_config.local_gpu_index;
+    local_expert_metadata.num_experts = router_nvlink_config.router_num_experts;
+    local_expert_metadata.experts_per_gpu = 8;
+    local_expert_metadata.first_global_expert = 24;
+    local_expert_metadata.num_tokens = router_nvlink_config.num_tokens;
+    local_expert_metadata.expert_token_indices = {0, 1, 2};
+    local_expert_metadata.expert_offsets = {0, 1, 1, 2, 2, 3, 3, 3, 3};
+    router_nvlink_buffers.install_expert_metadata(local_expert_metadata);
+    const auto& installed = router_nvlink_buffers.nvlink_receive_buffer_for_source(2, 3);
+    assert(installed.expert_metadata_ready);
+    assert(installed.expert_metadata.expert_token_indices ==
+           local_expert_metadata.expert_token_indices);
 
     DynamicChunkDistributor distributor(
         chunks,

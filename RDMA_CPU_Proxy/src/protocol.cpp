@@ -192,6 +192,107 @@ RouterX3Metadata deserialize_router_x3_metadata(
     return metadata;
 }
 
+std::string serialize_router_expert_metadata(
+    const RouterExpertMetadata& metadata) {
+    if (metadata.experts_per_gpu <= 0 ||
+        metadata.expert_offsets.size() !=
+            static_cast<std::size_t>(metadata.experts_per_gpu + 1)) {
+        throw std::runtime_error("router expert metadata offset count is invalid");
+    }
+    if (metadata.expert_offsets.front() != 0 ||
+        metadata.expert_offsets.back() < 0 ||
+        static_cast<std::size_t>(metadata.expert_offsets.back()) !=
+            metadata.expert_token_indices.size()) {
+        throw std::runtime_error("router expert metadata offset endpoints are invalid");
+    }
+    for (std::size_t i = 1; i < metadata.expert_offsets.size(); ++i) {
+        if (metadata.expert_offsets[i] < metadata.expert_offsets[i - 1]) {
+            throw std::runtime_error("router expert metadata offsets are not monotonic");
+        }
+    }
+
+    std::ostringstream out;
+    out << "router_expert_metadata_v1 "
+        << metadata.source_node_rank << ' '
+        << metadata.source_gpu_index << ' '
+        << metadata.destination_node_rank << ' '
+        << metadata.destination_gpu_index << ' '
+        << metadata.num_nodes << ' '
+        << metadata.num_gpus_per_node << ' '
+        << metadata.num_experts << ' '
+        << metadata.experts_per_gpu << ' '
+        << metadata.first_global_expert << ' '
+        << metadata.num_tokens << ' '
+        << metadata.expert_token_indices.size();
+    for (const auto offset : metadata.expert_offsets) out << ' ' << offset;
+    for (const auto index : metadata.expert_token_indices) out << ' ' << index;
+    return out.str();
+}
+
+RouterExpertMetadata deserialize_router_expert_metadata(
+    const std::string& payload,
+    std::size_t maximum_num_tokens,
+    std::size_t maximum_index_count) {
+    std::istringstream in(payload);
+    std::string version;
+    RouterExpertMetadata metadata;
+    std::size_t index_count = 0;
+    in >> version
+       >> metadata.source_node_rank
+       >> metadata.source_gpu_index
+       >> metadata.destination_node_rank
+       >> metadata.destination_gpu_index
+       >> metadata.num_nodes
+       >> metadata.num_gpus_per_node
+       >> metadata.num_experts
+       >> metadata.experts_per_gpu
+       >> metadata.first_global_expert
+       >> metadata.num_tokens
+       >> index_count;
+    if (!in || version != "router_expert_metadata_v1") {
+        throw std::runtime_error("failed to parse router expert metadata header");
+    }
+    if (metadata.num_nodes <= 0 || metadata.num_gpus_per_node <= 0 ||
+        metadata.num_experts <= 0 || metadata.experts_per_gpu <= 0) {
+        throw std::runtime_error("router expert metadata dimensions are invalid");
+    }
+    if (metadata.num_tokens > maximum_num_tokens ||
+        index_count > maximum_index_count) {
+        throw std::runtime_error("router expert metadata exceeds configured capacity");
+    }
+    metadata.expert_offsets.resize(
+        static_cast<std::size_t>(metadata.experts_per_gpu) + 1);
+    for (auto& offset : metadata.expert_offsets) {
+        in >> offset;
+        if (!in || offset < 0 ||
+            static_cast<std::size_t>(offset) > index_count) {
+            throw std::runtime_error("router expert metadata contains an invalid offset");
+        }
+    }
+    if (metadata.expert_offsets.front() != 0 ||
+        static_cast<std::size_t>(metadata.expert_offsets.back()) != index_count) {
+        throw std::runtime_error("router expert metadata offset endpoints are invalid");
+    }
+    for (std::size_t i = 1; i < metadata.expert_offsets.size(); ++i) {
+        if (metadata.expert_offsets[i] < metadata.expert_offsets[i - 1]) {
+            throw std::runtime_error("router expert metadata offsets are not monotonic");
+        }
+    }
+    metadata.expert_token_indices.resize(index_count);
+    for (auto& index : metadata.expert_token_indices) {
+        in >> index;
+        if (!in || index < 0 ||
+            static_cast<std::size_t>(index) >= metadata.num_tokens) {
+            throw std::runtime_error("router expert metadata contains an invalid token index");
+        }
+    }
+    std::string trailing;
+    if (in >> trailing) {
+        throw std::runtime_error("router expert metadata contains trailing fields");
+    }
+    return metadata;
+}
+
 std::vector<uint8_t> normalize_router_x4_for_nvlink(
     const std::vector<uint8_t>& token_masks,
     int num_gpus_per_node) {

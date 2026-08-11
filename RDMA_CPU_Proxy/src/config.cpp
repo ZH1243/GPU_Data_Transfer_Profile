@@ -305,6 +305,9 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "router_seed") {
         config.router_seed = static_cast<uint64_t>(std::stoull(value));
     }
+    else if (key == "router_metadata_port_base") {
+        config.router_metadata_port_base = static_cast<uint16_t>(std::stoul(value));
+    }
     else if (key == "send_queue_depth") config.send_queue_depth = std::stoi(value);
     else if (key == "recv_queue_depth") config.recv_queue_depth = std::stoi(value);
     else if (key == "cq_depth") config.cq_depth = std::stoi(value);
@@ -494,6 +497,8 @@ ProxyConfig load_config_file(const std::string& path) {
     config.router_top_k = number_as<int>(
         object, "top_k", number_as<int>(object, "router_top_k", config.router_top_k));
     config.router_seed = number_as<uint64_t>(object, "router_seed", config.router_seed);
+    config.router_metadata_port_base = number_as<uint16_t>(
+        object, "router_metadata_port_base", config.router_metadata_port_base);
     config.send_queue_depth = number_as<int>(object, "send_queue_depth", config.send_queue_depth);
     config.recv_queue_depth = number_as<int>(object, "recv_queue_depth", config.recv_queue_depth);
     config.cq_depth = number_as<int>(object, "cq_depth", config.cq_depth);
@@ -675,6 +680,14 @@ void validate_config(const ProxyConfig& config) {
             config.num_tokens > static_cast<std::size_t>(
                 std::numeric_limits<int32_t>::max() / config.router_top_k)) {
             throw std::runtime_error("num_tokens * top_k must fit in int32 in router mode");
+        }
+        if (config.nvlink_forwarding_enabled &&
+            (config.router_metadata_port_base == 0 ||
+             static_cast<unsigned>(config.router_metadata_port_base) +
+                     static_cast<unsigned>(config.num_gpus_per_node - 1) >
+                 std::numeric_limits<uint16_t>::max())) {
+            throw std::runtime_error(
+                "router_metadata_port_base does not leave one valid TCP port per local GPU");
         }
     }
     if (config.send_queue_depth <= 0 || config.recv_queue_depth <= 0 || config.cq_depth <= 0) {
@@ -871,6 +884,7 @@ std::string config_summary(const ProxyConfig& config) {
         << " num_experts=" << config.router_num_experts
         << " top_k=" << config.router_top_k
         << " router_seed=" << config.router_seed
+        << " router_metadata_port_base=" << config.router_metadata_port_base
         << " iterations=" << config.num_iterations
         << " dtype=" << to_string(config.dtype)
         << " sequential_peer_transfers=" << (config.sequential_peer_transfers ? "true" : "false")

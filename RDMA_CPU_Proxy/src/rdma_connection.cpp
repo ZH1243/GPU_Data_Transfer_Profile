@@ -575,4 +575,27 @@ std::string ConnectionManager::exchange_control_message(
     return exchange_payload_server(config_.listen_port, local_payload, timeout_ms);
 }
 
+std::string ConnectionManager::exchange_global_control_message(
+    const PeerAddress& peer,
+    int peer_gpu_index,
+    uint16_t local_listen_port,
+    const std::string& local_payload,
+    uint64_t timeout_ms) const {
+    if (config_.mock_mode) return local_payload;
+    if (peer_gpu_index < 0 || peer_gpu_index >= config_.num_gpus_per_node) {
+        throw std::runtime_error("global metadata peer GPU index is out of range");
+    }
+    const int local_global_rank =
+        config_.node_rank * config_.num_gpus_per_node + config_.local_gpu_index;
+    const int peer_global_rank =
+        peer.node_rank * config_.num_gpus_per_node + peer_gpu_index;
+    if (local_global_rank == peer_global_rank) {
+        throw std::runtime_error("cannot exchange global metadata with self");
+    }
+    if (local_global_rank < peer_global_rank) {
+        return exchange_payload_client(peer, local_payload, timeout_ms);
+    }
+    return exchange_payload_server(local_listen_port, local_payload, timeout_ms);
+}
+
 }  // namespace rdma_proxy

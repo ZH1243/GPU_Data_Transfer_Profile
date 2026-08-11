@@ -180,6 +180,21 @@ int main() {
 
         Proxy proxy(config);
         proxy.initialize();
+        for (int source_node = 0; source_node < config.num_nodes; ++source_node) {
+            for (int source_gpu = 0; source_gpu < config.num_gpus_per_node; ++source_gpu) {
+                const auto& metadata = proxy.router_expert_metadata_for_source(
+                    source_node, source_gpu);
+                if (metadata.source_node_rank != source_node ||
+                    metadata.source_gpu_index != source_gpu ||
+                    metadata.destination_node_rank != config.node_rank ||
+                    metadata.destination_gpu_index != config.local_gpu_index ||
+                    metadata.experts_per_gpu != 2 ||
+                    metadata.expert_offsets.size() != 3) {
+                    std::cerr << "router expert all-to-all metadata is incomplete\n";
+                    return 1;
+                }
+            }
+        }
         proxy.run();
         proxy.shutdown();
 
