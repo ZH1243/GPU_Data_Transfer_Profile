@@ -320,6 +320,11 @@ RouterExpertTokenHeadState Proxy::router_expert_token_head_state_for_source(
         source_node_rank, source_gpu_index);
 }
 
+const RouterNotificationPublicationBuffers&
+Proxy::router_notification_publication_buffers() const {
+    return cuda_buffers_.router_notification_publication_buffers();
+}
+
 void Proxy::run_once() {
     if (!initialized_) throw std::runtime_error("proxy is not initialized");
     run_iteration(0);
@@ -1390,6 +1395,7 @@ void Proxy::drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQue
                 notification.iteration,
                 notification.start_token,
                 notification.num_tokens);
+            cuda_buffers_.flush_router_notification_publication();
         }
         atomic_store_u64(&queue->tail, tail + 1);
         const auto dequeue_timestamp_ns = unix_epoch_nanoseconds_now();

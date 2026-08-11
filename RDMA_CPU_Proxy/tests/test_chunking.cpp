@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <cstring>
 #include <iostream>
 #include <set>
 #include <stdexcept>
@@ -158,6 +159,7 @@ int main() {
     router_nvlink_config.mock_mode = true;
     router_nvlink_config.router_routing_enabled = true;
     router_nvlink_config.nvlink_forwarding_enabled = true;
+    router_nvlink_config.nvlink_forward_completion_notifications_enabled = true;
     router_nvlink_config.router_num_experts = 256;
     router_nvlink_config.router_top_k = 8;
     router_nvlink_config.node_rank = 0;
@@ -191,6 +193,34 @@ int main() {
         }
     }
     assert(distinct_router_nvlink_allocations.size() == 32);
+
+    const auto& publication =
+        router_nvlink_buffers.router_notification_publication_buffers();
+    assert(publication.host_map.ptr != nullptr);
+    assert(publication.host_map.bytes == 1024);
+    assert(publication.host_flag.ptr != nullptr);
+    assert(publication.host_flag.bytes == sizeof(uint32_t));
+    assert(publication.device_map.ptr != nullptr);
+    assert(publication.device_map.bytes == 1024);
+    assert(publication.device_flag.ptr != nullptr);
+    assert(publication.device_flag.bytes == sizeof(uint32_t));
+    assert(std::all_of(
+        static_cast<const uint8_t*>(publication.host_map.ptr),
+        static_cast<const uint8_t*>(publication.host_map.ptr) + publication.host_map.bytes,
+        [](uint8_t value) { return value == 0; }));
+    assert(*static_cast<const uint32_t*>(publication.host_flag.ptr) == 0);
+    std::memset(publication.host_map.ptr, 0x5a, publication.host_map.bytes);
+    *static_cast<uint32_t*>(publication.host_flag.ptr) = 7;
+    std::memset(publication.device_map.ptr, 0xff, publication.device_map.bytes);
+    *static_cast<uint32_t*>(publication.device_flag.ptr) = 3;
+    router_nvlink_buffers.flush_router_notification_publication();
+    assert(std::all_of(
+        static_cast<const uint8_t*>(publication.device_map.ptr),
+        static_cast<const uint8_t*>(publication.device_map.ptr) + publication.device_map.bytes,
+        [](uint8_t value) { return value == 0x5a; }));
+    assert(*static_cast<const uint32_t*>(publication.device_flag.ptr) == 7);
+    std::memset(publication.host_map.ptr, 0, publication.host_map.bytes);
+    *static_cast<uint32_t*>(publication.host_flag.ptr) = 0;
 
     auto local_expert_metadata = expert_metadata;
     local_expert_metadata.source_node_rank = 2;

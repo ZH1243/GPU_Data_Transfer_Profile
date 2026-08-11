@@ -9,17 +9,32 @@
 #include <stdexcept>
 
 #if RDMA_PROXY_HAVE_CUDA
+#include <cuda.h>
 #include <cuda_runtime.h>
 #endif
 
 namespace rdma_proxy {
 namespace {
 
+constexpr std::size_t kRouterNotificationMapBytes = 1024;
+
 #if RDMA_PROXY_HAVE_CUDA
 void check_cuda(cudaError_t status, const char* what) {
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
     }
+}
+
+void check_cuda_driver(CUresult status, const char* what) {
+    if (status == CUDA_SUCCESS) return;
+    const char* name = nullptr;
+    const char* description = nullptr;
+    (void)cuGetErrorName(status, &name);
+    (void)cuGetErrorString(status, &description);
+    throw std::runtime_error(
+        std::string(what) + ": " +
+        (name ? name : "unknown CUDA driver error") +
+        (description ? std::string(" (") + description + ")" : std::string{}));
 }
 
 #endif
@@ -58,6 +73,28 @@ void launch_copy_tokens_kernel(void* dst, const void* src, std::size_t bytes);
 CudaBuffers::CudaBuffers(ProxyConfig config) : config_(std::move(config)) {}
 
 CudaBuffers::~CudaBuffers() {
+#if RDMA_PROXY_HAVE_CUDA
+    if (!config_.mock_mode && router_notification_publication_stream_) {
+        const auto set_device_status = cudaSetDevice(config_.cuda_device_id);
+        if (set_device_status != cudaSuccess) {
+            RDMA_PROXY_LOG_WARN(
+                "cudaSetDevice failed before router publication cleanup: ",
+                cudaGetErrorString(set_device_status));
+        } else {
+            const auto synchronize_status = cudaStreamSynchronize(
+                reinterpret_cast<cudaStream_t>(
+                    router_notification_publication_stream_));
+            if (synchronize_status != cudaSuccess) {
+                RDMA_PROXY_LOG_WARN(
+                    "cudaStreamSynchronize failed during router publication cleanup: ",
+                    cudaGetErrorString(synchronize_status));
+            }
+        }
+    }
+#endif
+    destroy_cuda_stream(
+        router_notification_publication_stream_, config_.mock_mode);
+    router_notification_publication_stream_ = nullptr;
     for (auto& entry : buffers_) {
         if (!config_.router_routing_enabled) free_buffer(entry.send);
         free_buffer(entry.recv);
@@ -66,6 +103,10 @@ CudaBuffers::~CudaBuffers() {
     for (auto& entry : nvlink_recv_buffers_) {
         free_buffer(entry.recv);
     }
+    free_buffer(router_notification_publication_buffers_.device_map);
+    free_buffer(router_notification_publication_buffers_.device_flag);
+    free_pinned_buffer(router_notification_publication_buffers_.host_map);
+    free_pinned_buffer(router_notification_publication_buffers_.host_flag);
 }
 
 void CudaBuffers::initialize() {
@@ -136,6 +177,42 @@ void CudaBuffers::initialize() {
         }
     }
 
+    if (config_.router_routing_enabled &&
+        config_.nvlink_forward_completion_notifications_enabled) {
+        auto& publication = router_notification_publication_buffers_;
+        allocate_pinned_buffer(publication.host_map, kRouterNotificationMapBytes);
+        allocate_pinned_buffer(publication.host_flag, sizeof(uint32_t));
+        allocate_buffer(publication.device_map, kRouterNotificationMapBytes);
+        allocate_buffer(publication.device_flag, sizeof(uint32_t));
+        router_notification_publication_stream_ = create_cuda_stream(
+            config_.cuda_device_id,
+            /*nonblocking=*/true,
+            config_.mock_mode);
+#if RDMA_PROXY_HAVE_CUDA
+        if (!config_.mock_mode) {
+            check_cuda_driver(cuInit(0), "cuInit for router publication");
+            CUdevice device = 0;
+            check_cuda_driver(
+                cuDeviceGet(&device, config_.cuda_device_id),
+                "cuDeviceGet for router publication");
+            int stream_memory_operations_supported = 0;
+            check_cuda_driver(
+                cuDeviceGetAttribute(
+                    &stream_memory_operations_supported,
+                    CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS,
+                    device),
+                "cuDeviceGetAttribute stream memory operations");
+            if (!stream_memory_operations_supported) {
+                throw std::runtime_error(
+                    "router notification publication requires CUDA stream memory operations");
+            }
+        }
+#endif
+        RDMA_PROXY_LOG_INFO(
+            "allocated router notification publication buffers map_bytes=",
+            kRouterNotificationMapBytes,
+            " flag_bytes=", sizeof(uint32_t));
+    }
 }
 
 void CudaBuffers::copy_tokens_to_send_buffer(int peer_rank, const void* src_device_or_host, std::size_t bytes) {
@@ -468,6 +545,60 @@ void CudaBuffers::update_expert_token_heads(
     state.received_token_frontier = received_end;
 }
 
+void CudaBuffers::flush_router_notification_publication() {
+    auto& publication = router_notification_publication_buffers_;
+    if (!publication.host_map.ptr || !publication.host_flag.ptr ||
+        !publication.device_map.ptr || !publication.device_flag.ptr ||
+        publication.host_map.bytes != kRouterNotificationMapBytes ||
+        publication.device_map.bytes != kRouterNotificationMapBytes ||
+        publication.host_flag.bytes != sizeof(uint32_t) ||
+        publication.device_flag.bytes != sizeof(uint32_t)) {
+        throw std::runtime_error(
+            "router notification publication buffers are not initialized");
+    }
+
+    if (config_.mock_mode) {
+        std::memcpy(
+            publication.device_map.ptr,
+            publication.host_map.ptr,
+            publication.host_map.bytes);
+        std::memcpy(
+            publication.device_flag.ptr,
+            publication.host_flag.ptr,
+            publication.host_flag.bytes);
+        return;
+    }
+#if RDMA_PROXY_HAVE_CUDA
+    if (!router_notification_publication_stream_) {
+        throw std::runtime_error(
+            "router notification publication stream is not initialized");
+    }
+    auto stream = reinterpret_cast<cudaStream_t>(
+        router_notification_publication_stream_);
+    check_cuda(cudaMemcpyAsync(
+        publication.device_map.ptr,
+        publication.host_map.ptr,
+        publication.host_map.bytes,
+        cudaMemcpyHostToDevice,
+        stream), "cudaMemcpyAsync H2D router notification map");
+
+    // A stream memory write is host-asynchronous, writes the aligned flag as
+    // one 32-bit value, and (without NO_MEMORY_BARRIER) performs a system-wide
+    // fence after the preceding map copy and before publishing the new flag.
+    const auto flag_value = *static_cast<const uint32_t*>(
+        publication.host_flag.ptr);
+    check_cuda_driver(cuStreamWriteValue32(
+        reinterpret_cast<CUstream>(stream),
+        reinterpret_cast<CUdeviceptr>(publication.device_flag.ptr),
+        flag_value,
+        CU_STREAM_WRITE_VALUE_DEFAULT),
+        "cuStreamWriteValue32 router notification flag");
+#else
+    throw std::runtime_error(
+        "CUDA router notification publication requested but CUDA support was not built");
+#endif
+}
+
 std::size_t CudaBuffers::token_buffer_bytes() const {
     return config_.num_tokens * config_.token_dimension * dtype_size(config_.dtype);
 }
@@ -504,6 +635,43 @@ void CudaBuffers::free_buffer(GpuBuffer& buffer) {
         const auto status = cudaFree(buffer.ptr);
         if (status != cudaSuccess) {
             RDMA_PROXY_LOG_WARN("cudaFree failed during cleanup: ", cudaGetErrorString(status));
+        }
+#endif
+    }
+    buffer.ptr = nullptr;
+    buffer.bytes = 0;
+}
+
+void CudaBuffers::allocate_pinned_buffer(
+    CpuPinnedBuffer& buffer,
+    std::size_t bytes) {
+    buffer.bytes = bytes;
+    buffer.is_mock_host_memory = config_.mock_mode;
+    if (config_.mock_mode) {
+        buffer.ptr = ::operator new(bytes);
+        std::memset(buffer.ptr, 0, bytes);
+        return;
+    }
+#if RDMA_PROXY_HAVE_CUDA
+    check_cuda(cudaMallocHost(&buffer.ptr, bytes), "cudaMallocHost");
+    std::memset(buffer.ptr, 0, bytes);
+#else
+    throw std::runtime_error(
+        "CUDA pinned allocation requested but CUDA support was not built");
+#endif
+}
+
+void CudaBuffers::free_pinned_buffer(CpuPinnedBuffer& buffer) {
+    if (!buffer.ptr) return;
+    if (buffer.is_mock_host_memory) {
+        ::operator delete(buffer.ptr);
+    } else {
+#if RDMA_PROXY_HAVE_CUDA
+        const auto status = cudaFreeHost(buffer.ptr);
+        if (status != cudaSuccess) {
+            RDMA_PROXY_LOG_WARN(
+                "cudaFreeHost failed during cleanup: ",
+                cudaGetErrorString(status));
         }
 #endif
     }

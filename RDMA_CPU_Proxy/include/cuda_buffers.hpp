@@ -17,6 +17,19 @@ struct GpuBuffer {
     bool is_mock_host_memory{false};
 };
 
+struct CpuPinnedBuffer {
+    void* ptr{nullptr};
+    std::size_t bytes{0};
+    bool is_mock_host_memory{false};
+};
+
+struct RouterNotificationPublicationBuffers {
+    CpuPinnedBuffer host_map;
+    CpuPinnedBuffer host_flag;
+    GpuBuffer device_map;
+    GpuBuffer device_flag;
+};
+
 struct PeerGpuBuffers {
     int peer_rank{-1};
     GpuBuffer send;
@@ -92,6 +105,10 @@ public:
         uint64_t iteration,
         std::size_t start_token,
         std::size_t num_tokens);
+    void flush_router_notification_publication();
+    const RouterNotificationPublicationBuffers& router_notification_publication_buffers() const {
+        return router_notification_publication_buffers_;
+    }
 
     std::size_t token_buffer_bytes() const;
     std::size_t nvlink_receive_buffer_bytes() const;
@@ -99,11 +116,15 @@ public:
 private:
     void allocate_buffer(GpuBuffer& buffer, std::size_t bytes);
     void free_buffer(GpuBuffer& buffer);
+    void allocate_pinned_buffer(CpuPinnedBuffer& buffer, std::size_t bytes);
+    void free_pinned_buffer(CpuPinnedBuffer& buffer);
 
     ProxyConfig config_;
     GpuBuffer router_send_buffer_;
     std::vector<PeerGpuBuffers> buffers_;
     std::vector<NvlinkReceiveBuffer> nvlink_recv_buffers_;
+    RouterNotificationPublicationBuffers router_notification_publication_buffers_;
+    void* router_notification_publication_stream_{nullptr};
     mutable std::mutex expert_token_heads_mutex_;
 };
 
