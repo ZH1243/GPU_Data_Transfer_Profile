@@ -313,6 +313,13 @@ const RouterExpertMetadata& Proxy::router_expert_metadata_for_source(
     return buffer.expert_metadata;
 }
 
+RouterExpertTokenHeadState Proxy::router_expert_token_head_state_for_source(
+    int source_node_rank,
+    int source_gpu_index) const {
+    return cuda_buffers_.expert_token_head_state_for_source(
+        source_node_rank, source_gpu_index);
+}
+
 void Proxy::run_once() {
     if (!initialized_) throw std::runtime_error("proxy is not initialized");
     run_iteration(0);
@@ -1371,6 +1378,19 @@ void Proxy::drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQue
         auto* wire_entry = nvlink_forward_notification_entry(
             nvlink_forward_notification_header_, queue, tail);
         const auto notification = *wire_entry;
+        if (notification.destination_gpu != config_.local_gpu_index ||
+            notification.source_gpu != queue->source_gpu) {
+            throw std::runtime_error(
+                "NVLink forwarding notification source/destination identity mismatch");
+        }
+        if (config_.router_routing_enabled) {
+            cuda_buffers_.update_expert_token_heads(
+                notification.peer_rank,
+                notification.source_gpu,
+                notification.iteration,
+                notification.start_token,
+                notification.num_tokens);
+        }
         atomic_store_u64(&queue->tail, tail + 1);
         const auto dequeue_timestamp_ns = unix_epoch_nanoseconds_now();
         nvlink_forward_notifications_received_.fetch_add(1);

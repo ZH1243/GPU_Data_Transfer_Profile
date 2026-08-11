@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -22,12 +23,23 @@ struct PeerGpuBuffers {
     GpuBuffer recv;
 };
 
+// CPU-side progress for the per-expert token-index lists attached to one
+// source-specific NVLink receive buffer. A head is the number of leading
+// entries in that expert's list whose token rows have arrived.
+struct RouterExpertTokenHeadState {
+    bool iteration_initialized{false};
+    uint64_t iteration{0};
+    std::size_t received_token_frontier{0};
+    std::vector<std::size_t> expert_token_heads;
+};
+
 struct NvlinkReceiveBuffer {
     int source_node_rank{-1};
     int source_gpu_index{-1};
     GpuBuffer recv;
     RouterExpertMetadata expert_metadata;
     bool expert_metadata_ready{false};
+    RouterExpertTokenHeadState expert_token_head_state;
 };
 
 struct CudaForwardCopy {
@@ -71,6 +83,15 @@ public:
         int source_node_rank,
         int source_gpu_index) const;
     void install_expert_metadata(RouterExpertMetadata metadata);
+    RouterExpertTokenHeadState expert_token_head_state_for_source(
+        int source_node_rank,
+        int source_gpu_index) const;
+    void update_expert_token_heads(
+        int source_node_rank,
+        int source_gpu_index,
+        uint64_t iteration,
+        std::size_t start_token,
+        std::size_t num_tokens);
 
     std::size_t token_buffer_bytes() const;
     std::size_t nvlink_receive_buffer_bytes() const;
@@ -83,6 +104,7 @@ private:
     GpuBuffer router_send_buffer_;
     std::vector<PeerGpuBuffers> buffers_;
     std::vector<NvlinkReceiveBuffer> nvlink_recv_buffers_;
+    mutable std::mutex expert_token_heads_mutex_;
 };
 
 void launch_copy_tokens(void* dst, const void* src, std::size_t bytes, bool mock_mode);

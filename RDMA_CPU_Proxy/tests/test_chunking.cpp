@@ -208,6 +208,41 @@ int main() {
     assert(installed.expert_metadata_ready);
     assert(installed.expert_metadata.expert_token_indices ==
            local_expert_metadata.expert_token_indices);
+    auto head_state = router_nvlink_buffers.expert_token_head_state_for_source(2, 3);
+    assert(!head_state.iteration_initialized);
+    assert(head_state.received_token_frontier == 0);
+    assert(head_state.expert_token_heads == std::vector<std::size_t>(8, 0));
+
+    router_nvlink_buffers.update_expert_token_heads(2, 3, 0, 0, 1);
+    head_state = router_nvlink_buffers.expert_token_head_state_for_source(2, 3);
+    assert(head_state.iteration_initialized);
+    assert(head_state.iteration == 0);
+    assert(head_state.received_token_frontier == 1);
+    assert((head_state.expert_token_heads ==
+            std::vector<std::size_t>{1, 0, 0, 0, 0, 0, 0, 0}));
+
+    router_nvlink_buffers.update_expert_token_heads(2, 3, 0, 1, 2);
+    head_state = router_nvlink_buffers.expert_token_head_state_for_source(2, 3);
+    assert(head_state.received_token_frontier == 3);
+    assert((head_state.expert_token_heads ==
+            std::vector<std::size_t>{1, 0, 1, 0, 1, 0, 0, 0}));
+
+    // The first notification for the next iteration resets every Head before
+    // advancing it against that iteration's received prefix.
+    router_nvlink_buffers.update_expert_token_heads(2, 3, 1, 0, 2);
+    head_state = router_nvlink_buffers.expert_token_head_state_for_source(2, 3);
+    assert(head_state.iteration == 1);
+    assert(head_state.received_token_frontier == 2);
+    assert((head_state.expert_token_heads ==
+            std::vector<std::size_t>{1, 0, 1, 0, 0, 0, 0, 0}));
+
+    bool rejected_noncontiguous_notification = false;
+    try {
+        router_nvlink_buffers.update_expert_token_heads(2, 3, 1, 3, 1);
+    } catch (const std::runtime_error&) {
+        rejected_noncontiguous_notification = true;
+    }
+    assert(rejected_noncontiguous_notification);
 
     DynamicChunkDistributor distributor(
         chunks,

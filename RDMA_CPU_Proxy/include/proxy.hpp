@@ -34,6 +34,9 @@ public:
     const RouterExpertMetadata& router_expert_metadata_for_source(
         int source_node_rank,
         int source_gpu_index) const;
+    RouterExpertTokenHeadState router_expert_token_head_state_for_source(
+        int source_node_rank,
+        int source_gpu_index) const;
 
 private:
     struct PeerState {

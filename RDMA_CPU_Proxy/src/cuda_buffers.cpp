@@ -340,12 +340,23 @@ void CudaBuffers::install_expert_metadata(RouterExpertMetadata metadata) {
             })) {
         throw std::runtime_error("expert metadata contains an invalid token index");
     }
+    for (int expert = 0; expert < expected_experts_per_gpu; ++expert) {
+        const auto begin = metadata.expert_token_indices.begin() +
+            metadata.expert_offsets[static_cast<std::size_t>(expert)];
+        const auto end = metadata.expert_token_indices.begin() +
+            metadata.expert_offsets[static_cast<std::size_t>(expert + 1)];
+        if (!std::is_sorted(begin, end)) {
+            throw std::runtime_error(
+                "expert metadata token indices are not monotonic within an expert list");
+        }
+    }
     if (metadata.source_node_rank < 0 ||
         metadata.source_node_rank >= config_.num_nodes ||
         metadata.source_gpu_index < 0 ||
         metadata.source_gpu_index >= config_.num_gpus_per_node) {
         throw std::runtime_error("expert metadata source is out of range");
     }
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
     auto it = std::find_if(
         nvlink_recv_buffers_.begin(), nvlink_recv_buffers_.end(),
         [&](const auto& entry) {
@@ -360,6 +371,101 @@ void CudaBuffers::install_expert_metadata(RouterExpertMetadata metadata) {
     }
     it->expert_metadata = std::move(metadata);
     it->expert_metadata_ready = true;
+    it->expert_token_head_state = RouterExpertTokenHeadState{};
+    it->expert_token_head_state.expert_token_heads.assign(
+        static_cast<std::size_t>(expected_experts_per_gpu), 0);
+}
+
+RouterExpertTokenHeadState CudaBuffers::expert_token_head_state_for_source(
+    int source_node_rank,
+    int source_gpu_index) const {
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    const auto it = std::find_if(
+        nvlink_recv_buffers_.begin(), nvlink_recv_buffers_.end(),
+        [&](const auto& entry) {
+            return entry.source_node_rank == source_node_rank &&
+                entry.source_gpu_index == source_gpu_index;
+        });
+    if (it == nvlink_recv_buffers_.end()) {
+        throw std::runtime_error("unknown NVLink source node/GPU");
+    }
+    if (!it->expert_metadata_ready) {
+        throw std::runtime_error("router expert metadata is not ready for source GPU");
+    }
+    return it->expert_token_head_state;
+}
+
+void CudaBuffers::update_expert_token_heads(
+    int source_node_rank,
+    int source_gpu_index,
+    uint64_t iteration,
+    std::size_t start_token,
+    std::size_t num_tokens) {
+    if (!config_.router_routing_enabled || !config_.nvlink_forwarding_enabled) {
+        throw std::runtime_error(
+            "expert token heads require combined router/NVLink mode");
+    }
+    if (start_token > config_.num_tokens ||
+        num_tokens > config_.num_tokens - start_token) {
+        throw std::runtime_error("received NVLink token range exceeds buffer capacity");
+    }
+
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    auto it = std::find_if(
+        nvlink_recv_buffers_.begin(), nvlink_recv_buffers_.end(),
+        [&](const auto& entry) {
+            return entry.source_node_rank == source_node_rank &&
+                entry.source_gpu_index == source_gpu_index;
+        });
+    if (it == nvlink_recv_buffers_.end()) {
+        throw std::runtime_error("unknown NVLink source node/GPU");
+    }
+    if (!it->expert_metadata_ready) {
+        throw std::runtime_error("router expert metadata is not ready for source GPU");
+    }
+
+    auto& state = it->expert_token_head_state;
+    const auto& metadata = it->expert_metadata;
+    if (!state.iteration_initialized || iteration > state.iteration) {
+        if (start_token != 0) {
+            throw std::runtime_error(
+                "first NVLink notification for an iteration does not start at token zero");
+        }
+        state.iteration_initialized = true;
+        state.iteration = iteration;
+        state.received_token_frontier = 0;
+        std::fill(
+            state.expert_token_heads.begin(),
+            state.expert_token_heads.end(),
+            std::size_t{0});
+    } else if (iteration < state.iteration) {
+        throw std::runtime_error("received stale NVLink forwarding notification");
+    }
+
+    if (start_token != state.received_token_frontier) {
+        throw std::runtime_error(
+            "NVLink forwarding notifications are not contiguous for source buffer");
+    }
+    const auto received_end = start_token + num_tokens;
+    if (state.expert_token_heads.size() !=
+        static_cast<std::size_t>(metadata.experts_per_gpu)) {
+        throw std::runtime_error("expert token head count does not match metadata");
+    }
+
+    for (int expert = 0; expert < metadata.experts_per_gpu; ++expert) {
+        const auto expert_index = static_cast<std::size_t>(expert);
+        const auto list_begin = static_cast<std::size_t>(
+            metadata.expert_offsets[expert_index]);
+        const auto list_end = static_cast<std::size_t>(
+            metadata.expert_offsets[expert_index + 1]);
+        auto& head = state.expert_token_heads[expert_index];
+        while (list_begin + head < list_end &&
+               static_cast<std::size_t>(
+                   metadata.expert_token_indices[list_begin + head]) < received_end) {
+            ++head;
+        }
+    }
+    state.received_token_frontier = received_end;
 }
 
 std::size_t CudaBuffers::token_buffer_bytes() const {
