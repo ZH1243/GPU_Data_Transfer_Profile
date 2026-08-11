@@ -188,26 +188,6 @@ void CudaBuffers::initialize() {
             config_.cuda_device_id,
             /*nonblocking=*/true,
             config_.mock_mode);
-#if RDMA_PROXY_HAVE_CUDA
-        if (!config_.mock_mode) {
-            check_cuda_driver(cuInit(0), "cuInit for router publication");
-            CUdevice device = 0;
-            check_cuda_driver(
-                cuDeviceGet(&device, config_.cuda_device_id),
-                "cuDeviceGet for router publication");
-            int stream_memory_operations_supported = 0;
-            check_cuda_driver(
-                cuDeviceGetAttribute(
-                    &stream_memory_operations_supported,
-                    CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS,
-                    device),
-                "cuDeviceGetAttribute stream memory operations");
-            if (!stream_memory_operations_supported) {
-                throw std::runtime_error(
-                    "router notification publication requires CUDA stream memory operations");
-            }
-        }
-#endif
         RDMA_PROXY_LOG_INFO(
             "allocated router notification publication buffers map_bytes=",
             kRouterNotificationMapBytes,
