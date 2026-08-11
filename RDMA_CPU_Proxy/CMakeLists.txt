@@ -97,6 +97,10 @@ if(RDMA_PROXY_BUILD_TESTS)
   add_executable(test_router_routing tests/test_router_routing.cpp)
   target_link_libraries(test_router_routing PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_router_routing COMMAND test_router_routing)
+
+  add_executable(test_global_metadata_exchange tests/test_global_metadata_exchange.cpp)
+  target_link_libraries(test_global_metadata_exchange PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_global_metadata_exchange COMMAND test_global_metadata_exchange)
 endif()
 
 message(STATUS "RDMA_PROXY_HAVE_CUDA=${RDMA_PROXY_HAVE_CUDA}")

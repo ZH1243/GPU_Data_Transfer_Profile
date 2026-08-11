@@ -511,6 +511,17 @@ void Proxy::exchange_router_expert_metadata_all_to_all() {
     const uint16_t local_metadata_port = static_cast<uint16_t>(
         static_cast<unsigned>(config_.router_metadata_port_base) +
         static_cast<unsigned>(config_.local_gpu_index));
+    install(router_routing_.expert_metadata_for_gpu(
+        config_.node_rank, config_.local_gpu_index));
+
+    struct OutgoingExpertMetadata {
+        PeerAddress endpoint;
+        std::string payload;
+    };
+    std::vector<OutgoingExpertMetadata> outgoing;
+    const auto total_gpus = static_cast<std::size_t>(
+        config_.num_nodes * config_.num_gpus_per_node);
+    outgoing.reserve(total_gpus - 1);
     for (int peer_node = 0; peer_node < config_.num_nodes; ++peer_node) {
         std::string peer_host = "::1";
         if (peer_node != config_.node_rank) {
@@ -528,43 +539,77 @@ void Proxy::exchange_router_expert_metadata_all_to_all() {
         for (int peer_gpu = 0; peer_gpu < config_.num_gpus_per_node; ++peer_gpu) {
             if (peer_node == config_.node_rank &&
                 peer_gpu == config_.local_gpu_index) {
-                install(router_routing_.expert_metadata_for_gpu(
-                    config_.node_rank, config_.local_gpu_index));
                 continue;
             }
 
-            PeerAddress endpoint;
-            endpoint.node_rank = peer_node;
-            endpoint.host = peer_host;
-            endpoint.port = static_cast<uint16_t>(
+            OutgoingExpertMetadata message;
+            message.endpoint.node_rank = peer_node;
+            message.endpoint.host = peer_host;
+            message.endpoint.port = static_cast<uint16_t>(
                 static_cast<unsigned>(config_.router_metadata_port_base) +
                 static_cast<unsigned>(peer_gpu));
-            const auto local_payload = serialize_router_expert_metadata(
+            message.payload = serialize_router_expert_metadata(
                 router_routing_.expert_metadata_for_gpu(peer_node, peer_gpu));
-            const auto remote_payload = connection_manager_.exchange_global_control_message(
-                endpoint,
-                peer_gpu,
-                local_metadata_port,
-                local_payload,
-                config_.completion_timeout_ms);
-            auto remote = deserialize_router_expert_metadata(
-                remote_payload, config_.num_tokens, maximum_index_count);
-            if (remote.source_node_rank != peer_node ||
-                remote.source_gpu_index != peer_gpu ||
-                remote.destination_node_rank != config_.node_rank ||
-                remote.destination_gpu_index != config_.local_gpu_index) {
-                throw std::runtime_error(
-                    "router expert metadata source/destination identity mismatch");
-            }
-            RDMA_PROXY_LOG_INFO(
-                "received router expert metadata source_node=", peer_node,
-                " source_gpu=", peer_gpu,
-                " destination_node=", config_.node_rank,
-                " destination_gpu=", config_.local_gpu_index,
-                " experts=", remote.experts_per_gpu,
-                " indices=", remote.expert_token_indices.size());
-            install(std::move(remote));
+            outgoing.push_back(std::move(message));
         }
+    }
+
+    if (maximum_index_count >
+        (std::numeric_limits<std::size_t>::max() - 4096) / 16) {
+        throw std::runtime_error("router expert metadata payload bound overflows size_t");
+    }
+    const auto maximum_payload_bytes = std::size_t{4096} +
+        (maximum_index_count +
+         static_cast<std::size_t>(router_routing_.experts_per_gpu() + 1)) * 16;
+    std::vector<std::string> received_payloads;
+    std::exception_ptr receive_error;
+    std::thread receiver([&] {
+        try {
+            received_payloads = connection_manager_.receive_global_control_messages(
+                local_metadata_port,
+                total_gpus - 1,
+                maximum_payload_bytes,
+                config_.completion_timeout_ms);
+        } catch (...) {
+            receive_error = std::current_exception();
+        }
+    });
+
+    std::exception_ptr send_error;
+    for (const auto& message : outgoing) {
+        try {
+            connection_manager_.send_global_control_message(
+                message.endpoint, message.payload, config_.completion_timeout_ms);
+        } catch (...) {
+            if (!send_error) send_error = std::current_exception();
+        }
+    }
+    receiver.join();
+    if (send_error) std::rethrow_exception(send_error);
+    if (receive_error) std::rethrow_exception(receive_error);
+
+    for (const auto& remote_payload : received_payloads) {
+        auto remote = deserialize_router_expert_metadata(
+            remote_payload, config_.num_tokens, maximum_index_count);
+        if (remote.source_node_rank < 0 ||
+            remote.source_node_rank >= config_.num_nodes ||
+            remote.source_gpu_index < 0 ||
+            remote.source_gpu_index >= config_.num_gpus_per_node ||
+            remote.destination_node_rank != config_.node_rank ||
+            remote.destination_gpu_index != config_.local_gpu_index ||
+            (remote.source_node_rank == config_.node_rank &&
+             remote.source_gpu_index == config_.local_gpu_index)) {
+            throw std::runtime_error(
+                "router expert metadata source/destination identity mismatch");
+        }
+        RDMA_PROXY_LOG_INFO(
+            "received router expert metadata source_node=", remote.source_node_rank,
+            " source_gpu=", remote.source_gpu_index,
+            " destination_node=", config_.node_rank,
+            " destination_gpu=", config_.local_gpu_index,
+            " experts=", remote.experts_per_gpu,
+            " indices=", remote.expert_token_indices.size());
+        install(std::move(remote));
     }
 }
 

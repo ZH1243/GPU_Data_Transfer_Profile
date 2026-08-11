@@ -2,6 +2,7 @@
 
 #include "logging.hpp"
 
+#include <algorithm>
 #include <arpa/inet.h>
 #include <chrono>
 #include <cstring>
@@ -15,6 +16,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <thread>
+#include <utility>
 #include <unistd.h>
 
 #if RDMA_PROXY_HAVE_VERBS
@@ -136,6 +138,123 @@ std::string exchange_payload_client(const PeerAddress& peer, const std::string& 
     recv_all(fd, remote.data(), remote.size());
     ::close(fd);
     return remote;
+}
+
+void send_payload_client_oneway(
+    const PeerAddress& peer,
+    const std::string& payload,
+    uint64_t timeout_ms) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    int fd = -1;
+    while (fd < 0) {
+        addrinfo hints{};
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_family = AF_UNSPEC;
+        addrinfo* result = nullptr;
+        const auto port = std::to_string(peer.port);
+        if (getaddrinfo(peer.host.c_str(), port.c_str(), &hints, &result) != 0) {
+            throw std::runtime_error("getaddrinfo failed for peer " + peer.host);
+        }
+        for (auto* rp = result; rp; rp = rp->ai_next) {
+            fd = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+            if (fd == -1) continue;
+            if (::connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
+            ::close(fd);
+            fd = -1;
+        }
+        freeaddrinfo(result);
+        if (fd >= 0) break;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw std::runtime_error("timed out connecting to peer metadata endpoint");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    const uint64_t len = host_to_be64(payload.size());
+    send_all(fd, &len, sizeof(len));
+    send_all(fd, payload.data(), payload.size());
+    ::close(fd);
+}
+
+std::vector<std::string> receive_payloads_server(
+    uint16_t listen_port,
+    std::size_t expected_messages,
+    std::size_t maximum_payload_bytes,
+    uint64_t timeout_ms) {
+    std::vector<std::string> payloads;
+    payloads.reserve(expected_messages);
+    if (expected_messages == 0) return payloads;
+
+    const int fd = ::socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd < 0) throw std::runtime_error("socket failed");
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    sockaddr_in6 addr{};
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr = in6addr_any;
+    addr.sin6_port = htons(listen_port);
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ::close(fd);
+        throw std::runtime_error("bind failed for global metadata listener");
+    }
+    const int backlog = expected_messages > static_cast<std::size_t>(SOMAXCONN) ?
+        SOMAXCONN : static_cast<int>(expected_messages);
+    if (::listen(fd, std::max(1, backlog)) != 0) {
+        ::close(fd);
+        throw std::runtime_error("listen failed for global metadata listener");
+    }
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (payloads.size() < expected_messages) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            ::close(fd);
+            throw std::runtime_error("timed out waiting for global metadata messages");
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+            deadline - now);
+        fd_set read_set;
+        FD_ZERO(&read_set);
+        FD_SET(fd, &read_set);
+        timeval timeout{};
+        timeout.tv_sec = static_cast<time_t>(remaining.count() / 1000000);
+        timeout.tv_usec = static_cast<suseconds_t>(remaining.count() % 1000000);
+        const int ready = ::select(fd + 1, &read_set, nullptr, nullptr, &timeout);
+        if (ready <= 0) {
+            ::close(fd);
+            if (ready == 0) {
+                throw std::runtime_error("timed out waiting for global metadata messages");
+            }
+            throw std::runtime_error("select failed for global metadata listener");
+        }
+
+        const int peer_fd = ::accept(fd, nullptr, nullptr);
+        if (peer_fd < 0) {
+            ::close(fd);
+            throw std::runtime_error("accept failed for global metadata listener");
+        }
+        try {
+            uint64_t remote_len_net = 0;
+            recv_all(peer_fd, &remote_len_net, sizeof(remote_len_net));
+            const auto remote_len = be64_to_host(remote_len_net);
+            if (remote_len > maximum_payload_bytes) {
+                throw std::runtime_error("global metadata payload exceeds configured capacity");
+            }
+            std::string payload(remote_len, '\0');
+            recv_all(peer_fd, payload.data(), payload.size());
+            payloads.push_back(std::move(payload));
+            ::close(peer_fd);
+        } catch (...) {
+            ::close(peer_fd);
+            ::close(fd);
+            throw;
+        }
+    }
+    ::close(fd);
+    return payloads;
 }
 
 std::string exchange_payload_server(uint16_t listen_port, const std::string& payload, uint64_t timeout_ms) {
@@ -575,27 +694,25 @@ std::string ConnectionManager::exchange_control_message(
     return exchange_payload_server(config_.listen_port, local_payload, timeout_ms);
 }
 
-std::string ConnectionManager::exchange_global_control_message(
+void ConnectionManager::send_global_control_message(
     const PeerAddress& peer,
-    int peer_gpu_index,
-    uint16_t local_listen_port,
     const std::string& local_payload,
     uint64_t timeout_ms) const {
-    if (config_.mock_mode) return local_payload;
-    if (peer_gpu_index < 0 || peer_gpu_index >= config_.num_gpus_per_node) {
-        throw std::runtime_error("global metadata peer GPU index is out of range");
-    }
-    const int local_global_rank =
-        config_.node_rank * config_.num_gpus_per_node + config_.local_gpu_index;
-    const int peer_global_rank =
-        peer.node_rank * config_.num_gpus_per_node + peer_gpu_index;
-    if (local_global_rank == peer_global_rank) {
-        throw std::runtime_error("cannot exchange global metadata with self");
-    }
-    if (local_global_rank < peer_global_rank) {
-        return exchange_payload_client(peer, local_payload, timeout_ms);
-    }
-    return exchange_payload_server(local_listen_port, local_payload, timeout_ms);
+    if (config_.mock_mode) return;
+    send_payload_client_oneway(peer, local_payload, timeout_ms);
+}
+
+std::vector<std::string> ConnectionManager::receive_global_control_messages(
+    uint16_t local_listen_port,
+    std::size_t expected_messages,
+    std::size_t maximum_payload_bytes,
+    uint64_t timeout_ms) const {
+    if (config_.mock_mode) return {};
+    return receive_payloads_server(
+        local_listen_port,
+        expected_messages,
+        maximum_payload_bytes,
+        timeout_ms);
 }
 
 }  // namespace rdma_proxy

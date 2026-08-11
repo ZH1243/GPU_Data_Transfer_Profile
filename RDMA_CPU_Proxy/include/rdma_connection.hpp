@@ -73,11 +73,14 @@ public:
         const PeerAddress& peer,
         const std::string& local_payload,
         uint64_t timeout_ms) const;
-    std::string exchange_global_control_message(
+    void send_global_control_message(
         const PeerAddress& peer,
-        int peer_gpu_index,
-        uint16_t local_listen_port,
         const std::string& local_payload,
+        uint64_t timeout_ms) const;
+    std::vector<std::string> receive_global_control_messages(
+        uint16_t local_listen_port,
+        std::size_t expected_messages,
+        std::size_t maximum_payload_bytes,
         uint64_t timeout_ms) const;
 
 private:
