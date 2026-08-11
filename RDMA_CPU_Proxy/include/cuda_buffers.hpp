@@ -105,6 +105,12 @@ public:
         uint64_t iteration,
         std::size_t start_token,
         std::size_t num_tokens);
+    void process_router_notification_completion(
+        int source_node_rank,
+        int source_gpu_index,
+        uint64_t iteration,
+        std::size_t start_token,
+        std::size_t num_tokens);
     void flush_router_notification_publication();
     const RouterNotificationPublicationBuffers& router_notification_publication_buffers() const {
         return router_notification_publication_buffers_;

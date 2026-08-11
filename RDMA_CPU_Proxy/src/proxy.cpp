@@ -1389,13 +1389,12 @@ void Proxy::drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQue
                 "NVLink forwarding notification source/destination identity mismatch");
         }
         if (config_.router_routing_enabled) {
-            cuda_buffers_.update_expert_token_heads(
+            cuda_buffers_.process_router_notification_completion(
                 notification.peer_rank,
                 notification.source_gpu,
                 notification.iteration,
                 notification.start_token,
                 notification.num_tokens);
-            cuda_buffers_.flush_router_notification_publication();
         }
         atomic_store_u64(&queue->tail, tail + 1);
         const auto dequeue_timestamp_ns = unix_epoch_nanoseconds_now();

@@ -354,6 +354,10 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
         config.nvlink_forward_completion_notifications_enabled =
             (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "nvlink_forward_notification_flush_only_enabled") {
+        config.nvlink_forward_notification_flush_only_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "nvlink_forward_notification_queue_depth") {
         config.nvlink_forward_notification_queue_depth = static_cast<std::size_t>(std::stoull(value));
     }
@@ -537,6 +541,10 @@ ProxyConfig load_config_file(const std::string& path) {
         object,
         "nvlink_forward_completion_notifications_enabled",
         config.nvlink_forward_completion_notifications_enabled);
+    config.nvlink_forward_notification_flush_only_enabled = get_bool(
+        object,
+        "nvlink_forward_notification_flush_only_enabled",
+        config.nvlink_forward_notification_flush_only_enabled);
     config.nvlink_forward_notification_queue_depth = number_as<std::size_t>(
         object,
         "nvlink_forward_notification_queue_depth",
@@ -736,6 +744,18 @@ void validate_config(const ProxyConfig& config) {
             throw std::runtime_error("nvlink_forward_notification_queue_depth exceeds uint32 range");
         }
     }
+    if (config.nvlink_forward_notification_flush_only_enabled) {
+        if (!config.nvlink_forward_completion_notifications_enabled) {
+            throw std::runtime_error(
+                "nvlink_forward_notification_flush_only_enabled requires "
+                "nvlink_forward_completion_notifications_enabled=true");
+        }
+        if (!config.router_routing_enabled) {
+            throw std::runtime_error(
+                "nvlink_forward_notification_flush_only_enabled requires "
+                "router_routing_enabled=true");
+        }
+    }
     if (config.nvlink_forward_notification_log_enabled) {
         if (!config.nvlink_forward_completion_notifications_enabled) {
             throw std::runtime_error(
@@ -903,6 +923,8 @@ std::string config_summary(const ProxyConfig& config) {
         << (config.nvlink_forward_synchronize_batches ? "true" : "false")
         << " nvlink_forward_completion_notifications_enabled="
         << (config.nvlink_forward_completion_notifications_enabled ? "true" : "false")
+        << " nvlink_forward_notification_flush_only_enabled="
+        << (config.nvlink_forward_notification_flush_only_enabled ? "true" : "false")
         << " nvlink_forward_notification_queue_depth="
         << config.nvlink_forward_notification_queue_depth
         << " nvlink_forward_notification_log_enabled="

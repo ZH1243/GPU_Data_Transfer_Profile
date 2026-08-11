@@ -525,6 +525,23 @@ void CudaBuffers::update_expert_token_heads(
     state.received_token_frontier = received_end;
 }
 
+void CudaBuffers::process_router_notification_completion(
+    int source_node_rank,
+    int source_gpu_index,
+    uint64_t iteration,
+    std::size_t start_token,
+    std::size_t num_tokens) {
+    if (!config_.nvlink_forward_notification_flush_only_enabled) {
+        update_expert_token_heads(
+            source_node_rank,
+            source_gpu_index,
+            iteration,
+            start_token,
+            num_tokens);
+    }
+    flush_router_notification_publication();
+}
+
 void CudaBuffers::flush_router_notification_publication() {
     auto& publication = router_notification_publication_buffers_;
     if (!publication.host_map.ptr || !publication.host_flag.ptr ||

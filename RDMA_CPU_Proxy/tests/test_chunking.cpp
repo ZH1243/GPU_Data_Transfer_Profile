@@ -160,6 +160,7 @@ int main() {
     router_nvlink_config.router_routing_enabled = true;
     router_nvlink_config.nvlink_forwarding_enabled = true;
     router_nvlink_config.nvlink_forward_completion_notifications_enabled = true;
+    router_nvlink_config.nvlink_forward_notification_flush_only_enabled = true;
     router_nvlink_config.router_num_experts = 256;
     router_nvlink_config.router_top_k = 8;
     router_nvlink_config.node_rank = 0;
@@ -242,6 +243,18 @@ int main() {
     assert(!head_state.iteration_initialized);
     assert(head_state.received_token_frontier == 0);
     assert(head_state.expert_token_heads == std::vector<std::size_t>(8, 0));
+
+    // Flush-only mode publishes map/flag for a completion without touching
+    // the source buffer's iteration, frontier, or expert Heads.
+    *static_cast<uint32_t*>(publication.host_flag.ptr) = 11;
+    *static_cast<uint32_t*>(publication.device_flag.ptr) = 3;
+    router_nvlink_buffers.process_router_notification_completion(2, 3, 0, 0, 1);
+    head_state = router_nvlink_buffers.expert_token_head_state_for_source(2, 3);
+    assert(!head_state.iteration_initialized);
+    assert(head_state.received_token_frontier == 0);
+    assert(head_state.expert_token_heads == std::vector<std::size_t>(8, 0));
+    assert(*static_cast<const uint32_t*>(publication.device_flag.ptr) == 11);
+    *static_cast<uint32_t*>(publication.host_flag.ptr) = 0;
 
     router_nvlink_buffers.update_expert_token_heads(2, 3, 0, 0, 1);
     head_state = router_nvlink_buffers.expert_token_head_state_for_source(2, 3);

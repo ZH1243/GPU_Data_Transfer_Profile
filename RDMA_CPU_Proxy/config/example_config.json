@@ -44,6 +44,7 @@
   "nvlink_forward_stream_nonblocking": true,
   "nvlink_forward_synchronize_batches": false,
   "nvlink_forward_completion_notifications_enabled": false,
+  "nvlink_forward_notification_flush_only_enabled": false,
   "nvlink_forward_notification_queue_depth": 1024,
   "nvlink_forward_notification_log_enabled": false,
   "nvlink_forward_notification_log_dir": "/tmp/rdma_cpu_proxy_nvlink_notifications",
