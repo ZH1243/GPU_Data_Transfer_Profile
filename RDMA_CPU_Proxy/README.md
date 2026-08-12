@@ -99,6 +99,8 @@ receive_buffers[num_nodes * num_gpus_per_node] {
 
 New rows are appended in notification processing order. The proxy copies only the contiguous range of rows appended for that dequeued notification, then publishes the new `uint32_t` flag on the same nonblocking CUDA stream. The flag equals `published_rows * works_per_batch`, so work IDs below the flag are ready. It is published as zero when a new iteration resets the scheduler, even if that iteration's first completion does not produce a row. Publication uses `cuStreamWriteValue32` with its default system-wide memory barrier; observing a new nonzero flag therefore implies the associated map rows are visible in HBM.
 
+Set `nvlink_forward_notification_flush_per_entry_enabled=true` to use fine-grained publication. In this mode, immediately after advancing one expert's Head and `num_ready_tokens`, the proxy emits every newly ready batch for that expert. Each emitted row updates its selected-list Tails and ready-work flag, then independently enqueues one row-sized H2D copy followed by one flag publication. These operations remain asynchronous, so CPU notification processing continues with the next row and expert without synchronizing the CUDA stream. When the option is false, all rows produced by one dequeued notification are still coalesced into one contiguous map copy and one flag publication. Per-entry mode requires router completion notifications and cannot be combined with flush-only mode.
+
 Set `nvlink_forward_notification_flush_only_enabled=true` to bypass all Head, Tail, and scheduler updates. Every dequeued router completion notification copies only the first map row and then publishes the current host flag. This option requires both `router_routing_enabled=true` and `nvlink_forward_completion_notifications_enabled=true`.
 
 The expert tables use a direct TCP all-to-all. Global proxy rank is `node_rank * num_gpus_per_node + local_gpu_index`; every rank sends one destination-specific table to every other rank and installs its own table locally. Each proxy runs one receiver that accepts the other `X - 1` messages in any arrival order. Connections use `router_metadata_port_base + local_gpu_index`. Remote node hosts are taken from `peers`, while same-node exchanges use IPv6 loopback. Configure the same unused `router_metadata_port_base` on every proxy in a run.
@@ -346,6 +348,7 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_synchronize_batches`
 - `nvlink_forward_completion_notifications_enabled`
 - `nvlink_forward_notification_flush_only_enabled`
+- `nvlink_forward_notification_flush_per_entry_enabled`
 - `expert_gemm_m_tile`
 - `expert_gemm_n_tile`
 - `expert_gemm_dimension`

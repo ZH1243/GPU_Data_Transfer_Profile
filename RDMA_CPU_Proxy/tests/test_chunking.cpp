@@ -454,6 +454,46 @@ int main() {
     assert(reset_source1_progress.expert_token_tails ==
            std::vector<std::size_t>{0});
 
+    // With all nine expert tokens becoming ready on the second notification,
+    // the default policy coalesces three appended rows into one publication.
+    // Per-entry mode publishes those same three rows independently.
+    const auto run_flush_policy = [&](bool flush_per_entry) {
+        auto policy_config = scheduler_config;
+        policy_config.nvlink_forward_notification_flush_per_entry_enabled =
+            flush_per_entry;
+        CudaBuffers policy_buffers(policy_config);
+        policy_buffers.initialize();
+
+        auto source0_metadata = scheduler_metadata;
+        source0_metadata.source_gpu_index = 0;
+        source0_metadata.expert_token_indices = {0, 1, 4};
+        source0_metadata.expert_offsets = {0, 3};
+        policy_buffers.install_expert_metadata(source0_metadata);
+        auto source1_metadata = scheduler_metadata;
+        source1_metadata.source_gpu_index = 1;
+        source1_metadata.expert_token_indices = {0, 2, 3, 4, 5, 6};
+        source1_metadata.expert_offsets = {0, 6};
+        policy_buffers.install_expert_metadata(source1_metadata);
+
+        const auto& policy_publication =
+            policy_buffers.router_notification_publication_buffers();
+        policy_buffers.process_router_notification_completion(0, 0, 0, 0, 7);
+        assert(policy_publication.map_flush_count == 0);
+        assert(policy_publication.flag_publication_count == 0);
+        policy_buffers.process_router_notification_completion(0, 1, 0, 0, 7);
+        assert(*static_cast<const uint32_t*>(policy_publication.device_flag.ptr) == 12);
+        const auto policy_state =
+            policy_buffers.router_computation_scheduler_state();
+        assert(policy_state.published_batches == 3);
+        return std::make_pair(
+            policy_publication.map_flush_count,
+            policy_publication.flag_publication_count);
+    };
+    assert(run_flush_policy(false) ==
+           std::make_pair(uint64_t{1}, uint64_t{1}));
+    assert(run_flush_policy(true) ==
+           std::make_pair(uint64_t{3}, uint64_t{3}));
+
     DynamicChunkDistributor distributor(
         chunks,
         /*peer_rank=*/2,

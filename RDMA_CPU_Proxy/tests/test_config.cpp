@@ -47,6 +47,7 @@ int main(int argc, char** argv) {
     assert(!config.nvlink_forward_synchronize_batches);
     assert(!config.nvlink_forward_completion_notifications_enabled);
     assert(!config.nvlink_forward_notification_flush_only_enabled);
+    assert(!config.nvlink_forward_notification_flush_per_entry_enabled);
     assert(config.expert_gemm_m_tile == 128);
     assert(config.expert_gemm_n_tile == 256);
     assert(config.expert_gemm_dimension == 8192);
@@ -157,9 +158,10 @@ int main(int argc, char** argv) {
         "--expert_gemm_m_tile=64",
         "--expert_gemm_n_tile=128",
         "--expert_gemm_dimension=4096",
+        "--nvlink_forward_notification_flush_per_entry_enabled=false",
         "--cpu_affinity=0-95,192-287",
     };
-    const auto peer_port_config = rdma_proxy::load_config(23, const_cast<char**>(peer_port_args));
+    const auto peer_port_config = rdma_proxy::load_config(24, const_cast<char**>(peer_port_args));
     for (const auto& peer : peer_port_config.peers) {
         assert(peer.port == 18521);
     }
@@ -180,6 +182,7 @@ int main(int argc, char** argv) {
     assert(peer_port_config.expert_gemm_m_tile == 64);
     assert(peer_port_config.expert_gemm_n_tile == 128);
     assert(peer_port_config.expert_gemm_dimension == 4096);
+    assert(!peer_port_config.nvlink_forward_notification_flush_per_entry_enabled);
     assert(peer_port_config.cpu_affinity == "0-95,192-287");
 
     const char* signal_interval_args[] = {
@@ -228,6 +231,32 @@ int main(int argc, char** argv) {
     valid_flush_only_config.nvlink_forward_completion_notifications_enabled = true;
     valid_flush_only_config.nvlink_forward_notification_flush_only_enabled = true;
     rdma_proxy::validate_config(valid_flush_only_config);
+
+    auto valid_flush_per_entry_config = valid_flush_only_config;
+    valid_flush_per_entry_config.nvlink_forward_notification_flush_only_enabled = false;
+    valid_flush_per_entry_config.nvlink_forward_notification_flush_per_entry_enabled = true;
+    rdma_proxy::validate_config(valid_flush_per_entry_config);
+
+    auto invalid_flush_per_entry_without_notifications = router_nvlink_config;
+    invalid_flush_per_entry_without_notifications
+        .nvlink_forward_notification_flush_per_entry_enabled = true;
+    bool rejected_flush_per_entry_without_notifications = false;
+    try {
+        rdma_proxy::validate_config(invalid_flush_per_entry_without_notifications);
+    } catch (const std::runtime_error&) {
+        rejected_flush_per_entry_without_notifications = true;
+    }
+    assert(rejected_flush_per_entry_without_notifications);
+
+    auto invalid_combined_flush_modes = valid_flush_only_config;
+    invalid_combined_flush_modes.nvlink_forward_notification_flush_per_entry_enabled = true;
+    bool rejected_combined_flush_modes = false;
+    try {
+        rdma_proxy::validate_config(invalid_combined_flush_modes);
+    } catch (const std::runtime_error&) {
+        rejected_combined_flush_modes = true;
+    }
+    assert(rejected_combined_flush_modes);
 
     auto invalid_flush_only_without_notifications = router_nvlink_config;
     invalid_flush_only_without_notifications.nvlink_forward_notification_flush_only_enabled = true;
@@ -307,6 +336,7 @@ int main(int argc, char** argv) {
   "nvlink_forward_synchronize_batches": false,
   "nvlink_forward_completion_notifications_enabled": false,
   "nvlink_forward_notification_flush_only_enabled": false,
+  "nvlink_forward_notification_flush_per_entry_enabled": false,
   "nvlink_forward_notification_queue_depth": 256,
   "nvlink_forward_notification_log_enabled": false,
   "nvlink_forward_notification_log_dir": "/tmp/rdma_cpu_proxy_test_notifications",
@@ -345,6 +375,7 @@ int main(int argc, char** argv) {
     assert(rdma_proxy::effective_nvlink_forward_threshold_tokens(nvlink_config) == 300);
     assert(!nvlink_config.nvlink_forward_completion_notifications_enabled);
     assert(!nvlink_config.nvlink_forward_notification_flush_only_enabled);
+    assert(!nvlink_config.nvlink_forward_notification_flush_per_entry_enabled);
     assert(nvlink_config.nvlink_forward_notification_queue_depth == 256);
     assert(!nvlink_config.nvlink_forward_notification_log_enabled);
     assert(nvlink_config.nvlink_forward_notification_log_dir == "/tmp/rdma_cpu_proxy_test_notifications");
@@ -421,6 +452,17 @@ int main(int argc, char** argv) {
         rejected_flush_only_without_router = true;
     }
     assert(rejected_flush_only_without_router);
+
+    auto invalid_flush_per_entry_without_router = valid_notification_config;
+    invalid_flush_per_entry_without_router
+        .nvlink_forward_notification_flush_per_entry_enabled = true;
+    bool rejected_flush_per_entry_without_router = false;
+    try {
+        rdma_proxy::validate_config(invalid_flush_per_entry_without_router);
+    } catch (const std::runtime_error&) {
+        rejected_flush_per_entry_without_router = true;
+    }
+    assert(rejected_flush_per_entry_without_router);
 
     auto invalid_notification_log_config = nvlink_config;
     invalid_notification_log_config.nvlink_forward_notification_log_enabled = true;

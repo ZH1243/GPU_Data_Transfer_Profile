@@ -358,6 +358,10 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
         config.nvlink_forward_notification_flush_only_enabled =
             (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "nvlink_forward_notification_flush_per_entry_enabled") {
+        config.nvlink_forward_notification_flush_per_entry_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "expert_gemm_m_tile") {
         config.expert_gemm_m_tile = static_cast<std::size_t>(std::stoull(value));
     }
@@ -554,6 +558,10 @@ ProxyConfig load_config_file(const std::string& path) {
         object,
         "nvlink_forward_notification_flush_only_enabled",
         config.nvlink_forward_notification_flush_only_enabled);
+    config.nvlink_forward_notification_flush_per_entry_enabled = get_bool(
+        object,
+        "nvlink_forward_notification_flush_per_entry_enabled",
+        config.nvlink_forward_notification_flush_per_entry_enabled);
     config.expert_gemm_m_tile = number_as<std::size_t>(
         object, "expert_gemm_m_tile", config.expert_gemm_m_tile);
     config.expert_gemm_n_tile = number_as<std::size_t>(
@@ -789,6 +797,23 @@ void validate_config(const ProxyConfig& config) {
                 "router_routing_enabled=true");
         }
     }
+    if (config.nvlink_forward_notification_flush_per_entry_enabled) {
+        if (!config.nvlink_forward_completion_notifications_enabled) {
+            throw std::runtime_error(
+                "nvlink_forward_notification_flush_per_entry_enabled requires "
+                "nvlink_forward_completion_notifications_enabled=true");
+        }
+        if (!config.router_routing_enabled) {
+            throw std::runtime_error(
+                "nvlink_forward_notification_flush_per_entry_enabled requires "
+                "router_routing_enabled=true");
+        }
+        if (config.nvlink_forward_notification_flush_only_enabled) {
+            throw std::runtime_error(
+                "nvlink_forward_notification_flush_per_entry_enabled cannot be combined "
+                "with nvlink_forward_notification_flush_only_enabled");
+        }
+    }
     if (config.nvlink_forward_notification_log_enabled) {
         if (!config.nvlink_forward_completion_notifications_enabled) {
             throw std::runtime_error(
@@ -958,6 +983,8 @@ std::string config_summary(const ProxyConfig& config) {
         << (config.nvlink_forward_completion_notifications_enabled ? "true" : "false")
         << " nvlink_forward_notification_flush_only_enabled="
         << (config.nvlink_forward_notification_flush_only_enabled ? "true" : "false")
+        << " nvlink_forward_notification_flush_per_entry_enabled="
+        << (config.nvlink_forward_notification_flush_per_entry_enabled ? "true" : "false")
         << " expert_gemm_m_tile=" << config.expert_gemm_m_tile
         << " expert_gemm_n_tile=" << config.expert_gemm_n_tile
         << " expert_gemm_dimension=" << config.expert_gemm_dimension

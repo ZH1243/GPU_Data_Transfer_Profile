@@ -31,6 +31,10 @@ struct RouterNotificationPublicationBuffers {
     std::size_t map_entry_bytes{0};
     std::size_t num_map_entries{0};
     uint32_t works_per_batch{0};
+    // CPU-side diagnostics counting successfully enqueued/copied map ranges
+    // and their corresponding flag publications.
+    uint64_t map_flush_count{0};
+    uint64_t flag_publication_count{0};
 };
 
 // One fixed-size map row starts with this header and is followed by one
@@ -163,7 +167,11 @@ private:
         NvlinkReceiveBuffer& buffer,
         uint64_t iteration,
         std::size_t start_token,
-        std::size_t num_tokens);
+        std::size_t num_tokens,
+        bool flush_ready_entries_per_entry);
+    std::size_t schedule_ready_computation_batches_for_expert_locked(
+        std::size_t expert,
+        bool flush_per_entry);
     std::size_t schedule_ready_computation_batches_locked();
     void flush_router_notification_publication_range(
         std::size_t map_offset,

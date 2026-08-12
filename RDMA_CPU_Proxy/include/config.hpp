@@ -76,6 +76,7 @@ struct ProxyConfig {
     bool nvlink_forward_synchronize_batches{false};
     bool nvlink_forward_completion_notifications_enabled{false};
     bool nvlink_forward_notification_flush_only_enabled{false};
+    bool nvlink_forward_notification_flush_per_entry_enabled{false};
     std::size_t expert_gemm_m_tile{128};
     std::size_t expert_gemm_n_tile{256};
     std::size_t expert_gemm_dimension{8192};

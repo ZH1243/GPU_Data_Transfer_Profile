@@ -607,7 +607,8 @@ void CudaBuffers::update_expert_token_heads_locked(
     NvlinkReceiveBuffer& buffer,
     uint64_t iteration,
     std::size_t start_token,
-    std::size_t num_tokens) {
+    std::size_t num_tokens,
+    bool flush_ready_entries_per_entry) {
     auto& scheduler = router_computation_scheduler_state_;
     if (!scheduler.iteration_initialized || iteration > scheduler.iteration) {
         if (start_token != 0) {
@@ -657,6 +658,10 @@ void CudaBuffers::update_expert_token_heads_locked(
             ++head;
         }
         scheduler.expert_num_ready_tokens[expert_index] += head - old_head;
+        if (flush_ready_entries_per_entry) {
+            schedule_ready_computation_batches_for_expert_locked(
+                expert_index, /*flush_per_entry=*/true);
+        }
     }
     progress.received_token_frontier = received_end;
 }
@@ -690,10 +695,14 @@ void CudaBuffers::update_expert_token_heads(
         throw std::runtime_error("router expert metadata is not ready for source GPU");
     }
     update_expert_token_heads_locked(
-        *it, iteration, start_token, num_tokens);
+        *it, iteration, start_token, num_tokens,
+        /*flush_ready_entries_per_entry=*/false);
 }
 
-std::size_t CudaBuffers::schedule_ready_computation_batches_locked() {
+std::size_t
+CudaBuffers::schedule_ready_computation_batches_for_expert_locked(
+    std::size_t expert,
+    bool flush_per_entry) {
     auto& scheduler = router_computation_scheduler_state_;
     auto& publication = router_notification_publication_buffers_;
     if (!scheduler.initialized || !scheduler.iteration_initialized) {
@@ -704,84 +713,97 @@ std::size_t CudaBuffers::schedule_ready_computation_batches_locked() {
          config_.local_gpu_index) *
         (config_.router_num_experts /
          (config_.num_nodes * config_.num_gpus_per_node)));
-    const auto first_new_batch = scheduler.published_batches;
-
-    for (std::size_t expert = 0;
-         expert < scheduler.expert_total_tokens.size(); ++expert) {
-        while (scheduler.expert_num_notified_batches[expert] <
-               scheduler.expert_total_batches[expert]) {
-            const auto next_expert_batch =
-                scheduler.expert_num_notified_batches[expert];
-            const bool is_last = next_expert_batch + 1 ==
-                scheduler.expert_total_batches[expert];
-            const auto batch_tokens = is_last
-                ? scheduler.expert_total_tokens[expert] -
-                    next_expert_batch * config_.expert_gemm_m_tile
-                : config_.expert_gemm_m_tile;
-            if (scheduler.expert_num_ready_tokens[expert] < batch_tokens) {
-                break;
-            }
-            if (scheduler.published_batches >= publication.num_map_entries) {
-                throw std::runtime_error("router computation map capacity exceeded");
-            }
-
-            auto* entry_bytes = static_cast<uint8_t*>(publication.host_map.ptr) +
-                scheduler.published_batches * publication.map_entry_bytes;
-            std::memset(entry_bytes, 0, publication.map_entry_bytes);
-            auto* header = reinterpret_cast<RouterComputationMapEntryHeader*>(
-                entry_bytes);
-            header->global_expert_id = first_global_expert +
-                static_cast<uint32_t>(expert);
-            auto* receive_infos =
-                reinterpret_cast<RouterComputationReceiveBufferInfo*>(
-                    entry_bytes + sizeof(RouterComputationMapEntryHeader));
-
-            std::size_t remaining = batch_tokens;
-            std::size_t used_buffers = 0;
-            for (auto& buffer : nvlink_recv_buffers_) {
-                auto& progress = buffer.expert_token_head_state;
-                const auto head = progress.expert_token_heads[expert];
-                auto& tail = progress.expert_token_tails[expert];
-                if (tail > head) {
-                    throw std::runtime_error("expert token Tail exceeds Head");
-                }
-                const auto available = head - tail;
-                if (available == 0) continue;
-                const auto selected = std::min(available, remaining);
-                if (tail > std::numeric_limits<uint32_t>::max() ||
-                    selected > std::numeric_limits<uint32_t>::max()) {
-                    throw std::runtime_error(
-                        "router computation receive-buffer range exceeds uint32 ABI");
-                }
-                auto& info = receive_infos[used_buffers++];
-                info.receive_buffer_id = static_cast<uint32_t>(
-                    buffer.source_node_rank * config_.num_gpus_per_node +
-                    buffer.source_gpu_index);
-                info.tail = static_cast<uint32_t>(tail);
-                info.length = static_cast<uint32_t>(selected);
-                tail += selected;
-                remaining -= selected;
-                if (remaining == 0) break;
-            }
-            if (remaining != 0) {
-                throw std::runtime_error(
-                    "num_ready_tokens is inconsistent with expert Head/Tail state");
-            }
-            header->num_used_receive_buffers =
-                static_cast<uint32_t>(used_buffers);
-            scheduler.expert_num_ready_tokens[expert] -= batch_tokens;
-            ++scheduler.expert_num_notified_batches[expert];
-            ++scheduler.published_batches;
-        }
+    if (expert >= scheduler.expert_total_tokens.size()) {
+        throw std::runtime_error("router computation expert index is out of range");
     }
+    const auto first_new_batch = scheduler.published_batches;
+    while (scheduler.expert_num_notified_batches[expert] <
+           scheduler.expert_total_batches[expert]) {
+        const auto next_expert_batch =
+            scheduler.expert_num_notified_batches[expert];
+        const bool is_last = next_expert_batch + 1 ==
+            scheduler.expert_total_batches[expert];
+        const auto batch_tokens = is_last
+            ? scheduler.expert_total_tokens[expert] -
+                next_expert_batch * config_.expert_gemm_m_tile
+            : config_.expert_gemm_m_tile;
+        if (scheduler.expert_num_ready_tokens[expert] < batch_tokens) {
+            break;
+        }
+        if (scheduler.published_batches >= publication.num_map_entries) {
+            throw std::runtime_error("router computation map capacity exceeded");
+        }
 
-    const auto new_batches = scheduler.published_batches - first_new_batch;
-    if (new_batches != 0) {
+        const auto map_entry_index = scheduler.published_batches;
+        auto* entry_bytes = static_cast<uint8_t*>(publication.host_map.ptr) +
+            map_entry_index * publication.map_entry_bytes;
+        std::memset(entry_bytes, 0, publication.map_entry_bytes);
+        auto* header = reinterpret_cast<RouterComputationMapEntryHeader*>(
+            entry_bytes);
+        header->global_expert_id = first_global_expert +
+            static_cast<uint32_t>(expert);
+        auto* receive_infos =
+            reinterpret_cast<RouterComputationReceiveBufferInfo*>(
+                entry_bytes + sizeof(RouterComputationMapEntryHeader));
+
+        std::size_t remaining = batch_tokens;
+        std::size_t used_buffers = 0;
+        for (auto& buffer : nvlink_recv_buffers_) {
+            auto& progress = buffer.expert_token_head_state;
+            const auto head = progress.expert_token_heads[expert];
+            auto& tail = progress.expert_token_tails[expert];
+            if (tail > head) {
+                throw std::runtime_error("expert token Tail exceeds Head");
+            }
+            const auto available = head - tail;
+            if (available == 0) continue;
+            const auto selected = std::min(available, remaining);
+            if (tail > std::numeric_limits<uint32_t>::max() ||
+                selected > std::numeric_limits<uint32_t>::max()) {
+                throw std::runtime_error(
+                    "router computation receive-buffer range exceeds uint32 ABI");
+            }
+            auto& info = receive_infos[used_buffers++];
+            info.receive_buffer_id = static_cast<uint32_t>(
+                buffer.source_node_rank * config_.num_gpus_per_node +
+                buffer.source_gpu_index);
+            info.tail = static_cast<uint32_t>(tail);
+            info.length = static_cast<uint32_t>(selected);
+            tail += selected;
+            remaining -= selected;
+            if (remaining == 0) break;
+        }
+        if (remaining != 0) {
+            throw std::runtime_error(
+                "num_ready_tokens is inconsistent with expert Head/Tail state");
+        }
+        header->num_used_receive_buffers =
+            static_cast<uint32_t>(used_buffers);
+        scheduler.expert_num_ready_tokens[expert] -= batch_tokens;
+        ++scheduler.expert_num_notified_batches[expert];
+        ++scheduler.published_batches;
         *static_cast<uint32_t*>(publication.host_flag.ptr) =
             static_cast<uint32_t>(scheduler.published_batches) *
             publication.works_per_batch;
+        if (flush_per_entry) {
+            flush_router_notification_publication_range(
+                map_entry_index * publication.map_entry_bytes,
+                publication.map_entry_bytes);
+        }
     }
-    return new_batches;
+
+    return scheduler.published_batches - first_new_batch;
+}
+
+std::size_t CudaBuffers::schedule_ready_computation_batches_locked() {
+    auto& scheduler = router_computation_scheduler_state_;
+    const auto first_new_batch = scheduler.published_batches;
+    for (std::size_t expert = 0;
+         expert < scheduler.expert_total_tokens.size(); ++expert) {
+        schedule_ready_computation_batches_for_expert_locked(
+            expert, /*flush_per_entry=*/false);
+    }
+    return scheduler.published_batches - first_new_batch;
 }
 
 void CudaBuffers::process_router_notification_completion(
@@ -814,8 +836,14 @@ void CudaBuffers::process_router_notification_completion(
     if (!it->expert_metadata_ready) {
         throw std::runtime_error("router expert metadata is not ready for source GPU");
     }
+    const bool flush_per_entry =
+        config_.nvlink_forward_notification_flush_per_entry_enabled;
     update_expert_token_heads_locked(
-        *it, iteration, start_token, num_tokens);
+        *it, iteration, start_token, num_tokens,
+        /*flush_ready_entries_per_entry=*/flush_per_entry);
+    if (flush_per_entry) {
+        return;
+    }
     const auto first_new_batch =
         router_computation_scheduler_state_.published_batches;
     const auto new_batches = schedule_ready_computation_batches_locked();
@@ -862,6 +890,8 @@ void CudaBuffers::flush_router_notification_publication_range(
             publication.device_flag.ptr,
             publication.host_flag.ptr,
             publication.host_flag.bytes);
+        if (map_bytes != 0) ++publication.map_flush_count;
+        ++publication.flag_publication_count;
         return;
     }
 #if RDMA_PROXY_HAVE_CUDA
@@ -891,6 +921,8 @@ void CudaBuffers::flush_router_notification_publication_range(
         flag_value,
         CU_STREAM_WRITE_VALUE_DEFAULT),
         "cuStreamWriteValue32 router notification flag");
+    if (map_bytes != 0) ++publication.map_flush_count;
+    ++publication.flag_publication_count;
 #else
     throw std::runtime_error(
         "CUDA router notification publication requested but CUDA support was not built");

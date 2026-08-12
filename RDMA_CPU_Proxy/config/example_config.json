@@ -45,6 +45,7 @@
   "nvlink_forward_synchronize_batches": false,
   "nvlink_forward_completion_notifications_enabled": false,
   "nvlink_forward_notification_flush_only_enabled": false,
+  "nvlink_forward_notification_flush_per_entry_enabled": false,
   "expert_gemm_m_tile": 128,
   "expert_gemm_n_tile": 256,
   "expert_gemm_dimension": 8192,
