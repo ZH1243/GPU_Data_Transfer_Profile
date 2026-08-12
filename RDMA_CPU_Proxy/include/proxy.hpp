@@ -37,6 +37,7 @@ public:
     RouterExpertTokenHeadState router_expert_token_head_state_for_source(
         int source_node_rank,
         int source_gpu_index) const;
+    RouterComputationSchedulerState router_computation_scheduler_state() const;
     const RouterNotificationPublicationBuffers&
     router_notification_publication_buffers() const;
 

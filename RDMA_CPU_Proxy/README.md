@@ -82,11 +82,24 @@ In this combined router/NVLink mode, every destination GPU allocates one separat
 
 Each source-specific inbound buffer also owns a `RouterExpertMetadata` table for the experts living on the destination GPU. Its `expert_offsets` has `experts_per_gpu + 1` entries and is normalized to zero; local expert `e` owns `expert_token_indices[expert_offsets[e]:expert_offsets[e + 1]]`. Those indices address rows in that particular source-specific compact buffer. `first_global_expert` identifies the global ID of local expert zero. Code using a `Proxy` can retrieve the table with `router_expert_metadata_for_source(source_node_rank, source_gpu_index)`.
 
-When NVLink forwarding completion notifications are also enabled, every source-specific inbound buffer keeps a CPU-side Head for each of those expert lists. A dequeued notification identifies the buffer by `(peer_rank, source_gpu)` and supplies the newly completed compact token range. The proxy advances each Head past all expert-list indices below the new received-token frontier. Heads start at zero and reset lazily when the first notification for a newer iteration arrives; the iteration number and received frontier are retained with the Heads. Notification ranges are required to be contiguous, which makes `expert_token_indices[expert_offsets[e]:expert_offsets[e] + Head[e]]` a received prefix. Code can obtain a thread-safe snapshot with `router_expert_token_head_state_for_source(source_node_rank, source_gpu_index)`.
+When NVLink forwarding completion notifications are also enabled, every source-specific inbound buffer keeps a CPU-side Head and Tail for each expert list. A dequeued notification identifies the buffer by `(peer_rank, source_gpu)` and supplies the newly completed compact token range. The proxy advances each Head past all expert-list indices below the new received-token frontier and adds the Head delta to that local expert's `num_ready_tokens`. The Tail is the number of leading list entries already assigned to GPU work: `[0, Tail)` is published, `[Tail, Head)` is ready but unpublished, and `[Head, end)` has not arrived. Notification ranges are required to be contiguous. Heads, Tails, ready counts, and per-expert notified-batch counts reset on a new iteration. Code can obtain thread-safe progress snapshots from `router_expert_token_head_state_for_source(...)` and `router_computation_scheduler_state()`.
 
-Every proxy using router completion notifications also allocates a zero-filled 1 KiB map and a zero-filled `uint32_t` flag in pinned CPU memory, with matching allocations in GPU HBM. After a dequeued notification advances the Heads, the proxy enqueues an asynchronous map copy followed by a 32-bit flag publication on a dedicated nonblocking CUDA stream. The flag publication uses `cuStreamWriteValue32` with its default system-wide memory barrier. Thus a polling kernel can observe either the previous complete flag value or the new complete flag value, and observing the new flag means the corresponding map copy has completed. Enqueueing is asynchronous with respect to the CPU notification thread; the stream is synchronized only during buffer teardown.
+The grouped-GEMM scheduler uses `expert_gemm_m_tile` tokens per computation batch. After the all-to-all expert metadata exchange, it sums every source list length to obtain the total token count for each local expert and allocates exactly `sum_e ceil(expert_tokens[e] / expert_gemm_m_tile)` map rows. This lets the last row for an expert use its exact remaining-token threshold rather than waiting for a full M tile. `expert_gemm_dimension` must be divisible by `expert_gemm_n_tile`; each map row represents `expert_gemm_dimension / expert_gemm_n_tile` ready work IDs.
 
-Set `nvlink_forward_notification_flush_only_enabled=true` to bypass Head updates. In this mode, every dequeued router completion notification directly publishes the map and then the flag; all per-buffer Head state, including its iteration and received-token frontier, remains unchanged. This option requires both `router_routing_enabled=true` and `nvlink_forward_completion_notifications_enabled=true`.
+Each fixed-size row has this GPU-facing `uint32_t` ABI:
+
+```text
+global_expert_id, num_used_receive_buffers,
+receive_buffers[num_nodes * num_gpus_per_node] {
+    receive_buffer_id, tail, length
+}
+```
+
+`receive_buffer_id` is `source_node_rank * num_gpus_per_node + source_gpu_index`. `tail` is the selected expert list's value before consumption, `length` is the number of tokens taken from that list, and unused receive-buffer slots are zero. The row size is therefore `8 + 12 * num_nodes * num_gpus_per_node` bytes. `RouterNotificationPublicationBuffers` exposes the host/device pointers together with `map_entry_bytes`, `num_map_entries`, and `works_per_batch`.
+
+New rows are appended in notification processing order. The proxy copies only the contiguous range of rows appended for that dequeued notification, then publishes the new `uint32_t` flag on the same nonblocking CUDA stream. The flag equals `published_rows * works_per_batch`, so work IDs below the flag are ready. It is published as zero when a new iteration resets the scheduler, even if that iteration's first completion does not produce a row. Publication uses `cuStreamWriteValue32` with its default system-wide memory barrier; observing a new nonzero flag therefore implies the associated map rows are visible in HBM.
+
+Set `nvlink_forward_notification_flush_only_enabled=true` to bypass all Head, Tail, and scheduler updates. Every dequeued router completion notification copies only the first map row and then publishes the current host flag. This option requires both `router_routing_enabled=true` and `nvlink_forward_completion_notifications_enabled=true`.
 
 The expert tables use a direct TCP all-to-all. Global proxy rank is `node_rank * num_gpus_per_node + local_gpu_index`; every rank sends one destination-specific table to every other rank and installs its own table locally. Each proxy runs one receiver that accepts the other `X - 1` messages in any arrival order. Connections use `router_metadata_port_base + local_gpu_index`. Remote node hosts are taken from `peers`, while same-node exchanges use IPv6 loopback. Configure the same unused `router_metadata_port_base` on every proxy in a run.
 
@@ -332,6 +345,10 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_stream_nonblocking`
 - `nvlink_forward_synchronize_batches`
 - `nvlink_forward_completion_notifications_enabled`
+- `nvlink_forward_notification_flush_only_enabled`
+- `expert_gemm_m_tile`
+- `expert_gemm_n_tile`
+- `expert_gemm_dimension`
 - `nvlink_forward_notification_queue_depth`
 - `nvlink_forward_notification_log_enabled`
 - `nvlink_forward_notification_log_dir`

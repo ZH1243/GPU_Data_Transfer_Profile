@@ -28,7 +28,27 @@ struct RouterNotificationPublicationBuffers {
     CpuPinnedBuffer host_flag;
     GpuBuffer device_map;
     GpuBuffer device_flag;
+    std::size_t map_entry_bytes{0};
+    std::size_t num_map_entries{0};
+    uint32_t works_per_batch{0};
 };
+
+// One fixed-size map row starts with this header and is followed by one
+// RouterComputationReceiveBufferInfo slot for every global source GPU. Unused
+// slots are zero. All fields intentionally use a 4-byte GPU-facing ABI.
+struct RouterComputationMapEntryHeader {
+    uint32_t global_expert_id{0};
+    uint32_t num_used_receive_buffers{0};
+};
+
+struct RouterComputationReceiveBufferInfo {
+    uint32_t receive_buffer_id{0};
+    uint32_t tail{0};
+    uint32_t length{0};
+};
+
+static_assert(sizeof(RouterComputationMapEntryHeader) == 8);
+static_assert(sizeof(RouterComputationReceiveBufferInfo) == 12);
 
 struct PeerGpuBuffers {
     int peer_rank{-1};
@@ -44,6 +64,18 @@ struct RouterExpertTokenHeadState {
     uint64_t iteration{0};
     std::size_t received_token_frontier{0};
     std::vector<std::size_t> expert_token_heads;
+    std::vector<std::size_t> expert_token_tails;
+};
+
+struct RouterComputationSchedulerState {
+    bool initialized{false};
+    bool iteration_initialized{false};
+    uint64_t iteration{0};
+    std::size_t published_batches{0};
+    std::vector<std::size_t> expert_total_tokens;
+    std::vector<std::size_t> expert_num_ready_tokens;
+    std::vector<std::size_t> expert_num_notified_batches;
+    std::vector<std::size_t> expert_total_batches;
 };
 
 struct NvlinkReceiveBuffer {
@@ -99,6 +131,7 @@ public:
     RouterExpertTokenHeadState expert_token_head_state_for_source(
         int source_node_rank,
         int source_gpu_index) const;
+    RouterComputationSchedulerState router_computation_scheduler_state() const;
     void update_expert_token_heads(
         int source_node_rank,
         int source_gpu_index,
@@ -124,6 +157,17 @@ private:
     void free_buffer(GpuBuffer& buffer);
     void allocate_pinned_buffer(CpuPinnedBuffer& buffer, std::size_t bytes);
     void free_pinned_buffer(CpuPinnedBuffer& buffer);
+    void initialize_router_computation_scheduler_locked();
+    void reset_router_computation_iteration_locked(uint64_t iteration);
+    void update_expert_token_heads_locked(
+        NvlinkReceiveBuffer& buffer,
+        uint64_t iteration,
+        std::size_t start_token,
+        std::size_t num_tokens);
+    std::size_t schedule_ready_computation_batches_locked();
+    void flush_router_notification_publication_range(
+        std::size_t map_offset,
+        std::size_t map_bytes);
 
     ProxyConfig config_;
     GpuBuffer router_send_buffer_;
@@ -132,6 +176,7 @@ private:
     RouterNotificationPublicationBuffers router_notification_publication_buffers_;
     void* router_notification_publication_stream_{nullptr};
     mutable std::mutex expert_token_heads_mutex_;
+    RouterComputationSchedulerState router_computation_scheduler_state_;
 };
 
 void launch_copy_tokens(void* dst, const void* src, std::size_t bytes, bool mock_mode);

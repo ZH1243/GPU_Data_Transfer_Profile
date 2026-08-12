@@ -9,6 +9,7 @@
 #include <iostream>
 #include <set>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 int main() {
@@ -195,14 +196,44 @@ int main() {
     }
     assert(distinct_router_nvlink_allocations.size() == 32);
 
+    auto local_expert_metadata = expert_metadata;
+    local_expert_metadata.source_node_rank = 2;
+    local_expert_metadata.source_gpu_index = 3;
+    local_expert_metadata.destination_node_rank = router_nvlink_config.node_rank;
+    local_expert_metadata.destination_gpu_index = router_nvlink_config.local_gpu_index;
+    local_expert_metadata.num_experts = router_nvlink_config.router_num_experts;
+    local_expert_metadata.experts_per_gpu = 8;
+    local_expert_metadata.first_global_expert = 24;
+    local_expert_metadata.num_tokens = router_nvlink_config.num_tokens;
+    local_expert_metadata.expert_token_indices = {0, 1, 2};
+    local_expert_metadata.expert_offsets = {0, 1, 1, 2, 2, 3, 3, 3, 3};
+    for (int source_node = 0; source_node < router_nvlink_config.num_nodes; ++source_node) {
+        for (int source_gpu = 0;
+             source_gpu < router_nvlink_config.num_gpus_per_node; ++source_gpu) {
+            auto source_metadata = local_expert_metadata;
+            source_metadata.source_node_rank = source_node;
+            source_metadata.source_gpu_index = source_gpu;
+            if (source_node != 2 || source_gpu != 3) {
+                source_metadata.expert_token_indices.clear();
+                source_metadata.expert_offsets.assign(9, 0);
+            }
+            router_nvlink_buffers.install_expert_metadata(
+                std::move(source_metadata));
+        }
+    }
+
     const auto& publication =
         router_nvlink_buffers.router_notification_publication_buffers();
+    const std::size_t expected_map_entry_bytes = 8 + 32 * 12;
+    assert(publication.map_entry_bytes == expected_map_entry_bytes);
+    assert(publication.num_map_entries == 3);
+    assert(publication.works_per_batch == 32);
     assert(publication.host_map.ptr != nullptr);
-    assert(publication.host_map.bytes == 1024);
+    assert(publication.host_map.bytes == 3 * expected_map_entry_bytes);
     assert(publication.host_flag.ptr != nullptr);
     assert(publication.host_flag.bytes == sizeof(uint32_t));
     assert(publication.device_map.ptr != nullptr);
-    assert(publication.device_map.bytes == 1024);
+    assert(publication.device_map.bytes == publication.host_map.bytes);
     assert(publication.device_flag.ptr != nullptr);
     assert(publication.device_flag.bytes == sizeof(uint32_t));
     assert(std::all_of(
@@ -222,19 +253,6 @@ int main() {
     assert(*static_cast<const uint32_t*>(publication.device_flag.ptr) == 7);
     std::memset(publication.host_map.ptr, 0, publication.host_map.bytes);
     *static_cast<uint32_t*>(publication.host_flag.ptr) = 0;
-
-    auto local_expert_metadata = expert_metadata;
-    local_expert_metadata.source_node_rank = 2;
-    local_expert_metadata.source_gpu_index = 3;
-    local_expert_metadata.destination_node_rank = router_nvlink_config.node_rank;
-    local_expert_metadata.destination_gpu_index = router_nvlink_config.local_gpu_index;
-    local_expert_metadata.num_experts = router_nvlink_config.router_num_experts;
-    local_expert_metadata.experts_per_gpu = 8;
-    local_expert_metadata.first_global_expert = 24;
-    local_expert_metadata.num_tokens = router_nvlink_config.num_tokens;
-    local_expert_metadata.expert_token_indices = {0, 1, 2};
-    local_expert_metadata.expert_offsets = {0, 1, 1, 2, 2, 3, 3, 3, 3};
-    router_nvlink_buffers.install_expert_metadata(local_expert_metadata);
     const auto& installed = router_nvlink_buffers.nvlink_receive_buffer_for_source(2, 3);
     assert(installed.expert_metadata_ready);
     assert(installed.expert_metadata.expert_token_indices ==
@@ -243,6 +261,7 @@ int main() {
     assert(!head_state.iteration_initialized);
     assert(head_state.received_token_frontier == 0);
     assert(head_state.expert_token_heads == std::vector<std::size_t>(8, 0));
+    assert(head_state.expert_token_tails == std::vector<std::size_t>(8, 0));
 
     // Flush-only mode publishes map/flag for a completion without touching
     // the source buffer's iteration, frontier, or expert Heads.
@@ -253,6 +272,7 @@ int main() {
     assert(!head_state.iteration_initialized);
     assert(head_state.received_token_frontier == 0);
     assert(head_state.expert_token_heads == std::vector<std::size_t>(8, 0));
+    assert(head_state.expert_token_tails == std::vector<std::size_t>(8, 0));
     assert(*static_cast<const uint32_t*>(publication.device_flag.ptr) == 11);
     *static_cast<uint32_t*>(publication.host_flag.ptr) = 0;
 
@@ -286,6 +306,153 @@ int main() {
         rejected_noncontiguous_notification = true;
     }
     assert(rejected_noncontiguous_notification);
+
+    // Build three computation batches for one local expert from two
+    // source-specific receive buffers. The final batch has one token, so it
+    // must be emitted without waiting for the configured four-token M tile.
+    ProxyConfig scheduler_config;
+    scheduler_config.mock_mode = true;
+    scheduler_config.router_routing_enabled = true;
+    scheduler_config.nvlink_forwarding_enabled = true;
+    scheduler_config.nvlink_forward_completion_notifications_enabled = true;
+    scheduler_config.router_num_experts = 2;
+    scheduler_config.router_top_k = 1;
+    scheduler_config.node_rank = 0;
+    scheduler_config.num_nodes = 1;
+    scheduler_config.local_gpu_index = 0;
+    scheduler_config.num_gpus_per_node = 2;
+    scheduler_config.num_tokens = 7;
+    scheduler_config.token_dimension = 2;
+    scheduler_config.dtype = DataType::kFP16;
+    scheduler_config.expert_gemm_m_tile = 4;
+    scheduler_config.expert_gemm_n_tile = 2;
+    scheduler_config.expert_gemm_dimension = 8;
+    CudaBuffers scheduler_buffers(scheduler_config);
+    scheduler_buffers.initialize();
+
+    RouterExpertMetadata scheduler_metadata;
+    scheduler_metadata.destination_node_rank = 0;
+    scheduler_metadata.destination_gpu_index = 0;
+    scheduler_metadata.num_nodes = 1;
+    scheduler_metadata.num_gpus_per_node = 2;
+    scheduler_metadata.num_experts = 2;
+    scheduler_metadata.experts_per_gpu = 1;
+    scheduler_metadata.first_global_expert = 0;
+    scheduler_metadata.num_tokens = 7;
+    scheduler_metadata.source_node_rank = 0;
+    scheduler_metadata.source_gpu_index = 0;
+    scheduler_metadata.expert_token_indices = {0, 1, 4};
+    scheduler_metadata.expert_offsets = {0, 3};
+    scheduler_buffers.install_expert_metadata(scheduler_metadata);
+    scheduler_metadata.source_gpu_index = 1;
+    scheduler_metadata.expert_token_indices = {0, 2, 3, 4, 5, 6};
+    scheduler_metadata.expert_offsets = {0, 6};
+    scheduler_buffers.install_expert_metadata(scheduler_metadata);
+
+    const auto& scheduler_publication =
+        scheduler_buffers.router_notification_publication_buffers();
+    assert(scheduler_publication.map_entry_bytes == 32);
+    assert(scheduler_publication.num_map_entries == 3);
+    assert(scheduler_publication.host_map.bytes == 96);
+    assert(scheduler_publication.works_per_batch == 4);
+    std::memset(
+        scheduler_publication.device_map.ptr, 0xff,
+        scheduler_publication.device_map.bytes);
+
+    scheduler_buffers.process_router_notification_completion(0, 0, 0, 0, 2);
+    assert(*static_cast<const uint32_t*>(scheduler_publication.device_flag.ptr) == 0);
+    assert(std::all_of(
+        static_cast<const uint8_t*>(scheduler_publication.device_map.ptr),
+        static_cast<const uint8_t*>(scheduler_publication.device_map.ptr) +
+            scheduler_publication.device_map.bytes,
+        [](uint8_t value) { return value == 0xff; }));
+
+    scheduler_buffers.process_router_notification_completion(0, 1, 0, 0, 3);
+    assert(*static_cast<const uint32_t*>(scheduler_publication.device_flag.ptr) == 4);
+    const auto* map_bytes = static_cast<const uint8_t*>(
+        scheduler_publication.device_map.ptr);
+    const auto* row0 = reinterpret_cast<const RouterComputationMapEntryHeader*>(
+        map_bytes);
+    const auto* row0_info =
+        reinterpret_cast<const RouterComputationReceiveBufferInfo*>(
+            map_bytes + sizeof(RouterComputationMapEntryHeader));
+    assert(row0->global_expert_id == 0);
+    assert(row0->num_used_receive_buffers == 2);
+    assert(row0_info[0].receive_buffer_id == 0);
+    assert(row0_info[0].tail == 0);
+    assert(row0_info[0].length == 2);
+    assert(row0_info[1].receive_buffer_id == 1);
+    assert(row0_info[1].tail == 0);
+    assert(row0_info[1].length == 2);
+    assert(std::all_of(
+        map_bytes + scheduler_publication.map_entry_bytes,
+        map_bytes + scheduler_publication.device_map.bytes,
+        [](uint8_t value) { return value == 0xff; }));
+
+    scheduler_buffers.process_router_notification_completion(0, 0, 0, 2, 3);
+    assert(*static_cast<const uint32_t*>(scheduler_publication.device_flag.ptr) == 4);
+    scheduler_buffers.process_router_notification_completion(0, 1, 0, 3, 3);
+    assert(*static_cast<const uint32_t*>(scheduler_publication.device_flag.ptr) == 8);
+    const auto* row1_bytes = map_bytes + scheduler_publication.map_entry_bytes;
+    const auto* row1_info =
+        reinterpret_cast<const RouterComputationReceiveBufferInfo*>(
+            row1_bytes + sizeof(RouterComputationMapEntryHeader));
+    assert(row1_info[0].receive_buffer_id == 0);
+    assert(row1_info[0].tail == 2);
+    assert(row1_info[0].length == 1);
+    assert(row1_info[1].receive_buffer_id == 1);
+    assert(row1_info[1].tail == 2);
+    assert(row1_info[1].length == 3);
+
+    scheduler_buffers.process_router_notification_completion(0, 1, 0, 6, 1);
+    assert(*static_cast<const uint32_t*>(scheduler_publication.device_flag.ptr) == 12);
+    const auto* row2_bytes = map_bytes + 2 * scheduler_publication.map_entry_bytes;
+    const auto* row2 = reinterpret_cast<const RouterComputationMapEntryHeader*>(
+        row2_bytes);
+    const auto* row2_info =
+        reinterpret_cast<const RouterComputationReceiveBufferInfo*>(
+            row2_bytes + sizeof(RouterComputationMapEntryHeader));
+    assert(row2->num_used_receive_buffers == 1);
+    assert(row2_info[0].receive_buffer_id == 1);
+    assert(row2_info[0].tail == 5);
+    assert(row2_info[0].length == 1);
+
+    const auto scheduler_state =
+        scheduler_buffers.router_computation_scheduler_state();
+    assert(scheduler_state.initialized);
+    assert(scheduler_state.published_batches == 3);
+    assert(scheduler_state.expert_total_tokens == std::vector<std::size_t>{9});
+    assert(scheduler_state.expert_num_ready_tokens == std::vector<std::size_t>{0});
+    assert(scheduler_state.expert_num_notified_batches == std::vector<std::size_t>{3});
+    assert(scheduler_state.expert_total_batches == std::vector<std::size_t>{3});
+    const auto source0_progress =
+        scheduler_buffers.expert_token_head_state_for_source(0, 0);
+    const auto source1_progress =
+        scheduler_buffers.expert_token_head_state_for_source(0, 1);
+    assert(source0_progress.expert_token_heads == std::vector<std::size_t>{3});
+    assert(source0_progress.expert_token_tails == std::vector<std::size_t>{3});
+    assert(source1_progress.expert_token_heads == std::vector<std::size_t>{6});
+    assert(source1_progress.expert_token_tails == std::vector<std::size_t>{6});
+
+    // A new iteration resets the GPU-visible work frontier even when its
+    // first completion has too few tokens to produce a map row.
+    scheduler_buffers.process_router_notification_completion(0, 0, 1, 0, 1);
+    assert(*static_cast<const uint32_t*>(scheduler_publication.device_flag.ptr) == 0);
+    const auto reset_scheduler_state =
+        scheduler_buffers.router_computation_scheduler_state();
+    assert(reset_scheduler_state.iteration == 1);
+    assert(reset_scheduler_state.published_batches == 0);
+    assert(reset_scheduler_state.expert_num_ready_tokens ==
+           std::vector<std::size_t>{1});
+    assert(reset_scheduler_state.expert_num_notified_batches ==
+           std::vector<std::size_t>{0});
+    const auto reset_source1_progress =
+        scheduler_buffers.expert_token_head_state_for_source(0, 1);
+    assert(!reset_source1_progress.iteration_initialized);
+    assert(reset_source1_progress.expert_token_heads ==
+           std::vector<std::size_t>{0});
+    assert(reset_source1_progress.expert_token_tails ==
+           std::vector<std::size_t>{0});
 
     DynamicChunkDistributor distributor(
         chunks,

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -15,8 +16,6 @@
 
 namespace rdma_proxy {
 namespace {
-
-constexpr std::size_t kRouterNotificationMapBytes = 1024;
 
 #if RDMA_PROXY_HAVE_CUDA
 void check_cuda(cudaError_t status, const char* what) {
@@ -180,18 +179,15 @@ void CudaBuffers::initialize() {
     if (config_.router_routing_enabled &&
         config_.nvlink_forward_completion_notifications_enabled) {
         auto& publication = router_notification_publication_buffers_;
-        allocate_pinned_buffer(publication.host_map, kRouterNotificationMapBytes);
         allocate_pinned_buffer(publication.host_flag, sizeof(uint32_t));
-        allocate_buffer(publication.device_map, kRouterNotificationMapBytes);
         allocate_buffer(publication.device_flag, sizeof(uint32_t));
         router_notification_publication_stream_ = create_cuda_stream(
             config_.cuda_device_id,
             /*nonblocking=*/true,
             config_.mock_mode);
         RDMA_PROXY_LOG_INFO(
-            "allocated router notification publication buffers map_bytes=",
-            kRouterNotificationMapBytes,
-            " flag_bytes=", sizeof(uint32_t));
+            "allocated router notification publication flag bytes=", sizeof(uint32_t),
+            "; map allocation waits for all expert metadata");
     }
 }
 
@@ -431,6 +427,17 @@ void CudaBuffers::install_expert_metadata(RouterExpertMetadata metadata) {
     it->expert_token_head_state = RouterExpertTokenHeadState{};
     it->expert_token_head_state.expert_token_heads.assign(
         static_cast<std::size_t>(expected_experts_per_gpu), 0);
+    it->expert_token_head_state.expert_token_tails.assign(
+        static_cast<std::size_t>(expected_experts_per_gpu), 0);
+
+    if (config_.nvlink_forward_completion_notifications_enabled &&
+        std::all_of(
+            nvlink_recv_buffers_.begin(), nvlink_recv_buffers_.end(),
+            [](const NvlinkReceiveBuffer& entry) {
+                return entry.expert_metadata_ready;
+            })) {
+        initialize_router_computation_scheduler_locked();
+    }
 }
 
 RouterExpertTokenHeadState CudaBuffers::expert_token_head_state_for_source(
@@ -450,6 +457,208 @@ RouterExpertTokenHeadState CudaBuffers::expert_token_head_state_for_source(
         throw std::runtime_error("router expert metadata is not ready for source GPU");
     }
     return it->expert_token_head_state;
+}
+
+RouterComputationSchedulerState
+CudaBuffers::router_computation_scheduler_state() const {
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    return router_computation_scheduler_state_;
+}
+
+void CudaBuffers::initialize_router_computation_scheduler_locked() {
+    if (router_computation_scheduler_state_.initialized) {
+        throw std::runtime_error("router computation scheduler is already initialized");
+    }
+    if (config_.expert_gemm_m_tile == 0 || config_.expert_gemm_n_tile == 0 ||
+        config_.expert_gemm_dimension == 0 ||
+        config_.expert_gemm_dimension % config_.expert_gemm_n_tile != 0) {
+        throw std::runtime_error("invalid expert GEMM tile configuration");
+    }
+
+    const auto experts_per_gpu = static_cast<std::size_t>(
+        config_.router_num_experts /
+        (config_.num_nodes * config_.num_gpus_per_node));
+    auto& state = router_computation_scheduler_state_;
+    state = RouterComputationSchedulerState{};
+    state.expert_total_tokens.assign(experts_per_gpu, 0);
+    state.expert_num_ready_tokens.assign(experts_per_gpu, 0);
+    state.expert_num_notified_batches.assign(experts_per_gpu, 0);
+    state.expert_total_batches.assign(experts_per_gpu, 0);
+
+    for (const auto& buffer : nvlink_recv_buffers_) {
+        if (!buffer.expert_metadata_ready) {
+            throw std::runtime_error(
+                "cannot initialize router computation scheduler before metadata exchange completes");
+        }
+        const auto& offsets = buffer.expert_metadata.expert_offsets;
+        for (std::size_t expert = 0; expert < experts_per_gpu; ++expert) {
+            const auto count = static_cast<std::size_t>(
+                offsets[expert + 1] - offsets[expert]);
+            auto& total = state.expert_total_tokens[expert];
+            if (count > std::numeric_limits<std::size_t>::max() - total) {
+                throw std::runtime_error("local expert token total overflows size_t");
+            }
+            total += count;
+        }
+    }
+
+    std::size_t total_batches = 0;
+    for (std::size_t expert = 0; expert < experts_per_gpu; ++expert) {
+        const auto tokens = state.expert_total_tokens[expert];
+        const auto batches = tokens / config_.expert_gemm_m_tile +
+            (tokens % config_.expert_gemm_m_tile != 0 ? 1 : 0);
+        state.expert_total_batches[expert] = batches;
+        if (batches > std::numeric_limits<std::size_t>::max() - total_batches) {
+            throw std::runtime_error("router computation batch count overflows size_t");
+        }
+        total_batches += batches;
+    }
+
+    const auto receive_buffer_count = nvlink_recv_buffers_.size();
+    if (receive_buffer_count >
+        (std::numeric_limits<std::size_t>::max() -
+         sizeof(RouterComputationMapEntryHeader)) /
+            sizeof(RouterComputationReceiveBufferInfo)) {
+        throw std::runtime_error("router computation map entry size overflows size_t");
+    }
+    auto& publication = router_notification_publication_buffers_;
+    publication.map_entry_bytes = sizeof(RouterComputationMapEntryHeader) +
+        receive_buffer_count * sizeof(RouterComputationReceiveBufferInfo);
+    // Flush-only mode is explicitly defined to publish the first row even if
+    // this GPU happens to receive no expert tokens.
+    publication.num_map_entries = total_batches == 0 &&
+            config_.nvlink_forward_notification_flush_only_enabled
+        ? 1
+        : total_batches;
+    publication.works_per_batch = static_cast<uint32_t>(
+        config_.expert_gemm_dimension / config_.expert_gemm_n_tile);
+    if (publication.num_map_entries != 0 &&
+        publication.map_entry_bytes >
+            std::numeric_limits<std::size_t>::max() /
+                publication.num_map_entries) {
+        throw std::runtime_error("router computation map size overflows size_t");
+    }
+    const auto map_bytes =
+        publication.num_map_entries * publication.map_entry_bytes;
+    if (map_bytes != 0) {
+        allocate_pinned_buffer(publication.host_map, map_bytes);
+        allocate_buffer(publication.device_map, map_bytes);
+    }
+
+    if (publication.works_per_batch != 0 &&
+        total_batches > std::numeric_limits<uint32_t>::max() /
+            publication.works_per_batch) {
+        throw std::runtime_error("router computation ready-work flag exceeds uint32 range");
+    }
+    state.initialized = true;
+    RDMA_PROXY_LOG_INFO(
+        "initialized router computation scheduler local_experts=",
+        experts_per_gpu,
+        " receive_buffers=", receive_buffer_count,
+        " computation_batches=", total_batches,
+        " map_entry_bytes=", publication.map_entry_bytes,
+        " map_bytes=", map_bytes,
+        " works_per_batch=", publication.works_per_batch);
+}
+
+void CudaBuffers::reset_router_computation_iteration_locked(uint64_t iteration) {
+    auto& scheduler = router_computation_scheduler_state_;
+    if (!scheduler.initialized) {
+        throw std::runtime_error("router computation scheduler is not initialized");
+    }
+    const bool reset_existing_iteration = scheduler.iteration_initialized;
+    if (reset_existing_iteration) {
+        // Rows are immutable within an iteration, but a new iteration reuses
+        // them. Wait for prior H2D reads before clearing pinned host memory.
+        synchronize_cuda_stream(
+            router_notification_publication_stream_, config_.mock_mode);
+    }
+    for (auto& buffer : nvlink_recv_buffers_) {
+        auto& progress = buffer.expert_token_head_state;
+        progress.iteration_initialized = false;
+        progress.iteration = iteration;
+        progress.received_token_frontier = 0;
+        std::fill(progress.expert_token_heads.begin(),
+                  progress.expert_token_heads.end(), std::size_t{0});
+        std::fill(progress.expert_token_tails.begin(),
+                  progress.expert_token_tails.end(), std::size_t{0});
+    }
+    std::fill(scheduler.expert_num_ready_tokens.begin(),
+              scheduler.expert_num_ready_tokens.end(), std::size_t{0});
+    std::fill(scheduler.expert_num_notified_batches.begin(),
+              scheduler.expert_num_notified_batches.end(), std::size_t{0});
+    scheduler.iteration_initialized = true;
+    scheduler.iteration = iteration;
+    scheduler.published_batches = 0;
+
+    auto& publication = router_notification_publication_buffers_;
+    if (publication.host_map.ptr && publication.host_map.bytes != 0) {
+        std::memset(publication.host_map.ptr, 0, publication.host_map.bytes);
+    }
+    *static_cast<uint32_t*>(publication.host_flag.ptr) = 0;
+    if (reset_existing_iteration) {
+        // Clear the ready-work frontier even when the first notification of
+        // the new iteration does not complete a map row.
+        flush_router_notification_publication_range(0, 0);
+    }
+}
+
+void CudaBuffers::update_expert_token_heads_locked(
+    NvlinkReceiveBuffer& buffer,
+    uint64_t iteration,
+    std::size_t start_token,
+    std::size_t num_tokens) {
+    auto& scheduler = router_computation_scheduler_state_;
+    if (!scheduler.iteration_initialized || iteration > scheduler.iteration) {
+        if (start_token != 0) {
+            throw std::runtime_error(
+                "first NVLink notification for an iteration does not start at token zero");
+        }
+        reset_router_computation_iteration_locked(iteration);
+    } else if (iteration < scheduler.iteration) {
+        throw std::runtime_error("received stale NVLink forwarding notification");
+    }
+
+    auto& progress = buffer.expert_token_head_state;
+    const auto& metadata = buffer.expert_metadata;
+    if (!progress.iteration_initialized) {
+        if (start_token != 0) {
+            throw std::runtime_error(
+                "first NVLink notification for a source buffer does not start at token zero");
+        }
+        progress.iteration_initialized = true;
+        progress.iteration = iteration;
+    } else if (progress.iteration != iteration) {
+        throw std::runtime_error("NVLink source-buffer iteration state mismatch");
+    }
+    if (start_token != progress.received_token_frontier) {
+        throw std::runtime_error(
+            "NVLink forwarding notifications are not contiguous for source buffer");
+    }
+
+    const auto received_end = start_token + num_tokens;
+    if (progress.expert_token_heads.size() !=
+            static_cast<std::size_t>(metadata.experts_per_gpu) ||
+        progress.expert_token_tails.size() !=
+            static_cast<std::size_t>(metadata.experts_per_gpu)) {
+        throw std::runtime_error("expert token progress count does not match metadata");
+    }
+    for (int expert = 0; expert < metadata.experts_per_gpu; ++expert) {
+        const auto expert_index = static_cast<std::size_t>(expert);
+        const auto list_begin = static_cast<std::size_t>(
+            metadata.expert_offsets[expert_index]);
+        const auto list_end = static_cast<std::size_t>(
+            metadata.expert_offsets[expert_index + 1]);
+        auto& head = progress.expert_token_heads[expert_index];
+        const auto old_head = head;
+        while (list_begin + head < list_end &&
+               static_cast<std::size_t>(
+                   metadata.expert_token_indices[list_begin + head]) < received_end) {
+            ++head;
+        }
+        scheduler.expert_num_ready_tokens[expert_index] += head - old_head;
+    }
+    progress.received_token_frontier = received_end;
 }
 
 void CudaBuffers::update_expert_token_heads(
@@ -480,49 +689,99 @@ void CudaBuffers::update_expert_token_heads(
     if (!it->expert_metadata_ready) {
         throw std::runtime_error("router expert metadata is not ready for source GPU");
     }
+    update_expert_token_heads_locked(
+        *it, iteration, start_token, num_tokens);
+}
 
-    auto& state = it->expert_token_head_state;
-    const auto& metadata = it->expert_metadata;
-    if (!state.iteration_initialized || iteration > state.iteration) {
-        if (start_token != 0) {
-            throw std::runtime_error(
-                "first NVLink notification for an iteration does not start at token zero");
+std::size_t CudaBuffers::schedule_ready_computation_batches_locked() {
+    auto& scheduler = router_computation_scheduler_state_;
+    auto& publication = router_notification_publication_buffers_;
+    if (!scheduler.initialized || !scheduler.iteration_initialized) {
+        throw std::runtime_error("router computation scheduler iteration is not initialized");
+    }
+    const auto first_global_expert = static_cast<uint32_t>(
+        (config_.node_rank * config_.num_gpus_per_node +
+         config_.local_gpu_index) *
+        (config_.router_num_experts /
+         (config_.num_nodes * config_.num_gpus_per_node)));
+    const auto first_new_batch = scheduler.published_batches;
+
+    for (std::size_t expert = 0;
+         expert < scheduler.expert_total_tokens.size(); ++expert) {
+        while (scheduler.expert_num_notified_batches[expert] <
+               scheduler.expert_total_batches[expert]) {
+            const auto next_expert_batch =
+                scheduler.expert_num_notified_batches[expert];
+            const bool is_last = next_expert_batch + 1 ==
+                scheduler.expert_total_batches[expert];
+            const auto batch_tokens = is_last
+                ? scheduler.expert_total_tokens[expert] -
+                    next_expert_batch * config_.expert_gemm_m_tile
+                : config_.expert_gemm_m_tile;
+            if (scheduler.expert_num_ready_tokens[expert] < batch_tokens) {
+                break;
+            }
+            if (scheduler.published_batches >= publication.num_map_entries) {
+                throw std::runtime_error("router computation map capacity exceeded");
+            }
+
+            auto* entry_bytes = static_cast<uint8_t*>(publication.host_map.ptr) +
+                scheduler.published_batches * publication.map_entry_bytes;
+            std::memset(entry_bytes, 0, publication.map_entry_bytes);
+            auto* header = reinterpret_cast<RouterComputationMapEntryHeader*>(
+                entry_bytes);
+            header->global_expert_id = first_global_expert +
+                static_cast<uint32_t>(expert);
+            auto* receive_infos =
+                reinterpret_cast<RouterComputationReceiveBufferInfo*>(
+                    entry_bytes + sizeof(RouterComputationMapEntryHeader));
+
+            std::size_t remaining = batch_tokens;
+            std::size_t used_buffers = 0;
+            for (auto& buffer : nvlink_recv_buffers_) {
+                auto& progress = buffer.expert_token_head_state;
+                const auto head = progress.expert_token_heads[expert];
+                auto& tail = progress.expert_token_tails[expert];
+                if (tail > head) {
+                    throw std::runtime_error("expert token Tail exceeds Head");
+                }
+                const auto available = head - tail;
+                if (available == 0) continue;
+                const auto selected = std::min(available, remaining);
+                if (tail > std::numeric_limits<uint32_t>::max() ||
+                    selected > std::numeric_limits<uint32_t>::max()) {
+                    throw std::runtime_error(
+                        "router computation receive-buffer range exceeds uint32 ABI");
+                }
+                auto& info = receive_infos[used_buffers++];
+                info.receive_buffer_id = static_cast<uint32_t>(
+                    buffer.source_node_rank * config_.num_gpus_per_node +
+                    buffer.source_gpu_index);
+                info.tail = static_cast<uint32_t>(tail);
+                info.length = static_cast<uint32_t>(selected);
+                tail += selected;
+                remaining -= selected;
+                if (remaining == 0) break;
+            }
+            if (remaining != 0) {
+                throw std::runtime_error(
+                    "num_ready_tokens is inconsistent with expert Head/Tail state");
+            }
+            header->num_used_receive_buffers =
+                static_cast<uint32_t>(used_buffers);
+            scheduler.expert_num_ready_tokens[expert] -= batch_tokens;
+            ++scheduler.expert_num_notified_batches[expert];
+            ++scheduler.published_batches;
         }
-        state.iteration_initialized = true;
-        state.iteration = iteration;
-        state.received_token_frontier = 0;
-        std::fill(
-            state.expert_token_heads.begin(),
-            state.expert_token_heads.end(),
-            std::size_t{0});
-    } else if (iteration < state.iteration) {
-        throw std::runtime_error("received stale NVLink forwarding notification");
     }
 
-    if (start_token != state.received_token_frontier) {
-        throw std::runtime_error(
-            "NVLink forwarding notifications are not contiguous for source buffer");
+    const auto new_batches = scheduler.published_batches - first_new_batch;
+    if (new_batches != 0) {
+        *static_cast<uint32_t*>(publication.host_flag.ptr) =
+            static_cast<uint32_t>(scheduler.published_batches) *
+            publication.works_per_batch;
     }
-    const auto received_end = start_token + num_tokens;
-    if (state.expert_token_heads.size() !=
-        static_cast<std::size_t>(metadata.experts_per_gpu)) {
-        throw std::runtime_error("expert token head count does not match metadata");
-    }
-
-    for (int expert = 0; expert < metadata.experts_per_gpu; ++expert) {
-        const auto expert_index = static_cast<std::size_t>(expert);
-        const auto list_begin = static_cast<std::size_t>(
-            metadata.expert_offsets[expert_index]);
-        const auto list_end = static_cast<std::size_t>(
-            metadata.expert_offsets[expert_index + 1]);
-        auto& head = state.expert_token_heads[expert_index];
-        while (list_begin + head < list_end &&
-               static_cast<std::size_t>(
-                   metadata.expert_token_indices[list_begin + head]) < received_end) {
-            ++head;
-        }
-    }
-    state.received_token_frontier = received_end;
+    return new_batches;
 }
 
 void CudaBuffers::process_router_notification_completion(
@@ -531,34 +790,74 @@ void CudaBuffers::process_router_notification_completion(
     uint64_t iteration,
     std::size_t start_token,
     std::size_t num_tokens) {
-    if (!config_.nvlink_forward_notification_flush_only_enabled) {
-        update_expert_token_heads(
-            source_node_rank,
-            source_gpu_index,
-            iteration,
-            start_token,
-            num_tokens);
+    if (config_.nvlink_forward_notification_flush_only_enabled) {
+        const auto entry_bytes =
+            router_notification_publication_buffers_.map_entry_bytes;
+        flush_router_notification_publication_range(0, entry_bytes);
+        return;
     }
-    flush_router_notification_publication();
+    if (start_token > config_.num_tokens ||
+        num_tokens > config_.num_tokens - start_token) {
+        throw std::runtime_error("received NVLink token range exceeds buffer capacity");
+    }
+
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    auto it = std::find_if(
+        nvlink_recv_buffers_.begin(), nvlink_recv_buffers_.end(),
+        [&](const auto& entry) {
+            return entry.source_node_rank == source_node_rank &&
+                entry.source_gpu_index == source_gpu_index;
+        });
+    if (it == nvlink_recv_buffers_.end()) {
+        throw std::runtime_error("unknown NVLink source node/GPU");
+    }
+    if (!it->expert_metadata_ready) {
+        throw std::runtime_error("router expert metadata is not ready for source GPU");
+    }
+    update_expert_token_heads_locked(
+        *it, iteration, start_token, num_tokens);
+    const auto first_new_batch =
+        router_computation_scheduler_state_.published_batches;
+    const auto new_batches = schedule_ready_computation_batches_locked();
+    if (new_batches != 0) {
+        flush_router_notification_publication_range(
+            first_new_batch *
+                router_notification_publication_buffers_.map_entry_bytes,
+            new_batches *
+                router_notification_publication_buffers_.map_entry_bytes);
+    }
 }
 
 void CudaBuffers::flush_router_notification_publication() {
+    flush_router_notification_publication_range(
+        0, router_notification_publication_buffers_.host_map.bytes);
+}
+
+void CudaBuffers::flush_router_notification_publication_range(
+    std::size_t map_offset,
+    std::size_t map_bytes) {
     auto& publication = router_notification_publication_buffers_;
-    if (!publication.host_map.ptr || !publication.host_flag.ptr ||
-        !publication.device_map.ptr || !publication.device_flag.ptr ||
-        publication.host_map.bytes != kRouterNotificationMapBytes ||
-        publication.device_map.bytes != kRouterNotificationMapBytes ||
+    if (!publication.host_flag.ptr || !publication.device_flag.ptr ||
         publication.host_flag.bytes != sizeof(uint32_t) ||
         publication.device_flag.bytes != sizeof(uint32_t)) {
         throw std::runtime_error(
             "router notification publication buffers are not initialized");
     }
+    if (map_offset > publication.host_map.bytes ||
+        map_bytes > publication.host_map.bytes - map_offset ||
+        publication.host_map.bytes != publication.device_map.bytes ||
+        (map_bytes != 0 &&
+         (!publication.host_map.ptr || !publication.device_map.ptr))) {
+        throw std::runtime_error("router notification map flush range is invalid");
+    }
 
     if (config_.mock_mode) {
-        std::memcpy(
-            publication.device_map.ptr,
-            publication.host_map.ptr,
-            publication.host_map.bytes);
+        if (map_bytes != 0) {
+            std::memcpy(
+                static_cast<uint8_t*>(publication.device_map.ptr) + map_offset,
+                static_cast<const uint8_t*>(publication.host_map.ptr) + map_offset,
+                map_bytes);
+        }
         std::memcpy(
             publication.device_flag.ptr,
             publication.host_flag.ptr,
@@ -572,12 +871,14 @@ void CudaBuffers::flush_router_notification_publication() {
     }
     auto stream = reinterpret_cast<cudaStream_t>(
         router_notification_publication_stream_);
-    check_cuda(cudaMemcpyAsync(
-        publication.device_map.ptr,
-        publication.host_map.ptr,
-        publication.host_map.bytes,
-        cudaMemcpyHostToDevice,
-        stream), "cudaMemcpyAsync H2D router notification map");
+    if (map_bytes != 0) {
+        check_cuda(cudaMemcpyAsync(
+            static_cast<uint8_t*>(publication.device_map.ptr) + map_offset,
+            static_cast<const uint8_t*>(publication.host_map.ptr) + map_offset,
+            map_bytes,
+            cudaMemcpyHostToDevice,
+            stream), "cudaMemcpyAsync H2D router notification map range");
+    }
 
     // A stream memory write is host-asynchronous, writes the aligned flag as
     // one 32-bit value, and (without NO_MEMORY_BARRIER) performs a system-wide

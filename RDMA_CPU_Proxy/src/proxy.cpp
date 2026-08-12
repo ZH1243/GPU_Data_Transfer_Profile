@@ -320,6 +320,11 @@ RouterExpertTokenHeadState Proxy::router_expert_token_head_state_for_source(
         source_node_rank, source_gpu_index);
 }
 
+RouterComputationSchedulerState
+Proxy::router_computation_scheduler_state() const {
+    return cuda_buffers_.router_computation_scheduler_state();
+}
+
 const RouterNotificationPublicationBuffers&
 Proxy::router_notification_publication_buffers() const {
     return cuda_buffers_.router_notification_publication_buffers();

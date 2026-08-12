@@ -358,6 +358,15 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
         config.nvlink_forward_notification_flush_only_enabled =
             (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "expert_gemm_m_tile") {
+        config.expert_gemm_m_tile = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "expert_gemm_n_tile") {
+        config.expert_gemm_n_tile = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "expert_gemm_dimension") {
+        config.expert_gemm_dimension = static_cast<std::size_t>(std::stoull(value));
+    }
     else if (key == "nvlink_forward_notification_queue_depth") {
         config.nvlink_forward_notification_queue_depth = static_cast<std::size_t>(std::stoull(value));
     }
@@ -545,6 +554,12 @@ ProxyConfig load_config_file(const std::string& path) {
         object,
         "nvlink_forward_notification_flush_only_enabled",
         config.nvlink_forward_notification_flush_only_enabled);
+    config.expert_gemm_m_tile = number_as<std::size_t>(
+        object, "expert_gemm_m_tile", config.expert_gemm_m_tile);
+    config.expert_gemm_n_tile = number_as<std::size_t>(
+        object, "expert_gemm_n_tile", config.expert_gemm_n_tile);
+    config.expert_gemm_dimension = number_as<std::size_t>(
+        object, "expert_gemm_dimension", config.expert_gemm_dimension);
     config.nvlink_forward_notification_queue_depth = number_as<std::size_t>(
         object,
         "nvlink_forward_notification_queue_depth",
@@ -743,6 +758,24 @@ void validate_config(const ProxyConfig& config) {
             static_cast<std::size_t>(std::numeric_limits<uint32_t>::max())) {
             throw std::runtime_error("nvlink_forward_notification_queue_depth exceeds uint32 range");
         }
+        if (config.router_routing_enabled) {
+            if (config.expert_gemm_m_tile == 0 || config.expert_gemm_n_tile == 0 ||
+                config.expert_gemm_dimension == 0) {
+                throw std::runtime_error(
+                    "expert_gemm_m_tile, expert_gemm_n_tile, and expert_gemm_dimension "
+                    "must be > 0 for router completion notifications");
+            }
+            if (config.expert_gemm_dimension % config.expert_gemm_n_tile != 0) {
+                throw std::runtime_error(
+                    "expert_gemm_dimension must be divisible by expert_gemm_n_tile");
+            }
+            const auto works_per_batch =
+                config.expert_gemm_dimension / config.expert_gemm_n_tile;
+            if (works_per_batch >
+                static_cast<std::size_t>(std::numeric_limits<uint32_t>::max())) {
+                throw std::runtime_error("expert GEMM works per batch exceeds uint32 range");
+            }
+        }
     }
     if (config.nvlink_forward_notification_flush_only_enabled) {
         if (!config.nvlink_forward_completion_notifications_enabled) {
@@ -925,6 +958,9 @@ std::string config_summary(const ProxyConfig& config) {
         << (config.nvlink_forward_completion_notifications_enabled ? "true" : "false")
         << " nvlink_forward_notification_flush_only_enabled="
         << (config.nvlink_forward_notification_flush_only_enabled ? "true" : "false")
+        << " expert_gemm_m_tile=" << config.expert_gemm_m_tile
+        << " expert_gemm_n_tile=" << config.expert_gemm_n_tile
+        << " expert_gemm_dimension=" << config.expert_gemm_dimension
         << " nvlink_forward_notification_queue_depth="
         << config.nvlink_forward_notification_queue_depth
         << " nvlink_forward_notification_log_enabled="
