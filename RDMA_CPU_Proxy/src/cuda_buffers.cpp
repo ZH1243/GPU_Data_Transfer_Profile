@@ -107,6 +107,7 @@ CudaBuffers::~CudaBuffers() {
     free_buffer(router_notification_publication_buffers_.device_ready_rows);
     free_pinned_buffer(router_notification_publication_buffers_.host_table);
     free_pinned_buffer(router_notification_publication_buffers_.host_ready_rows);
+    free_pinned_buffer(router_notification_ready_values_);
 }
 
 void CudaBuffers::initialize() {
@@ -618,6 +619,20 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
         allocate_pinned_buffer(publication.host_table, table_bytes);
         allocate_buffer(publication.device_table, table_bytes);
     }
+    if (config_.nvlink_forward_notification_flag_update_mode ==
+        NvlinkForwardNotificationFlagUpdateMode::kMemcpy) {
+        const auto ready_value_count = publication.table_rows + 1;
+        allocate_pinned_buffer(
+            router_notification_ready_values_,
+            ready_value_count * sizeof(int32_t));
+        auto* ready_values = static_cast<int32_t*>(
+            router_notification_ready_values_.ptr);
+        for (std::size_t ready_rows = 0;
+             ready_rows < ready_value_count;
+             ++ready_rows) {
+            ready_values[ready_rows] = static_cast<int32_t>(ready_rows);
+        }
+    }
     state.initialized = true;
     RDMA_PROXY_LOG_INFO(
         "initialized QuACK gather-table scheduler local_experts=",
@@ -967,6 +982,29 @@ void CudaBuffers::flush_router_notification_publication_range(
         throw std::runtime_error("QuACK gather-table flush range is invalid");
     }
 
+    const auto ready_rows = *static_cast<const int32_t*>(
+        publication.host_ready_rows.ptr);
+    if (ready_rows < 0 ||
+        static_cast<std::size_t>(ready_rows) > publication.table_rows) {
+        throw std::runtime_error(
+            "QuACK ready-row publication value is outside the table range");
+    }
+    const void* ready_rows_memcpy_source = publication.host_ready_rows.ptr;
+    if (config_.nvlink_forward_notification_flag_update_mode ==
+        NvlinkForwardNotificationFlagUpdateMode::kMemcpy) {
+        const auto required_ready_value_bytes =
+            (publication.table_rows + 1) * sizeof(int32_t);
+        if (!router_notification_ready_values_.ptr ||
+            router_notification_ready_values_.bytes !=
+                required_ready_value_bytes) {
+            throw std::runtime_error(
+                "NVLink notification memcpy flag staging is not initialized");
+        }
+        ready_rows_memcpy_source =
+            static_cast<const int32_t*>(
+                router_notification_ready_values_.ptr) + ready_rows;
+    }
+
     if (config_.mock_mode) {
         if (table_bytes != 0) {
             std::memcpy(
@@ -976,7 +1014,7 @@ void CudaBuffers::flush_router_notification_publication_range(
         }
         std::memcpy(
             publication.device_ready_rows.ptr,
-            publication.host_ready_rows.ptr,
+            ready_rows_memcpy_source,
             publication.host_ready_rows.bytes);
         if (table_bytes != 0) ++publication.table_flush_count;
         ++publication.ready_rows_publication_count;
@@ -998,17 +1036,27 @@ void CudaBuffers::flush_router_notification_publication_range(
             stream), "cudaMemcpyAsync H2D QuACK gather-table range");
     }
 
-    // A stream memory write is host-asynchronous, writes the aligned flag as
-    // one 32-bit value, and (without NO_MEMORY_BARRIER) performs a system-wide
-    // fence after the preceding table copy and before publishing ready rows.
-    const auto ready_rows = *static_cast<const int32_t*>(
-        publication.host_ready_rows.ptr);
-    check_cuda_driver(cuStreamWriteValue32(
-        reinterpret_cast<CUstream>(stream),
-        reinterpret_cast<CUdeviceptr>(publication.device_ready_rows.ptr),
-        static_cast<cuuint32_t>(ready_rows),
-        CU_STREAM_WRITE_VALUE_DEFAULT),
-        "cuStreamWriteValue32 QuACK gather ready rows");
+    if (config_.nvlink_forward_notification_flag_update_mode ==
+        NvlinkForwardNotificationFlagUpdateMode::kMemcpy) {
+        check_cuda(cudaMemcpyAsync(
+            publication.device_ready_rows.ptr,
+            ready_rows_memcpy_source,
+            sizeof(int32_t),
+            cudaMemcpyHostToDevice,
+            stream),
+            "cudaMemcpyAsync H2D QuACK gather ready rows");
+    } else {
+        // A stream memory write is host-asynchronous, writes the aligned flag
+        // as one 32-bit value, and (without NO_MEMORY_BARRIER) performs a
+        // system-wide fence after the preceding table copy and before
+        // publishing ready rows.
+        check_cuda_driver(cuStreamWriteValue32(
+            reinterpret_cast<CUstream>(stream),
+            reinterpret_cast<CUdeviceptr>(publication.device_ready_rows.ptr),
+            static_cast<cuuint32_t>(ready_rows),
+            CU_STREAM_WRITE_VALUE_DEFAULT),
+            "cuStreamWriteValue32 QuACK gather ready rows");
+    }
     if (table_bytes != 0) ++publication.table_flush_count;
     ++publication.ready_rows_publication_count;
 #else

@@ -362,6 +362,10 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
         config.nvlink_forward_notification_flush_per_entry_enabled =
             (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "nvlink_forward_notification_flag_update_mode") {
+        config.nvlink_forward_notification_flag_update_mode =
+            nvlink_forward_notification_flag_update_mode_from_string(value);
+    }
     else if (key == "expert_gemm_m_tile") {
         config.expert_gemm_m_tile = static_cast<std::size_t>(std::stoull(value));
     }
@@ -454,6 +458,34 @@ DataType dtype_from_string(const std::string& value) {
     if (v == "fp16" || v == "half") return DataType::kFP16;
     if (v == "fp32" || v == "float") return DataType::kFP32;
     throw std::runtime_error("unsupported dtype: " + value);
+}
+
+std::string to_string(NvlinkForwardNotificationFlagUpdateMode mode) {
+    switch (mode) {
+        case NvlinkForwardNotificationFlagUpdateMode::kMemcpy:
+            return "memcpy";
+        case NvlinkForwardNotificationFlagUpdateMode::kStreamWrite:
+            return "stream-write";
+    }
+    return "stream-write";
+}
+
+NvlinkForwardNotificationFlagUpdateMode
+nvlink_forward_notification_flag_update_mode_from_string(
+    const std::string& value) {
+    std::string normalized = value;
+    std::transform(
+        normalized.begin(), normalized.end(), normalized.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (normalized == "memcpy") {
+        return NvlinkForwardNotificationFlagUpdateMode::kMemcpy;
+    }
+    if (normalized == "stream-write" || normalized == "stream_write") {
+        return NvlinkForwardNotificationFlagUpdateMode::kStreamWrite;
+    }
+    throw std::runtime_error(
+        "unsupported NVLink notification flag update mode: " + value +
+        "; expected memcpy or stream-write");
 }
 
 bool nvlink_forward_dynamic_threshold_enabled(const ProxyConfig& config) {
@@ -568,6 +600,11 @@ ProxyConfig load_config_file(const std::string& path) {
         object,
         "nvlink_forward_notification_flush_per_entry_enabled",
         config.nvlink_forward_notification_flush_per_entry_enabled);
+    config.nvlink_forward_notification_flag_update_mode =
+        nvlink_forward_notification_flag_update_mode_from_string(get_string(
+            object,
+            "nvlink_forward_notification_flag_update_mode",
+            to_string(config.nvlink_forward_notification_flag_update_mode)));
     config.expert_gemm_m_tile = number_as<std::size_t>(
         object, "expert_gemm_m_tile", config.expert_gemm_m_tile);
     config.expert_gemm_n_tile = number_as<std::size_t>(
@@ -1007,6 +1044,8 @@ std::string config_summary(const ProxyConfig& config) {
         << (config.nvlink_forward_notification_flush_only_enabled ? "true" : "false")
         << " nvlink_forward_notification_flush_per_entry_enabled="
         << (config.nvlink_forward_notification_flush_per_entry_enabled ? "true" : "false")
+        << " nvlink_forward_notification_flag_update_mode="
+        << to_string(config.nvlink_forward_notification_flag_update_mode)
         << " expert_gemm_m_tile=" << config.expert_gemm_m_tile
         << " expert_gemm_n_tile=" << config.expert_gemm_n_tile
         << " expert_gemm_dimension=" << config.expert_gemm_dimension

@@ -162,6 +162,8 @@ int main() {
     router_nvlink_config.nvlink_forwarding_enabled = true;
     router_nvlink_config.nvlink_forward_completion_notifications_enabled = true;
     router_nvlink_config.nvlink_forward_notification_flush_only_enabled = true;
+    router_nvlink_config.nvlink_forward_notification_flag_update_mode =
+        NvlinkForwardNotificationFlagUpdateMode::kMemcpy;
     router_nvlink_config.router_num_experts = 256;
     router_nvlink_config.router_top_k = 8;
     router_nvlink_config.node_rank = 0;

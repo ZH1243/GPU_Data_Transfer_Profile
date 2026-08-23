@@ -48,6 +48,19 @@ int main(int argc, char** argv) {
     assert(!config.nvlink_forward_completion_notifications_enabled);
     assert(!config.nvlink_forward_notification_flush_only_enabled);
     assert(!config.nvlink_forward_notification_flush_per_entry_enabled);
+    assert(config.nvlink_forward_notification_flag_update_mode ==
+           rdma_proxy::NvlinkForwardNotificationFlagUpdateMode::kStreamWrite);
+    assert(rdma_proxy::to_string(
+               rdma_proxy::NvlinkForwardNotificationFlagUpdateMode::kMemcpy) ==
+           "memcpy");
+    bool rejected_invalid_flag_update_mode = false;
+    try {
+        (void)rdma_proxy::nvlink_forward_notification_flag_update_mode_from_string(
+            "invalid");
+    } catch (const std::runtime_error&) {
+        rejected_invalid_flag_update_mode = true;
+    }
+    assert(rejected_invalid_flag_update_mode);
     assert(config.expert_gemm_m_tile == 128);
     assert(config.expert_gemm_n_tile == 256);
     assert(config.expert_gemm_dimension == 8192);
@@ -163,9 +176,10 @@ int main(int argc, char** argv) {
         "--expert_gemm_cluster_m=2",
         "--expert_gemm_max_swizzle_size=4",
         "--nvlink_forward_notification_flush_per_entry_enabled=false",
+        "--nvlink_forward_notification_flag_update_mode=memcpy",
         "--cpu_affinity=0-95,192-287",
     };
-    const auto peer_port_config = rdma_proxy::load_config(26, const_cast<char**>(peer_port_args));
+    const auto peer_port_config = rdma_proxy::load_config(27, const_cast<char**>(peer_port_args));
     for (const auto& peer : peer_port_config.peers) {
         assert(peer.port == 18521);
     }
@@ -189,6 +203,8 @@ int main(int argc, char** argv) {
     assert(peer_port_config.expert_gemm_cluster_m == 2);
     assert(peer_port_config.expert_gemm_max_swizzle_size == 4);
     assert(!peer_port_config.nvlink_forward_notification_flush_per_entry_enabled);
+    assert(peer_port_config.nvlink_forward_notification_flag_update_mode ==
+           rdma_proxy::NvlinkForwardNotificationFlagUpdateMode::kMemcpy);
     assert(peer_port_config.cpu_affinity == "0-95,192-287");
 
     const char* signal_interval_args[] = {
@@ -343,6 +359,7 @@ int main(int argc, char** argv) {
   "nvlink_forward_completion_notifications_enabled": false,
   "nvlink_forward_notification_flush_only_enabled": false,
   "nvlink_forward_notification_flush_per_entry_enabled": false,
+  "nvlink_forward_notification_flag_update_mode": "memcpy",
   "nvlink_forward_notification_queue_depth": 256,
   "nvlink_forward_notification_log_enabled": false,
   "nvlink_forward_notification_log_dir": "/tmp/rdma_cpu_proxy_test_notifications",
@@ -382,6 +399,8 @@ int main(int argc, char** argv) {
     assert(!nvlink_config.nvlink_forward_completion_notifications_enabled);
     assert(!nvlink_config.nvlink_forward_notification_flush_only_enabled);
     assert(!nvlink_config.nvlink_forward_notification_flush_per_entry_enabled);
+    assert(nvlink_config.nvlink_forward_notification_flag_update_mode ==
+           rdma_proxy::NvlinkForwardNotificationFlagUpdateMode::kMemcpy);
     assert(nvlink_config.nvlink_forward_notification_queue_depth == 256);
     assert(!nvlink_config.nvlink_forward_notification_log_enabled);
     assert(nvlink_config.nvlink_forward_notification_log_dir == "/tmp/rdma_cpu_proxy_test_notifications");

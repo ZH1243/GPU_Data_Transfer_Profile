@@ -13,6 +13,11 @@ enum class DataType {
     kFP32,
 };
 
+enum class NvlinkForwardNotificationFlagUpdateMode {
+    kMemcpy,
+    kStreamWrite,
+};
+
 struct PeerAddress {
     int node_rank{-1};
     std::string host;
@@ -77,6 +82,9 @@ struct ProxyConfig {
     bool nvlink_forward_completion_notifications_enabled{false};
     bool nvlink_forward_notification_flush_only_enabled{false};
     bool nvlink_forward_notification_flush_per_entry_enabled{false};
+    NvlinkForwardNotificationFlagUpdateMode
+        nvlink_forward_notification_flag_update_mode{
+            NvlinkForwardNotificationFlagUpdateMode::kStreamWrite};
     std::size_t expert_gemm_m_tile{128};
     std::size_t expert_gemm_n_tile{256};
     std::size_t expert_gemm_dimension{8192};
@@ -107,6 +115,10 @@ struct ProxyConfig {
 std::size_t dtype_size(DataType dtype);
 std::string to_string(DataType dtype);
 DataType dtype_from_string(const std::string& value);
+std::string to_string(NvlinkForwardNotificationFlagUpdateMode mode);
+NvlinkForwardNotificationFlagUpdateMode
+nvlink_forward_notification_flag_update_mode_from_string(
+    const std::string& value);
 bool nvlink_forward_dynamic_threshold_enabled(const ProxyConfig& config);
 std::size_t effective_nvlink_forward_threshold_tokens(const ProxyConfig& config);
 bool effective_rdma_chunk_per_token_sge_enabled(const ProxyConfig& config);

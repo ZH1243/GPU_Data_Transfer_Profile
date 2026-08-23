@@ -181,6 +181,9 @@ private:
     std::vector<PeerGpuBuffers> buffers_;
     std::vector<NvlinkReceiveBuffer> nvlink_recv_buffers_;
     RouterNotificationPublicationBuffers router_notification_publication_buffers_;
+    // cudaMemcpyAsync flag publications need immutable pinned source values
+    // until their stream operations complete. Slot i permanently contains i.
+    CpuPinnedBuffer router_notification_ready_values_;
     void* router_notification_publication_stream_{nullptr};
     mutable std::mutex expert_token_heads_mutex_;
     RouterComputationSchedulerState router_computation_scheduler_state_;

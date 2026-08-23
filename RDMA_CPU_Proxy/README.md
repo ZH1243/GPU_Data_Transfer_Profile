@@ -97,11 +97,13 @@ start_0, end_0, start_1, end_1, ..., start_B-1, end_B-1
 
 Here `B = num_nodes * num_gpus_per_node`. Pair `(start_j, end_j)` is an absolute half-open range in `A_idx_j`, including that expert's `expert_offsets[e]`; an unused buffer has `start_j == end_j`. Each ready M-cluster contributes `n_groups` rows with identical buffer ranges and `cid_n_base = 0, group_size, ...`. The row width is `2 + 2 * B` integers. `RouterNotificationPublicationBuffers` exposes the host/device table and ready-row pointers plus its shape, group, and `A_idx` metadata.
 
-The NVLink completion receiver thread advances Heads, prepares newly ready rows in pinned host memory, copies only that contiguous row range to the GPU table, and then publishes an `int32_t` ready-row count on the same nonblocking CUDA stream. As in QuACK, row `i` is consumable when `ready_rows >= i + 1`. The proxy publishes zero before starting each iteration. Publication uses `cuStreamWriteValue32` with its default system-wide memory barrier, so observing a larger ready-row count implies all rows in that newly visible prefix are already in HBM.
+The NVLink completion receiver thread advances Heads, prepares newly ready rows in pinned host memory, copies only that contiguous row range to the GPU table, and then publishes an `int32_t` ready-row count on the same nonblocking CUDA stream. As in QuACK, row `i` is consumable when `ready_rows >= i + 1`. The proxy publishes zero before starting each iteration. Flag publication uses either `cuStreamWriteValue32` or a four-byte `cudaMemcpyAsync`, selected by `nvlink_forward_notification_flag_update_mode`, so observing a larger ready-row count implies all rows in that newly visible prefix are already in HBM.
 
 Set `nvlink_forward_notification_flush_per_entry_enabled=true` to use fine-grained publication. In this mode, each emitted table row independently enqueues one row-sized H2D copy followed by one ready-row publication. These operations remain asynchronous, so CPU notification processing continues without synchronizing the CUDA stream. When the option is false, all rows produced by one dequeued notification are coalesced into one contiguous table copy and one ready-row publication. Per-entry mode requires router completion notifications and cannot be combined with flush-only mode.
 
 Set `nvlink_forward_notification_flush_only_enabled=true` to bypass all Head, Tail, and scheduler updates. Every dequeued router completion notification copies only the first table row and then publishes the current host ready-row value. This diagnostic option requires both `router_routing_enabled=true` and `nvlink_forward_completion_notifications_enabled=true`.
+
+Set `nvlink_forward_notification_flag_update_mode` to select how the CPU proxy publishes the 32-bit ready-row flag to GPU HBM. `stream-write` (the default, preserving the original behavior) uses `cuStreamWriteValue32`; `memcpy` uses a four-byte `cudaMemcpyAsync` from an immutable CUDA-pinned staging value. In both modes, table-row copies and flag publication use the same nonblocking CUDA stream, so the flag is ordered after the rows it makes visible.
 
 The expert tables use a direct TCP all-to-all. Global proxy rank is `node_rank * num_gpus_per_node + local_gpu_index`; every rank sends one destination-specific table to every other rank and installs its own table locally. Each proxy runs one receiver that accepts the other `X - 1` messages in any arrival order. Connections use `router_metadata_port_base + local_gpu_index`. Remote node hosts are taken from `peers`, while same-node exchanges use IPv6 loopback. Configure the same unused `router_metadata_port_base` on every proxy in a run.
 
@@ -349,6 +351,7 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_completion_notifications_enabled`
 - `nvlink_forward_notification_flush_only_enabled`
 - `nvlink_forward_notification_flush_per_entry_enabled`
+- `nvlink_forward_notification_flag_update_mode` (`stream-write` or `memcpy`)
 - `expert_gemm_m_tile`
 - `expert_gemm_n_tile`
 - `expert_gemm_dimension`
