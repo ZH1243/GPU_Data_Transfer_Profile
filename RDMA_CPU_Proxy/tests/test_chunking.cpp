@@ -224,57 +224,78 @@ int main() {
 
     const auto& publication =
         router_nvlink_buffers.router_notification_publication_buffers();
-    const std::size_t expected_map_entry_bytes = 8 + 32 * 12;
-    assert(publication.map_entry_bytes == expected_map_entry_bytes);
-    assert(publication.num_map_entries == 3);
-    assert(publication.works_per_batch == 32);
-    assert(publication.host_map.ptr != nullptr);
-    assert(publication.host_map.bytes == 3 * expected_map_entry_bytes);
-    assert(publication.host_flag.ptr != nullptr);
-    assert(publication.host_flag.bytes == sizeof(uint32_t));
-    assert(publication.device_map.ptr != nullptr);
-    assert(publication.device_map.bytes == publication.host_map.bytes);
-    assert(publication.device_flag.ptr != nullptr);
-    assert(publication.device_flag.bytes == sizeof(uint32_t));
+    const std::size_t expected_table_width = 2 + 2 * 32;
+    const std::size_t expected_table_row_bytes =
+        expected_table_width * sizeof(int32_t);
+    assert(publication.table_width == expected_table_width);
+    assert(publication.table_row_bytes == expected_table_row_bytes);
+    assert(publication.table_rows == 12);
+    assert(publication.num_input_buffers == 32);
+    assert(publication.a_idx_capacity == 3);
+    assert(publication.n_groups_per_m_cluster == 4);
+    assert(publication.group_size == 8);
+    assert(publication.host_table.ptr != nullptr);
+    assert(publication.host_table.bytes == 12 * expected_table_row_bytes);
+    assert(publication.host_ready_rows.ptr != nullptr);
+    assert(publication.host_ready_rows.bytes == sizeof(int32_t));
+    assert(publication.device_table.ptr != nullptr);
+    assert(publication.device_table.bytes == publication.host_table.bytes);
+    assert(publication.device_ready_rows.ptr != nullptr);
+    assert(publication.device_ready_rows.bytes == sizeof(int32_t));
     assert(std::all_of(
-        static_cast<const uint8_t*>(publication.host_map.ptr),
-        static_cast<const uint8_t*>(publication.host_map.ptr) + publication.host_map.bytes,
+        static_cast<const uint8_t*>(publication.host_table.ptr),
+        static_cast<const uint8_t*>(publication.host_table.ptr) + publication.host_table.bytes,
         [](uint8_t value) { return value == 0; }));
-    assert(*static_cast<const uint32_t*>(publication.host_flag.ptr) == 0);
-    std::memset(publication.host_map.ptr, 0x5a, publication.host_map.bytes);
-    *static_cast<uint32_t*>(publication.host_flag.ptr) = 7;
-    std::memset(publication.device_map.ptr, 0xff, publication.device_map.bytes);
-    *static_cast<uint32_t*>(publication.device_flag.ptr) = 3;
+    assert(*static_cast<const int32_t*>(publication.host_ready_rows.ptr) == 0);
+    std::memset(publication.host_table.ptr, 0x5a, publication.host_table.bytes);
+    *static_cast<int32_t*>(publication.host_ready_rows.ptr) = 7;
+    std::memset(publication.device_table.ptr, 0xff, publication.device_table.bytes);
+    *static_cast<int32_t*>(publication.device_ready_rows.ptr) = 3;
     router_nvlink_buffers.flush_router_notification_publication();
     assert(std::all_of(
-        static_cast<const uint8_t*>(publication.device_map.ptr),
-        static_cast<const uint8_t*>(publication.device_map.ptr) + publication.device_map.bytes,
+        static_cast<const uint8_t*>(publication.device_table.ptr),
+        static_cast<const uint8_t*>(publication.device_table.ptr) + publication.device_table.bytes,
         [](uint8_t value) { return value == 0x5a; }));
-    assert(*static_cast<const uint32_t*>(publication.device_flag.ptr) == 7);
-    std::memset(publication.host_map.ptr, 0, publication.host_map.bytes);
-    *static_cast<uint32_t*>(publication.host_flag.ptr) = 0;
+    assert(*static_cast<const int32_t*>(publication.device_ready_rows.ptr) == 7);
+    std::memset(publication.host_table.ptr, 0, publication.host_table.bytes);
+    *static_cast<int32_t*>(publication.host_ready_rows.ptr) = 0;
     const auto& installed = router_nvlink_buffers.nvlink_receive_buffer_for_source(2, 3);
     assert(installed.expert_metadata_ready);
     assert(installed.expert_metadata.expert_token_indices ==
            local_expert_metadata.expert_token_indices);
+    assert(installed.expert_token_index_count == 3);
+    assert(installed.expert_token_indices_device.bytes == 3 * sizeof(int32_t));
+    assert((std::vector<int32_t>(
+                static_cast<const int32_t*>(installed.expert_token_indices_device.ptr),
+                static_cast<const int32_t*>(installed.expert_token_indices_device.ptr) + 3) ==
+            std::vector<int32_t>{0, 1, 2}));
+    const auto& empty_installed =
+        router_nvlink_buffers.nvlink_receive_buffer_for_source(0, 0);
+    assert(empty_installed.expert_token_index_count == 0);
+    assert(empty_installed.expert_token_indices_device.bytes == 3 * sizeof(int32_t));
+    assert((std::vector<int32_t>(
+                static_cast<const int32_t*>(empty_installed.expert_token_indices_device.ptr),
+                static_cast<const int32_t*>(empty_installed.expert_token_indices_device.ptr) + 3) ==
+            std::vector<int32_t>{0, 0, 0}));
     auto head_state = router_nvlink_buffers.expert_token_head_state_for_source(2, 3);
     assert(!head_state.iteration_initialized);
     assert(head_state.received_token_frontier == 0);
     assert(head_state.expert_token_heads == std::vector<std::size_t>(8, 0));
     assert(head_state.expert_token_tails == std::vector<std::size_t>(8, 0));
 
-    // Flush-only mode publishes map/flag for a completion without touching
+    // Flush-only mode publishes the first table row and current ready-row flag
+    // for a completion without touching
     // the source buffer's iteration, frontier, or expert Heads.
-    *static_cast<uint32_t*>(publication.host_flag.ptr) = 11;
-    *static_cast<uint32_t*>(publication.device_flag.ptr) = 3;
+    *static_cast<int32_t*>(publication.host_ready_rows.ptr) = 11;
+    *static_cast<int32_t*>(publication.device_ready_rows.ptr) = 3;
     router_nvlink_buffers.process_router_notification_completion(2, 3, 0, 0, 1);
     head_state = router_nvlink_buffers.expert_token_head_state_for_source(2, 3);
     assert(!head_state.iteration_initialized);
     assert(head_state.received_token_frontier == 0);
     assert(head_state.expert_token_heads == std::vector<std::size_t>(8, 0));
     assert(head_state.expert_token_tails == std::vector<std::size_t>(8, 0));
-    assert(*static_cast<const uint32_t*>(publication.device_flag.ptr) == 11);
-    *static_cast<uint32_t*>(publication.host_flag.ptr) = 0;
+    assert(*static_cast<const int32_t*>(publication.device_ready_rows.ptr) == 11);
+    *static_cast<int32_t*>(publication.host_ready_rows.ptr) = 0;
 
     router_nvlink_buffers.update_expert_token_heads(2, 3, 0, 0, 1);
     head_state = router_nvlink_buffers.expert_token_head_state_for_source(2, 3);
@@ -307,9 +328,10 @@ int main() {
     }
     assert(rejected_noncontiguous_notification);
 
-    // Build three computation batches for one local expert from two
-    // source-specific receive buffers. The final batch has one token, so it
-    // must be emitted without waiting for the configured four-token M tile.
+    // Build three M-clusters for one local expert from two source-specific
+    // receive buffers. Each cluster expands to two QuACK N-group rows. The
+    // final cluster has one token, so it must be emitted without waiting for
+    // the configured four-token M-cluster capacity.
     ProxyConfig scheduler_config;
     scheduler_config.mock_mode = true;
     scheduler_config.router_routing_enabled = true;
@@ -327,6 +349,8 @@ int main() {
     scheduler_config.expert_gemm_m_tile = 4;
     scheduler_config.expert_gemm_n_tile = 2;
     scheduler_config.expert_gemm_dimension = 8;
+    scheduler_config.expert_gemm_cluster_m = 1;
+    scheduler_config.expert_gemm_max_swizzle_size = 2;
     CudaBuffers scheduler_buffers(scheduler_config);
     scheduler_buffers.initialize();
 
@@ -351,76 +375,89 @@ int main() {
 
     const auto& scheduler_publication =
         scheduler_buffers.router_notification_publication_buffers();
-    assert(scheduler_publication.map_entry_bytes == 32);
-    assert(scheduler_publication.num_map_entries == 3);
-    assert(scheduler_publication.host_map.bytes == 96);
-    assert(scheduler_publication.works_per_batch == 4);
+    assert(scheduler_publication.table_width == 6);
+    assert(scheduler_publication.table_row_bytes == 6 * sizeof(int32_t));
+    assert(scheduler_publication.table_rows == 6);
+    assert(scheduler_publication.num_input_buffers == 2);
+    assert(scheduler_publication.a_idx_capacity == 6);
+    assert(scheduler_publication.n_groups_per_m_cluster == 2);
+    assert(scheduler_publication.group_size == 2);
+    assert(scheduler_publication.host_table.bytes == 36 * sizeof(int32_t));
+    const auto& scheduler_source0 =
+        scheduler_buffers.nvlink_receive_buffer_for_source(0, 0);
+    const auto& scheduler_source1 =
+        scheduler_buffers.nvlink_receive_buffer_for_source(0, 1);
+    assert(scheduler_source0.expert_token_index_count == 3);
+    assert(scheduler_source1.expert_token_index_count == 6);
+    assert((std::vector<int32_t>(
+                static_cast<const int32_t*>(
+                    scheduler_source0.expert_token_indices_device.ptr),
+                static_cast<const int32_t*>(
+                    scheduler_source0.expert_token_indices_device.ptr) + 6) ==
+            std::vector<int32_t>{0, 1, 4, 0, 0, 0}));
+    assert((std::vector<int32_t>(
+                static_cast<const int32_t*>(
+                    scheduler_source1.expert_token_indices_device.ptr),
+                static_cast<const int32_t*>(
+                    scheduler_source1.expert_token_indices_device.ptr) + 6) ==
+            std::vector<int32_t>{0, 2, 3, 4, 5, 6}));
+
+    scheduler_buffers.begin_router_notification_iteration(0);
     std::memset(
-        scheduler_publication.device_map.ptr, 0xff,
-        scheduler_publication.device_map.bytes);
+        scheduler_publication.device_table.ptr, 0xff,
+        scheduler_publication.device_table.bytes);
 
     scheduler_buffers.process_router_notification_completion(0, 0, 0, 0, 2);
-    assert(*static_cast<const uint32_t*>(scheduler_publication.device_flag.ptr) == 0);
+    assert(*static_cast<const int32_t*>(
+               scheduler_publication.device_ready_rows.ptr) == 0);
     assert(std::all_of(
-        static_cast<const uint8_t*>(scheduler_publication.device_map.ptr),
-        static_cast<const uint8_t*>(scheduler_publication.device_map.ptr) +
-            scheduler_publication.device_map.bytes,
+        static_cast<const uint8_t*>(scheduler_publication.device_table.ptr),
+        static_cast<const uint8_t*>(scheduler_publication.device_table.ptr) +
+            scheduler_publication.device_table.bytes,
         [](uint8_t value) { return value == 0xff; }));
 
     scheduler_buffers.process_router_notification_completion(0, 1, 0, 0, 3);
-    assert(*static_cast<const uint32_t*>(scheduler_publication.device_flag.ptr) == 4);
-    const auto* map_bytes = static_cast<const uint8_t*>(
-        scheduler_publication.device_map.ptr);
-    const auto* row0 = reinterpret_cast<const RouterComputationMapEntryHeader*>(
-        map_bytes);
-    const auto* row0_info =
-        reinterpret_cast<const RouterComputationReceiveBufferInfo*>(
-            map_bytes + sizeof(RouterComputationMapEntryHeader));
-    assert(row0->global_expert_id == 0);
-    assert(row0->num_used_receive_buffers == 2);
-    assert(row0_info[0].receive_buffer_id == 0);
-    assert(row0_info[0].tail == 0);
-    assert(row0_info[0].length == 2);
-    assert(row0_info[1].receive_buffer_id == 1);
-    assert(row0_info[1].tail == 0);
-    assert(row0_info[1].length == 2);
+    assert(*static_cast<const int32_t*>(
+               scheduler_publication.device_ready_rows.ptr) == 2);
+    const auto* table = static_cast<const int32_t*>(
+        scheduler_publication.device_table.ptr);
+    const auto row = [&](std::size_t index) {
+        return table + index * scheduler_publication.table_width;
+    };
+    assert((std::vector<int32_t>(row(0), row(0) + 6) ==
+            std::vector<int32_t>{0, 0, 0, 2, 0, 2}));
+    assert((std::vector<int32_t>(row(1), row(1) + 6) ==
+            std::vector<int32_t>{0, 2, 0, 2, 0, 2}));
     assert(std::all_of(
-        map_bytes + scheduler_publication.map_entry_bytes,
-        map_bytes + scheduler_publication.device_map.bytes,
+        reinterpret_cast<const uint8_t*>(row(2)),
+        static_cast<const uint8_t*>(scheduler_publication.device_table.ptr) +
+            scheduler_publication.device_table.bytes,
         [](uint8_t value) { return value == 0xff; }));
 
     scheduler_buffers.process_router_notification_completion(0, 0, 0, 2, 3);
-    assert(*static_cast<const uint32_t*>(scheduler_publication.device_flag.ptr) == 4);
+    assert(*static_cast<const int32_t*>(
+               scheduler_publication.device_ready_rows.ptr) == 2);
     scheduler_buffers.process_router_notification_completion(0, 1, 0, 3, 3);
-    assert(*static_cast<const uint32_t*>(scheduler_publication.device_flag.ptr) == 8);
-    const auto* row1_bytes = map_bytes + scheduler_publication.map_entry_bytes;
-    const auto* row1_info =
-        reinterpret_cast<const RouterComputationReceiveBufferInfo*>(
-            row1_bytes + sizeof(RouterComputationMapEntryHeader));
-    assert(row1_info[0].receive_buffer_id == 0);
-    assert(row1_info[0].tail == 2);
-    assert(row1_info[0].length == 1);
-    assert(row1_info[1].receive_buffer_id == 1);
-    assert(row1_info[1].tail == 2);
-    assert(row1_info[1].length == 3);
+    assert(*static_cast<const int32_t*>(
+               scheduler_publication.device_ready_rows.ptr) == 4);
+    assert((std::vector<int32_t>(row(2), row(2) + 6) ==
+            std::vector<int32_t>{0, 0, 2, 3, 2, 5}));
+    assert((std::vector<int32_t>(row(3), row(3) + 6) ==
+            std::vector<int32_t>{0, 2, 2, 3, 2, 5}));
 
     scheduler_buffers.process_router_notification_completion(0, 1, 0, 6, 1);
-    assert(*static_cast<const uint32_t*>(scheduler_publication.device_flag.ptr) == 12);
-    const auto* row2_bytes = map_bytes + 2 * scheduler_publication.map_entry_bytes;
-    const auto* row2 = reinterpret_cast<const RouterComputationMapEntryHeader*>(
-        row2_bytes);
-    const auto* row2_info =
-        reinterpret_cast<const RouterComputationReceiveBufferInfo*>(
-            row2_bytes + sizeof(RouterComputationMapEntryHeader));
-    assert(row2->num_used_receive_buffers == 1);
-    assert(row2_info[0].receive_buffer_id == 1);
-    assert(row2_info[0].tail == 5);
-    assert(row2_info[0].length == 1);
+    assert(*static_cast<const int32_t*>(
+               scheduler_publication.device_ready_rows.ptr) == 6);
+    assert((std::vector<int32_t>(row(4), row(4) + 6) ==
+            std::vector<int32_t>{0, 0, 3, 3, 5, 6}));
+    assert((std::vector<int32_t>(row(5), row(5) + 6) ==
+            std::vector<int32_t>{0, 2, 3, 3, 5, 6}));
 
     const auto scheduler_state =
         scheduler_buffers.router_computation_scheduler_state();
     assert(scheduler_state.initialized);
     assert(scheduler_state.published_batches == 3);
+    assert(scheduler_state.published_rows == 6);
     assert(scheduler_state.expert_total_tokens == std::vector<std::size_t>{9});
     assert(scheduler_state.expert_num_ready_tokens == std::vector<std::size_t>{0});
     assert(scheduler_state.expert_num_notified_batches == std::vector<std::size_t>{3});
@@ -434,14 +471,19 @@ int main() {
     assert(source1_progress.expert_token_heads == std::vector<std::size_t>{6});
     assert(source1_progress.expert_token_tails == std::vector<std::size_t>{6});
 
-    // A new iteration resets the GPU-visible work frontier even when its
-    // first completion has too few tokens to produce a map row.
+    // A new iteration resets the GPU-visible ready-row prefix even when its
+    // first completion has too few tokens to produce a table row.
+    scheduler_buffers.begin_router_notification_iteration(1);
+    assert(*static_cast<const int32_t*>(
+               scheduler_publication.device_ready_rows.ptr) == 0);
     scheduler_buffers.process_router_notification_completion(0, 0, 1, 0, 1);
-    assert(*static_cast<const uint32_t*>(scheduler_publication.device_flag.ptr) == 0);
+    assert(*static_cast<const int32_t*>(
+               scheduler_publication.device_ready_rows.ptr) == 0);
     const auto reset_scheduler_state =
         scheduler_buffers.router_computation_scheduler_state();
     assert(reset_scheduler_state.iteration == 1);
     assert(reset_scheduler_state.published_batches == 0);
+    assert(reset_scheduler_state.published_rows == 0);
     assert(reset_scheduler_state.expert_num_ready_tokens ==
            std::vector<std::size_t>{1});
     assert(reset_scheduler_state.expert_num_notified_batches ==
@@ -455,8 +497,8 @@ int main() {
            std::vector<std::size_t>{0});
 
     // With all nine expert tokens becoming ready on the second notification,
-    // the default policy coalesces three appended rows into one publication.
-    // Per-entry mode publishes those same three rows independently.
+    // the default policy coalesces six appended rows into one publication.
+    // Per-entry mode publishes those same six rows independently.
     const auto run_flush_policy = [&](bool flush_per_entry) {
         auto policy_config = scheduler_config;
         policy_config.nvlink_forward_notification_flush_per_entry_enabled =
@@ -477,22 +519,27 @@ int main() {
 
         const auto& policy_publication =
             policy_buffers.router_notification_publication_buffers();
+        policy_buffers.begin_router_notification_iteration(0);
         policy_buffers.process_router_notification_completion(0, 0, 0, 0, 7);
-        assert(policy_publication.map_flush_count == 0);
-        assert(policy_publication.flag_publication_count == 0);
+        const auto table_flushes_before = policy_publication.table_flush_count;
+        const auto ready_publications_before =
+            policy_publication.ready_rows_publication_count;
         policy_buffers.process_router_notification_completion(0, 1, 0, 0, 7);
-        assert(*static_cast<const uint32_t*>(policy_publication.device_flag.ptr) == 12);
+        assert(*static_cast<const int32_t*>(
+                   policy_publication.device_ready_rows.ptr) == 6);
         const auto policy_state =
             policy_buffers.router_computation_scheduler_state();
         assert(policy_state.published_batches == 3);
+        assert(policy_state.published_rows == 6);
         return std::make_pair(
-            policy_publication.map_flush_count,
-            policy_publication.flag_publication_count);
+            policy_publication.table_flush_count - table_flushes_before,
+            policy_publication.ready_rows_publication_count -
+                ready_publications_before);
     };
     assert(run_flush_policy(false) ==
            std::make_pair(uint64_t{1}, uint64_t{1}));
     assert(run_flush_policy(true) ==
-           std::make_pair(uint64_t{3}, uint64_t{3}));
+           std::make_pair(uint64_t{6}, uint64_t{6}));
 
     DynamicChunkDistributor distributor(
         chunks,

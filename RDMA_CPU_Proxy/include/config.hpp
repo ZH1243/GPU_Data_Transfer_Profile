@@ -80,6 +80,8 @@ struct ProxyConfig {
     std::size_t expert_gemm_m_tile{128};
     std::size_t expert_gemm_n_tile{256};
     std::size_t expert_gemm_dimension{8192};
+    std::size_t expert_gemm_cluster_m{1};
+    std::size_t expert_gemm_max_swizzle_size{8};
     std::size_t nvlink_forward_notification_queue_depth{1024};
     bool nvlink_forward_notification_log_enabled{false};
     std::string nvlink_forward_notification_log_dir{"/tmp/rdma_cpu_proxy_nvlink_notifications"};

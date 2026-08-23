@@ -49,6 +49,8 @@
   "expert_gemm_m_tile": 128,
   "expert_gemm_n_tile": 256,
   "expert_gemm_dimension": 8192,
+  "expert_gemm_cluster_m": 1,
+  "expert_gemm_max_swizzle_size": 8,
   "nvlink_forward_notification_queue_depth": 1024,
   "nvlink_forward_notification_log_enabled": false,
   "nvlink_forward_notification_log_dir": "/tmp/rdma_cpu_proxy_nvlink_notifications",

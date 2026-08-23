@@ -51,6 +51,8 @@ int main(int argc, char** argv) {
     assert(config.expert_gemm_m_tile == 128);
     assert(config.expert_gemm_n_tile == 256);
     assert(config.expert_gemm_dimension == 8192);
+    assert(config.expert_gemm_cluster_m == 1);
+    assert(config.expert_gemm_max_swizzle_size == 8);
     assert(config.nvlink_forward_notification_queue_depth == 1024);
     assert(!config.nvlink_forward_notification_log_enabled);
     assert(config.nvlink_forward_notification_log_dir == "/tmp/rdma_cpu_proxy_nvlink_notifications");
@@ -158,10 +160,12 @@ int main(int argc, char** argv) {
         "--expert_gemm_m_tile=64",
         "--expert_gemm_n_tile=128",
         "--expert_gemm_dimension=4096",
+        "--expert_gemm_cluster_m=2",
+        "--expert_gemm_max_swizzle_size=4",
         "--nvlink_forward_notification_flush_per_entry_enabled=false",
         "--cpu_affinity=0-95,192-287",
     };
-    const auto peer_port_config = rdma_proxy::load_config(24, const_cast<char**>(peer_port_args));
+    const auto peer_port_config = rdma_proxy::load_config(26, const_cast<char**>(peer_port_args));
     for (const auto& peer : peer_port_config.peers) {
         assert(peer.port == 18521);
     }
@@ -182,6 +186,8 @@ int main(int argc, char** argv) {
     assert(peer_port_config.expert_gemm_m_tile == 64);
     assert(peer_port_config.expert_gemm_n_tile == 128);
     assert(peer_port_config.expert_gemm_dimension == 4096);
+    assert(peer_port_config.expert_gemm_cluster_m == 2);
+    assert(peer_port_config.expert_gemm_max_swizzle_size == 4);
     assert(!peer_port_config.nvlink_forward_notification_flush_per_entry_enabled);
     assert(peer_port_config.cpu_affinity == "0-95,192-287");
 
@@ -435,13 +441,18 @@ int main(int argc, char** argv) {
     invalid_expert_gemm_config.router_num_experts = 256;
     invalid_expert_gemm_config.router_top_k = 8;
     invalid_expert_gemm_config.expert_gemm_dimension = 8193;
-    bool rejected_nondivisible_expert_dimension = false;
+    bool rejected_nondivisible_n_swizzle_groups = false;
     try {
         rdma_proxy::validate_config(invalid_expert_gemm_config);
     } catch (const std::runtime_error&) {
-        rejected_nondivisible_expert_dimension = true;
+        rejected_nondivisible_n_swizzle_groups = true;
     }
-    assert(rejected_nondivisible_expert_dimension);
+    assert(rejected_nondivisible_n_swizzle_groups);
+
+    auto valid_partial_n_tile_config = invalid_expert_gemm_config;
+    valid_partial_n_tile_config.expert_gemm_max_swizzle_size = 3;
+    valid_partial_n_tile_config.nvlink_forward_use_round_robin = false;
+    rdma_proxy::validate_config(valid_partial_n_tile_config);
 
     auto invalid_flush_only_without_router = valid_notification_config;
     invalid_flush_only_without_router.nvlink_forward_notification_flush_only_enabled = true;

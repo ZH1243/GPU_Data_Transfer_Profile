@@ -1463,6 +1463,10 @@ void Proxy::nvlink_forward_notification_loop() {
 }
 
 void Proxy::run_iteration(uint64_t iteration) {
+    // Reset and publish QuACK's ready-row prefix before any completion for the
+    // iteration can make a gather-table row visible.
+    cuda_buffers_.begin_router_notification_iteration(iteration);
+
     std::vector<std::vector<ChunkDescriptor>> chunks_by_peer;
     chunks_by_peer.reserve(peers_.size());
     std::size_t total_bytes = 0;

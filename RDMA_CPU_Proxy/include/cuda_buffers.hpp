@@ -24,35 +24,25 @@ struct CpuPinnedBuffer {
 };
 
 struct RouterNotificationPublicationBuffers {
-    CpuPinnedBuffer host_map;
-    CpuPinnedBuffer host_flag;
-    GpuBuffer device_map;
-    GpuBuffer device_flag;
-    std::size_t map_entry_bytes{0};
-    std::size_t num_map_entries{0};
-    uint32_t works_per_batch{0};
-    // CPU-side diagnostics counting successfully enqueued/copied map ranges
-    // and their corresponding flag publications.
-    uint64_t map_flush_count{0};
-    uint64_t flag_publication_count{0};
+    // QuACK multi-buffer gather-table ABI. Each row is a contiguous int32 row:
+    //   (local_expert_id, cid_n_base, start_0, end_0, ..., start_B-1, end_B-1)
+    // where buffer slot j is the j-th entry of nvlink_receive_buffers().
+    CpuPinnedBuffer host_table;
+    CpuPinnedBuffer host_ready_rows;
+    GpuBuffer device_table;
+    GpuBuffer device_ready_rows;
+    std::size_t table_row_bytes{0};
+    std::size_t table_rows{0};
+    std::size_t table_width{0};
+    std::size_t num_input_buffers{0};
+    std::size_t a_idx_capacity{0};
+    std::size_t n_groups_per_m_cluster{0};
+    int32_t group_size{0};
+    // CPU-side diagnostics counting successfully enqueued/copied table ranges
+    // and their corresponding ready-row publications.
+    uint64_t table_flush_count{0};
+    uint64_t ready_rows_publication_count{0};
 };
-
-// One fixed-size map row starts with this header and is followed by one
-// RouterComputationReceiveBufferInfo slot for every global source GPU. Unused
-// slots are zero. All fields intentionally use a 4-byte GPU-facing ABI.
-struct RouterComputationMapEntryHeader {
-    uint32_t global_expert_id{0};
-    uint32_t num_used_receive_buffers{0};
-};
-
-struct RouterComputationReceiveBufferInfo {
-    uint32_t receive_buffer_id{0};
-    uint32_t tail{0};
-    uint32_t length{0};
-};
-
-static_assert(sizeof(RouterComputationMapEntryHeader) == 8);
-static_assert(sizeof(RouterComputationReceiveBufferInfo) == 12);
 
 struct PeerGpuBuffers {
     int peer_rank{-1};
@@ -75,7 +65,11 @@ struct RouterComputationSchedulerState {
     bool initialized{false};
     bool iteration_initialized{false};
     uint64_t iteration{0};
+    // M-clusters whose input ranges have been assigned.
     std::size_t published_batches{0};
+    // QuACK gather-table rows made available. One M-cluster contributes one
+    // row for every N group.
+    std::size_t published_rows{0};
     std::vector<std::size_t> expert_total_tokens;
     std::vector<std::size_t> expert_num_ready_tokens;
     std::vector<std::size_t> expert_num_notified_batches;
@@ -86,6 +80,10 @@ struct NvlinkReceiveBuffer {
     int source_node_rank{-1};
     int source_gpu_index{-1};
     GpuBuffer recv;
+    // QuACK A_idx_j. All source buffers use the same padded device allocation
+    // size; expert_token_index_count records the meaningful prefix.
+    GpuBuffer expert_token_indices_device;
+    std::size_t expert_token_index_count{0};
     RouterExpertMetadata expert_metadata;
     bool expert_metadata_ready{false};
     RouterExpertTokenHeadState expert_token_head_state;
@@ -136,6 +134,7 @@ public:
         int source_node_rank,
         int source_gpu_index) const;
     RouterComputationSchedulerState router_computation_scheduler_state() const;
+    void begin_router_notification_iteration(uint64_t iteration);
     void update_expert_token_heads(
         int source_node_rank,
         int source_gpu_index,
@@ -174,8 +173,8 @@ private:
         bool flush_per_entry);
     std::size_t schedule_ready_computation_batches_locked();
     void flush_router_notification_publication_range(
-        std::size_t map_offset,
-        std::size_t map_bytes);
+        std::size_t table_offset,
+        std::size_t table_bytes);
 
     ProxyConfig config_;
     GpuBuffer router_send_buffer_;
