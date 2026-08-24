@@ -51,7 +51,8 @@ if(RDMA_PROXY_HAVE_CUDA)
   list(APPEND RDMA_PROXY_SOURCES src/cuda_kernels.cu ${EXPERT_TOKEN_IDX_KERNEL_SOURCE})
 endif()
 
-add_library(rdma_cpu_proxy_lib ${RDMA_PROXY_SOURCES})
+add_library(rdma_cpu_proxy_lib STATIC ${RDMA_PROXY_SOURCES})
+set_target_properties(rdma_cpu_proxy_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(rdma_cpu_proxy_lib PUBLIC include)
 if(RDMA_PROXY_HAVE_CUDA)
   target_include_directories(rdma_cpu_proxy_lib PRIVATE
@@ -81,6 +82,18 @@ target_link_libraries(rdma_cpu_proxy_lib PUBLIC Threads::Threads)
 add_executable(rdma_cpu_proxy src/main.cpp)
 target_link_libraries(rdma_cpu_proxy PRIVATE rdma_cpu_proxy_lib)
 
+# Stable C ABI for Python ctypes and other non-C++ embedding environments.
+# Keep this separate from the executable so the legacy launch path remains
+# available and both entry points share the exact same implementation library.
+add_library(rdma_cpu_proxy_shared SHARED src/c_api.cpp)
+set_target_properties(rdma_cpu_proxy_shared PROPERTIES
+  OUTPUT_NAME rdma_cpu_proxy
+  VERSION 1.0.0
+  SOVERSION 1
+)
+target_include_directories(rdma_cpu_proxy_shared PUBLIC include)
+target_link_libraries(rdma_cpu_proxy_shared PRIVATE rdma_cpu_proxy_lib)
+
 if(RDMA_PROXY_BUILD_TESTS)
   enable_testing()
 
@@ -103,6 +116,10 @@ if(RDMA_PROXY_BUILD_TESTS)
   add_executable(test_global_metadata_exchange tests/test_global_metadata_exchange.cpp)
   target_link_libraries(test_global_metadata_exchange PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_global_metadata_exchange COMMAND test_global_metadata_exchange)
+
+  add_executable(test_c_api tests/test_c_api.cpp)
+  target_link_libraries(test_c_api PRIVATE rdma_cpu_proxy_shared)
+  add_test(NAME test_c_api COMMAND test_c_api ${CMAKE_CURRENT_SOURCE_DIR}/config/example_config.json)
 endif()
 
 message(STATUS "RDMA_PROXY_HAVE_CUDA=${RDMA_PROXY_HAVE_CUDA}")

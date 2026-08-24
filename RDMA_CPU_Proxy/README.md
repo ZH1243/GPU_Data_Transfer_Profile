@@ -278,6 +278,62 @@ cmake --build RDMA_CPU_Proxy/build
 
 If CUDA or libibverbs is found automatically, the relevant real path is compiled in. Otherwise the binary can still be built for mock-mode tests.
 
+## Shared Library and torchrun
+
+The build also produces a shared library for embedding the proxy in another
+process:
+
+```text
+RDMA_CPU_Proxy/build-hopper/librdma_cpu_proxy.so
+```
+
+Build both the legacy executable and the shared library with:
+
+```bash
+cmake -S RDMA_CPU_Proxy -B RDMA_CPU_Proxy/build-hopper \
+  -DRDMA_PROXY_REQUIRE_CUDA=ON \
+  -DRDMA_PROXY_REQUIRE_VERBS=ON
+cmake --build RDMA_CPU_Proxy/build-hopper \
+  --target rdma_cpu_proxy rdma_cpu_proxy_shared
+```
+
+The executable remains available at
+`RDMA_CPU_Proxy/build-hopper/rdma_cpu_proxy`. The shared library exports the
+stable C interface declared in `include/rdma_proxy_c_api.h`. Its opaque handle
+API supports separate create, initialize, run, shutdown, and destroy calls;
+`rdma_proxy_run_argv` provides the complete blocking lifecycle used by the
+Python worker.
+
+The supplied torchrun worker loads the library with `ctypes.CDLL`. It derives
+the proxy topology from `LOCAL_RANK`, `LOCAL_WORLD_SIZE`, `RANK`, `WORLD_SIZE`,
+and `GROUP_RANK`, then appends the per-worker GPU, NIC, and TCP-port overrides
+to the normal proxy command-line arguments. It does not initialize a Torch
+distributed process group; torchrun is used only to launch and monitor one
+Python/proxy process per GPU.
+
+For the checked-in two-node, seven-GPU launch, start node 0 and node 1 with:
+
+```bash
+RDMA_CPU_Proxy/scripts/run_node0_torchrun.sh
+RDMA_CPU_Proxy/scripts/run_node1_torchrun.sh
+```
+
+The scripts preserve the original mapping of logical GPUs `0..6` to physical
+CUDA devices `0,1,2,3,5,6,7`, including the corresponding RDMA devices. They
+also pass the same proxy workload options as `run_node0.sh` and `run_node1.sh`.
+The rendezvous defaults to node 0 at `28.49.38.169:29500`; override it when
+needed:
+
+```bash
+MASTER_ADDR=<node-0-address> MASTER_PORT=<unused-port> \
+  RDMA_CPU_Proxy/scripts/run_node0_torchrun.sh
+```
+
+Set `RDMA_PROXY_BUILD_DIR` if the shared library is in a build directory other
+than `RDMA_CPU_Proxy/build-hopper`, or `TORCHRUN_BIN` to select a different
+torchrun executable. Use a fixed node count and `--max_restarts=0`; the proxy's
+peer connections and synchronization barriers assume fixed membership.
+
 ## Example Launch
 
 Edit `config/example_config.json` for each node and GPU process. Every proxy should use the same `local_gpu_index` value as the GPU it owns, and peers should point to the same-index proxy on other nodes.
