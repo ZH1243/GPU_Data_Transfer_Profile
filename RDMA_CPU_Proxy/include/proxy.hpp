@@ -30,6 +30,8 @@ public:
     void initialize();
     void run();
     void run_once();
+    void run_iteration_step(uint64_t iteration);
+    void finish_run();
     void shutdown();
     const RouterExpertMetadata& router_expert_metadata_for_source(
         int source_node_rank,

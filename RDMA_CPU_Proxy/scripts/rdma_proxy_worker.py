@@ -7,11 +7,14 @@ import argparse
 import ctypes
 import os
 from pathlib import Path
+import queue
 import shlex
 import sys
+import threading
 
 
 EXPECTED_ABI_VERSION = 1
+CONCURRENT_KERNEL_ELEMENTS = 1 << 20
 
 
 def environment_integer(name: str) -> int:
@@ -120,6 +123,26 @@ def load_proxy_library(path: Path) -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_char_p),
     ]
     library.rdma_proxy_run_argv.restype = ctypes.c_int
+    library.rdma_proxy_create.argtypes = [
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_char_p),
+    ]
+    library.rdma_proxy_create.restype = ctypes.c_void_p
+    library.rdma_proxy_initialize.argtypes = [ctypes.c_void_p]
+    library.rdma_proxy_initialize.restype = ctypes.c_int
+    library.rdma_proxy_get_num_iterations.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    library.rdma_proxy_get_num_iterations.restype = ctypes.c_int
+    library.rdma_proxy_run_iteration.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+    library.rdma_proxy_run_iteration.restype = ctypes.c_int
+    library.rdma_proxy_finish.argtypes = [ctypes.c_void_p]
+    library.rdma_proxy_finish.restype = ctypes.c_int
+    library.rdma_proxy_shutdown.argtypes = [ctypes.c_void_p]
+    library.rdma_proxy_shutdown.restype = ctypes.c_int
+    library.rdma_proxy_destroy.argtypes = [ctypes.c_void_p]
+    library.rdma_proxy_destroy.restype = None
     library.rdma_proxy_last_error.argtypes = []
     library.rdma_proxy_last_error.restype = ctypes.c_char_p
 
@@ -132,19 +155,159 @@ def load_proxy_library(path: Path) -> ctypes.CDLL:
     return library
 
 
-def run_proxy(library: ctypes.CDLL, proxy_argv: list[str]) -> int:
+def encode_proxy_argv(proxy_argv: list[str]) -> ctypes.Array:
     encoded_argv = [os.fsencode(argument) for argument in proxy_argv]
-    c_argv = (ctypes.c_char_p * len(encoded_argv))(*encoded_argv)
-    status = library.rdma_proxy_run_argv(len(encoded_argv), c_argv)
+    return (ctypes.c_char_p * len(encoded_argv))(*encoded_argv)
+
+
+def proxy_last_error(library: ctypes.CDLL) -> str:
+    error_pointer = library.rdma_proxy_last_error()
+    return (
+        error_pointer.decode("utf-8", errors="replace")
+        if error_pointer
+        else "unknown proxy error"
+    )
+
+
+def require_proxy_success(library: ctypes.CDLL, status: int, operation: str) -> None:
     if status != 0:
-        error_pointer = library.rdma_proxy_last_error()
-        error = (
-            error_pointer.decode("utf-8", errors="replace")
-            if error_pointer
-            else "unknown proxy error"
-        )
-        raise RuntimeError(error)
+        raise RuntimeError(f"{operation} failed: {proxy_last_error(library)}")
+
+
+def run_proxy(library: ctypes.CDLL, proxy_argv: list[str]) -> int:
+    c_argv = encode_proxy_argv(proxy_argv)
+    status = library.rdma_proxy_run_argv(len(proxy_argv), c_argv)
+    if status != 0:
+        raise RuntimeError(proxy_last_error(library))
     return status
+
+
+def run_proxy_with_concurrent_kernel(
+    library: ctypes.CDLL,
+    proxy_argv: list[str],
+    cuda_device_id: int,
+) -> int:
+    """Let Python launch one independent CUDA kernel with each proxy iteration."""
+
+    c_argv = encode_proxy_argv(proxy_argv)
+    handle = library.rdma_proxy_create(len(proxy_argv), c_argv)
+    if not handle:
+        raise RuntimeError(f"proxy creation failed: {proxy_last_error(library)}")
+
+    initialized = False
+    coordinator: threading.Thread | None = None
+    commands: queue.Queue = queue.Queue()
+    results: queue.Queue = queue.Queue()
+    try:
+        require_proxy_success(
+            library, library.rdma_proxy_initialize(handle), "proxy initialization"
+        )
+        initialized = True
+
+        num_iterations = ctypes.c_uint64()
+        require_proxy_success(
+            library,
+            library.rdma_proxy_get_num_iterations(handle, ctypes.byref(num_iterations)),
+            "querying num_iterations",
+        )
+        if num_iterations.value == 0:
+            raise RuntimeError(
+                "--concurrent-kernel requires a finite, nonzero --num_iterations"
+            )
+
+        try:
+            import torch
+        except ImportError as error:
+            raise RuntimeError("--concurrent-kernel requires PyTorch") from error
+        if not torch.cuda.is_available():
+            raise RuntimeError("--concurrent-kernel requires an available CUDA device")
+
+        torch.cuda.set_device(cuda_device_id)
+        kernel_stream = torch.cuda.Stream(device=cuda_device_id)
+        kernel_finished = torch.cuda.Event(enable_timing=False, blocking=False)
+        with torch.cuda.stream(kernel_stream):
+            kernel_tensor = torch.zeros(
+                CONCURRENT_KERNEL_ELEMENTS,
+                dtype=torch.float32,
+                device=f"cuda:{cuda_device_id}",
+            )
+        kernel_stream.synchronize()
+
+        def proxy_iteration_coordinator() -> None:
+            while True:
+                command = commands.get()
+                if command is None:
+                    return
+                iteration, start_barrier = command
+                try:
+                    # The Python main thread waits on the same barrier immediately
+                    # before enqueueing its CUDA kernel.
+                    start_barrier.wait()
+                    status = library.rdma_proxy_run_iteration(handle, iteration)
+                    error = None if status == 0 else proxy_last_error(library)
+                    results.put((status, error))
+                except BaseException as error:
+                    results.put((-1, f"proxy coordinator failed: {error}"))
+                    return
+
+        coordinator = threading.Thread(
+            target=proxy_iteration_coordinator,
+            name="rdma-proxy-iteration-coordinator",
+        )
+        coordinator.start()
+
+        print(
+            "concurrent-kernel mode enabled: Python will launch one independent "
+            f"torch.add kernel over {CONCURRENT_KERNEL_ELEMENTS} float32 elements "
+            "with each proxy iteration",
+            flush=True,
+        )
+
+        for iteration in range(num_iterations.value):
+            start_barrier = threading.Barrier(2)
+            commands.put((iteration, start_barrier))
+            start_barrier.wait()
+
+            kernel_error: BaseException | None = None
+            try:
+                # add_ is an asynchronous pointwise CUDA kernel. Recording and
+                # waiting on this stream-local event does not synchronize the
+                # proxy's independent CUDA streams.
+                with torch.cuda.stream(kernel_stream):
+                    kernel_tensor.add_(1.0)
+                    kernel_finished.record(kernel_stream)
+                kernel_finished.synchronize()
+            except BaseException as error:
+                kernel_error = error
+
+            proxy_status, proxy_error = results.get()
+            if kernel_error is not None:
+                raise RuntimeError(
+                    f"concurrent CUDA kernel failed at iteration {iteration}: {kernel_error}"
+                ) from kernel_error
+            if proxy_status != 0:
+                raise RuntimeError(
+                    f"proxy iteration {iteration} failed: {proxy_error}"
+                )
+
+        commands.put(None)
+        coordinator.join()
+        coordinator = None
+        require_proxy_success(library, library.rdma_proxy_finish(handle), "proxy finish")
+        return 0
+    finally:
+        if coordinator is not None:
+            commands.put(None)
+            coordinator.join()
+        if initialized:
+            shutdown_status = library.rdma_proxy_shutdown(handle)
+            if shutdown_status != 0:
+                print(
+                    f"proxy shutdown failed: {proxy_last_error(library)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        library.rdma_proxy_destroy(handle)
 
 
 def main() -> int:
@@ -157,6 +320,11 @@ def main() -> int:
     parser.add_argument("--rdma-device-map", required=True)
     parser.add_argument("--listen-port-base", type=int, default=18515)
     parser.add_argument("--local-rank", "--local_rank", dest="launcher_local_rank", type=int)
+    parser.add_argument(
+        "--concurrent-kernel",
+        action="store_true",
+        help="launch an independent PyTorch CUDA kernel with every proxy iteration",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -178,6 +346,10 @@ def main() -> int:
         return 0
 
     library = load_proxy_library(args.library.resolve())
+    if args.concurrent_kernel:
+        return run_proxy_with_concurrent_kernel(
+            library, proxy_argv, int(metadata["cuda_device_id"])
+        )
     return run_proxy(library, proxy_argv)
 
 
@@ -187,4 +359,3 @@ if __name__ == "__main__":
     except Exception as error:
         print(f"rdma_proxy_worker failed: {error}", file=sys.stderr, flush=True)
         raise SystemExit(1)
-

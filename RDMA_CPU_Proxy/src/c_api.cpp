@@ -6,19 +6,25 @@
 #include "proxy.hpp"
 
 #include <exception>
-#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
-struct RdmaProxyHandle {
-    explicit RdmaProxyHandle(rdma_proxy::ProxyConfig config)
-        : proxy(std::move(config)) {}
+#if RDMA_PROXY_HAVE_CUDA
+#include <cuda_runtime_api.h>
+#endif
 
+struct RdmaProxyHandle {
+    explicit RdmaProxyHandle(rdma_proxy::ProxyConfig value)
+        : config(std::move(value)), proxy(config) {}
+
+    rdma_proxy::ProxyConfig config;
     rdma_proxy::Proxy proxy;
     bool initialized{false};
     bool shut_down{false};
+    bool finished{false};
+    uint64_t next_iteration{0};
 };
 
 namespace {
@@ -68,6 +74,20 @@ std::vector<char*> make_mutable_argv(
     return mutable_argv;
 }
 
+void select_proxy_cuda_device(const RdmaProxyHandle& handle) {
+#if RDMA_PROXY_HAVE_CUDA
+    if (handle.config.mock_mode) return;
+    const auto status = cudaSetDevice(handle.config.cuda_device_id);
+    if (status != cudaSuccess) {
+        throw std::runtime_error(
+            "cudaSetDevice failed in proxy iteration coordinator: " +
+            std::string(cudaGetErrorString(status)));
+    }
+#else
+    (void)handle;
+#endif
+}
+
 }  // namespace
 
 extern "C" int rdma_proxy_abi_version(void) {
@@ -102,6 +122,8 @@ extern "C" int rdma_proxy_initialize(RdmaProxyHandle* handle) {
         handle->proxy.initialize();
         handle->initialized = true;
         handle->shut_down = false;
+        handle->finished = false;
+        handle->next_iteration = 0;
         return 0;
     } catch (...) {
         return record_current_exception();
@@ -118,8 +140,94 @@ extern "C" int rdma_proxy_run(RdmaProxyHandle* handle) {
         last_error = "rdma_proxy_run requires an initialized proxy";
         return -1;
     }
+    if (handle->next_iteration != 0 || handle->finished) {
+        last_error = "rdma_proxy_run cannot follow per-iteration execution";
+        return -1;
+    }
     try {
+        select_proxy_cuda_device(*handle);
         handle->proxy.run();
+        if (handle->config.num_iterations != 0) {
+            handle->next_iteration = handle->config.num_iterations;
+            handle->finished = true;
+        }
+        return 0;
+    } catch (...) {
+        return record_current_exception();
+    }
+}
+
+extern "C" int rdma_proxy_get_num_iterations(
+    RdmaProxyHandle* handle,
+    uint64_t* num_iterations) {
+    clear_error();
+    if (handle == nullptr || num_iterations == nullptr) {
+        last_error = "rdma_proxy_get_num_iterations received a null argument";
+        return -1;
+    }
+    *num_iterations = static_cast<uint64_t>(handle->config.num_iterations);
+    return 0;
+}
+
+extern "C" int rdma_proxy_run_iteration(
+    RdmaProxyHandle* handle,
+    uint64_t iteration) {
+    clear_error();
+    if (handle == nullptr) {
+        last_error = "rdma_proxy_run_iteration received a null handle";
+        return -1;
+    }
+    if (!handle->initialized || handle->shut_down) {
+        last_error = "rdma_proxy_run_iteration requires an initialized proxy";
+        return -1;
+    }
+    if (handle->config.num_iterations == 0) {
+        last_error = "per-iteration execution requires finite num_iterations";
+        return -1;
+    }
+    if (handle->finished) {
+        last_error = "proxy run is already finished";
+        return -1;
+    }
+    if (iteration != handle->next_iteration) {
+        last_error = "proxy iterations must be submitted in increasing order";
+        return -1;
+    }
+    try {
+        // cudaSetDevice state is host-thread-local. Per-iteration embedding may
+        // call this function from a coordinator thread other than the thread
+        // that initialized the proxy, so select the configured device here.
+        select_proxy_cuda_device(*handle);
+        handle->proxy.run_iteration_step(iteration);
+        ++handle->next_iteration;
+        return 0;
+    } catch (...) {
+        return record_current_exception();
+    }
+}
+
+extern "C" int rdma_proxy_finish(RdmaProxyHandle* handle) {
+    clear_error();
+    if (handle == nullptr) {
+        last_error = "rdma_proxy_finish received a null handle";
+        return -1;
+    }
+    if (!handle->initialized || handle->shut_down) {
+        last_error = "rdma_proxy_finish requires an initialized proxy";
+        return -1;
+    }
+    if (handle->config.num_iterations == 0) {
+        last_error = "per-iteration execution requires finite num_iterations";
+        return -1;
+    }
+    if (handle->next_iteration != handle->config.num_iterations) {
+        last_error = "cannot finish before all configured iterations complete";
+        return -1;
+    }
+    if (handle->finished) return 0;
+    try {
+        handle->proxy.finish_run();
+        handle->finished = true;
         return 0;
     } catch (...) {
         return record_current_exception();
@@ -175,4 +283,3 @@ extern "C" int rdma_proxy_run_argv(
 extern "C" const char* rdma_proxy_last_error(void) {
     return last_error.c_str();
 }
-

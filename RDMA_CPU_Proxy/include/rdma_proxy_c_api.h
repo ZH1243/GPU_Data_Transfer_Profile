@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -33,6 +35,16 @@ RDMA_PROXY_C_API RdmaProxyHandle* rdma_proxy_create(
 
 RDMA_PROXY_C_API int rdma_proxy_initialize(RdmaProxyHandle* handle);
 RDMA_PROXY_C_API int rdma_proxy_run(RdmaProxyHandle* handle);
+
+/* Finite-run iteration control for embedding runtimes that own the main loop. */
+RDMA_PROXY_C_API int rdma_proxy_get_num_iterations(
+    RdmaProxyHandle* handle,
+    uint64_t* num_iterations);
+RDMA_PROXY_C_API int rdma_proxy_run_iteration(
+    RdmaProxyHandle* handle,
+    uint64_t iteration);
+RDMA_PROXY_C_API int rdma_proxy_finish(RdmaProxyHandle* handle);
+
 RDMA_PROXY_C_API int rdma_proxy_shutdown(RdmaProxyHandle* handle);
 RDMA_PROXY_C_API void rdma_proxy_destroy(RdmaProxyHandle* handle);
 
@@ -50,4 +62,3 @@ RDMA_PROXY_C_API const char* rdma_proxy_last_error(void);
 #ifdef __cplusplus
 }
 #endif
-

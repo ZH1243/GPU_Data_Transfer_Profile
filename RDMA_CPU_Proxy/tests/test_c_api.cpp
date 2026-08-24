@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <string>
+#include <thread>
 
 int main(int argc, char** argv) {
     if (rdma_proxy_abi_version() != 1) {
@@ -34,6 +35,50 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    RdmaProxyHandle* handle = rdma_proxy_create(proxy_argc, proxy_argv);
+    if (!handle) {
+        std::cerr << "per-iteration proxy creation failed: " << rdma_proxy_last_error() << '\n';
+        return 1;
+    }
+    if (rdma_proxy_initialize(handle) != 0) {
+        std::cerr << "per-iteration proxy initialization failed: " << rdma_proxy_last_error() << '\n';
+        rdma_proxy_destroy(handle);
+        return 1;
+    }
+    uint64_t num_iterations = 0;
+    if (rdma_proxy_get_num_iterations(handle, &num_iterations) != 0 || num_iterations != 1) {
+        std::cerr << "per-iteration proxy reported unexpected iteration count: "
+                  << rdma_proxy_last_error() << '\n';
+        rdma_proxy_shutdown(handle);
+        rdma_proxy_destroy(handle);
+        return 1;
+    }
+    int iteration_status = -1;
+    std::string iteration_error;
+    std::thread iteration_thread([&] {
+        iteration_status = rdma_proxy_run_iteration(handle, 0);
+        if (iteration_status != 0) iteration_error = rdma_proxy_last_error();
+    });
+    iteration_thread.join();
+    if (iteration_status != 0) {
+        std::cerr << "per-iteration proxy run failed: " << iteration_error << '\n';
+        rdma_proxy_shutdown(handle);
+        rdma_proxy_destroy(handle);
+        return 1;
+    }
+    if (rdma_proxy_finish(handle) != 0) {
+        std::cerr << "per-iteration proxy finish failed: " << rdma_proxy_last_error() << '\n';
+        rdma_proxy_shutdown(handle);
+        rdma_proxy_destroy(handle);
+        return 1;
+    }
+    if (rdma_proxy_shutdown(handle) != 0) {
+        std::cerr << "per-iteration proxy shutdown failed: " << rdma_proxy_last_error() << '\n';
+        rdma_proxy_destroy(handle);
+        return 1;
+    }
+    rdma_proxy_destroy(handle);
+
     const char* invalid_argv[] = {"rdma_cpu_proxy"};
     if (rdma_proxy_create(1, invalid_argv) != nullptr) {
         std::cerr << "invalid proxy arguments unexpectedly created a handle\n";
@@ -45,4 +90,3 @@ int main(int argc, char** argv) {
     }
     return 0;
 }
-

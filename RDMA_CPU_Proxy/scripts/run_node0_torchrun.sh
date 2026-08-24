@@ -53,4 +53,5 @@ master_port="${MASTER_PORT:-29500}"
     --nvlink_forward_log_batches=false \
     --local_iteration_sync_enabled=true \
     --log_qp_reports=false \
-    --mock_mode=false
+    --mock_mode=false \
+    "$@"

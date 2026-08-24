@@ -331,9 +331,7 @@ Proxy::router_notification_publication_buffers() const {
 }
 
 void Proxy::run_once() {
-    if (!initialized_) throw std::runtime_error("proxy is not initialized");
-    run_iteration(0);
-    synchronize_iteration(0);
+    run_iteration_step(0);
     report_rdma_bandwidth_summary();
 }
 
@@ -342,9 +340,22 @@ void Proxy::run() {
     for (uint64_t iteration = 0;
          config_.num_iterations == 0 || iteration < static_cast<uint64_t>(config_.num_iterations);
          ++iteration) {
-        run_iteration(iteration);
-        synchronize_iteration(iteration);
+        run_iteration_step(iteration);
     }
+    finish_run();
+}
+
+void Proxy::run_iteration_step(uint64_t iteration) {
+    if (!initialized_) throw std::runtime_error("proxy is not initialized");
+    if (config_.num_iterations != 0 && iteration >= config_.num_iterations) {
+        throw std::runtime_error("proxy iteration index exceeds configured num_iterations");
+    }
+    run_iteration(iteration);
+    synchronize_iteration(iteration);
+}
+
+void Proxy::finish_run() {
+    if (!initialized_) throw std::runtime_error("proxy is not initialized");
     if (config_.num_iterations != 0) {
         report_rdma_bandwidth_summary();
     }

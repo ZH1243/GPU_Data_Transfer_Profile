@@ -334,6 +334,32 @@ than `RDMA_CPU_Proxy/build-hopper`, or `TORCHRUN_BIN` to select a different
 torchrun executable. Use a fixed node count and `--max_restarts=0`; the proxy's
 peer connections and synchronization barriers assume fixed membership.
 
+### Python-controlled concurrent kernel
+
+Pass `--concurrent-kernel` to opt into a Python-controlled iteration loop:
+
+```bash
+RDMA_CPU_Proxy/scripts/run_node0_torchrun.sh --concurrent-kernel
+RDMA_CPU_Proxy/scripts/run_node1_torchrun.sh --concurrent-kernel
+```
+
+Without this option, the worker continues to call `rdma_proxy_run_argv` and the
+behavior is unchanged. With the option enabled, Python creates and initializes
+the proxy once, leaving its C++ QP/CQ/forwarding threads alive. At each
+iteration a persistent Python coordinator thread and the Python main thread are
+released from the same barrier: the coordinator calls
+`rdma_proxy_run_iteration`, while the main thread launches an independent
+in-place `torch.add` CUDA kernel over 1,048,576 float32 elements on a dedicated
+PyTorch stream. A stream-local CUDA event waits for that demonstration kernel
+without synchronizing the proxy's CUDA streams. After both operations complete,
+the worker advances to the next iteration.
+
+This demonstration kernel has no data dependency on the proxy and allocates
+its own tensor. Concurrent-kernel mode requires PyTorch with CUDA and a finite,
+nonzero `num_iterations`. The shell launchers forward any additional arguments
+to the Python worker, so the same mechanism can be used for later worker or
+proxy overrides.
+
 ## Example Launch
 
 Edit `config/example_config.json` for each node and GPU process. Every proxy should use the same `local_gpu_index` value as the GPU it owns, and peers should point to the same-index proxy on other nodes.
