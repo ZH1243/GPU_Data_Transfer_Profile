@@ -591,9 +591,21 @@ def main() -> int:
     return run_proxy(library, proxy_argv, int(metadata["cuda_device_id"]))
 
 
-if __name__ == "__main__":
+def worker_entrypoint() -> int:
+    """Preserve a readable local diagnostic before TorchElastic records it."""
     try:
-        raise SystemExit(main())
+        return main()
     except Exception as error:
         print(f"rdma_proxy_worker failed: {error}", file=sys.stderr, flush=True)
-        raise SystemExit(1)
+        raise
+
+
+if __name__ == "__main__":
+    try:
+        from torch.distributed.elastic.multiprocessing.errors import record
+    except ImportError:
+        # A direct dry-run can still explain a missing PyTorch installation.
+        recorded_worker_entrypoint = worker_entrypoint
+    else:
+        recorded_worker_entrypoint = record(worker_entrypoint)
+    raise SystemExit(recorded_worker_entrypoint())
