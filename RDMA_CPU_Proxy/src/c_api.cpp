@@ -6,6 +6,7 @@
 #include "proxy.hpp"
 
 #include <exception>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -88,6 +89,36 @@ void select_proxy_cuda_device(const RdmaProxyHandle& handle) {
 #endif
 }
 
+RdmaProxyDeviceBufferRequest make_c_device_buffer_request(
+    const rdma_proxy::DeviceBufferAllocationRequest& request) {
+    if (request.dimensions.size() > 2) {
+        throw std::runtime_error(
+            "external device-buffer request has more than two dimensions");
+    }
+    if (request.bytes > std::numeric_limits<uint64_t>::max()) {
+        throw std::runtime_error("external device-buffer byte size exceeds C ABI range");
+    }
+    RdmaProxyDeviceBufferRequest result{};
+    result.struct_size = sizeof(result);
+    result.version = 1;
+    result.kind = static_cast<int32_t>(request.kind);
+    result.element_type = static_cast<int32_t>(request.element_type);
+    result.peer_rank = request.peer_rank;
+    result.source_node_rank = request.source_node_rank;
+    result.source_gpu_index = request.source_gpu_index;
+    result.dimension_count = static_cast<uint32_t>(request.dimensions.size());
+    result.bytes = static_cast<uint64_t>(request.bytes);
+    for (std::size_t index = 0; index < request.dimensions.size(); ++index) {
+        if (request.dimensions[index] > std::numeric_limits<uint64_t>::max()) {
+            throw std::runtime_error(
+                "external device-buffer dimension exceeds C ABI range");
+        }
+        result.dimensions[index] =
+            static_cast<uint64_t>(request.dimensions[index]);
+    }
+    return result;
+}
+
 }  // namespace
 
 extern "C" int rdma_proxy_abi_version(void) {
@@ -109,6 +140,36 @@ extern "C" RdmaProxyHandle* rdma_proxy_create(
     } catch (...) {
         record_current_exception();
         return nullptr;
+    }
+}
+
+extern "C" int rdma_proxy_set_device_buffer_allocator(
+    RdmaProxyHandle* handle,
+    RdmaProxyDeviceBufferAllocator allocator,
+    void* context) {
+    clear_error();
+    if (handle == nullptr) {
+        last_error = "rdma_proxy_set_device_buffer_allocator received a null handle";
+        return -1;
+    }
+    if (handle->initialized) {
+        last_error = "device-buffer allocator must be set before proxy initialization";
+        return -1;
+    }
+    try {
+        if (allocator == nullptr) {
+            handle->proxy.set_external_device_buffer_allocator({});
+        } else {
+            handle->proxy.set_external_device_buffer_allocator(
+                [allocator, context](
+                    const rdma_proxy::DeviceBufferAllocationRequest& request) -> void* {
+                    const auto c_request = make_c_device_buffer_request(request);
+                    return reinterpret_cast<void*>(allocator(context, &c_request));
+                });
+        }
+        return 0;
+    } catch (...) {
+        return record_current_exception();
     }
 }
 

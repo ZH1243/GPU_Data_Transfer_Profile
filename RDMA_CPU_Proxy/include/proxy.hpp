@@ -27,6 +27,7 @@ public:
     Proxy(const Proxy&) = delete;
     Proxy& operator=(const Proxy&) = delete;
 
+    void set_external_device_buffer_allocator(ExternalDeviceBufferAllocator allocator);
     void initialize();
     void run();
     void run_once();
@@ -73,6 +74,9 @@ private:
         void* ptr{nullptr};
         std::size_t bytes{0};
         bool imported_cuda_ipc{false};
+        // cudaIpcOpenMemHandle returns the allocation base; ptr may include a
+        // PyTorch storage offset and therefore cannot be passed to close.
+        void* imported_cuda_ipc_base{nullptr};
     };
 
     struct ForwardDestinationState {

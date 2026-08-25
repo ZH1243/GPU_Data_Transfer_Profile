@@ -21,6 +21,46 @@ extern "C" {
  */
 typedef struct RdmaProxyHandle RdmaProxyHandle;
 
+/* Device-buffer kinds requested through RdmaProxyDeviceBufferAllocator. */
+typedef enum RdmaProxyDeviceBufferKind {
+    RDMA_PROXY_DEVICE_BUFFER_RDMA_SEND = 1,
+    RDMA_PROXY_DEVICE_BUFFER_RDMA_RECEIVE = 2,
+    RDMA_PROXY_DEVICE_BUFFER_NVLINK_RECEIVE = 3,
+    RDMA_PROXY_DEVICE_BUFFER_ROUTER_A_IDX = 4,
+    RDMA_PROXY_DEVICE_BUFFER_GATHER_TABLE = 5,
+    RDMA_PROXY_DEVICE_BUFFER_GATHER_READY_ROWS = 6,
+} RdmaProxyDeviceBufferKind;
+
+typedef enum RdmaProxyDeviceBufferElementType {
+    RDMA_PROXY_DEVICE_BUFFER_BF16 = 1,
+    RDMA_PROXY_DEVICE_BUFFER_FP16 = 2,
+    RDMA_PROXY_DEVICE_BUFFER_FP32 = 3,
+    RDMA_PROXY_DEVICE_BUFFER_INT32 = 4,
+} RdmaProxyDeviceBufferElementType;
+
+/*
+ * Allocation request passed to an embedding runtime. dimensions contains up
+ * to two logical tensor dimensions; bytes is always the required allocation
+ * size. Negative peer/source identifiers mean "not applicable".
+ */
+typedef struct RdmaProxyDeviceBufferRequest {
+    uint32_t struct_size;
+    uint32_t version;
+    int32_t kind;
+    int32_t element_type;
+    int32_t peer_rank;
+    int32_t source_node_rank;
+    int32_t source_gpu_index;
+    uint32_t dimension_count;
+    uint64_t bytes;
+    uint64_t dimensions[2];
+} RdmaProxyDeviceBufferRequest;
+
+/* Return a device pointer as uintptr_t, or zero to reject the request. */
+typedef uintptr_t (*RdmaProxyDeviceBufferAllocator)(
+    void* context,
+    const RdmaProxyDeviceBufferRequest* request);
+
 /* Increment this value only when the exported ABI changes incompatibly. */
 RDMA_PROXY_C_API int rdma_proxy_abi_version(void);
 
@@ -32,6 +72,17 @@ RDMA_PROXY_C_API int rdma_proxy_abi_version(void);
 RDMA_PROXY_C_API RdmaProxyHandle* rdma_proxy_create(
     int argc,
     const char* const* argv);
+
+/*
+ * Install an allocator before rdma_proxy_initialize(). The proxy borrows all
+ * returned buffers and never frees them; the embedding runtime must keep them
+ * alive until after rdma_proxy_shutdown()/rdma_proxy_destroy(). Passing NULL
+ * restores the proxy's normal internal CUDA allocation behavior.
+ */
+RDMA_PROXY_C_API int rdma_proxy_set_device_buffer_allocator(
+    RdmaProxyHandle* handle,
+    RdmaProxyDeviceBufferAllocator allocator,
+    void* context);
 
 RDMA_PROXY_C_API int rdma_proxy_initialize(RdmaProxyHandle* handle);
 RDMA_PROXY_C_API int rdma_proxy_run(RdmaProxyHandle* handle);

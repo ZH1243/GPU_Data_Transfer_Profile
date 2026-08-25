@@ -1,8 +1,36 @@
 #include "rdma_proxy_c_api.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <thread>
+#include <vector>
+
+namespace {
+
+struct ExternalAllocations {
+    std::vector<void*> pointers;
+    std::vector<RdmaProxyDeviceBufferRequest> requests;
+};
+
+uintptr_t allocate_external_buffer(
+    void* context,
+    const RdmaProxyDeviceBufferRequest* request) {
+    if (!context || !request || request->struct_size != sizeof(*request) ||
+        request->version != 1 || request->bytes == 0) {
+        return 0;
+    }
+    auto* allocations = static_cast<ExternalAllocations*>(context);
+    void* pointer = std::malloc(static_cast<std::size_t>(request->bytes));
+    if (!pointer) return 0;
+    std::memset(pointer, 0, static_cast<std::size_t>(request->bytes));
+    allocations->pointers.push_back(pointer);
+    allocations->requests.push_back(*request);
+    return reinterpret_cast<uintptr_t>(pointer);
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
     if (rdma_proxy_abi_version() != 1) {
@@ -40,9 +68,46 @@ int main(int argc, char** argv) {
         std::cerr << "per-iteration proxy creation failed: " << rdma_proxy_last_error() << '\n';
         return 1;
     }
+    ExternalAllocations external_allocations;
+    if (rdma_proxy_set_device_buffer_allocator(
+            handle, allocate_external_buffer, &external_allocations) != 0) {
+        std::cerr << "failed to install external allocator: "
+                  << rdma_proxy_last_error() << '\n';
+        rdma_proxy_destroy(handle);
+        return 1;
+    }
     if (rdma_proxy_initialize(handle) != 0) {
         std::cerr << "per-iteration proxy initialization failed: " << rdma_proxy_last_error() << '\n';
         rdma_proxy_destroy(handle);
+        return 1;
+    }
+    std::size_t send_request_count = 0;
+    std::size_t receive_request_count = 0;
+    bool invalid_request = false;
+    for (const auto& request : external_allocations.requests) {
+        send_request_count +=
+            request.kind == RDMA_PROXY_DEVICE_BUFFER_RDMA_SEND ? 1 : 0;
+        receive_request_count +=
+            request.kind == RDMA_PROXY_DEVICE_BUFFER_RDMA_RECEIVE ? 1 : 0;
+        invalid_request = invalid_request || request.dimension_count != 2 ||
+            request.dimensions[0] != 32 || request.dimensions[1] != 8 ||
+            request.bytes != 32 * 8 * 2;
+    }
+    if (external_allocations.requests.size() != 6 ||
+        send_request_count != 3 || receive_request_count != 3 ||
+        invalid_request) {
+        std::cerr << "external allocator received unexpected buffer requests\n";
+        rdma_proxy_shutdown(handle);
+        rdma_proxy_destroy(handle);
+        for (void* pointer : external_allocations.pointers) std::free(pointer);
+        return 1;
+    }
+    if (rdma_proxy_set_device_buffer_allocator(
+            handle, allocate_external_buffer, &external_allocations) == 0) {
+        std::cerr << "external allocator was accepted after initialization\n";
+        rdma_proxy_shutdown(handle);
+        rdma_proxy_destroy(handle);
+        for (void* pointer : external_allocations.pointers) std::free(pointer);
         return 1;
     }
     uint64_t num_iterations = 0;
@@ -78,6 +143,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     rdma_proxy_destroy(handle);
+    // The proxy borrows callback allocations and must leave freeing them to
+    // the embedding runtime.
+    for (void* pointer : external_allocations.pointers) std::free(pointer);
 
     const char* invalid_argv[] = {"rdma_cpu_proxy"};
     if (rdma_proxy_create(1, invalid_argv) != nullptr) {

@@ -301,8 +301,8 @@ The executable remains available at
 `RDMA_CPU_Proxy/build-hopper/rdma_cpu_proxy`. The shared library exports the
 stable C interface declared in `include/rdma_proxy_c_api.h`. Its opaque handle
 API supports separate create, initialize, run, shutdown, and destroy calls;
-`rdma_proxy_run_argv` provides the complete blocking lifecycle used by the
-Python worker.
+`rdma_proxy_run_argv` provides a complete blocking lifecycle for embedders that
+want the proxy to retain its normal internal allocation behavior.
 
 The supplied torchrun worker loads the library with `ctypes.CDLL`. It derives
 the proxy topology from `LOCAL_RANK`, `LOCAL_WORLD_SIZE`, `RANK`, `WORLD_SIZE`,
@@ -310,6 +310,18 @@ and `GROUP_RANK`, then appends the per-worker GPU, NIC, and TCP-port overrides
 to the normal proxy command-line arguments. It does not initialize a Torch
 distributed process group; torchrun is used only to launch and monitor one
 Python/proxy process per GPU.
+
+The worker installs `rdma_proxy_set_device_buffer_allocator` before proxy
+initialization. When C++ needs an RDMA send/receive buffer, source-specific
+NVLink receive buffer, padded router `A_idx`, gather table, or ready-row flag,
+it sends Python a typed shape/size request. Python allocates an ordinary CUDA
+`torch.Tensor`, returns its `data_ptr()`, and retains the tensor through proxy
+shutdown. C++ borrows and registers those pointers but never calls `cudaFree`
+on them. Router-dependent shapes are therefore still computed by the existing
+C++ metadata exchange rather than duplicated in Python. This ownership change
+applies only to the supplied Python worker; the standalone executable and
+`rdma_proxy_run_argv` continue to allocate their buffers internally. The worker
+requires CUDA-enabled PyTorch in both normal and concurrent-kernel modes.
 
 For the checked-in two-node, seven-GPU launch, start node 0 and node 1 with:
 
@@ -343,9 +355,9 @@ RDMA_CPU_Proxy/scripts/run_node0_torchrun.sh --concurrent-kernel
 RDMA_CPU_Proxy/scripts/run_node1_torchrun.sh --concurrent-kernel
 ```
 
-Without this option, the worker continues to call `rdma_proxy_run_argv` and the
-behavior is unchanged. With the option enabled, Python creates and initializes
-the proxy once, leaving its C++ QP/CQ/forwarding threads alive. At each
+Without this option, the worker calls the handle-based blocking `rdma_proxy_run`
+entry point. With the option enabled, Python instead owns the iteration loop,
+leaving the initialized C++ QP/CQ/forwarding threads alive. At each
 iteration a persistent Python coordinator thread and the Python main thread are
 released from the same barrier: the coordinator calls
 `rdma_proxy_run_iteration`, while the main thread launches an independent

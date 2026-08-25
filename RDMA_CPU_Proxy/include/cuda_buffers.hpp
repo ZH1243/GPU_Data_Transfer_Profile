@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -15,7 +16,39 @@ struct GpuBuffer {
     void* ptr{nullptr};
     std::size_t bytes{0};
     bool is_mock_host_memory{false};
+    // Borrowed buffers are allocated and retained by the embedding runtime.
+    // CudaBuffers may read/write them but must never release their storage.
+    bool is_externally_owned{false};
 };
+
+enum class DeviceBufferKind : int32_t {
+    kRdmaSend = 1,
+    kRdmaReceive = 2,
+    kNvlinkReceive = 3,
+    kRouterAIdx = 4,
+    kGatherTable = 5,
+    kGatherReadyRows = 6,
+};
+
+enum class DeviceBufferElementType : int32_t {
+    kBF16 = 1,
+    kFP16 = 2,
+    kFP32 = 3,
+    kInt32 = 4,
+};
+
+struct DeviceBufferAllocationRequest {
+    DeviceBufferKind kind{DeviceBufferKind::kRdmaSend};
+    DeviceBufferElementType element_type{DeviceBufferElementType::kBF16};
+    int peer_rank{-1};
+    int source_node_rank{-1};
+    int source_gpu_index{-1};
+    std::size_t bytes{0};
+    std::vector<std::size_t> dimensions;
+};
+
+using ExternalDeviceBufferAllocator =
+    std::function<void*(const DeviceBufferAllocationRequest&)>;
 
 struct CpuPinnedBuffer {
     void* ptr{nullptr};
@@ -95,6 +128,11 @@ struct CudaForwardCopy {
     std::size_t bytes{0};
 };
 
+struct CudaIpcMemoryHandle {
+    std::string handle_hex;
+    std::size_t offset{0};
+};
+
 class CudaBuffers {
 public:
     explicit CudaBuffers(ProxyConfig config);
@@ -103,6 +141,7 @@ public:
     CudaBuffers(const CudaBuffers&) = delete;
     CudaBuffers& operator=(const CudaBuffers&) = delete;
 
+    void set_external_device_buffer_allocator(ExternalDeviceBufferAllocator allocator);
     void initialize();
     void copy_tokens_to_send_buffer(int peer_rank, const void* src_device_or_host, std::size_t bytes);
     void fill_test_pattern(int peer_rank, int source_rank, int destination_rank, uint64_t iteration);
@@ -156,7 +195,9 @@ public:
     std::size_t nvlink_receive_buffer_bytes() const;
 
 private:
-    void allocate_buffer(GpuBuffer& buffer, std::size_t bytes);
+    void allocate_buffer(
+        GpuBuffer& buffer,
+        const DeviceBufferAllocationRequest& request);
     void free_buffer(GpuBuffer& buffer);
     void allocate_pinned_buffer(CpuPinnedBuffer& buffer, std::size_t bytes);
     void free_pinned_buffer(CpuPinnedBuffer& buffer);
@@ -177,6 +218,7 @@ private:
         std::size_t table_bytes);
 
     ProxyConfig config_;
+    ExternalDeviceBufferAllocator external_device_buffer_allocator_;
     GpuBuffer router_send_buffer_;
     std::vector<PeerGpuBuffers> buffers_;
     std::vector<NvlinkReceiveBuffer> nvlink_recv_buffers_;
@@ -204,7 +246,7 @@ void launch_cuda_forward_copy_batch_async(
     void* stream,
     bool use_batch_api,
     bool mock_mode);
-std::string export_cuda_ipc_memory_handle(void* ptr, bool mock_mode);
+CudaIpcMemoryHandle export_cuda_ipc_memory_handle(void* ptr, bool mock_mode);
 void* open_cuda_ipc_memory_handle(const std::string& handle_hex, uint64_t mock_addr, bool mock_mode);
 void close_cuda_ipc_memory_handle(void* ptr, bool mock_mode);
 

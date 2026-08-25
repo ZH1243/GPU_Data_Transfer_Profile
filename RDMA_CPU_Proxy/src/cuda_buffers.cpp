@@ -63,6 +63,37 @@ std::vector<uint8_t> make_test_pattern(
     return pattern;
 }
 
+DeviceBufferElementType device_buffer_element_type(DataType dtype) {
+    switch (dtype) {
+        case DataType::kBF16: return DeviceBufferElementType::kBF16;
+        case DataType::kFP16: return DeviceBufferElementType::kFP16;
+        case DataType::kFP32: return DeviceBufferElementType::kFP32;
+    }
+    throw std::runtime_error("unsupported device-buffer data type");
+}
+
+DeviceBufferAllocationRequest token_buffer_request(
+    DeviceBufferKind kind,
+    const ProxyConfig& config,
+    std::size_t bytes,
+    int peer_rank = -1,
+    int source_node_rank = -1,
+    int source_gpu_index = -1) {
+    DeviceBufferAllocationRequest request;
+    request.kind = kind;
+    request.element_type = device_buffer_element_type(config.dtype);
+    request.peer_rank = peer_rank;
+    request.source_node_rank = source_node_rank;
+    request.source_gpu_index = source_gpu_index;
+    request.bytes = bytes;
+    const auto row_bytes = config.token_dimension * dtype_size(config.dtype);
+    if (row_bytes == 0 || bytes % row_bytes != 0) {
+        throw std::runtime_error("device token-buffer size is not row aligned");
+    }
+    request.dimensions = {bytes / row_bytes, config.token_dimension};
+    return request;
+}
+
 }  // namespace
 
 #if RDMA_PROXY_HAVE_CUDA
@@ -70,6 +101,17 @@ void launch_copy_tokens_kernel(void* dst, const void* src, std::size_t bytes);
 #endif
 
 CudaBuffers::CudaBuffers(ProxyConfig config) : config_(std::move(config)) {}
+
+void CudaBuffers::set_external_device_buffer_allocator(
+    ExternalDeviceBufferAllocator allocator) {
+    if (!buffers_.empty() || router_send_buffer_.ptr ||
+        !nvlink_recv_buffers_.empty() ||
+        router_notification_publication_buffers_.device_ready_rows.ptr) {
+        throw std::runtime_error(
+            "external device-buffer allocator must be set before initialization");
+    }
+    external_device_buffer_allocator_ = std::move(allocator);
+}
 
 CudaBuffers::~CudaBuffers() {
 #if RDMA_PROXY_HAVE_CUDA
@@ -126,7 +168,9 @@ void CudaBuffers::initialize() {
     buffers_.clear();
     buffers_.reserve(config_.peers.size());
     if (config_.router_routing_enabled) {
-        allocate_buffer(router_send_buffer_, bytes);
+        allocate_buffer(
+            router_send_buffer_,
+            token_buffer_request(DeviceBufferKind::kRdmaSend, config_, bytes));
         RDMA_PROXY_LOG_INFO("allocated shared router RDMA send buffer bytes=", bytes);
     }
     for (const auto& peer : config_.peers) {
@@ -135,9 +179,15 @@ void CudaBuffers::initialize() {
         if (config_.router_routing_enabled) {
             entry.send = router_send_buffer_;
         } else {
-            allocate_buffer(entry.send, bytes);
+            allocate_buffer(
+                entry.send,
+                token_buffer_request(
+                    DeviceBufferKind::kRdmaSend, config_, bytes, peer.node_rank));
         }
-        allocate_buffer(entry.recv, bytes);
+        allocate_buffer(
+            entry.recv,
+            token_buffer_request(
+                DeviceBufferKind::kRdmaReceive, config_, bytes, peer.node_rank));
         buffers_.push_back(entry);
         RDMA_PROXY_LOG_INFO("allocated GPU buffers for peer ", peer.node_rank, " bytes=", bytes);
     }
@@ -154,7 +204,15 @@ void CudaBuffers::initialize() {
                     NvlinkReceiveBuffer entry;
                     entry.source_node_rank = source_node;
                     entry.source_gpu_index = source_gpu;
-                    allocate_buffer(entry.recv, forwarding_bytes);
+                    allocate_buffer(
+                        entry.recv,
+                        token_buffer_request(
+                            DeviceBufferKind::kNvlinkReceive,
+                            config_,
+                            forwarding_bytes,
+                            -1,
+                            source_node,
+                            source_gpu));
                     nvlink_recv_buffers_.push_back(entry);
                     RDMA_PROXY_LOG_INFO(
                         "allocated router NVLink receive buffer local_gpu=", config_.local_gpu_index,
@@ -169,7 +227,15 @@ void CudaBuffers::initialize() {
                 if (source_gpu == config_.local_gpu_index) continue;
                 NvlinkReceiveBuffer entry;
                 entry.source_gpu_index = source_gpu;
-                allocate_buffer(entry.recv, forwarding_bytes);
+                allocate_buffer(
+                    entry.recv,
+                    token_buffer_request(
+                        DeviceBufferKind::kNvlinkReceive,
+                        config_,
+                        forwarding_bytes,
+                        -1,
+                        -1,
+                        source_gpu));
                 nvlink_recv_buffers_.push_back(entry);
                 RDMA_PROXY_LOG_INFO("allocated NVLink receive buffer local_gpu=", config_.local_gpu_index,
                                     " source_gpu=", source_gpu,
@@ -182,7 +248,16 @@ void CudaBuffers::initialize() {
         config_.nvlink_forward_completion_notifications_enabled) {
         auto& publication = router_notification_publication_buffers_;
         allocate_pinned_buffer(publication.host_ready_rows, sizeof(int32_t));
-        allocate_buffer(publication.device_ready_rows, sizeof(int32_t));
+        allocate_buffer(
+            publication.device_ready_rows,
+            DeviceBufferAllocationRequest{
+                DeviceBufferKind::kGatherReadyRows,
+                DeviceBufferElementType::kInt32,
+                -1,
+                -1,
+                -1,
+                sizeof(int32_t),
+                {1}});
         router_notification_publication_stream_ = create_cuda_stream(
             config_.cuda_device_id,
             /*nonblocking=*/true,
@@ -539,7 +614,14 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
             buffer.expert_metadata.expert_token_indices.size();
         allocate_buffer(
             buffer.expert_token_indices_device,
-            a_idx_capacity * sizeof(int32_t));
+            DeviceBufferAllocationRequest{
+                DeviceBufferKind::kRouterAIdx,
+                DeviceBufferElementType::kInt32,
+                -1,
+                buffer.source_node_rank,
+                buffer.source_gpu_index,
+                a_idx_capacity * sizeof(int32_t),
+                {a_idx_capacity}});
         std::vector<int32_t> padded_indices(a_idx_capacity, 0);
         std::copy(
             buffer.expert_metadata.expert_token_indices.begin(),
@@ -617,7 +699,16 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
     const auto table_bytes = publication.table_rows * publication.table_row_bytes;
     if (table_bytes != 0) {
         allocate_pinned_buffer(publication.host_table, table_bytes);
-        allocate_buffer(publication.device_table, table_bytes);
+        allocate_buffer(
+            publication.device_table,
+            DeviceBufferAllocationRequest{
+                DeviceBufferKind::kGatherTable,
+                DeviceBufferElementType::kInt32,
+                -1,
+                -1,
+                -1,
+                table_bytes,
+                {publication.table_rows, publication.table_width}});
     }
     if (config_.nvlink_forward_notification_flag_update_mode ==
         NvlinkForwardNotificationFlagUpdateMode::kMemcpy) {
@@ -1076,17 +1167,38 @@ std::size_t CudaBuffers::nvlink_receive_buffer_bytes() const {
     return token_buffer_bytes() * config_.peers.size();
 }
 
-void CudaBuffers::allocate_buffer(GpuBuffer& buffer, std::size_t bytes) {
-    buffer.bytes = bytes;
+void CudaBuffers::allocate_buffer(
+    GpuBuffer& buffer,
+    const DeviceBufferAllocationRequest& request) {
+    if (request.bytes == 0) {
+        throw std::runtime_error("cannot allocate a zero-byte device buffer");
+    }
+    buffer.bytes = request.bytes;
     buffer.is_mock_host_memory = config_.mock_mode;
+    if (external_device_buffer_allocator_) {
+        buffer.ptr = external_device_buffer_allocator_(request);
+        if (!buffer.ptr) {
+            buffer.bytes = 0;
+            throw std::runtime_error("external device-buffer allocator returned a null pointer");
+        }
+        buffer.is_externally_owned = true;
+        RDMA_PROXY_LOG_INFO(
+            "borrowed externally allocated device buffer kind=",
+            static_cast<int>(request.kind),
+            " bytes=", request.bytes,
+            " peer=", request.peer_rank,
+            " source_node=", request.source_node_rank,
+            " source_gpu=", request.source_gpu_index);
+        return;
+    }
     if (config_.mock_mode) {
-        buffer.ptr = ::operator new(bytes);
-        std::memset(buffer.ptr, 0, bytes);
+        buffer.ptr = ::operator new(request.bytes);
+        std::memset(buffer.ptr, 0, request.bytes);
         return;
     }
 #if RDMA_PROXY_HAVE_CUDA
-    check_cuda(cudaMalloc(&buffer.ptr, bytes), "cudaMalloc");
-    check_cuda(cudaMemset(buffer.ptr, 0, bytes), "cudaMemset");
+    check_cuda(cudaMalloc(&buffer.ptr, request.bytes), "cudaMalloc");
+    check_cuda(cudaMemset(buffer.ptr, 0, request.bytes), "cudaMemset");
 #else
     throw std::runtime_error("CUDA allocation requested but CUDA support was not built");
 #endif
@@ -1094,6 +1206,12 @@ void CudaBuffers::allocate_buffer(GpuBuffer& buffer, std::size_t bytes) {
 
 void CudaBuffers::free_buffer(GpuBuffer& buffer) {
     if (!buffer.ptr) return;
+    if (buffer.is_externally_owned) {
+        buffer.ptr = nullptr;
+        buffer.bytes = 0;
+        buffer.is_externally_owned = false;
+        return;
+    }
     if (buffer.is_mock_host_memory) {
         ::operator delete(buffer.ptr);
     } else {
@@ -1315,22 +1433,39 @@ void launch_cuda_forward_copy_batch_async(
 #endif
 }
 
-std::string export_cuda_ipc_memory_handle(void* ptr, bool mock_mode) {
+CudaIpcMemoryHandle export_cuda_ipc_memory_handle(void* ptr, bool mock_mode) {
     if (!ptr) throw std::runtime_error("cannot export null CUDA IPC pointer");
     std::ostringstream out;
     out << std::hex << std::setfill('0');
     if (mock_mode) {
         out << std::setw(sizeof(uintptr_t) * 2) << reinterpret_cast<uintptr_t>(ptr);
-        return out.str();
+        return CudaIpcMemoryHandle{out.str(), 0};
     }
 #if RDMA_PROXY_HAVE_CUDA
+    CUdeviceptr allocation_base = 0;
+    std::size_t allocation_bytes = 0;
+    check_cuda_driver(
+        cuMemGetAddressRange(
+            &allocation_base,
+            &allocation_bytes,
+            reinterpret_cast<CUdeviceptr>(ptr)),
+        "cuMemGetAddressRange");
+    const auto pointer_value = reinterpret_cast<uintptr_t>(ptr);
+    const auto base_value = static_cast<uintptr_t>(allocation_base);
+    if (pointer_value < base_value ||
+        pointer_value - base_value >= allocation_bytes) {
+        throw std::runtime_error("CUDA IPC pointer is outside its allocation range");
+    }
     cudaIpcMemHandle_t handle{};
-    check_cuda(cudaIpcGetMemHandle(&handle, ptr), "cudaIpcGetMemHandle");
+    check_cuda(
+        cudaIpcGetMemHandle(
+            &handle, reinterpret_cast<void*>(allocation_base)),
+        "cudaIpcGetMemHandle");
     const auto* bytes = reinterpret_cast<const unsigned char*>(&handle);
     for (std::size_t i = 0; i < sizeof(handle); ++i) {
         out << std::setw(2) << static_cast<unsigned>(bytes[i]);
     }
-    return out.str();
+    return CudaIpcMemoryHandle{out.str(), pointer_value - base_value};
 #else
     throw std::runtime_error("CUDA IPC export requested but CUDA support was not built");
 #endif

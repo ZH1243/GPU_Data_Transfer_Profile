@@ -543,6 +543,53 @@ int main() {
     assert(run_flush_policy(true) ==
            std::make_pair(uint64_t{6}, uint64_t{6}));
 
+    // The embedding allocator receives both the statically shaped transport
+    // buffers and the router-dependent QuACK tensors allocated after metadata
+    // installation. CudaBuffers borrows every returned pointer.
+    std::vector<void*> external_device_pointers;
+    std::vector<DeviceBufferAllocationRequest> external_device_requests;
+    {
+        CudaBuffers external_buffers(scheduler_config);
+        external_buffers.set_external_device_buffer_allocator(
+            [&](const DeviceBufferAllocationRequest& request) -> void* {
+                void* pointer = ::operator new(request.bytes);
+                std::memset(pointer, 0, request.bytes);
+                external_device_pointers.push_back(pointer);
+                external_device_requests.push_back(request);
+                return pointer;
+            });
+        external_buffers.initialize();
+        auto source0_metadata = scheduler_metadata;
+        source0_metadata.source_gpu_index = 0;
+        source0_metadata.expert_token_indices = {0, 1, 4};
+        source0_metadata.expert_offsets = {0, 3};
+        external_buffers.install_expert_metadata(source0_metadata);
+        auto source1_metadata = scheduler_metadata;
+        source1_metadata.source_gpu_index = 1;
+        source1_metadata.expert_token_indices = {0, 2, 3, 4, 5, 6};
+        source1_metadata.expert_offsets = {0, 6};
+        external_buffers.install_expert_metadata(source1_metadata);
+
+        const auto count_kind = [&](DeviceBufferKind kind) {
+            return std::count_if(
+                external_device_requests.begin(),
+                external_device_requests.end(),
+                [&](const DeviceBufferAllocationRequest& request) {
+                    return request.kind == kind;
+                });
+        };
+        assert(external_device_requests.size() == 7);
+        assert(count_kind(DeviceBufferKind::kRdmaSend) == 1);
+        assert(count_kind(DeviceBufferKind::kNvlinkReceive) == 2);
+        assert(count_kind(DeviceBufferKind::kRouterAIdx) == 2);
+        assert(count_kind(DeviceBufferKind::kGatherTable) == 1);
+        assert(count_kind(DeviceBufferKind::kGatherReadyRows) == 1);
+        const auto& last_request = external_device_requests.back();
+        assert(last_request.kind == DeviceBufferKind::kGatherTable);
+        assert((last_request.dimensions == std::vector<std::size_t>{6, 6}));
+    }
+    for (void* pointer : external_device_pointers) ::operator delete(pointer);
+
     DynamicChunkDistributor distributor(
         chunks,
         /*peer_rank=*/2,

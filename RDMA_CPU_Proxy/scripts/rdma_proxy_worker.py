@@ -16,6 +16,174 @@ import threading
 EXPECTED_ABI_VERSION = 1
 CONCURRENT_KERNEL_ELEMENTS = 1 << 20
 
+DEVICE_BUFFER_RDMA_SEND = 1
+DEVICE_BUFFER_RDMA_RECEIVE = 2
+DEVICE_BUFFER_NVLINK_RECEIVE = 3
+DEVICE_BUFFER_ROUTER_A_IDX = 4
+DEVICE_BUFFER_GATHER_TABLE = 5
+DEVICE_BUFFER_GATHER_READY_ROWS = 6
+
+DEVICE_BUFFER_BF16 = 1
+DEVICE_BUFFER_FP16 = 2
+DEVICE_BUFFER_FP32 = 3
+DEVICE_BUFFER_INT32 = 4
+
+
+class DeviceBufferRequest(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("kind", ctypes.c_int32),
+        ("element_type", ctypes.c_int32),
+        ("peer_rank", ctypes.c_int32),
+        ("source_node_rank", ctypes.c_int32),
+        ("source_gpu_index", ctypes.c_int32),
+        ("dimension_count", ctypes.c_uint32),
+        ("bytes", ctypes.c_uint64),
+        ("dimensions", ctypes.c_uint64 * 2),
+    ]
+
+
+DeviceBufferAllocatorCallback = ctypes.CFUNCTYPE(
+    ctypes.c_uint64,
+    ctypes.c_void_p,
+    ctypes.POINTER(DeviceBufferRequest),
+)
+
+
+class TorchDeviceBuffers:
+    """Own proxy-visible CUDA tensors and service C++ allocation requests."""
+
+    _KIND_NAMES = {
+        DEVICE_BUFFER_RDMA_SEND: "rdma_send",
+        DEVICE_BUFFER_RDMA_RECEIVE: "rdma_receive",
+        DEVICE_BUFFER_NVLINK_RECEIVE: "nvlink_receive",
+        DEVICE_BUFFER_ROUTER_A_IDX: "router_a_idx",
+        DEVICE_BUFFER_GATHER_TABLE: "gather_table",
+        DEVICE_BUFFER_GATHER_READY_ROWS: "gather_ready_rows",
+    }
+
+    def __init__(self, torch_module, cuda_device_id: int) -> None:
+        self.torch = torch_module
+        self.cuda_device_id = cuda_device_id
+        self.tensors: dict[tuple[int, int, int, int], object] = {}
+        self.allocation_error: BaseException | None = None
+        # ctypes callbacks must themselves remain strongly referenced for as
+        # long as C++ can invoke them.
+        self.callback = DeviceBufferAllocatorCallback(self._allocate)
+
+    def _allocate(
+        self,
+        _context: int | None,
+        request_pointer: ctypes.POINTER(DeviceBufferRequest),
+    ) -> int:
+        try:
+            if not request_pointer:
+                raise RuntimeError("C++ requested a device buffer without a descriptor")
+            request = request_pointer.contents
+            if request.struct_size != ctypes.sizeof(DeviceBufferRequest):
+                raise RuntimeError(
+                    "device-buffer request structure size mismatch: "
+                    f"C++={request.struct_size}, Python={ctypes.sizeof(DeviceBufferRequest)}"
+                )
+            if request.version != 1:
+                raise RuntimeError(
+                    f"unsupported device-buffer request version {request.version}"
+                )
+            if request.dimension_count < 1 or request.dimension_count > 2:
+                raise RuntimeError(
+                    f"invalid device-buffer dimension count {request.dimension_count}"
+                )
+
+            dtype_by_element_type = {
+                DEVICE_BUFFER_BF16: self.torch.bfloat16,
+                DEVICE_BUFFER_FP16: self.torch.float16,
+                DEVICE_BUFFER_FP32: self.torch.float32,
+                DEVICE_BUFFER_INT32: self.torch.int32,
+            }
+            try:
+                dtype = dtype_by_element_type[request.element_type]
+                kind_name = self._KIND_NAMES[request.kind]
+            except KeyError as error:
+                raise RuntimeError(
+                    "C++ requested an unknown device-buffer kind or element type: "
+                    f"kind={request.kind}, element_type={request.element_type}"
+                ) from error
+
+            shape = tuple(
+                int(request.dimensions[index])
+                for index in range(request.dimension_count)
+            )
+            tensor = self.torch.empty(
+                shape,
+                dtype=dtype,
+                device=f"cuda:{self.cuda_device_id}",
+            )
+            tensor_bytes = tensor.numel() * tensor.element_size()
+            if tensor_bytes != request.bytes:
+                raise RuntimeError(
+                    f"{kind_name} tensor shape {shape} occupies {tensor_bytes} bytes, "
+                    f"but C++ requested {request.bytes}"
+                )
+
+            # The launch scripts disable C++ test-pattern filling. Give the
+            # shared RDMA send tensor finite floating-point payloads now so it
+            # is also suitable as the future communication/GEMM input source.
+            if request.kind == DEVICE_BUFFER_RDMA_SEND:
+                tensor.normal_(mean=0.0, std=0.02)
+
+            key = (
+                int(request.kind),
+                int(request.peer_rank),
+                int(request.source_node_rank),
+                int(request.source_gpu_index),
+            )
+            if key in self.tensors:
+                raise RuntimeError(f"duplicate C++ device-buffer request for key {key}")
+            self.tensors[key] = tensor
+            return int(tensor.data_ptr())
+        except BaseException as error:
+            self.allocation_error = error
+            return 0
+
+    def finish_initialization(self) -> None:
+        if self.allocation_error is not None:
+            raise RuntimeError(
+                f"Python device-buffer allocation failed: {self.allocation_error}"
+            ) from self.allocation_error
+        # In particular, finish the random send-buffer initialization before
+        # the first C++ iteration is allowed to post RDMA work.
+        self.torch.cuda.synchronize(self.cuda_device_id)
+        total_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in self.tensors.values()
+        )
+        counts: dict[str, int] = {}
+        for kind, _, _, _ in self.tensors:
+            name = self._KIND_NAMES[kind]
+            counts[name] = counts.get(name, 0) + 1
+        print(
+            "Python owns proxy CUDA buffers: "
+            f"count={len(self.tensors)} bytes={total_bytes} by_kind={counts}",
+            flush=True,
+        )
+
+    def tensors_of_kind(self, kind: int) -> list[object]:
+        """Return tensors in the same allocation/source order used by C++."""
+        return [
+            tensor
+            for (tensor_kind, _, _, _), tensor in self.tensors.items()
+            if tensor_kind == kind
+        ]
+
+    def only_tensor_of_kind(self, kind: int):
+        tensors = self.tensors_of_kind(kind)
+        if len(tensors) != 1:
+            raise RuntimeError(
+                f"expected one {self._KIND_NAMES[kind]} tensor, got {len(tensors)}"
+            )
+        return tensors[0]
+
 
 def environment_integer(name: str) -> int:
     value = os.environ.get(name)
@@ -128,8 +296,16 @@ def load_proxy_library(path: Path) -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_char_p),
     ]
     library.rdma_proxy_create.restype = ctypes.c_void_p
+    library.rdma_proxy_set_device_buffer_allocator.argtypes = [
+        ctypes.c_void_p,
+        DeviceBufferAllocatorCallback,
+        ctypes.c_void_p,
+    ]
+    library.rdma_proxy_set_device_buffer_allocator.restype = ctypes.c_int
     library.rdma_proxy_initialize.argtypes = [ctypes.c_void_p]
     library.rdma_proxy_initialize.restype = ctypes.c_int
+    library.rdma_proxy_run.argtypes = [ctypes.c_void_p]
+    library.rdma_proxy_run.restype = ctypes.c_int
     library.rdma_proxy_get_num_iterations.argtypes = [
         ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_uint64),
@@ -174,12 +350,72 @@ def require_proxy_success(library: ctypes.CDLL, status: int, operation: str) -> 
         raise RuntimeError(f"{operation} failed: {proxy_last_error(library)}")
 
 
-def run_proxy(library: ctypes.CDLL, proxy_argv: list[str]) -> int:
+def import_torch_for_proxy(cuda_device_id: int):
+    try:
+        import torch
+    except ImportError as error:
+        raise RuntimeError("the Python-owned buffer path requires PyTorch") from error
+    if not torch.cuda.is_available():
+        raise RuntimeError("the Python-owned buffer path requires an available CUDA device")
+    torch.cuda.set_device(cuda_device_id)
+    return torch
+
+
+def install_python_device_buffers(
+    library: ctypes.CDLL,
+    handle: int,
+    torch_module,
+    cuda_device_id: int,
+) -> TorchDeviceBuffers:
+    buffers = TorchDeviceBuffers(torch_module, cuda_device_id)
+    require_proxy_success(
+        library,
+        library.rdma_proxy_set_device_buffer_allocator(
+            handle, buffers.callback, None
+        ),
+        "installing Python device-buffer allocator",
+    )
+    return buffers
+
+
+def run_proxy(
+    library: ctypes.CDLL,
+    proxy_argv: list[str],
+    cuda_device_id: int,
+) -> int:
     c_argv = encode_proxy_argv(proxy_argv)
-    status = library.rdma_proxy_run_argv(len(proxy_argv), c_argv)
-    if status != 0:
-        raise RuntimeError(proxy_last_error(library))
-    return status
+    torch = import_torch_for_proxy(cuda_device_id)
+    handle = library.rdma_proxy_create(len(proxy_argv), c_argv)
+    if not handle:
+        raise RuntimeError(f"proxy creation failed: {proxy_last_error(library)}")
+
+    initialized = False
+    device_buffers: TorchDeviceBuffers | None = None
+    try:
+        device_buffers = install_python_device_buffers(
+            library, handle, torch, cuda_device_id
+        )
+        initialize_status = library.rdma_proxy_initialize(handle)
+        if initialize_status != 0 and device_buffers.allocation_error is not None:
+            raise RuntimeError(
+                "proxy initialization failed after Python rejected a buffer request: "
+                f"{device_buffers.allocation_error}; C++: {proxy_last_error(library)}"
+            ) from device_buffers.allocation_error
+        require_proxy_success(library, initialize_status, "proxy initialization")
+        initialized = True
+        device_buffers.finish_initialization()
+        require_proxy_success(library, library.rdma_proxy_run(handle), "proxy run")
+        return 0
+    finally:
+        if initialized:
+            shutdown_status = library.rdma_proxy_shutdown(handle)
+            if shutdown_status != 0:
+                print(
+                    f"proxy shutdown failed: {proxy_last_error(library)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        library.rdma_proxy_destroy(handle)
 
 
 def run_proxy_with_concurrent_kernel(
@@ -190,6 +426,7 @@ def run_proxy_with_concurrent_kernel(
     """Let Python launch one independent CUDA kernel with each proxy iteration."""
 
     c_argv = encode_proxy_argv(proxy_argv)
+    torch = import_torch_for_proxy(cuda_device_id)
     handle = library.rdma_proxy_create(len(proxy_argv), c_argv)
     if not handle:
         raise RuntimeError(f"proxy creation failed: {proxy_last_error(library)}")
@@ -198,11 +435,20 @@ def run_proxy_with_concurrent_kernel(
     coordinator: threading.Thread | None = None
     commands: queue.Queue = queue.Queue()
     results: queue.Queue = queue.Queue()
+    device_buffers: TorchDeviceBuffers | None = None
     try:
-        require_proxy_success(
-            library, library.rdma_proxy_initialize(handle), "proxy initialization"
+        device_buffers = install_python_device_buffers(
+            library, handle, torch, cuda_device_id
         )
+        initialize_status = library.rdma_proxy_initialize(handle)
+        if initialize_status != 0 and device_buffers.allocation_error is not None:
+            raise RuntimeError(
+                "proxy initialization failed after Python rejected a buffer request: "
+                f"{device_buffers.allocation_error}; C++: {proxy_last_error(library)}"
+            ) from device_buffers.allocation_error
+        require_proxy_success(library, initialize_status, "proxy initialization")
         initialized = True
+        device_buffers.finish_initialization()
 
         num_iterations = ctypes.c_uint64()
         require_proxy_success(
@@ -215,14 +461,6 @@ def run_proxy_with_concurrent_kernel(
                 "--concurrent-kernel requires a finite, nonzero --num_iterations"
             )
 
-        try:
-            import torch
-        except ImportError as error:
-            raise RuntimeError("--concurrent-kernel requires PyTorch") from error
-        if not torch.cuda.is_available():
-            raise RuntimeError("--concurrent-kernel requires an available CUDA device")
-
-        torch.cuda.set_device(cuda_device_id)
         kernel_stream = torch.cuda.Stream(device=cuda_device_id)
         kernel_finished = torch.cuda.Event(enable_timing=False, blocking=False)
         with torch.cuda.stream(kernel_stream):
@@ -350,7 +588,7 @@ def main() -> int:
         return run_proxy_with_concurrent_kernel(
             library, proxy_argv, int(metadata["cuda_device_id"])
         )
-    return run_proxy(library, proxy_argv)
+    return run_proxy(library, proxy_argv, int(metadata["cuda_device_id"]))
 
 
 if __name__ == "__main__":

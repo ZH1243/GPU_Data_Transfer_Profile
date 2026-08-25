@@ -19,6 +19,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <fcntl.h>
@@ -282,6 +283,15 @@ Proxy::Proxy(ProxyConfig config)
 
 Proxy::~Proxy() {
     shutdown();
+}
+
+void Proxy::set_external_device_buffer_allocator(
+    ExternalDeviceBufferAllocator allocator) {
+    if (initialized_) {
+        throw std::runtime_error(
+            "external device-buffer allocator must be set before proxy initialization");
+    }
+    cuda_buffers_.set_external_device_buffer_allocator(std::move(allocator));
 }
 
 void Proxy::initialize() {
@@ -2171,10 +2181,12 @@ void Proxy::stop_forwarding_thread() {
     for (auto& dst : forwarding_destinations_) {
         for (auto& source_buffer : dst.source_buffers) {
             if (source_buffer.imported_cuda_ipc) {
-                close_cuda_ipc_memory_handle(source_buffer.ptr, config_.mock_mode);
+                close_cuda_ipc_memory_handle(
+                    source_buffer.imported_cuda_ipc_base, config_.mock_mode);
             }
             source_buffer.ptr = nullptr;
             source_buffer.imported_cuda_ipc = false;
+            source_buffer.imported_cuda_ipc_base = nullptr;
         }
     }
     forwarding_destinations_.clear();
@@ -2269,12 +2281,15 @@ void Proxy::publish_local_nvlink_receive_buffers() const {
         << "cuda_device_id " << config_.cuda_device_id << '\n'
         << "buffer_bytes " << cuda_buffers_.nvlink_receive_buffer_bytes() << '\n';
     for (const auto& entry : cuda_buffers_.nvlink_receive_buffers()) {
+        const auto ipc = export_cuda_ipc_memory_handle(
+            entry.recv.ptr, config_.mock_mode);
         if (entry.source_node_rank >= 0) {
             out << "source_node " << entry.source_node_rank << ' ';
         }
         out << "source_gpu " << entry.source_gpu_index
             << " mock_addr " << reinterpret_cast<uintptr_t>(entry.recv.ptr)
-            << " ipc_handle " << export_cuda_ipc_memory_handle(entry.recv.ptr, config_.mock_mode)
+            << " ipc_handle " << ipc.handle_hex
+            << " ipc_offset " << ipc.offset
             << '\n';
     }
     out.close();
@@ -2303,7 +2318,8 @@ Proxy::ForwardDestinationState Proxy::load_forward_destination(int dst_gpu) cons
             -1,
             reinterpret_cast<void*>(static_cast<uintptr_t>(it->buffer_addr)),
             it->buffer_bytes,
-            false});
+            false,
+            nullptr});
         return destination;
     }
 
@@ -2312,6 +2328,7 @@ Proxy::ForwardDestinationState Proxy::load_forward_destination(int dst_gpu) cons
         int source_gpu_index{-1};
         uint64_t mock_addr{0};
         std::string ipc_handle;
+        std::size_t ipc_offset{0};
     };
 
     const auto path = nvlink_exchange_file(dst_gpu);
@@ -2354,12 +2371,15 @@ Proxy::ForwardDestinationState Proxy::load_forward_destination(int dst_gpu) cons
                 std::string source_gpu_key;
                 std::string mock_key;
                 std::string handle_key;
+                std::string offset_key;
                 in >> entry.source_node_rank
                    >> source_gpu_key >> entry.source_gpu_index
                    >> mock_key >> entry.mock_addr
-                   >> handle_key >> entry.ipc_handle;
+                   >> handle_key >> entry.ipc_handle
+                   >> offset_key >> entry.ipc_offset;
                 if (!in || source_gpu_key != "source_gpu" ||
-                    mock_key != "mock_addr" || handle_key != "ipc_handle") {
+                    mock_key != "mock_addr" || handle_key != "ipc_handle" ||
+                    offset_key != "ipc_offset") {
                     throw std::runtime_error("malformed node-aware NVLink source buffer entry in " + path);
                 }
                 published_buffers.push_back(std::move(entry));
@@ -2367,10 +2387,13 @@ Proxy::ForwardDestinationState Proxy::load_forward_destination(int dst_gpu) cons
                 PublishedBuffer entry;
                 std::string mock_key;
                 std::string handle_key;
+                std::string offset_key;
                 in >> entry.source_gpu_index
                    >> mock_key >> entry.mock_addr
-                   >> handle_key >> entry.ipc_handle;
-                if (!in || mock_key != "mock_addr" || handle_key != "ipc_handle") {
+                   >> handle_key >> entry.ipc_handle
+                   >> offset_key >> entry.ipc_offset;
+                if (!in || mock_key != "mock_addr" || handle_key != "ipc_handle" ||
+                    offset_key != "ipc_offset") {
                     throw std::runtime_error("malformed NVLink source buffer entry in " + path);
                 }
                 published_buffers.push_back(std::move(entry));
@@ -2420,15 +2443,35 @@ Proxy::ForwardDestinationState Proxy::load_forward_destination(int dst_gpu) cons
         destination.gpu_index = dst_gpu;
         destination.cuda_device_id = cuda_device_id;
         destination.source_buffers.reserve(selected_buffers.size());
+        // PyTorch may suballocate several tensors from one CUDA allocation.
+        // Their exported IPC handles are then identical and must be opened and
+        // closed only once in this importing process.
+        std::unordered_map<std::string, void*> opened_ipc_allocations;
         try {
             for (const auto* published : selected_buffers) {
-                void* ptr = open_cuda_ipc_memory_handle(
-                    published->ipc_handle, published->mock_addr, config_.mock_mode);
+                void* ipc_base = nullptr;
+                bool owns_ipc_import = false;
+                const auto existing = opened_ipc_allocations.find(
+                    published->ipc_handle);
+                if (existing != opened_ipc_allocations.end()) {
+                    ipc_base = existing->second;
+                } else {
+                    ipc_base = open_cuda_ipc_memory_handle(
+                        published->ipc_handle,
+                        published->mock_addr,
+                        config_.mock_mode);
+                    opened_ipc_allocations.emplace(
+                        published->ipc_handle, ipc_base);
+                    owns_ipc_import = true;
+                }
+                void* ptr = reinterpret_cast<void*>(
+                    reinterpret_cast<uintptr_t>(ipc_base) + published->ipc_offset);
                 destination.source_buffers.push_back(ForwardDestinationBufferState{
                     published->source_node_rank,
                     ptr,
                     buffer_bytes,
-                    true});
+                    owns_ipc_import,
+                    ipc_base});
                 RDMA_PROXY_LOG_INFO(
                     "imported NVLink receive buffer local_rank=", config_.node_rank,
                     " source_node=", published->source_node_rank,
@@ -2443,7 +2486,8 @@ Proxy::ForwardDestinationState Proxy::load_forward_destination(int dst_gpu) cons
         } catch (...) {
             for (auto& source_buffer : destination.source_buffers) {
                 if (source_buffer.imported_cuda_ipc) {
-                    close_cuda_ipc_memory_handle(source_buffer.ptr, config_.mock_mode);
+                    close_cuda_ipc_memory_handle(
+                        source_buffer.imported_cuda_ipc_base, config_.mock_mode);
                 }
             }
             throw;
