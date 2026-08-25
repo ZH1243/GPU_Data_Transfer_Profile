@@ -31,6 +31,7 @@ public:
     void initialize();
     void run();
     void run_once();
+    void prepare_iteration_step(uint64_t iteration);
     void run_iteration_step(uint64_t iteration);
     void finish_run();
     void shutdown();
@@ -291,6 +292,8 @@ private:
     std::mutex nvlink_forward_notification_log_mutex_;
     std::deque<std::string> nvlink_forward_notification_log_queue_;
     std::vector<double> rdma_iteration_bandwidth_gbps_;
+    bool iteration_prepared_{false};
+    uint64_t prepared_iteration_{0};
     LocalIterationSyncHeader* local_iteration_sync_header_{nullptr};
     std::size_t local_iteration_sync_size_{0};
     int local_iteration_sync_fd_{-1};

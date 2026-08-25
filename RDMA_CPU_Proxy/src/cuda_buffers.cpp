@@ -542,6 +542,15 @@ CudaBuffers::router_computation_scheduler_state() const {
     return router_computation_scheduler_state_;
 }
 
+bool CudaBuffers::is_router_computation_input(
+    const NvlinkReceiveBuffer& buffer) const {
+    if (!config_.router_computation_forwarded_inputs_only) return true;
+    return buffer.source_node_rank >= 0 &&
+        buffer.source_node_rank != config_.node_rank &&
+        buffer.source_gpu_index >= 0 &&
+        buffer.source_gpu_index != config_.local_gpu_index;
+}
+
 void CudaBuffers::initialize_router_computation_scheduler_locked() {
     if (router_computation_scheduler_state_.initialized) {
         throw std::runtime_error("router computation scheduler is already initialized");
@@ -581,8 +590,19 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
     state.expert_num_notified_batches.assign(experts_per_gpu, 0);
     state.expert_total_batches.assign(experts_per_gpu, 0);
 
+    router_computation_buffer_indices_.clear();
+    for (std::size_t index = 0; index < nvlink_recv_buffers_.size(); ++index) {
+        if (is_router_computation_input(nvlink_recv_buffers_[index])) {
+            router_computation_buffer_indices_.push_back(index);
+        }
+    }
+    if (router_computation_buffer_indices_.empty()) {
+        throw std::runtime_error("QuACK gather scheduler has no active input buffers");
+    }
+
     std::size_t a_idx_capacity = 0;
-    for (const auto& buffer : nvlink_recv_buffers_) {
+    for (const auto buffer_index : router_computation_buffer_indices_) {
+        const auto& buffer = nvlink_recv_buffers_[buffer_index];
         if (!buffer.expert_metadata_ready) {
             throw std::runtime_error(
                 "cannot initialize router computation scheduler before metadata exchange completes");
@@ -609,7 +629,8 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
     if (a_idx_capacity > std::numeric_limits<std::size_t>::max() / sizeof(int32_t)) {
         throw std::runtime_error("QuACK A_idx allocation size overflows size_t");
     }
-    for (auto& buffer : nvlink_recv_buffers_) {
+    for (const auto buffer_index : router_computation_buffer_indices_) {
+        auto& buffer = nvlink_recv_buffers_[buffer_index];
         buffer.expert_token_index_count =
             buffer.expert_metadata.expert_token_indices.size();
         allocate_buffer(
@@ -658,7 +679,7 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
         total_batches += batches;
     }
 
-    const auto receive_buffer_count = nvlink_recv_buffers_.size();
+    const auto receive_buffer_count = router_computation_buffer_indices_.size();
     auto& publication = router_notification_publication_buffers_;
     if (receive_buffer_count >
         (std::numeric_limits<std::size_t>::max() - 2) / 2) {
@@ -797,6 +818,15 @@ void CudaBuffers::begin_router_notification_iteration(uint64_t iteration) {
     }
 }
 
+void CudaBuffers::synchronize_router_notification_publication() {
+    if (!config_.router_routing_enabled ||
+        !config_.nvlink_forward_completion_notifications_enabled) {
+        return;
+    }
+    synchronize_cuda_stream(
+        router_notification_publication_stream_, config_.mock_mode);
+}
+
 void CudaBuffers::update_expert_token_heads_locked(
     NvlinkReceiveBuffer& buffer,
     uint64_t iteration,
@@ -888,6 +918,10 @@ void CudaBuffers::update_expert_token_heads(
     if (!it->expert_metadata_ready) {
         throw std::runtime_error("router expert metadata is not ready for source GPU");
     }
+    if (!is_router_computation_input(*it)) {
+        throw std::runtime_error(
+            "received a completion for a source buffer excluded from QuACK inputs");
+    }
     update_expert_token_heads_locked(
         *it, iteration, start_token, num_tokens,
         /*flush_ready_entries_per_entry=*/false);
@@ -928,10 +962,13 @@ CudaBuffers::schedule_ready_computation_batches_for_expert_locked(
         }
 
         std::size_t remaining = batch_tokens;
-        std::vector<int32_t> ranges(2 * nvlink_recv_buffers_.size(), 0);
+        std::vector<int32_t> ranges(
+            2 * router_computation_buffer_indices_.size(), 0);
         for (std::size_t buffer_index = 0;
-             buffer_index < nvlink_recv_buffers_.size(); ++buffer_index) {
-            auto& buffer = nvlink_recv_buffers_[buffer_index];
+             buffer_index < router_computation_buffer_indices_.size();
+             ++buffer_index) {
+            auto& buffer = nvlink_recv_buffers_[
+                router_computation_buffer_indices_[buffer_index]];
             auto& progress = buffer.expert_token_head_state;
             const auto head = progress.expert_token_heads[expert];
             auto& tail = progress.expert_token_tails[expert];

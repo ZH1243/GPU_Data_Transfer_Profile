@@ -118,6 +118,13 @@ int main(int argc, char** argv) {
         rdma_proxy_destroy(handle);
         return 1;
     }
+    if (rdma_proxy_prepare_iteration(handle, 0) != 0) {
+        std::cerr << "per-iteration proxy prepare failed: "
+                  << rdma_proxy_last_error() << '\n';
+        rdma_proxy_shutdown(handle);
+        rdma_proxy_destroy(handle);
+        return 1;
+    }
     int iteration_status = -1;
     std::string iteration_error;
     std::thread iteration_thread([&] {

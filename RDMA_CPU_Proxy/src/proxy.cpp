@@ -355,13 +355,37 @@ void Proxy::run() {
     finish_run();
 }
 
+void Proxy::prepare_iteration_step(uint64_t iteration) {
+    if (!initialized_) throw std::runtime_error("proxy is not initialized");
+    if (config_.num_iterations != 0 && iteration >= config_.num_iterations) {
+        throw std::runtime_error("proxy iteration index exceeds configured num_iterations");
+    }
+    if (iteration_prepared_) {
+        if (prepared_iteration_ == iteration) return;
+        throw std::runtime_error(
+            "cannot prepare a new proxy iteration while another is pending");
+    }
+    cuda_buffers_.begin_router_notification_iteration(iteration);
+    // begin_router_notification_iteration publishes ready_rows=0 on the
+    // proxy's private stream. Make that reset visible before Python queues a
+    // persistent scheduler which immediately polls the flag.
+    cuda_buffers_.synchronize_router_notification_publication();
+    prepared_iteration_ = iteration;
+    iteration_prepared_ = true;
+}
+
 void Proxy::run_iteration_step(uint64_t iteration) {
     if (!initialized_) throw std::runtime_error("proxy is not initialized");
     if (config_.num_iterations != 0 && iteration >= config_.num_iterations) {
         throw std::runtime_error("proxy iteration index exceeds configured num_iterations");
     }
+    if (!iteration_prepared_) prepare_iteration_step(iteration);
+    if (prepared_iteration_ != iteration) {
+        throw std::runtime_error("prepared proxy iteration index does not match run request");
+    }
     run_iteration(iteration);
     synchronize_iteration(iteration);
+    iteration_prepared_ = false;
 }
 
 void Proxy::finish_run() {
@@ -382,6 +406,7 @@ void Proxy::shutdown() {
     }
     peers_.clear();
     release_local_iteration_sync();
+    iteration_prepared_ = false;
     initialized_ = false;
 }
 
@@ -1484,10 +1509,6 @@ void Proxy::nvlink_forward_notification_loop() {
 }
 
 void Proxy::run_iteration(uint64_t iteration) {
-    // Reset and publish QuACK's ready-row prefix before any completion for the
-    // iteration can make a gather-table row visible.
-    cuda_buffers_.begin_router_notification_iteration(iteration);
-
     std::vector<std::vector<ChunkDescriptor>> chunks_by_peer;
     chunks_by_peer.reserve(peers_.size());
     std::size_t total_bytes = 0;

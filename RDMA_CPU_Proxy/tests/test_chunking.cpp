@@ -590,6 +590,49 @@ int main() {
     }
     for (void* pointer : external_device_pointers) ::operator delete(pointer);
 
+    // The current forwarding-only GroupedGEMM scope includes remote-node,
+    // cross-local-GPU sources and excludes local-node plus remote same-index
+    // buffers. For 2 nodes x 2 GPUs this leaves exactly source (1, 1).
+    auto forwarded_config = scheduler_config;
+    forwarded_config.num_nodes = 2;
+    forwarded_config.num_gpus_per_node = 2;
+    forwarded_config.router_num_experts = 4;
+    forwarded_config.router_computation_forwarded_inputs_only = true;
+    CudaBuffers forwarded_buffers(forwarded_config);
+    forwarded_buffers.initialize();
+    for (int source_node = 0; source_node < 2; ++source_node) {
+        for (int source_gpu = 0; source_gpu < 2; ++source_gpu) {
+            RouterExpertMetadata metadata;
+            metadata.source_node_rank = source_node;
+            metadata.source_gpu_index = source_gpu;
+            metadata.destination_node_rank = 0;
+            metadata.destination_gpu_index = 0;
+            metadata.num_nodes = 2;
+            metadata.num_gpus_per_node = 2;
+            metadata.num_experts = 4;
+            metadata.experts_per_gpu = 1;
+            metadata.first_global_expert = 0;
+            metadata.num_tokens = 7;
+            metadata.expert_token_indices =
+                source_node == 1 && source_gpu == 1
+                ? std::vector<int32_t>{0, 1, 2}
+                : std::vector<int32_t>{};
+            metadata.expert_offsets = {
+                0, static_cast<int32_t>(metadata.expert_token_indices.size())};
+            forwarded_buffers.install_expert_metadata(std::move(metadata));
+        }
+    }
+    const auto& forwarded_publication =
+        forwarded_buffers.router_notification_publication_buffers();
+    assert(forwarded_publication.num_input_buffers == 1);
+    assert(forwarded_publication.table_width == 4);
+    assert(forwarded_publication.table_rows == 2);
+    assert(forwarded_publication.a_idx_capacity == 3);
+    assert(forwarded_buffers.nvlink_receive_buffer_for_source(
+               1, 1).expert_token_indices_device.ptr != nullptr);
+    assert(forwarded_buffers.nvlink_receive_buffer_for_source(
+               0, 0).expert_token_indices_device.ptr == nullptr);
+
     DynamicChunkDistributor distributor(
         chunks,
         /*peer_rank=*/2,

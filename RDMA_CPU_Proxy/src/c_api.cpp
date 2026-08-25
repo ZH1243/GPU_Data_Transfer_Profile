@@ -267,6 +267,35 @@ extern "C" int rdma_proxy_run_iteration(
     }
 }
 
+extern "C" int rdma_proxy_prepare_iteration(
+    RdmaProxyHandle* handle,
+    uint64_t iteration) {
+    clear_error();
+    if (handle == nullptr) {
+        last_error = "rdma_proxy_prepare_iteration received a null handle";
+        return -1;
+    }
+    if (!handle->initialized || handle->shut_down) {
+        last_error = "rdma_proxy_prepare_iteration requires an initialized proxy";
+        return -1;
+    }
+    if (handle->config.num_iterations == 0) {
+        last_error = "per-iteration execution requires finite num_iterations";
+        return -1;
+    }
+    if (handle->finished || iteration != handle->next_iteration) {
+        last_error = "only the next unfinished proxy iteration can be prepared";
+        return -1;
+    }
+    try {
+        select_proxy_cuda_device(*handle);
+        handle->proxy.prepare_iteration_step(iteration);
+        return 0;
+    } catch (...) {
+        return record_current_exception();
+    }
+}
+
 extern "C" int rdma_proxy_finish(RdmaProxyHandle* handle) {
     clear_error();
     if (handle == nullptr) {

@@ -359,18 +359,29 @@ Without this option, the worker calls the handle-based blocking `rdma_proxy_run`
 entry point. With the option enabled, Python instead owns the iteration loop,
 leaving the initialized C++ QP/CQ/forwarding threads alive. At each
 iteration a persistent Python coordinator thread and the Python main thread are
-released from the same barrier: the coordinator calls
-`rdma_proxy_run_iteration`, while the main thread launches an independent
-in-place `torch.add` CUDA kernel over 1,048,576 float32 elements on a dedicated
-PyTorch stream. A stream-local CUDA event waits for that demonstration kernel
-without synchronizing the proxy's CUDA streams. After both operations complete,
-the worker advances to the next iteration.
+released from the same barrier. Before releasing them, the main thread calls
+`rdma_proxy_prepare_iteration`, which resets the proxy-owned gather ready flag
+to zero and waits until that reset is GPU-visible. The coordinator then calls
+`rdma_proxy_run_iteration`, while the main thread launches QuACK's persistent
+multi-buffer GroupedGEMM on a dedicated PyTorch stream. Its inputs are the
+Python-owned NVLink receive tensors, padded `A_idx` tensors, dynamically
+published gather table, and ready-row flag.
 
-This demonstration kernel has no data dependency on the proxy and allocates
-its own tensor. Concurrent-kernel mode requires PyTorch with CUDA and a finite,
-nonzero `num_iterations`. The shell launchers forward any additional arguments
-to the Python worker, so the same mechanism can be used for later worker or
-proxy overrides.
+The current forwarding path populates only remote-node sources whose local GPU
+index differs from the destination GPU. Concurrent mode therefore enables
+`router_computation_forwarded_inputs_only`: for the supplied 2-node x 7-GPU
+launch, GroupedGEMM consumes 6 matching `(X, A_idx)` pairs per GPU instead of
+waiting on all 14 allocated source slots. Python allocates and randomly
+initializes local expert weights once, then allocates an output tensor sized for
+the padded route capacity. The default QuACK repository is the sibling
+`quack_for_communication_overlap` checkout; override it with `--quack-root`.
+The first iteration includes QuACK compilation overhead.
+
+Concurrent-kernel mode requires a Hopper SM90 GPU, CUDA-enabled PyTorch, QuACK,
+`--num-experts`, and a finite nonzero `num_iterations`. Tile/output parameters
+default to the proxy scheduler values and can be overridden with the
+`--grouped-gemm-*` worker options; the worker forwards matching scheduler values
+to C++. The shell launchers forward additional arguments to the worker.
 
 ## Example Launch
 

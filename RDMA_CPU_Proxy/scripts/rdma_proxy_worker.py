@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import math
 import os
 from pathlib import Path
 import queue
@@ -14,7 +15,6 @@ import threading
 
 
 EXPECTED_ABI_VERSION = 1
-CONCURRENT_KERNEL_ELEMENTS = 1 << 20
 
 DEVICE_BUFFER_RDMA_SEND = 1
 DEVICE_BUFFER_RDMA_RECEIVE = 2
@@ -185,6 +185,172 @@ class TorchDeviceBuffers:
         return tensors[0]
 
 
+class GroupedGemmRunner:
+    """Launch QuACK's readiness-gated multi-buffer GroupedGEMM."""
+
+    def __init__(
+        self,
+        torch_module,
+        device_buffers: TorchDeviceBuffers,
+        *,
+        cuda_device_id: int,
+        world_size: int,
+        num_experts: int,
+        output_dimension: int,
+        tile_m: int,
+        tile_n: int,
+        tile_k: int | None,
+        cluster_m: int,
+        max_swizzle_size: int,
+        quack_root: Path,
+    ) -> None:
+        self.torch = torch_module
+        self.cuda_device_id = cuda_device_id
+        capability = torch_module.cuda.get_device_capability(cuda_device_id)
+        if capability[0] != 9:
+            raise RuntimeError(
+                f"QuACK GroupedGEMM requires Hopper SM90, got SM{capability[0]}{capability[1]}"
+            )
+        if num_experts <= 0 or num_experts % world_size != 0:
+            raise RuntimeError(
+                f"--num-experts={num_experts} must be divisible by WORLD_SIZE={world_size}"
+            )
+        quack_root = quack_root.resolve()
+        if not (quack_root / "quack" / "gemm.py").is_file():
+            raise RuntimeError(f"QuACK repository not found at {quack_root}")
+        quack_root_text = str(quack_root)
+        if quack_root_text not in sys.path:
+            sys.path.insert(0, quack_root_text)
+        try:
+            from quack.gemm import gemm as quack_gemm
+        except Exception as error:
+            raise RuntimeError(f"failed to import QuACK from {quack_root}: {error}") from error
+        self.quack_gemm = quack_gemm
+
+        a_idx_entries = [
+            (key, tensor)
+            for key, tensor in device_buffers.tensors.items()
+            if key[0] == DEVICE_BUFFER_ROUTER_A_IDX
+        ]
+        if not a_idx_entries:
+            raise RuntimeError(
+                "C++ exposed no active A_idx tensors; forwarded-input gather mode is not initialized"
+            )
+        x_buffers = []
+        a_idx = []
+        source_pairs = []
+        for (_, _, source_node, source_gpu), index_tensor in a_idx_entries:
+            x_key = (
+                DEVICE_BUFFER_NVLINK_RECEIVE,
+                -1,
+                source_node,
+                source_gpu,
+            )
+            try:
+                x_tensor = device_buffers.tensors[x_key]
+            except KeyError as error:
+                raise RuntimeError(
+                    "missing NVLink tensor matching active A_idx source "
+                    f"node={source_node}, gpu={source_gpu}"
+                ) from error
+            x_buffers.append(x_tensor)
+            a_idx.append(index_tensor)
+            source_pairs.append((source_node, source_gpu))
+
+        first_x = x_buffers[0]
+        if first_x.dtype not in (torch_module.bfloat16, torch_module.float16):
+            raise RuntimeError(
+                f"QuACK runner supports bf16/fp16 inputs, got {first_x.dtype}"
+            )
+        if any(tensor.shape != first_x.shape or tensor.dtype != first_x.dtype
+               for tensor in x_buffers):
+            raise RuntimeError("active NVLink input tensors do not share shape and dtype")
+        first_a_idx = a_idx[0]
+        if any(tensor.shape != first_a_idx.shape or tensor.dtype != torch_module.int32
+               for tensor in a_idx):
+            raise RuntimeError("active A_idx tensors do not share int32 shape")
+
+        work_table = device_buffers.only_tensor_of_kind(
+            DEVICE_BUFFER_GATHER_TABLE
+        )
+        ready_rows = device_buffers.only_tensor_of_kind(
+            DEVICE_BUFFER_GATHER_READY_ROWS
+        )
+        expected_width = 2 + 2 * len(x_buffers)
+        if work_table.ndim != 2 or work_table.shape[1] != expected_width:
+            raise RuntimeError(
+                f"gather table shape {tuple(work_table.shape)} does not match "
+                f"{len(x_buffers)} active inputs (expected width {expected_width})"
+            )
+        if work_table.shape[0] == 0:
+            raise RuntimeError("QuACK gather table has zero rows")
+
+        clusters_n = math.ceil(output_dimension / tile_n)
+        group_size = min(max_swizzle_size, clusters_n)
+        if group_size == 0 or clusters_n % group_size != 0:
+            raise RuntimeError(
+                "GroupedGEMM N clusters must be divisible by the effective swizzle group"
+            )
+
+        local_experts = num_experts // world_size
+        hidden_dimension = int(first_x.shape[1])
+        self.weights = torch_module.randn(
+            (local_experts, hidden_dimension, output_dimension),
+            dtype=first_x.dtype,
+            device=first_x.device,
+        )
+        self.weights.mul_(1.0 / math.sqrt(hidden_dimension))
+        self.output = torch_module.empty(
+            (len(x_buffers) * int(first_a_idx.numel()), output_dimension),
+            dtype=first_x.dtype,
+            device=first_x.device,
+        )
+        torch_module.cuda.synchronize(cuda_device_id)
+
+        self.x_buffers = tuple(x_buffers)
+        self.a_idx = tuple(a_idx)
+        self.work_table = work_table
+        self.ready_rows = ready_rows
+        self.transposed_weights = self.weights.transpose(1, 2)
+        self.tile_m = tile_m
+        self.tile_n = tile_n
+        self.tile_k = tile_k
+        self.cluster_m = cluster_m
+        self.max_swizzle_size = max_swizzle_size
+        print(
+            "GroupedGEMM configured: "
+            f"active_sources={source_pairs} X={tuple(first_x.shape)} "
+            f"A_idx={tuple(first_a_idx.shape)} W={tuple(self.weights.shape)} "
+            f"output={tuple(self.output.shape)} table={tuple(work_table.shape)}",
+            flush=True,
+        )
+
+    def launch(self) -> None:
+        self.quack_gemm(
+            self.x_buffers,
+            self.transposed_weights,
+            self.output,
+            C=None,
+            tile_count_semaphore=None,
+            tile_M=self.tile_m,
+            tile_N=self.tile_n,
+            tile_K=self.tile_k,
+            cluster_M=self.cluster_m,
+            cluster_N=1,
+            cluster_K=1,
+            pingpong=False,
+            persistent=True,
+            is_dynamic_persistent=False,
+            max_swizzle_size=self.max_swizzle_size,
+            cu_seqlens_m=None,
+            A_idx=self.a_idx,
+            gather_work_table=self.work_table,
+            gather_work_table_ready=self.ready_rows,
+            multi_buffer_gather=True,
+            use_tma_gather=False,
+        )
+
+
 def environment_integer(name: str) -> int:
     value = os.environ.get(name)
     if value is None:
@@ -265,6 +431,19 @@ def build_proxy_argv(
         f"--rdma_device_name={rdma_devices[local_rank]}",
         f"--listen_port={listen_port}",
     ]
+    if args.num_experts is not None:
+        generated_args.append(f"--num_experts={args.num_experts}")
+    if args.concurrent_kernel:
+        generated_args.extend(
+            [
+                "--router_computation_forwarded_inputs_only=true",
+                f"--expert_gemm_m_tile={args.expert_gemm_m_tile}",
+                f"--expert_gemm_n_tile={args.expert_gemm_n_tile}",
+                f"--expert_gemm_dimension={args.expert_gemm_dimension}",
+                f"--expert_gemm_cluster_m={args.expert_gemm_cluster_m}",
+                f"--expert_gemm_max_swizzle_size={args.expert_gemm_max_swizzle_size}",
+            ]
+        )
     metadata: dict[str, int | str] = {
         "rank": rank,
         "node_rank": node_rank,
@@ -272,6 +451,8 @@ def build_proxy_argv(
         "cuda_device_id": cuda_device_id,
         "rdma_device_name": rdma_devices[local_rank],
         "listen_port": listen_port,
+        "world_size": world_size,
+        "num_nodes": num_nodes,
     }
     return ["rdma_cpu_proxy", *proxy_args, *generated_args], metadata
 
@@ -311,6 +492,11 @@ def load_proxy_library(path: Path) -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_uint64),
     ]
     library.rdma_proxy_get_num_iterations.restype = ctypes.c_int
+    library.rdma_proxy_prepare_iteration.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+    ]
+    library.rdma_proxy_prepare_iteration.restype = ctypes.c_int
     library.rdma_proxy_run_iteration.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
     library.rdma_proxy_run_iteration.restype = ctypes.c_int
     library.rdma_proxy_finish.argtypes = [ctypes.c_void_p]
@@ -422,8 +608,18 @@ def run_proxy_with_concurrent_kernel(
     library: ctypes.CDLL,
     proxy_argv: list[str],
     cuda_device_id: int,
+    *,
+    world_size: int,
+    num_experts: int,
+    expert_gemm_dimension: int,
+    expert_gemm_m_tile: int,
+    expert_gemm_n_tile: int,
+    expert_gemm_k_tile: int | None,
+    expert_gemm_cluster_m: int,
+    expert_gemm_max_swizzle_size: int,
+    quack_root: Path,
 ) -> int:
-    """Let Python launch one independent CUDA kernel with each proxy iteration."""
+    """Launch readiness-gated QuACK GroupedGEMM with each proxy iteration."""
 
     c_argv = encode_proxy_argv(proxy_argv)
     torch = import_torch_for_proxy(cuda_device_id)
@@ -461,15 +657,22 @@ def run_proxy_with_concurrent_kernel(
                 "--concurrent-kernel requires a finite, nonzero --num_iterations"
             )
 
+        grouped_gemm = GroupedGemmRunner(
+            torch,
+            device_buffers,
+            cuda_device_id=cuda_device_id,
+            world_size=world_size,
+            num_experts=num_experts,
+            output_dimension=expert_gemm_dimension,
+            tile_m=expert_gemm_m_tile,
+            tile_n=expert_gemm_n_tile,
+            tile_k=expert_gemm_k_tile,
+            cluster_m=expert_gemm_cluster_m,
+            max_swizzle_size=expert_gemm_max_swizzle_size,
+            quack_root=quack_root,
+        )
         kernel_stream = torch.cuda.Stream(device=cuda_device_id)
         kernel_finished = torch.cuda.Event(enable_timing=False, blocking=False)
-        with torch.cuda.stream(kernel_stream):
-            kernel_tensor = torch.zeros(
-                CONCURRENT_KERNEL_ELEMENTS,
-                dtype=torch.float32,
-                device=f"cuda:{cuda_device_id}",
-            )
-        kernel_stream.synchronize()
 
         def proxy_iteration_coordinator() -> None:
             while True:
@@ -495,26 +698,26 @@ def run_proxy_with_concurrent_kernel(
         coordinator.start()
 
         print(
-            "concurrent-kernel mode enabled: Python will launch one independent "
-            f"torch.add kernel over {CONCURRENT_KERNEL_ELEMENTS} float32 elements "
-            "with each proxy iteration",
+            "concurrent-kernel mode enabled: Python will launch one readiness-gated "
+            "QuACK multi-buffer GroupedGEMM with each proxy iteration",
             flush=True,
         )
 
         for iteration in range(num_iterations.value):
+            require_proxy_success(
+                library,
+                library.rdma_proxy_prepare_iteration(handle, iteration),
+                f"preparing proxy iteration {iteration}",
+            )
             start_barrier = threading.Barrier(2)
             commands.put((iteration, start_barrier))
             start_barrier.wait()
 
             kernel_error: BaseException | None = None
             try:
-                # add_ is an asynchronous pointwise CUDA kernel. Recording and
-                # waiting on this stream-local event does not synchronize the
-                # proxy's independent CUDA streams.
                 with torch.cuda.stream(kernel_stream):
-                    kernel_tensor.add_(1.0)
+                    grouped_gemm.launch()
                     kernel_finished.record(kernel_stream)
-                kernel_finished.synchronize()
             except BaseException as error:
                 kernel_error = error
 
@@ -527,6 +730,7 @@ def run_proxy_with_concurrent_kernel(
                 raise RuntimeError(
                     f"proxy iteration {iteration} failed: {proxy_error}"
                 )
+            kernel_finished.synchronize()
 
         commands.put(None)
         coordinator.join()
@@ -561,7 +765,33 @@ def main() -> int:
     parser.add_argument(
         "--concurrent-kernel",
         action="store_true",
-        help="launch an independent PyTorch CUDA kernel with every proxy iteration",
+        help="launch QuACK multi-buffer GroupedGEMM with every proxy iteration",
+    )
+    parser.add_argument("--num-experts", "--num_experts", type=int)
+    parser.add_argument("--grouped-gemm-m-tile", dest="expert_gemm_m_tile", type=int, default=128)
+    parser.add_argument("--grouped-gemm-n-tile", dest="expert_gemm_n_tile", type=int, default=256)
+    parser.add_argument(
+        "--grouped-gemm-k-tile", dest="expert_gemm_k_tile", type=int, default=None
+    )
+    parser.add_argument(
+        "--grouped-gemm-output-dimension",
+        dest="expert_gemm_dimension",
+        type=int,
+        default=8192,
+    )
+    parser.add_argument(
+        "--grouped-gemm-cluster-m", dest="expert_gemm_cluster_m", type=int, default=1
+    )
+    parser.add_argument(
+        "--grouped-gemm-max-swizzle-size",
+        dest="expert_gemm_max_swizzle_size",
+        type=int,
+        default=8,
+    )
+    parser.add_argument(
+        "--quack-root",
+        type=Path,
+        default=Path(__file__).resolve().parents[3] / "quack_for_communication_overlap",
     )
     parser.add_argument(
         "--dry-run",
@@ -585,8 +815,21 @@ def main() -> int:
 
     library = load_proxy_library(args.library.resolve())
     if args.concurrent_kernel:
+        if args.num_experts is None:
+            raise RuntimeError("--concurrent-kernel requires --num-experts")
         return run_proxy_with_concurrent_kernel(
-            library, proxy_argv, int(metadata["cuda_device_id"])
+            library,
+            proxy_argv,
+            int(metadata["cuda_device_id"]),
+            world_size=int(metadata["world_size"]),
+            num_experts=args.num_experts,
+            expert_gemm_dimension=args.expert_gemm_dimension,
+            expert_gemm_m_tile=args.expert_gemm_m_tile,
+            expert_gemm_n_tile=args.expert_gemm_n_tile,
+            expert_gemm_k_tile=args.expert_gemm_k_tile,
+            expert_gemm_cluster_m=args.expert_gemm_cluster_m,
+            expert_gemm_max_swizzle_size=args.expert_gemm_max_swizzle_size,
+            quack_root=args.quack_root,
         )
     return run_proxy(library, proxy_argv, int(metadata["cuda_device_id"]))
 

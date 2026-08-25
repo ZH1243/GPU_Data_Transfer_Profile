@@ -174,6 +174,7 @@ public:
         int source_gpu_index) const;
     RouterComputationSchedulerState router_computation_scheduler_state() const;
     void begin_router_notification_iteration(uint64_t iteration);
+    void synchronize_router_notification_publication();
     void update_expert_token_heads(
         int source_node_rank,
         int source_gpu_index,
@@ -202,6 +203,7 @@ private:
     void allocate_pinned_buffer(CpuPinnedBuffer& buffer, std::size_t bytes);
     void free_pinned_buffer(CpuPinnedBuffer& buffer);
     void initialize_router_computation_scheduler_locked();
+    bool is_router_computation_input(const NvlinkReceiveBuffer& buffer) const;
     void reset_router_computation_iteration_locked(uint64_t iteration);
     void update_expert_token_heads_locked(
         NvlinkReceiveBuffer& buffer,
@@ -229,6 +231,7 @@ private:
     void* router_notification_publication_stream_{nullptr};
     mutable std::mutex expert_token_heads_mutex_;
     RouterComputationSchedulerState router_computation_scheduler_state_;
+    std::vector<std::size_t> router_computation_buffer_indices_;
 };
 
 void launch_copy_tokens(void* dst, const void* src, std::size_t bytes, bool mock_mode);

@@ -362,6 +362,10 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
         config.nvlink_forward_notification_flush_per_entry_enabled =
             (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "router_computation_forwarded_inputs_only") {
+        config.router_computation_forwarded_inputs_only =
+            (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "nvlink_forward_notification_flag_update_mode") {
         config.nvlink_forward_notification_flag_update_mode =
             nvlink_forward_notification_flag_update_mode_from_string(value);
@@ -605,6 +609,10 @@ ProxyConfig load_config_file(const std::string& path) {
             object,
             "nvlink_forward_notification_flag_update_mode",
             to_string(config.nvlink_forward_notification_flag_update_mode)));
+    config.router_computation_forwarded_inputs_only = get_bool(
+        object,
+        "router_computation_forwarded_inputs_only",
+        config.router_computation_forwarded_inputs_only);
     config.expert_gemm_m_tile = number_as<std::size_t>(
         object, "expert_gemm_m_tile", config.expert_gemm_m_tile);
     config.expert_gemm_n_tile = number_as<std::size_t>(
@@ -1044,6 +1052,8 @@ std::string config_summary(const ProxyConfig& config) {
         << (config.nvlink_forward_notification_flush_only_enabled ? "true" : "false")
         << " nvlink_forward_notification_flush_per_entry_enabled="
         << (config.nvlink_forward_notification_flush_per_entry_enabled ? "true" : "false")
+        << " router_computation_forwarded_inputs_only="
+        << (config.router_computation_forwarded_inputs_only ? "true" : "false")
         << " nvlink_forward_notification_flag_update_mode="
         << to_string(config.nvlink_forward_notification_flag_update_mode)
         << " expert_gemm_m_tile=" << config.expert_gemm_m_tile

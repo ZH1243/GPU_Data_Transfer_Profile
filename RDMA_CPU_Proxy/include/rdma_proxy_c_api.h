@@ -91,6 +91,15 @@ RDMA_PROXY_C_API int rdma_proxy_run(RdmaProxyHandle* handle);
 RDMA_PROXY_C_API int rdma_proxy_get_num_iterations(
     RdmaProxyHandle* handle,
     uint64_t* num_iterations);
+/*
+ * Reset the gather-table publication state for one iteration and wait until
+ * ready_rows=0 is visible on the configured GPU. This lets an embedding
+ * runtime safely launch a readiness-gated persistent kernel before calling
+ * rdma_proxy_run_iteration, possibly from another host thread.
+ */
+RDMA_PROXY_C_API int rdma_proxy_prepare_iteration(
+    RdmaProxyHandle* handle,
+    uint64_t iteration);
 RDMA_PROXY_C_API int rdma_proxy_run_iteration(
     RdmaProxyHandle* handle,
     uint64_t iteration);
