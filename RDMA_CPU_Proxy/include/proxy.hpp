@@ -33,6 +33,9 @@ public:
     void run_once();
     void prepare_iteration_step(uint64_t iteration);
     void run_iteration_step(uint64_t iteration);
+    void record_router_computation_end(uint64_t iteration, uintptr_t cuda_stream);
+    float router_computation_elapsed_ms(uint64_t iteration);
+    std::size_t router_computation_num_tokens() const;
     void finish_run();
     void shutdown();
     const RouterExpertMetadata& router_expert_metadata_for_source(

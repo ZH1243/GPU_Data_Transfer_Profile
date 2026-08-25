@@ -388,6 +388,23 @@ void Proxy::run_iteration_step(uint64_t iteration) {
     iteration_prepared_ = false;
 }
 
+void Proxy::record_router_computation_end(
+    uint64_t iteration,
+    uintptr_t cuda_stream) {
+    if (!initialized_) throw std::runtime_error("proxy is not initialized");
+    cuda_buffers_.record_router_computation_end(iteration, cuda_stream);
+}
+
+float Proxy::router_computation_elapsed_ms(uint64_t iteration) {
+    if (!initialized_) throw std::runtime_error("proxy is not initialized");
+    return cuda_buffers_.router_computation_elapsed_ms(iteration);
+}
+
+std::size_t Proxy::router_computation_num_tokens() const {
+    if (!initialized_) throw std::runtime_error("proxy is not initialized");
+    return cuda_buffers_.router_computation_num_tokens();
+}
+
 void Proxy::finish_run() {
     if (!initialized_) throw std::runtime_error("proxy is not initialized");
     if (config_.num_iterations != 0) {

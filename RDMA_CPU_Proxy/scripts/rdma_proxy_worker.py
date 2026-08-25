@@ -497,6 +497,23 @@ def load_proxy_library(path: Path) -> ctypes.CDLL:
         ctypes.c_uint64,
     ]
     library.rdma_proxy_prepare_iteration.restype = ctypes.c_int
+    library.rdma_proxy_record_computation_end.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+    ]
+    library.rdma_proxy_record_computation_end.restype = ctypes.c_int
+    library.rdma_proxy_get_computation_elapsed_ms.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    library.rdma_proxy_get_computation_elapsed_ms.restype = ctypes.c_int
+    library.rdma_proxy_get_computation_num_tokens.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    library.rdma_proxy_get_computation_num_tokens.restype = ctypes.c_int
     library.rdma_proxy_run_iteration.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
     library.rdma_proxy_run_iteration.restype = ctypes.c_int
     library.rdma_proxy_finish.argtypes = [ctypes.c_void_p]
@@ -671,6 +688,24 @@ def run_proxy_with_concurrent_kernel(
             max_swizzle_size=expert_gemm_max_swizzle_size,
             quack_root=quack_root,
         )
+        computation_tokens = ctypes.c_uint64()
+        require_proxy_success(
+            library,
+            library.rdma_proxy_get_computation_num_tokens(
+                handle, ctypes.byref(computation_tokens)
+            ),
+            "querying GroupedGEMM routed-token count",
+        )
+        if computation_tokens.value == 0:
+            raise RuntimeError("GroupedGEMM has zero meaningful routed tokens")
+        hidden_dimension = int(grouped_gemm.x_buffers[0].shape[1])
+        useful_flops = (
+            2
+            * int(computation_tokens.value)
+            * hidden_dimension
+            * expert_gemm_dimension
+        )
+        iteration_throughputs: list[tuple[int, float, float]] = []
         kernel_stream = torch.cuda.Stream(device=cuda_device_id)
         kernel_finished = torch.cuda.Event(enable_timing=False, blocking=False)
 
@@ -717,6 +752,16 @@ def run_proxy_with_concurrent_kernel(
             try:
                 with torch.cuda.stream(kernel_stream):
                     grouped_gemm.launch()
+                require_proxy_success(
+                    library,
+                    library.rdma_proxy_record_computation_end(
+                        handle,
+                        iteration,
+                        int(kernel_stream.cuda_stream),
+                    ),
+                    f"recording GroupedGEMM end for iteration {iteration}",
+                )
+                with torch.cuda.stream(kernel_stream):
                     kernel_finished.record(kernel_stream)
             except BaseException as error:
                 kernel_error = error
@@ -731,11 +776,40 @@ def run_proxy_with_concurrent_kernel(
                     f"proxy iteration {iteration} failed: {proxy_error}"
                 )
             kernel_finished.synchronize()
+            elapsed_ms = ctypes.c_float()
+            require_proxy_success(
+                library,
+                library.rdma_proxy_get_computation_elapsed_ms(
+                    handle, iteration, ctypes.byref(elapsed_ms)
+                ),
+                f"querying GroupedGEMM timing for iteration {iteration}",
+            )
+            if elapsed_ms.value <= 0.0:
+                raise RuntimeError(
+                    f"GroupedGEMM iteration {iteration} reported invalid "
+                    f"elapsed time {elapsed_ms.value} ms"
+                )
+            effective_tflops = useful_flops / (elapsed_ms.value * 1.0e9)
+            iteration_throughputs.append(
+                (iteration, float(elapsed_ms.value), effective_tflops)
+            )
 
         commands.put(None)
         coordinator.join()
         coordinator = None
         require_proxy_success(library, library.rdma_proxy_finish(handle), "proxy finish")
+        print(
+            "GroupedGEMM effective throughput by iteration "
+            f"(useful_routes={computation_tokens.value}, K={hidden_dimension}, "
+            f"N={expert_gemm_dimension}):",
+            flush=True,
+        )
+        for iteration, elapsed_value, effective_tflops in iteration_throughputs:
+            print(
+                f"  iteration {iteration}: elapsed_ms={elapsed_value:.4f} "
+                f"effective_throughput={effective_tflops:.2f} TFLOP/s",
+                flush=True,
+            )
         return 0
     finally:
         if coordinator is not None:

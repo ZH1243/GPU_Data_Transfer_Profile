@@ -377,6 +377,15 @@ the padded route capacity. The default QuACK repository is the sibling
 `quack_for_communication_overlap` checkout; override it with `--quack-root`.
 The first iteration includes QuACK compilation overhead.
 
+Each GPU process also reports per-iteration effective throughput at the end of
+the run. C++ records a CUDA start event on its publication stream immediately
+before the first non-empty gather-table copy. Python asks C++ to record the end
+event on the QuACK stream directly after the GroupedGEMM launch, so that event
+executes when the kernel finishes. The reported useful work is
+`2 * active_routed_tokens * K * N`; padded `A_idx` capacity is not counted.
+Because the interval begins at the first table flush, it includes readiness
+stalling and table streaming after that point, not just GEMM math.
+
 Concurrent-kernel mode requires a Hopper SM90 GPU, CUDA-enabled PyTorch, QuACK,
 `--num-experts`, and a finite nonzero `num_iterations`. Tile/output parameters
 default to the proxy scheduler values and can be overridden with the

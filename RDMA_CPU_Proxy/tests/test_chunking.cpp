@@ -628,10 +628,24 @@ int main() {
     assert(forwarded_publication.table_width == 4);
     assert(forwarded_publication.table_rows == 2);
     assert(forwarded_publication.a_idx_capacity == 3);
+    assert(forwarded_buffers.router_computation_num_tokens() == 3);
     assert(forwarded_buffers.nvlink_receive_buffer_for_source(
                1, 1).expert_token_indices_device.ptr != nullptr);
     assert(forwarded_buffers.nvlink_receive_buffer_for_source(
                0, 0).expert_token_indices_device.ptr == nullptr);
+    forwarded_buffers.begin_router_notification_iteration(0);
+    // Python can enqueue the end event before the first table flush reaches
+    // the publication thread; GPU execution still orders the persistent
+    // kernel's completion after all readiness-gated table work.
+    forwarded_buffers.record_router_computation_end(0, 0);
+    forwarded_buffers.process_router_notification_completion(1, 1, 0, 0, 3);
+    bool rejected_mock_gpu_timing = false;
+    try {
+        (void)forwarded_buffers.router_computation_elapsed_ms(0);
+    } catch (const std::runtime_error&) {
+        rejected_mock_gpu_timing = true;
+    }
+    assert(rejected_mock_gpu_timing);
 
     DynamicChunkDistributor distributor(
         chunks,

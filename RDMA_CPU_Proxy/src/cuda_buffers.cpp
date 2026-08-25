@@ -133,6 +133,30 @@ CudaBuffers::~CudaBuffers() {
         }
     }
 #endif
+    if (!config_.mock_mode) {
+#if RDMA_PROXY_HAVE_CUDA
+        if (router_computation_start_event_) {
+            const auto status = cudaEventDestroy(reinterpret_cast<cudaEvent_t>(
+                router_computation_start_event_));
+            if (status != cudaSuccess) {
+                RDMA_PROXY_LOG_WARN(
+                    "cudaEventDestroy(start) failed during cleanup: ",
+                    cudaGetErrorString(status));
+            }
+        }
+        if (router_computation_end_event_) {
+            const auto status = cudaEventDestroy(reinterpret_cast<cudaEvent_t>(
+                router_computation_end_event_));
+            if (status != cudaSuccess) {
+                RDMA_PROXY_LOG_WARN(
+                    "cudaEventDestroy(end) failed during cleanup: ",
+                    cudaGetErrorString(status));
+            }
+        }
+#endif
+    }
+    router_computation_start_event_ = nullptr;
+    router_computation_end_event_ = nullptr;
     destroy_cuda_stream(
         router_notification_publication_stream_, config_.mock_mode);
     router_notification_publication_stream_ = nullptr;
@@ -262,6 +286,18 @@ void CudaBuffers::initialize() {
             config_.cuda_device_id,
             /*nonblocking=*/true,
             config_.mock_mode);
+#if RDMA_PROXY_HAVE_CUDA
+        if (!config_.mock_mode) {
+            cudaEvent_t start_event = nullptr;
+            cudaEvent_t end_event = nullptr;
+            check_cuda(cudaEventCreate(&start_event),
+                       "cudaEventCreate QuACK computation start");
+            router_computation_start_event_ = start_event;
+            check_cuda(cudaEventCreate(&end_event),
+                       "cudaEventCreate QuACK computation end");
+            router_computation_end_event_ = end_event;
+        }
+#endif
         RDMA_PROXY_LOG_INFO(
             "allocated QuACK gather ready-row flag bytes=", sizeof(int32_t),
             "; table and A_idx allocation waits for all expert metadata");
@@ -790,6 +826,15 @@ void CudaBuffers::reset_router_computation_iteration_locked(uint64_t iteration) 
     scheduler.published_batches = 0;
     scheduler.published_rows = 0;
 
+    {
+        std::lock_guard<std::mutex> timing_lock(
+            router_computation_timing_mutex_);
+        router_computation_timing_initialized_ = true;
+        router_computation_timing_iteration_ = iteration;
+        router_computation_start_recorded_ = false;
+        router_computation_end_recorded_ = false;
+    }
+
     auto& publication = router_notification_publication_buffers_;
     if (publication.host_table.ptr && publication.host_table.bytes != 0) {
         std::memset(publication.host_table.ptr, 0, publication.host_table.bytes);
@@ -825,6 +870,90 @@ void CudaBuffers::synchronize_router_notification_publication() {
     }
     synchronize_cuda_stream(
         router_notification_publication_stream_, config_.mock_mode);
+}
+
+void CudaBuffers::record_router_computation_end(
+    uint64_t iteration,
+    uintptr_t cuda_stream) {
+    std::lock_guard<std::mutex> lock(router_computation_timing_mutex_);
+    if (!router_computation_timing_initialized_ ||
+        router_computation_timing_iteration_ != iteration) {
+        throw std::runtime_error(
+            "router computation timing iteration is not prepared");
+    }
+    if (router_computation_end_recorded_) {
+        throw std::runtime_error(
+            "router computation end event is already recorded");
+    }
+    if (config_.mock_mode) {
+        router_computation_end_recorded_ = true;
+        return;
+    }
+#if RDMA_PROXY_HAVE_CUDA
+    if (!router_computation_end_event_ || cuda_stream == 0) {
+        throw std::runtime_error(
+            "router computation end event or CUDA stream is invalid");
+    }
+    check_cuda(
+        cudaEventRecord(
+            reinterpret_cast<cudaEvent_t>(router_computation_end_event_),
+            reinterpret_cast<cudaStream_t>(cuda_stream)),
+        "cudaEventRecord QuACK computation end");
+    router_computation_end_recorded_ = true;
+#else
+    (void)cuda_stream;
+    throw std::runtime_error(
+        "router computation timing requested without CUDA support");
+#endif
+}
+
+float CudaBuffers::router_computation_elapsed_ms(uint64_t iteration) {
+    std::lock_guard<std::mutex> lock(router_computation_timing_mutex_);
+    if (!router_computation_timing_initialized_ ||
+        router_computation_timing_iteration_ != iteration ||
+        !router_computation_start_recorded_ ||
+        !router_computation_end_recorded_) {
+        throw std::runtime_error(
+            "router computation timing events are incomplete");
+    }
+    if (config_.mock_mode) {
+        throw std::runtime_error(
+            "GPU computation elapsed time is unavailable in mock mode");
+    }
+#if RDMA_PROXY_HAVE_CUDA
+    check_cuda(
+        cudaEventSynchronize(
+            reinterpret_cast<cudaEvent_t>(router_computation_end_event_)),
+        "cudaEventSynchronize QuACK computation end");
+    float elapsed_ms = 0.0F;
+    check_cuda(
+        cudaEventElapsedTime(
+            &elapsed_ms,
+            reinterpret_cast<cudaEvent_t>(router_computation_start_event_),
+            reinterpret_cast<cudaEvent_t>(router_computation_end_event_)),
+        "cudaEventElapsedTime QuACK computation");
+    return elapsed_ms;
+#else
+    throw std::runtime_error(
+        "router computation timing requested without CUDA support");
+#endif
+}
+
+std::size_t CudaBuffers::router_computation_num_tokens() const {
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    if (!router_computation_scheduler_state_.initialized) {
+        throw std::runtime_error(
+            "router computation scheduler is not initialized");
+    }
+    std::size_t total = 0;
+    for (const auto count :
+         router_computation_scheduler_state_.expert_total_tokens) {
+        if (count > std::numeric_limits<std::size_t>::max() - total) {
+            throw std::runtime_error("router computation token total overflows size_t");
+        }
+        total += count;
+    }
+    return total;
 }
 
 void CudaBuffers::update_expert_token_heads_locked(
@@ -1135,6 +1264,14 @@ void CudaBuffers::flush_router_notification_publication_range(
 
     if (config_.mock_mode) {
         if (table_bytes != 0) {
+            std::lock_guard<std::mutex> timing_lock(
+                router_computation_timing_mutex_);
+            if (router_computation_timing_initialized_ &&
+                !router_computation_start_recorded_) {
+                router_computation_start_recorded_ = true;
+            }
+        }
+        if (table_bytes != 0) {
             std::memcpy(
                 static_cast<uint8_t*>(publication.device_table.ptr) + table_offset,
                 static_cast<const uint8_t*>(publication.host_table.ptr) + table_offset,
@@ -1156,6 +1293,23 @@ void CudaBuffers::flush_router_notification_publication_range(
     auto stream = reinterpret_cast<cudaStream_t>(
         router_notification_publication_stream_);
     if (table_bytes != 0) {
+        {
+            std::lock_guard<std::mutex> timing_lock(
+                router_computation_timing_mutex_);
+            if (!router_computation_timing_initialized_) {
+                throw std::runtime_error(
+                    "router computation timing iteration is not initialized");
+            }
+            if (!router_computation_start_recorded_) {
+                check_cuda(
+                    cudaEventRecord(
+                        reinterpret_cast<cudaEvent_t>(
+                            router_computation_start_event_),
+                        stream),
+                    "cudaEventRecord QuACK computation start");
+                router_computation_start_recorded_ = true;
+            }
+        }
         check_cuda(cudaMemcpyAsync(
             static_cast<uint8_t*>(publication.device_table.ptr) + table_offset,
             static_cast<const uint8_t*>(publication.host_table.ptr) + table_offset,

@@ -175,6 +175,9 @@ public:
     RouterComputationSchedulerState router_computation_scheduler_state() const;
     void begin_router_notification_iteration(uint64_t iteration);
     void synchronize_router_notification_publication();
+    void record_router_computation_end(uint64_t iteration, uintptr_t cuda_stream);
+    float router_computation_elapsed_ms(uint64_t iteration);
+    std::size_t router_computation_num_tokens() const;
     void update_expert_token_heads(
         int source_node_rank,
         int source_gpu_index,
@@ -229,6 +232,13 @@ private:
     // until their stream operations complete. Slot i permanently contains i.
     CpuPinnedBuffer router_notification_ready_values_;
     void* router_notification_publication_stream_{nullptr};
+    void* router_computation_start_event_{nullptr};
+    void* router_computation_end_event_{nullptr};
+    mutable std::mutex router_computation_timing_mutex_;
+    bool router_computation_timing_initialized_{false};
+    bool router_computation_start_recorded_{false};
+    bool router_computation_end_recorded_{false};
+    uint64_t router_computation_timing_iteration_{0};
     mutable std::mutex expert_token_heads_mutex_;
     RouterComputationSchedulerState router_computation_scheduler_state_;
     std::vector<std::size_t> router_computation_buffer_indices_;

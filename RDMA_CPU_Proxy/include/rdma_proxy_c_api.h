@@ -103,6 +103,19 @@ RDMA_PROXY_C_API int rdma_proxy_prepare_iteration(
 RDMA_PROXY_C_API int rdma_proxy_run_iteration(
     RdmaProxyHandle* handle,
     uint64_t iteration);
+
+/* GPU-event timing for readiness-gated computation launched by the embedder. */
+RDMA_PROXY_C_API int rdma_proxy_record_computation_end(
+    RdmaProxyHandle* handle,
+    uint64_t iteration,
+    uintptr_t cuda_stream);
+RDMA_PROXY_C_API int rdma_proxy_get_computation_elapsed_ms(
+    RdmaProxyHandle* handle,
+    uint64_t iteration,
+    float* elapsed_ms);
+RDMA_PROXY_C_API int rdma_proxy_get_computation_num_tokens(
+    RdmaProxyHandle* handle,
+    uint64_t* num_tokens);
 RDMA_PROXY_C_API int rdma_proxy_finish(RdmaProxyHandle* handle);
 
 RDMA_PROXY_C_API int rdma_proxy_shutdown(RdmaProxyHandle* handle);

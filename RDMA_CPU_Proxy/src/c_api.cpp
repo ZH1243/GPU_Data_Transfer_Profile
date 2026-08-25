@@ -296,6 +296,76 @@ extern "C" int rdma_proxy_prepare_iteration(
     }
 }
 
+extern "C" int rdma_proxy_record_computation_end(
+    RdmaProxyHandle* handle,
+    uint64_t iteration,
+    uintptr_t cuda_stream) {
+    clear_error();
+    if (handle == nullptr) {
+        last_error = "rdma_proxy_record_computation_end received a null handle";
+        return -1;
+    }
+    if (!handle->initialized || handle->shut_down) {
+        last_error = "recording computation end requires an initialized proxy";
+        return -1;
+    }
+    try {
+        select_proxy_cuda_device(*handle);
+        handle->proxy.record_router_computation_end(
+            iteration, cuda_stream);
+        return 0;
+    } catch (...) {
+        return record_current_exception();
+    }
+}
+
+extern "C" int rdma_proxy_get_computation_elapsed_ms(
+    RdmaProxyHandle* handle,
+    uint64_t iteration,
+    float* elapsed_ms) {
+    clear_error();
+    if (handle == nullptr || elapsed_ms == nullptr) {
+        last_error = "rdma_proxy_get_computation_elapsed_ms received a null argument";
+        return -1;
+    }
+    if (!handle->initialized || handle->shut_down) {
+        last_error = "querying computation time requires an initialized proxy";
+        return -1;
+    }
+    try {
+        select_proxy_cuda_device(*handle);
+        *elapsed_ms = handle->proxy.router_computation_elapsed_ms(iteration);
+        return 0;
+    } catch (...) {
+        return record_current_exception();
+    }
+}
+
+extern "C" int rdma_proxy_get_computation_num_tokens(
+    RdmaProxyHandle* handle,
+    uint64_t* num_tokens) {
+    clear_error();
+    if (handle == nullptr || num_tokens == nullptr) {
+        last_error = "rdma_proxy_get_computation_num_tokens received a null argument";
+        return -1;
+    }
+    if (!handle->initialized || handle->shut_down) {
+        last_error = "querying computation tokens requires an initialized proxy";
+        return -1;
+    }
+    try {
+        const auto count = handle->proxy.router_computation_num_tokens();
+        if (count > std::numeric_limits<uint64_t>::max()) {
+            throw std::runtime_error(
+                "router computation token count exceeds C ABI range");
+        }
+        *num_tokens = static_cast<uint64_t>(count);
+        return 0;
+    } catch (...) {
+        return record_current_exception();
+    }
+}
+
 extern "C" int rdma_proxy_finish(RdmaProxyHandle* handle) {
     clear_error();
     if (handle == nullptr) {
