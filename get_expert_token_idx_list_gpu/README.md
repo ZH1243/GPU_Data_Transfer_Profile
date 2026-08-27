@@ -70,9 +70,13 @@ The temporary `x1` and `x2` arrays are never materialized.  The CUDA code uses
 per-chunk `(node, mask)` histograms and a stable counting-sort scatter to
 write aligned `x3` and `x4` entries directly. It then computes the per-GPU
 filtered ranks in `x3`
-order and rebuilds `expert_token_indices`, so each value matches the token's
-new arrival position at its destination GPU.  Output and scratch allocation
-remain outside the measured interval.
+order and rebuilds `expert_token_indices`. For destinations whose node-local
+GPU index differs from `local_gpu_id`, each value matches the token's compact
+arrival position after NVLink forwarding. For the destination whose local GPU
+index equals `local_gpu_id`, each value is instead the token's position in the
+complete destination-node `x3` slice, allowing that GPU to consume its RDMA
+receive buffer directly without a compaction copy. Output and scratch
+allocation remain outside the measured interval.
 
 The Python driver allocates `R` in GPU HBM, invokes the CUDA input generator,
 runs one correctness check against a CPU implementation, and reports average

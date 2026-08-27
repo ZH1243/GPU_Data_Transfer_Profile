@@ -19,6 +19,10 @@ struct GpuBuffer {
     // Borrowed buffers are allocated and retained by the embedding runtime.
     // CudaBuffers may read/write them but must never release their storage.
     bool is_externally_owned{false};
+    // Aliases share storage with another GpuBuffer descriptor and never own
+    // that storage, regardless of whether the original allocation is internal
+    // or supplied by an embedding runtime.
+    bool is_alias{false};
 };
 
 enum class DeviceBufferKind : int32_t {
@@ -202,6 +206,10 @@ private:
     void allocate_buffer(
         GpuBuffer& buffer,
         const DeviceBufferAllocationRequest& request);
+    void alias_buffer(
+        GpuBuffer& buffer,
+        const GpuBuffer& source,
+        const DeviceBufferAllocationRequest& request);
     void free_buffer(GpuBuffer& buffer);
     void allocate_pinned_buffer(CpuPinnedBuffer& buffer, std::size_t bytes);
     void free_pinned_buffer(CpuPinnedBuffer& buffer);
@@ -246,6 +254,8 @@ private:
 
 void launch_copy_tokens(void* dst, const void* src, std::size_t bytes, bool mock_mode);
 void* create_cuda_stream(int cuda_device_id, bool nonblocking, bool mock_mode);
+void select_cuda_device_for_thread(int cuda_device_id, bool mock_mode);
+void flush_gpudirect_rdma_writes(int cuda_device_id, bool mock_mode);
 void destroy_cuda_stream(void* stream, bool mock_mode);
 void synchronize_cuda_stream(void* stream, bool mock_mode);
 void enable_cuda_peer_access(int cuda_device_id, int peer_cuda_device_id, bool mock_mode);

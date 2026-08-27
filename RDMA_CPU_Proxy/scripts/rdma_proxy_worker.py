@@ -63,9 +63,18 @@ class TorchDeviceBuffers:
         DEVICE_BUFFER_GATHER_READY_ROWS: "gather_ready_rows",
     }
 
-    def __init__(self, torch_module, cuda_device_id: int) -> None:
+    def __init__(
+        self,
+        torch_module,
+        cuda_device_id: int,
+        *,
+        node_rank: int,
+        local_gpu_index: int,
+    ) -> None:
         self.torch = torch_module
         self.cuda_device_id = cuda_device_id
+        self.node_rank = node_rank
+        self.local_gpu_index = local_gpu_index
         self.tensors: dict[tuple[int, int, int, int], object] = {}
         self.allocation_error: BaseException | None = None
         # ctypes callbacks must themselves remain strongly referenced for as
@@ -114,6 +123,41 @@ class TorchDeviceBuffers:
                 int(request.dimensions[index])
                 for index in range(request.dimension_count)
             )
+            key = (
+                int(request.kind),
+                int(request.peer_rank),
+                int(request.source_node_rank),
+                int(request.source_gpu_index),
+            )
+            if (
+                request.kind == DEVICE_BUFFER_NVLINK_RECEIVE
+                and request.source_node_rank != self.node_rank
+                and request.source_gpu_index == self.local_gpu_index
+            ):
+                rdma_key = (
+                    DEVICE_BUFFER_RDMA_RECEIVE,
+                    int(request.source_node_rank),
+                    -1,
+                    -1,
+                )
+                try:
+                    tensor = self.tensors[rdma_key]
+                except KeyError as error:
+                    raise RuntimeError(
+                        "direct-RDMA input alias was requested before its peer "
+                        f"receive tensor: source_node={request.source_node_rank}"
+                    ) from error
+                tensor_bytes = tensor.numel() * tensor.element_size()
+                if tuple(tensor.shape) != shape or tensor.dtype != dtype or tensor_bytes != request.bytes:
+                    raise RuntimeError(
+                        "direct-RDMA input alias descriptor does not match its RDMA "
+                        f"receive tensor: shape={shape}, bytes={request.bytes}"
+                    )
+                if key in self.tensors:
+                    raise RuntimeError(f"duplicate C++ device-buffer request for key {key}")
+                self.tensors[key] = tensor
+                return int(tensor.data_ptr())
+
             tensor = self.torch.empty(
                 shape,
                 dtype=dtype,
@@ -132,12 +176,6 @@ class TorchDeviceBuffers:
             if request.kind == DEVICE_BUFFER_RDMA_SEND:
                 tensor.normal_(mean=0.0, std=0.02)
 
-            key = (
-                int(request.kind),
-                int(request.peer_rank),
-                int(request.source_node_rank),
-                int(request.source_gpu_index),
-            )
             if key in self.tensors:
                 raise RuntimeError(f"duplicate C++ device-buffer request for key {key}")
             self.tensors[key] = tensor
@@ -154,9 +192,12 @@ class TorchDeviceBuffers:
         # In particular, finish the random send-buffer initialization before
         # the first C++ iteration is allowed to post RDMA work.
         self.torch.cuda.synchronize(self.cuda_device_id)
+        unique_tensors = {
+            int(tensor.data_ptr()): tensor for tensor in self.tensors.values()
+        }
         total_bytes = sum(
             tensor.numel() * tensor.element_size()
-            for tensor in self.tensors.values()
+            for tensor in unique_tensors.values()
         )
         counts: dict[str, int] = {}
         for kind, _, _, _ in self.tensors:
@@ -164,7 +205,9 @@ class TorchDeviceBuffers:
             counts[name] = counts.get(name, 0) + 1
         print(
             "Python owns proxy CUDA buffers: "
-            f"count={len(self.tensors)} bytes={total_bytes} by_kind={counts}",
+            f"logical_count={len(self.tensors)} "
+            f"physical_count={len(unique_tensors)} bytes={total_bytes} "
+            f"by_kind={counts}",
             flush=True,
         )
 
@@ -569,8 +612,16 @@ def install_python_device_buffers(
     handle: int,
     torch_module,
     cuda_device_id: int,
+    *,
+    node_rank: int,
+    local_gpu_index: int,
 ) -> TorchDeviceBuffers:
-    buffers = TorchDeviceBuffers(torch_module, cuda_device_id)
+    buffers = TorchDeviceBuffers(
+        torch_module,
+        cuda_device_id,
+        node_rank=node_rank,
+        local_gpu_index=local_gpu_index,
+    )
     require_proxy_success(
         library,
         library.rdma_proxy_set_device_buffer_allocator(
@@ -585,6 +636,9 @@ def run_proxy(
     library: ctypes.CDLL,
     proxy_argv: list[str],
     cuda_device_id: int,
+    *,
+    node_rank: int,
+    local_gpu_index: int,
 ) -> int:
     c_argv = encode_proxy_argv(proxy_argv)
     torch = import_torch_for_proxy(cuda_device_id)
@@ -596,7 +650,12 @@ def run_proxy(
     device_buffers: TorchDeviceBuffers | None = None
     try:
         device_buffers = install_python_device_buffers(
-            library, handle, torch, cuda_device_id
+            library,
+            handle,
+            torch,
+            cuda_device_id,
+            node_rank=node_rank,
+            local_gpu_index=local_gpu_index,
         )
         initialize_status = library.rdma_proxy_initialize(handle)
         if initialize_status != 0 and device_buffers.allocation_error is not None:
@@ -626,6 +685,8 @@ def run_proxy_with_concurrent_kernel(
     proxy_argv: list[str],
     cuda_device_id: int,
     *,
+    node_rank: int,
+    local_gpu_index: int,
     world_size: int,
     num_experts: int,
     expert_gemm_dimension: int,
@@ -651,7 +712,12 @@ def run_proxy_with_concurrent_kernel(
     device_buffers: TorchDeviceBuffers | None = None
     try:
         device_buffers = install_python_device_buffers(
-            library, handle, torch, cuda_device_id
+            library,
+            handle,
+            torch,
+            cuda_device_id,
+            node_rank=node_rank,
+            local_gpu_index=local_gpu_index,
         )
         initialize_status = library.rdma_proxy_initialize(handle)
         if initialize_status != 0 and device_buffers.allocation_error is not None:
@@ -895,6 +961,8 @@ def main() -> int:
             library,
             proxy_argv,
             int(metadata["cuda_device_id"]),
+            node_rank=int(metadata["node_rank"]),
+            local_gpu_index=int(metadata["local_rank"]),
             world_size=int(metadata["world_size"]),
             num_experts=args.num_experts,
             expert_gemm_dimension=args.expert_gemm_dimension,
@@ -905,7 +973,13 @@ def main() -> int:
             expert_gemm_max_swizzle_size=args.expert_gemm_max_swizzle_size,
             quack_root=args.quack_root,
         )
-    return run_proxy(library, proxy_argv, int(metadata["cuda_device_id"]))
+    return run_proxy(
+        library,
+        proxy_argv,
+        int(metadata["cuda_device_id"]),
+        node_rank=int(metadata["node_rank"]),
+        local_gpu_index=int(metadata["local_rank"]),
+    )
 
 
 def worker_entrypoint() -> int:

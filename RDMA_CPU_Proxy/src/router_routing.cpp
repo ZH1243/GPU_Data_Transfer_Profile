@@ -166,13 +166,18 @@ void RouterRouting::initialize_mock() {
 
         std::vector<int32_t> gpu_positions(
             static_cast<std::size_t>(config_.num_gpus_per_node), 0);
-        for (const auto& [mask, token] : node_entries) {
+        for (std::size_t node_position = 0;
+             node_position < node_entries.size();
+             ++node_position) {
+            const auto& [mask, token] = node_entries[node_position];
             for (const int expert : routes[token]) {
                 if (expert / experts_per_node != node) continue;
                 const int local_gpu =
                     (expert / experts_per_gpu()) % config_.num_gpus_per_node;
                 expert_lists[static_cast<std::size_t>(expert)].push_back(
-                    gpu_positions[static_cast<std::size_t>(local_gpu)]);
+                    local_gpu == config_.local_gpu_index
+                        ? static_cast<int32_t>(node_position)
+                        : gpu_positions[static_cast<std::size_t>(local_gpu)]);
             }
             for (int gpu = 0; gpu < config_.num_gpus_per_node; ++gpu) {
                 int bit = config_.local_gpu_index - gpu;

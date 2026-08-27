@@ -730,6 +730,7 @@ __global__ __launch_bounds__(kBlockThreads) void scatter_reordered_chunks_kernel
     int experts_per_gpu,
     int experts_per_node,
     int gpus_per_node,
+    int local_gpu_id,
     int num_chunks_per_node,
     int radix_end_bit,
     const int32_t* __restrict__ node_token_indices,
@@ -795,11 +796,19 @@ __global__ __launch_bounds__(kBlockThreads) void scatter_reordered_chunks_kernel
     }
     unsigned mask = __ballot_sync(0xffffffffu, routed_to_gpu);
     if (routed_to_gpu) {
-      int32_t index = chunk_prefixes[chunk_row + experts_per_node + gpu];
-      for (int previous_warp = 0; previous_warp < warp; ++previous_warp) {
-        index += warp_gpu_counts[gpu * kWarps + previous_warp];
+      // The source-local GPU consumes the destination-node x3 RDMA receive
+      // buffer directly, without the compaction performed by NVLink
+      // forwarding. Its A_idx therefore addresses the full x3 node slice.
+      // Every other GPU still addresses its independently compacted NVLink
+      // destination buffer.
+      int32_t index = position - begin;
+      if (gpu != local_gpu_id) {
+        index = chunk_prefixes[chunk_row + experts_per_node + gpu];
+        for (int previous_warp = 0; previous_warp < warp; ++previous_warp) {
+          index += warp_gpu_counts[gpu * kWarps + previous_warp];
+        }
+        index += __popc(mask & ((1u << lane) - 1u));
       }
-      index += __popc(mask & ((1u << lane) - 1u));
 #pragma unroll
       for (int route = 0; route < ITEMS_PER_THREAD; ++route) {
         if (experts[route] < experts_per_node &&
@@ -846,6 +855,8 @@ __global__ void scatter_reordered_by_expert_fallback_kernel(
     int top_k,
     int experts_per_gpu,
     int experts_per_node,
+    int gpus_per_node,
+    int local_gpu_id,
     const int32_t* __restrict__ node_token_indices,
     const int32_t* __restrict__ node_offsets,
     const int32_t* __restrict__ expert_offsets,
@@ -899,7 +910,11 @@ __global__ void scatter_reordered_by_expert_fallback_kernel(
     gpu_rank += __popc(gpu_mask & ((1u << lane) - 1u));
     expert_rank += __popc(expert_mask & ((1u << lane) - 1u));
     if (routed_to_expert) {
-      expert_token_indices[expert_offsets[expert] + expert_rank] = gpu_rank;
+      const int owner_local_gpu = owner_gpu % gpus_per_node;
+      const int32_t input_index = owner_local_gpu == local_gpu_id
+          ? position - begin
+          : gpu_rank;
+      expert_token_indices[expert_offsets[expert] + expert_rank] = input_index;
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -1039,6 +1054,7 @@ void launch_scatter_reordered_specialized(
     int experts_per_gpu,
     int experts_per_node,
     int gpus_per_node,
+    int local_gpu_id,
     int num_chunks_per_node,
     int num_nodes,
     int radix_end_bit,
@@ -1062,6 +1078,7 @@ void launch_scatter_reordered_specialized(
       experts_per_gpu,
       experts_per_node,
       gpus_per_node,
+      local_gpu_id,
       num_chunks_per_node,
       radix_end_bit,
       node_token_indices,
@@ -1191,8 +1208,9 @@ void get_expert_token_idx_node_mask_cuda_raw(
   if (!specialized_top_k) {
     scatter_reordered_by_expert_fallback_kernel<<<
         num_experts, kBlockThreads, 0, stream>>>(
-        r, top_k, experts_per_gpu, experts_per_node, node_token_indices,
-        node_offsets, expert_offsets, expert_token_indices);
+        r, top_k, experts_per_gpu, experts_per_node, gpus_per_node,
+        local_gpu_id, node_token_indices, node_offsets, expert_offsets,
+        expert_token_indices);
     check_cuda_status(
         cudaGetLastError(), "scatter_reordered_by_expert_fallback_kernel launch");
     return;
@@ -1221,7 +1239,7 @@ void get_expert_token_idx_node_mask_cuda_raw(
 #define LAUNCH_RAW_NODE_SCATTER(TOP_K_VALUE)                                \
   launch_scatter_reordered_specialized<TOP_K_VALUE>(                        \
       r, top_k, experts_per_gpu, experts_per_node, gpus_per_node,            \
-      num_chunks_per_node, num_nodes, expert_radix_end_bit,                  \
+      local_gpu_id, num_chunks_per_node, num_nodes, expert_radix_end_bit,    \
       node_token_indices, node_offsets, reordered_chunk_counts,              \
       reordered_chunk_prefixes, expert_offsets, expert_token_indices,        \
       scatter_smem, stream)
@@ -1592,6 +1610,8 @@ void get_expert_token_idx_node_mask_cuda(
         top_k,
         experts_per_gpu,
         experts_per_node,
+        gpus_per_node,
+        local_gpu_id,
         x3,
         node_offsets.data_ptr<int32_t>(),
         expert_offsets.data_ptr<int32_t>(),
@@ -1639,7 +1659,8 @@ void get_expert_token_idx_node_mask_cuda(
 #define LAUNCH_NODE_SCATTER(TOP_K_VALUE)                                    \
   launch_scatter_reordered_specialized<TOP_K_VALUE>(                        \
       input, top_k, experts_per_gpu, experts_per_node, gpus_per_node,       \
-      num_chunks_per_node, num_nodes, expert_radix_end_bit, x3,             \
+      local_gpu_id, num_chunks_per_node, num_nodes, expert_radix_end_bit,   \
+      x3,                                                                    \
       node_offsets.data_ptr<int32_t>(), reordered_counts,                    \
       reordered_prefixes, output_offsets, output, scatter_smem, stream)
 

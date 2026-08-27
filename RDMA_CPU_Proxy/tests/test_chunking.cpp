@@ -164,6 +164,7 @@ int main() {
     router_nvlink_config.nvlink_forward_notification_flush_only_enabled = true;
     router_nvlink_config.nvlink_forward_notification_flag_update_mode =
         NvlinkForwardNotificationFlagUpdateMode::kMemcpy;
+    router_nvlink_config.router_computation_forwarded_inputs_only = true;
     router_nvlink_config.router_num_experts = 256;
     router_nvlink_config.router_top_k = 8;
     router_nvlink_config.node_rank = 0;
@@ -193,6 +194,14 @@ int main() {
             assert(buffer.recv.ptr != nullptr);
             assert(buffer.recv.bytes == expected_forwarding_buffer_bytes);
             assert(!buffer.expert_metadata_ready);
+            if (source_node != router_nvlink_config.node_rank &&
+                source_gpu == router_nvlink_config.local_gpu_index) {
+                assert(buffer.recv.ptr ==
+                       router_nvlink_buffers.buffers_for_peer(source_node).recv.ptr);
+                assert(buffer.recv.is_alias);
+            } else {
+                assert(!buffer.recv.is_alias);
+            }
             distinct_router_nvlink_allocations.insert(buffer.recv.ptr);
         }
     }
@@ -226,13 +235,14 @@ int main() {
 
     const auto& publication =
         router_nvlink_buffers.router_notification_publication_buffers();
-    const std::size_t expected_table_width = 2 + 2 * 32;
+    const std::size_t expected_remote_inputs = 3 * 8;
+    const std::size_t expected_table_width = 2 + 2 * expected_remote_inputs;
     const std::size_t expected_table_row_bytes =
         expected_table_width * sizeof(int32_t);
     assert(publication.table_width == expected_table_width);
     assert(publication.table_row_bytes == expected_table_row_bytes);
     assert(publication.table_rows == 12);
-    assert(publication.num_input_buffers == 32);
+    assert(publication.num_input_buffers == expected_remote_inputs);
     assert(publication.a_idx_capacity == 3);
     assert(publication.n_groups_per_m_cluster == 4);
     assert(publication.group_size == 8);
@@ -272,13 +282,15 @@ int main() {
                 static_cast<const int32_t*>(installed.expert_token_indices_device.ptr) + 3) ==
             std::vector<int32_t>{0, 1, 2}));
     const auto& empty_installed =
-        router_nvlink_buffers.nvlink_receive_buffer_for_source(0, 0);
+        router_nvlink_buffers.nvlink_receive_buffer_for_source(1, 0);
     assert(empty_installed.expert_token_index_count == 0);
     assert(empty_installed.expert_token_indices_device.bytes == 3 * sizeof(int32_t));
     assert((std::vector<int32_t>(
                 static_cast<const int32_t*>(empty_installed.expert_token_indices_device.ptr),
                 static_cast<const int32_t*>(empty_installed.expert_token_indices_device.ptr) + 3) ==
             std::vector<int32_t>{0, 0, 0}));
+    assert(router_nvlink_buffers.nvlink_receive_buffer_for_source(
+               0, 0).expert_token_indices_device.ptr == nullptr);
     auto head_state = router_nvlink_buffers.expert_token_head_state_for_source(2, 3);
     assert(!head_state.iteration_initialized);
     assert(head_state.received_token_frontier == 0);
@@ -590,14 +602,15 @@ int main() {
     }
     for (void* pointer : external_device_pointers) ::operator delete(pointer);
 
-    // The current forwarding-only GroupedGEMM scope includes remote-node,
-    // cross-local-GPU sources and excludes local-node plus remote same-index
-    // buffers. For 2 nodes x 2 GPUs this leaves exactly source (1, 1).
+    // The remote-input GroupedGEMM scope includes both the compact forwarded
+    // input (1, 1) and the direct RDMA alias (1, 0), while excluding local-node
+    // buffers.
     auto forwarded_config = scheduler_config;
     forwarded_config.num_nodes = 2;
     forwarded_config.num_gpus_per_node = 2;
     forwarded_config.router_num_experts = 4;
     forwarded_config.router_computation_forwarded_inputs_only = true;
+    forwarded_config.peers = {PeerAddress{1, "peer-1", 1}};
     CudaBuffers forwarded_buffers(forwarded_config);
     forwarded_buffers.initialize();
     for (int source_node = 0; source_node < 2; ++source_node) {
@@ -613,9 +626,10 @@ int main() {
             metadata.experts_per_gpu = 1;
             metadata.first_global_expert = 0;
             metadata.num_tokens = 7;
-            metadata.expert_token_indices =
-                source_node == 1 && source_gpu == 1
-                ? std::vector<int32_t>{0, 1, 2}
+            metadata.expert_token_indices = source_node == 1
+                ? (source_gpu == 0
+                    ? std::vector<int32_t>{0, 2}
+                    : std::vector<int32_t>{0, 1, 2})
                 : std::vector<int32_t>{};
             metadata.expert_offsets = {
                 0, static_cast<int32_t>(metadata.expert_token_indices.size())};
@@ -624,11 +638,15 @@ int main() {
     }
     const auto& forwarded_publication =
         forwarded_buffers.router_notification_publication_buffers();
-    assert(forwarded_publication.num_input_buffers == 1);
-    assert(forwarded_publication.table_width == 4);
-    assert(forwarded_publication.table_rows == 2);
+    assert(forwarded_publication.num_input_buffers == 2);
+    assert(forwarded_publication.table_width == 6);
+    assert(forwarded_publication.table_rows == 4);
     assert(forwarded_publication.a_idx_capacity == 3);
-    assert(forwarded_buffers.router_computation_num_tokens() == 3);
+    assert(forwarded_buffers.router_computation_num_tokens() == 5);
+    const auto& direct_input = forwarded_buffers.nvlink_receive_buffer_for_source(1, 0);
+    assert(direct_input.recv.is_alias);
+    assert(direct_input.recv.ptr == forwarded_buffers.buffers_for_peer(1).recv.ptr);
+    assert(direct_input.expert_token_indices_device.ptr != nullptr);
     assert(forwarded_buffers.nvlink_receive_buffer_for_source(
                1, 1).expert_token_indices_device.ptr != nullptr);
     assert(forwarded_buffers.nvlink_receive_buffer_for_source(
@@ -638,6 +656,7 @@ int main() {
     // the publication thread; GPU execution still orders the persistent
     // kernel's completion after all readiness-gated table work.
     forwarded_buffers.record_router_computation_end(0, 0);
+    forwarded_buffers.process_router_notification_completion(1, 0, 0, 0, 3);
     forwarded_buffers.process_router_notification_completion(1, 1, 0, 0, 3);
     bool rejected_mock_gpu_timing = false;
     try {

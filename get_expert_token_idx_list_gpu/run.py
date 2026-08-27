@@ -176,11 +176,15 @@ def cpu_node_mask_reference(
     expert_lists: List[List[int]] = [[] for _ in range(num_experts)]
     for node, entries in enumerate(node_entries):
         gpu_positions = [0] * gpus_per_node
-        for mask, token in entries:
+        for node_position, (mask, token) in enumerate(entries):
             for expert in routes[token]:
                 if expert // experts_per_node == node:
                     local_gpu = (expert // experts_per_gpu) % gpus_per_node
-                    expert_lists[expert].append(gpu_positions[local_gpu])
+                    expert_lists[expert].append(
+                        node_position
+                        if local_gpu == local_gpu_id
+                        else gpu_positions[local_gpu]
+                    )
             for gpu in range(gpus_per_node):
                 bit = (local_gpu_id - gpu) % gpus_per_node
                 if mask & (1 << bit):

@@ -41,7 +41,10 @@ typedef enum RdmaProxyDeviceBufferElementType {
 /*
  * Allocation request passed to an embedding runtime. dimensions contains up
  * to two logical tensor dimensions; bytes is always the required allocation
- * size. Negative peer/source identifiers mean "not applicable".
+ * size. Negative peer/source identifiers mean "not applicable". A router
+ * NVLINK_RECEIVE request whose remote source GPU equals this proxy's local GPU
+ * is a logical alias request: the allocator must return the pointer previously
+ * supplied for that source node's RDMA_RECEIVE request.
  */
 typedef struct RdmaProxyDeviceBufferRequest {
     uint32_t struct_size;

@@ -107,8 +107,9 @@ namespace {
 constexpr uint64_t kLocalIterationSyncMagic = 0x52444d415053594eULL;  // "RDMAPSyn"
 constexpr uint32_t kLocalIterationSyncVersion = 3;
 constexpr uint64_t kNvlinkForwardNotificationMagic = 0x52444d414e464e51ULL;  // "RDMANFNQ"
-constexpr uint32_t kNvlinkForwardNotificationVersion = 2;
+constexpr uint32_t kNvlinkForwardNotificationVersion = 3;
 constexpr uint32_t kNvlinkForwardRoundRobinFlag = 1U;
+constexpr uint32_t kDirectRdmaInputFlag = 1U << 1;
 
 std::size_t checked_add(std::size_t a, std::size_t b, const char* description) {
     if (b > std::numeric_limits<std::size_t>::max() - a) {
@@ -260,10 +261,8 @@ std::size_t routing_column_for_gpu(int local_gpu, int dst_gpu, int num_gpus_per_
 }
 
 std::size_t nvlink_notification_queue_index_for_source(int receiver_gpu, int source_gpu) {
-    if (source_gpu == receiver_gpu) {
-        throw std::runtime_error("NVLink notification source GPU cannot match receiver GPU");
-    }
-    return static_cast<std::size_t>(source_gpu < receiver_gpu ? source_gpu : source_gpu - 1);
+    (void)receiver_gpu;
+    return static_cast<std::size_t>(source_gpu);
 }
 
 uint64_t unix_epoch_nanoseconds_now() {
@@ -947,7 +946,7 @@ void Proxy::initialize_nvlink_forward_notifications() {
     if (nvlink_forward_notification_header_) return;
 
 #if defined(__unix__) || defined(__APPLE__)
-    const auto queue_count = static_cast<std::size_t>(config_.num_gpus_per_node - 1);
+    const auto queue_count = static_cast<std::size_t>(config_.num_gpus_per_node);
     const auto queue_capacity = config_.nvlink_forward_notification_queue_depth;
     const auto entry_bytes = sizeof(NvlinkForwardNotification);
     if (entry_bytes > static_cast<std::size_t>(std::numeric_limits<uint32_t>::max())) {
@@ -1050,18 +1049,16 @@ void Proxy::initialize_nvlink_forward_notifications() {
 
     auto* queues = reinterpret_cast<NvlinkForwardNotificationQueue*>(
         reinterpret_cast<char*>(mapping) + sizeof(NvlinkForwardNotificationHeader));
-    std::size_t queue_index = 0;
     for (int source_gpu = 0; source_gpu < config_.num_gpus_per_node; ++source_gpu) {
-        if (source_gpu == config_.local_gpu_index) continue;
         auto* queue = reinterpret_cast<NvlinkForwardNotificationQueue*>(
-            reinterpret_cast<char*>(queues) + queue_index * sizeof(NvlinkForwardNotificationQueue));
+            reinterpret_cast<char*>(queues) +
+            static_cast<std::size_t>(source_gpu) * sizeof(NvlinkForwardNotificationQueue));
         queue->source_gpu = source_gpu;
         queue->capacity = static_cast<uint32_t>(queue_capacity);
         atomic_store_u64(&queue->head, 0);
         atomic_store_u64(&queue->tail, 0);
         atomic_store_u64(&queue->dropped, 0);
         atomic_store_u64(&queue->sender_done, 0);
-        ++queue_index;
     }
     atomic_store_i32(&header->pid, current_process_id());
     atomic_store_u32(&header->initialized, 1);
@@ -1125,8 +1122,9 @@ void Proxy::prepare_forwarding_notification_destinations() {
 
 #if defined(__unix__) || defined(__APPLE__)
     forwarding_notification_destinations_.clear();
-    forwarding_notification_destinations_.reserve(forwarding_destinations_.size());
-    const auto queue_count = static_cast<std::size_t>(config_.num_gpus_per_node - 1);
+    forwarding_notification_destinations_.reserve(
+        static_cast<std::size_t>(config_.num_gpus_per_node));
+    const auto queue_count = static_cast<std::size_t>(config_.num_gpus_per_node);
     const auto entry_bytes = sizeof(NvlinkForwardNotification);
     if (entry_bytes > static_cast<std::size_t>(std::numeric_limits<uint32_t>::max())) {
         throw std::runtime_error("NVLink notification entry size exceeds uint32 range");
@@ -1150,8 +1148,14 @@ void Proxy::prepare_forwarding_notification_destinations() {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(config_.completion_timeout_ms);
 
+    std::vector<int> destination_gpus;
+    destination_gpus.reserve(static_cast<std::size_t>(config_.num_gpus_per_node));
+    destination_gpus.push_back(config_.local_gpu_index);
     for (const auto& dst : forwarding_destinations_) {
-        const auto name = nvlink_forward_notification_shm_name(dst.gpu_index);
+        destination_gpus.push_back(dst.gpu_index);
+    }
+    for (const int destination_gpu : destination_gpus) {
+        const auto name = nvlink_forward_notification_shm_name(destination_gpu);
         std::string last_wait_reason = "shared memory not present";
         while (std::chrono::steady_clock::now() < deadline) {
             int fd = shm_open(name.c_str(), O_RDWR, 0600);
@@ -1182,7 +1186,7 @@ void Proxy::prepare_forwarding_notification_destinations() {
                 header->magic != kNvlinkForwardNotificationMagic ||
                 header->version != kNvlinkForwardNotificationVersion ||
                 header->node_rank != config_.node_rank ||
-                header->gpu_index != dst.gpu_index ||
+                header->gpu_index != destination_gpu ||
                 header->num_gpus_per_node != static_cast<uint32_t>(config_.num_gpus_per_node) ||
                 header->queue_count != static_cast<uint32_t>(queue_count) ||
                 header->queue_capacity != static_cast<uint32_t>(config_.nvlink_forward_notification_queue_depth) ||
@@ -1207,16 +1211,16 @@ void Proxy::prepare_forwarding_notification_destinations() {
             }
 
             forwarding_notification_destinations_.push_back(
-                ForwardNotificationDestinationState{dst.gpu_index, header, expected_size, fd});
+                ForwardNotificationDestinationState{destination_gpu, header, expected_size, fd});
             RDMA_PROXY_LOG_INFO("mapped NVLink completion notification queue local_rank=", config_.node_rank,
                                 " src_gpu=", config_.local_gpu_index,
-                                " dst_gpu=", dst.gpu_index,
+                                " dst_gpu=", destination_gpu,
                                 " receiver_pid=", receiver_pid,
                                 " name=", name);
             break;
         }
         if (forwarding_notification_destinations_.empty() ||
-            forwarding_notification_destinations_.back().gpu_index != dst.gpu_index) {
+            forwarding_notification_destinations_.back().gpu_index != destination_gpu) {
             throw std::runtime_error("timed out waiting for NVLink completion notification shared memory " +
                                      name + " reason=" + last_wait_reason);
         }
@@ -1488,6 +1492,7 @@ void Proxy::drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQue
 void Proxy::nvlink_forward_notification_loop() {
     try {
         if (!nvlink_forward_notification_header_) return;
+        select_cuda_device_for_thread(config_.cuda_device_id, config_.mock_mode);
         bool stopping = false;
         auto stop_deadline = std::chrono::steady_clock::time_point{};
         while (true) {
@@ -2662,6 +2667,25 @@ void Proxy::issue_forwarding_batch(
     const auto legacy_peer_slot_offset = cuda_buffers_.token_buffer_bytes() * peer_slot;
     const bool compact_router_destinations =
         config_.router_routing_enabled && !config_.nvlink_forward_use_round_robin;
+    if (compact_router_destinations &&
+        config_.nvlink_forward_completion_notifications_enabled) {
+        // The same-local-GPU source already resides in this proxy's peer RDMA
+        // receive buffer. Publish the full newly arrived x3 range through the
+        // ordinary notification pipeline, but issue no NVLink copy.
+        NvlinkForwardNotification notification;
+        notification.iteration = iteration;
+        notification.batch_index = batch_index_in_iteration;
+        notification.peer_slot = peer_slot;
+        notification.start_token = batch_start_token;
+        notification.num_tokens = batch_tokens;
+        notification.byte_offset = batch_start_token * token_bytes;
+        notification.bytes = batch_tokens * token_bytes;
+        notification.source_gpu = config_.local_gpu_index;
+        notification.destination_gpu = config_.local_gpu_index;
+        notification.peer_rank = peer.peer_rank;
+        notification.flags = kDirectRdmaInputFlag;
+        completed_notifications.push_back(notification);
+    }
     if (compact_router_destinations) {
         if (peer_slot >= forwarding_compaction_iteration_by_peer_.size() ||
             peer_slot >= forwarding_compaction_next_source_token_by_peer_.size() ||
@@ -2889,6 +2913,15 @@ void Proxy::issue_forwarding_batch(
     }
     if (config_.nvlink_forward_synchronize_batches) {
         synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
+        if (compact_router_destinations &&
+            config_.nvlink_forward_completion_notifications_enabled) {
+            // Unlike forwarded inputs, the direct same-local-GPU input has no
+            // CUDA copy submission between CQ readiness and consumption by the
+            // already-running GroupedGEMM. Make GPUDirect writes visible before
+            // its notification can publish gather-table work.
+            flush_gpudirect_rdma_writes(
+                config_.cuda_device_id, config_.mock_mode);
+        }
         const auto batch_timing_end = std::chrono::steady_clock::now();
         enqueue_forward_completion_notifications(std::move(completed_notifications));
         const auto batch_seconds = std::chrono::duration<double>(batch_timing_end - batch_timing_start).count();
@@ -3170,6 +3203,7 @@ void Proxy::record_out_of_order_forwarding_arrival(
 
 void Proxy::forwarding_loop() {
     try {
+        select_cuda_device_for_thread(config_.cuda_device_id, config_.mock_mode);
         const auto peer_order = nvlink_forward_peer_order();
         const bool dynamic_threshold = nvlink_forward_dynamic_threshold_enabled(config_);
         const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config_);

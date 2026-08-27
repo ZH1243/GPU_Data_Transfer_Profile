@@ -47,7 +47,13 @@ int main() {
                 masks.begin(), masks.end(),
                 [&](uint8_t mask) { return (mask & gpu_mask) != 0; }));
             for (const auto index : metadata.expert_token_indices) {
-                assert(index >= 0 && index < destination_token_count);
+                assert(index >= 0);
+                if (gpu == config.local_gpu_index) {
+                    assert(static_cast<std::size_t>(index) < masks.size());
+                    assert((masks[static_cast<std::size_t>(index)] & gpu_mask) != 0);
+                } else {
+                    assert(index < destination_token_count);
+                }
             }
             for (int expert = 0; expert < routing.experts_per_gpu(); ++expert) {
                 const auto begin = metadata.expert_offsets[static_cast<std::size_t>(expert)];

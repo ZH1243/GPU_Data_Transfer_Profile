@@ -228,15 +228,28 @@ void CudaBuffers::initialize() {
                     NvlinkReceiveBuffer entry;
                     entry.source_node_rank = source_node;
                     entry.source_gpu_index = source_gpu;
-                    allocate_buffer(
-                        entry.recv,
-                        token_buffer_request(
-                            DeviceBufferKind::kNvlinkReceive,
-                            config_,
-                            forwarding_bytes,
-                            -1,
-                            source_node,
-                            source_gpu));
+                    const auto request = token_buffer_request(
+                        DeviceBufferKind::kNvlinkReceive,
+                        config_,
+                        forwarding_bytes,
+                        -1,
+                        source_node,
+                        source_gpu);
+                    if (source_node != config_.node_rank &&
+                        source_gpu == config_.local_gpu_index) {
+                        alias_buffer(
+                            entry.recv,
+                            buffers_for_peer(source_node).recv,
+                            request);
+                        RDMA_PROXY_LOG_INFO(
+                            "aliased router direct-RDMA input local_gpu=",
+                            config_.local_gpu_index,
+                            " source_node=", source_node,
+                            " source_gpu=", source_gpu,
+                            " bytes=", forwarding_bytes);
+                    } else {
+                        allocate_buffer(entry.recv, request);
+                    }
                     nvlink_recv_buffers_.push_back(entry);
                     RDMA_PROXY_LOG_INFO(
                         "allocated router NVLink receive buffer local_gpu=", config_.local_gpu_index,
@@ -583,8 +596,7 @@ bool CudaBuffers::is_router_computation_input(
     if (!config_.router_computation_forwarded_inputs_only) return true;
     return buffer.source_node_rank >= 0 &&
         buffer.source_node_rank != config_.node_rank &&
-        buffer.source_gpu_index >= 0 &&
-        buffer.source_gpu_index != config_.local_gpu_index;
+        buffer.source_gpu_index >= 0;
 }
 
 void CudaBuffers::initialize_router_computation_scheduler_locked() {
@@ -1395,12 +1407,38 @@ void CudaBuffers::allocate_buffer(
 #endif
 }
 
+void CudaBuffers::alias_buffer(
+    GpuBuffer& buffer,
+    const GpuBuffer& source,
+    const DeviceBufferAllocationRequest& request) {
+    if (!source.ptr || source.bytes != request.bytes) {
+        throw std::runtime_error(
+            "device-buffer alias source is missing or has the wrong size");
+    }
+    if (external_device_buffer_allocator_) {
+        void* exposed_ptr = external_device_buffer_allocator_(request);
+        if (!exposed_ptr) {
+            throw std::runtime_error(
+                "external device-buffer allocator rejected an alias request");
+        }
+        if (exposed_ptr != source.ptr) {
+            throw std::runtime_error(
+                "external device-buffer allocator did not return the RDMA receive "
+                "pointer for a direct-input alias");
+        }
+    }
+    buffer = source;
+    buffer.is_alias = true;
+}
+
 void CudaBuffers::free_buffer(GpuBuffer& buffer) {
     if (!buffer.ptr) return;
+    if (buffer.is_alias) {
+        buffer = GpuBuffer{};
+        return;
+    }
     if (buffer.is_externally_owned) {
-        buffer.ptr = nullptr;
-        buffer.bytes = 0;
-        buffer.is_externally_owned = false;
+        buffer = GpuBuffer{};
         return;
     }
     if (buffer.is_mock_host_memory) {
@@ -1413,8 +1451,7 @@ void CudaBuffers::free_buffer(GpuBuffer& buffer) {
         }
 #endif
     }
-    buffer.ptr = nullptr;
-    buffer.bytes = 0;
+    buffer = GpuBuffer{};
 }
 
 void CudaBuffers::allocate_pinned_buffer(
@@ -1481,6 +1518,31 @@ void* create_cuda_stream(int cuda_device_id, bool nonblocking, bool mock_mode) {
     (void)cuda_device_id;
     (void)nonblocking;
     throw std::runtime_error("CUDA stream requested but CUDA support was not built");
+#endif
+}
+
+void select_cuda_device_for_thread(int cuda_device_id, bool mock_mode) {
+    if (mock_mode) return;
+#if RDMA_PROXY_HAVE_CUDA
+    check_cuda(cudaSetDevice(cuda_device_id), "cudaSetDevice for proxy worker thread");
+#else
+    (void)cuda_device_id;
+    throw std::runtime_error("CUDA device selection requested without CUDA support");
+#endif
+}
+
+void flush_gpudirect_rdma_writes(int cuda_device_id, bool mock_mode) {
+    if (mock_mode) return;
+#if RDMA_PROXY_HAVE_CUDA
+    select_cuda_device_for_thread(cuda_device_id, mock_mode);
+    check_cuda_driver(
+        cuFlushGPUDirectRDMAWrites(
+            CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX,
+            CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER),
+        "cuFlushGPUDirectRDMAWrites direct input visibility");
+#else
+    (void)cuda_device_id;
+    throw std::runtime_error("GPUDirect RDMA visibility flush requested without CUDA support");
 #endif
 }
 
