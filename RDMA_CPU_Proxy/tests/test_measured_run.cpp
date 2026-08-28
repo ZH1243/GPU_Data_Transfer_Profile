@@ -225,6 +225,7 @@ int main() {
         config.num_nodes = 4;
         config.num_iterations = 1;
         config.sequential_peer_transfers = true;
+        config.local_forwarding_rdma_overlap_enabled = true;
         config.peers = {
             PeerAddress{1, "mock-peer-b", 18515},
             PeerAddress{2, "mock-peer-c", 18515},

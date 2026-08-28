@@ -320,6 +320,10 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "sequential_peer_transfers") {
         config.sequential_peer_transfers = (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "local_forwarding_rdma_overlap_enabled") {
+        config.local_forwarding_rdma_overlap_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "nvlink_forwarding_enabled" || key == "nvlink_forwarding_enable") {
         config.nvlink_forwarding_enabled = (value == "1" || value == "true" || value == "yes");
     }
@@ -574,6 +578,10 @@ ProxyConfig load_config_file(const std::string& path) {
     config.validate_data = get_bool(object, "validate_data", config.validate_data);
     config.sequential_peer_transfers = get_bool(
         object, "sequential_peer_transfers", config.sequential_peer_transfers);
+    config.local_forwarding_rdma_overlap_enabled = get_bool(
+        object,
+        "local_forwarding_rdma_overlap_enabled",
+        config.local_forwarding_rdma_overlap_enabled);
     config.nvlink_forwarding_enabled = get_bool(
         object, "nvlink_forwarding_enabled", config.nvlink_forwarding_enabled);
     config.nvlink_forward_threshold_tokens = number_as<std::size_t>(
@@ -791,6 +799,12 @@ void validate_config(const ProxyConfig& config) {
         throw std::runtime_error("max_in_flight_chunks_per_qp must be <= send_queue_depth");
     }
     if (config.completion_timeout_ms == 0) throw std::runtime_error("completion_timeout_ms must be > 0");
+    if (config.local_forwarding_rdma_overlap_enabled &&
+        !config.sequential_peer_transfers) {
+        throw std::runtime_error(
+            "local_forwarding_rdma_overlap_enabled requires "
+            "sequential_peer_transfers=true");
+    }
     if (config.num_nodes > 1 && static_cast<int>(config.peers.size()) != config.num_nodes - 1) {
         throw std::runtime_error("peers must contain exactly num_nodes - 1 entries");
     }
@@ -1064,6 +1078,8 @@ std::string config_summary(const ProxyConfig& config) {
         << " iterations=" << config.num_iterations
         << " dtype=" << to_string(config.dtype)
         << " sequential_peer_transfers=" << (config.sequential_peer_transfers ? "true" : "false")
+        << " local_forwarding_rdma_overlap_enabled="
+        << (config.local_forwarding_rdma_overlap_enabled ? "true" : "false")
         << " nvlink_forwarding_enabled=" << (config.nvlink_forwarding_enabled ? "true" : "false")
         << " nvlink_forward_threshold_tokens=" << config.nvlink_forward_threshold_tokens
         << " nvlink_forward_threshold_chunks=" << config.nvlink_forward_threshold_chunks

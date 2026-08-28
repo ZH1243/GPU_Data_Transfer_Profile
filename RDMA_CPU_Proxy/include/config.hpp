@@ -69,6 +69,10 @@ struct ProxyConfig {
     bool fill_test_data{true};
     bool validate_data{true};
     bool sequential_peer_transfers{false};
+    // Prime the first sequential remote transfer before draining the local
+    // router-staging source. Remote NVLink forwarding remains gated behind
+    // completion of the local source.
+    bool local_forwarding_rdma_overlap_enabled{false};
     bool nvlink_forwarding_enabled{false};
     std::size_t nvlink_forward_threshold_tokens{0};
     std::size_t nvlink_forward_threshold_chunks{0};

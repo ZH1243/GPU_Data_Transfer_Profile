@@ -33,6 +33,7 @@ int main(int argc, char** argv) {
     assert(config.fill_test_data);
     assert(config.validate_data);
     assert(!config.sequential_peer_transfers);
+    assert(!config.local_forwarding_rdma_overlap_enabled);
     assert(!config.nvlink_forwarding_enabled);
     assert(config.nvlink_forward_threshold_tokens == 700);
     assert(config.nvlink_forward_threshold_chunks == 0);
@@ -160,6 +161,7 @@ int main(int argc, char** argv) {
         "--completion_timeout_ms=1000",
         "--validate_data=false",
         "--sequential_peer_transfers=true",
+        "--local_forwarding_rdma_overlap_enabled=true",
         "--log_qp_reports=true",
         "--log_marker_wait_reports=true",
         "--nvlink_forward_local_batch_sync_enabled=false",
@@ -180,7 +182,7 @@ int main(int argc, char** argv) {
         "--nvlink_forward_notification_flag_update_mode=memcpy",
         "--cpu_affinity=0-95,192-287",
     };
-    const auto peer_port_config = rdma_proxy::load_config(27, const_cast<char**>(peer_port_args));
+    const auto peer_port_config = rdma_proxy::load_config(28, const_cast<char**>(peer_port_args));
     for (const auto& peer : peer_port_config.peers) {
         assert(peer.port == 18521);
     }
@@ -188,6 +190,7 @@ int main(int argc, char** argv) {
     assert(peer_port_config.completion_timeout_ms == 1000);
     assert(!peer_port_config.validate_data);
     assert(peer_port_config.sequential_peer_transfers);
+    assert(peer_port_config.local_forwarding_rdma_overlap_enabled);
     assert(peer_port_config.log_qp_reports);
     assert(peer_port_config.log_marker_wait_reports);
     assert(peer_port_config.local_iteration_sync_enabled);
@@ -207,6 +210,16 @@ int main(int argc, char** argv) {
     assert(peer_port_config.nvlink_forward_notification_flag_update_mode ==
            rdma_proxy::NvlinkForwardNotificationFlagUpdateMode::kMemcpy);
     assert(peer_port_config.cpu_affinity == "0-95,192-287");
+
+    auto invalid_overlap_config = peer_port_config;
+    invalid_overlap_config.sequential_peer_transfers = false;
+    bool rejected_overlap_without_sequential_transfers = false;
+    try {
+        rdma_proxy::validate_config(invalid_overlap_config);
+    } catch (const std::runtime_error&) {
+        rejected_overlap_without_sequential_transfers = true;
+    }
+    assert(rejected_overlap_without_sequential_transfers);
 
     const char* signal_interval_args[] = {
         "test_config",

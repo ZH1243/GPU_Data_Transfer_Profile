@@ -1563,15 +1563,33 @@ void Proxy::run_iteration(uint64_t iteration) {
     synchronize_iteration_start(iteration);
 
     const auto start = std::chrono::steady_clock::now();
-    // The local x3 staging buffer has no CQ/immediate readiness source. Drain
-    // it first for this iteration, then permit ordinary remote-node forwarding.
-    process_local_router_forwarding_iteration(iteration);
     std::vector<std::shared_ptr<DynamicChunkDistributor>> dispatchers(peers_.size());
+    std::vector<std::size_t> sequential_order;
     if (config_.sequential_peer_transfers) {
-        const auto order = sequential_peer_order();
-        for (const auto peer_index : order) {
-            dispatchers[peer_index] = enqueue_chunks(
-                peers_[peer_index], cuda_buffers_.peer_buffers()[peer_index], chunks_by_peer[peer_index]);
+        sequential_order = sequential_peer_order();
+        if (config_.local_forwarding_rdma_overlap_enabled &&
+            !sequential_order.empty()) {
+            const auto first_peer_index = sequential_order.front();
+            dispatchers[first_peer_index] = enqueue_chunks(
+                peers_[first_peer_index],
+                cuda_buffers_.peer_buffers()[first_peer_index],
+                chunks_by_peer[first_peer_index]);
+        }
+    }
+
+    // The local x3 staging buffer has no CQ/immediate readiness source. Drain
+    // it before permitting ordinary remote-node forwarding. In the opt-in
+    // overlap mode, the first sequential remote transfer was primed above and
+    // can progress independently while this local source is drained.
+    process_local_router_forwarding_iteration(iteration);
+    if (config_.sequential_peer_transfers) {
+        for (const auto peer_index : sequential_order) {
+            if (!dispatchers[peer_index]) {
+                dispatchers[peer_index] = enqueue_chunks(
+                    peers_[peer_index],
+                    cuda_buffers_.peer_buffers()[peer_index],
+                    chunks_by_peer[peer_index]);
+            }
             wait_for_outgoing_transfer(peers_[peer_index], baselines[peer_index], dispatchers[peer_index]);
         }
         for (std::size_t i = 0; i < peers_.size(); ++i) {
