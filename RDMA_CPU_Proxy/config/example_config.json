@@ -33,6 +33,7 @@
   "fill_test_data": true,
   "validate_data": true,
   "sequential_peer_transfers": false,
+  "local_forwarding_rdma_overlap_enabled": false,
   "nvlink_forwarding_enabled": false,
   "nvlink_forward_threshold_tokens": 700,
   "nvlink_forward_threshold_chunks": 0,
