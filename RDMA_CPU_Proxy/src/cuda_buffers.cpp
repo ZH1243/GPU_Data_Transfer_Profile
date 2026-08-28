@@ -12,6 +12,7 @@
 #if RDMA_PROXY_HAVE_CUDA
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <nvtx3/nvToolsExt.h>
 #endif
 
 namespace rdma_proxy {
@@ -1535,11 +1536,16 @@ void flush_gpudirect_rdma_writes(int cuda_device_id, bool mock_mode) {
     if (mock_mode) return;
 #if RDMA_PROXY_HAVE_CUDA
     select_cuda_device_for_thread(cuda_device_id, mock_mode);
+    const auto range_name =
+        "RDMA proxy: cuFlushGPUDirectRDMAWrites(TO_OWNER), cuda_device=" +
+        std::to_string(cuda_device_id);
+    nvtxRangePushA(range_name.c_str());
+    const auto status = cuFlushGPUDirectRDMAWrites(
+        CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX,
+        CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER);
+    nvtxRangePop();
     check_cuda_driver(
-        cuFlushGPUDirectRDMAWrites(
-            CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX,
-            CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER),
-        "cuFlushGPUDirectRDMAWrites direct input visibility");
+        status, "cuFlushGPUDirectRDMAWrites direct input visibility");
 #else
     (void)cuda_device_id;
     throw std::runtime_error("GPUDirect RDMA visibility flush requested without CUDA support");
