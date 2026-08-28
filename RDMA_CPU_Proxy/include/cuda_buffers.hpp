@@ -172,6 +172,9 @@ public:
     const NvlinkReceiveBuffer& nvlink_receive_buffer_for_source(
         int source_node_rank,
         int source_gpu_index) const;
+    void stage_local_router_input(
+        const std::vector<std::size_t>& source_token_indices,
+        const int32_t* device_source_token_indices);
     void install_expert_metadata(RouterExpertMetadata metadata);
     RouterExpertTokenHeadState expert_token_head_state_for_source(
         int source_node_rank,

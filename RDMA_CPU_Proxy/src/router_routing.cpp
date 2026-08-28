@@ -98,6 +98,22 @@ const std::vector<uint8_t>& RouterRouting::token_masks_for_node(int node_rank) c
     return token_masks_by_node_[static_cast<std::size_t>(node_rank)];
 }
 
+const int32_t* RouterRouting::device_token_indices_for_node(int node_rank) const {
+    if (!initialized_) throw std::runtime_error("router routing is not initialized");
+    if (node_rank < 0 || node_rank >= config_.num_nodes) {
+        throw std::runtime_error("router node rank out of range");
+    }
+    if (config_.mock_mode) return nullptr;
+#if RDMA_PROXY_HAVE_CUDA
+    if (!device_x3_ || !pinned_node_offsets_) {
+        throw std::runtime_error("router device x3 is not initialized");
+    }
+    return device_x3_ + pinned_node_offsets_[node_rank];
+#else
+    throw std::runtime_error("router device x3 requested without CUDA support");
+#endif
+}
+
 const RouterExpertMetadata& RouterRouting::expert_metadata_for_gpu(
     int node_rank,
     int local_gpu_index) const {
@@ -252,6 +268,7 @@ void RouterRouting::initialize_cuda() {
         "cudaMalloc expert token indices"));
     auto* x3 = static_cast<int32_t*>(allocate(
         max_node_tokens * sizeof(int32_t), "cudaMalloc x3"));
+    device_x3_ = x3;
     auto* x4 = static_cast<uint8_t*>(allocate(max_node_tokens * sizeof(uint8_t), "cudaMalloc x4"));
     auto* node_offsets = static_cast<int32_t*>(allocate(
         (num_nodes + 1) * sizeof(int32_t), "cudaMalloc node offsets"));
@@ -393,6 +410,7 @@ void RouterRouting::release_cuda() noexcept {
     pinned_x3_ = nullptr;
     pinned_x4_ = nullptr;
     pinned_node_offsets_ = nullptr;
+    device_x3_ = nullptr;
     for (auto it = device_allocations_.rbegin(); it != device_allocations_.rend(); ++it) {
         cudaFree(*it);
     }

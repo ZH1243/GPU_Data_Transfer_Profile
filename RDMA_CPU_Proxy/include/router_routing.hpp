@@ -23,6 +23,7 @@ public:
     const RouterExpertMetadata& expert_metadata_for_gpu(
         int node_rank,
         int local_gpu_index) const;
+    const int32_t* device_token_indices_for_node(int node_rank) const;
     int experts_per_gpu() const;
 
 private:
@@ -38,6 +39,7 @@ private:
     int32_t* pinned_x3_{nullptr};
     uint8_t* pinned_x4_{nullptr};
     int32_t* pinned_node_offsets_{nullptr};
+    int32_t* device_x3_{nullptr};
     bool initialized_{false};
 };
 

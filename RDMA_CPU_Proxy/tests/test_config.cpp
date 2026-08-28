@@ -48,6 +48,7 @@ int main(int argc, char** argv) {
     assert(!config.nvlink_forward_completion_notifications_enabled);
     assert(!config.nvlink_forward_notification_flush_only_enabled);
     assert(!config.nvlink_forward_notification_flush_per_entry_enabled);
+    assert(!config.router_local_input_staging_enabled);
     assert(config.nvlink_forward_notification_flag_update_mode ==
            rdma_proxy::NvlinkForwardNotificationFlagUpdateMode::kStreamWrite);
     assert(rdma_proxy::to_string(
@@ -258,6 +259,22 @@ int main(int argc, char** argv) {
     valid_flush_per_entry_config.nvlink_forward_notification_flush_only_enabled = false;
     valid_flush_per_entry_config.nvlink_forward_notification_flush_per_entry_enabled = true;
     rdma_proxy::validate_config(valid_flush_per_entry_config);
+
+    auto valid_local_staging_config = valid_flush_only_config;
+    valid_local_staging_config.nvlink_forward_notification_flush_only_enabled = false;
+    valid_local_staging_config.fill_test_data = false;
+    valid_local_staging_config.router_local_input_staging_enabled = true;
+    rdma_proxy::validate_config(valid_local_staging_config);
+
+    auto invalid_local_staging_fill_config = valid_local_staging_config;
+    invalid_local_staging_fill_config.fill_test_data = true;
+    bool rejected_local_staging_fill = false;
+    try {
+        rdma_proxy::validate_config(invalid_local_staging_fill_config);
+    } catch (const std::runtime_error&) {
+        rejected_local_staging_fill = true;
+    }
+    assert(rejected_local_staging_fill);
 
     auto invalid_flush_per_entry_without_notifications = router_nvlink_config;
     invalid_flush_per_entry_without_notifications

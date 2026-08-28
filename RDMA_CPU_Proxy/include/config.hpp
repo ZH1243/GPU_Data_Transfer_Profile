@@ -86,6 +86,9 @@ struct ProxyConfig {
     // inputs are populated by NVLink forwarding; same-local-GPU inputs alias
     // the corresponding direct RDMA receive buffers.
     bool router_computation_forwarded_inputs_only{false};
+    // Populate the otherwise-unused local-node source descriptors from the
+    // shared router send buffer and include them in the QuACK input set.
+    bool router_local_input_staging_enabled{false};
     NvlinkForwardNotificationFlagUpdateMode
         nvlink_forward_notification_flag_update_mode{
             NvlinkForwardNotificationFlagUpdateMode::kStreamWrite};

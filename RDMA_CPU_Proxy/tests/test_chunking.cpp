@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstring>
 #include <iostream>
+#include <numeric>
 #include <set>
 #include <stdexcept>
 #include <utility>
@@ -610,9 +611,26 @@ int main() {
     forwarded_config.num_gpus_per_node = 2;
     forwarded_config.router_num_experts = 4;
     forwarded_config.router_computation_forwarded_inputs_only = true;
+    forwarded_config.router_local_input_staging_enabled = true;
     forwarded_config.peers = {PeerAddress{1, "peer-1", 1}};
     CudaBuffers forwarded_buffers(forwarded_config);
     forwarded_buffers.initialize();
+    std::vector<uint8_t> local_source_bytes(forwarded_buffers.token_buffer_bytes());
+    std::iota(local_source_bytes.begin(), local_source_bytes.end(), uint8_t{0});
+    forwarded_buffers.copy_tokens_to_send_buffer(
+        1, local_source_bytes.data(), local_source_bytes.size());
+    const std::vector<std::size_t> staged_order{6, 1, 4};
+    forwarded_buffers.stage_local_router_input(staged_order, nullptr);
+    const auto& staged_input = forwarded_buffers.nvlink_receive_buffer_for_source(0, 0);
+    const auto staged_row_bytes =
+        forwarded_config.token_dimension * dtype_size(forwarded_config.dtype);
+    for (std::size_t row = 0; row < staged_order.size(); ++row) {
+        assert(std::memcmp(
+                   static_cast<const uint8_t*>(staged_input.recv.ptr) +
+                       row * staged_row_bytes,
+                   local_source_bytes.data() + staged_order[row] * staged_row_bytes,
+                   staged_row_bytes) == 0);
+    }
     for (int source_node = 0; source_node < 2; ++source_node) {
         for (int source_gpu = 0; source_gpu < 2; ++source_gpu) {
             RouterExpertMetadata metadata;
@@ -638,8 +656,8 @@ int main() {
     }
     const auto& forwarded_publication =
         forwarded_buffers.router_notification_publication_buffers();
-    assert(forwarded_publication.num_input_buffers == 2);
-    assert(forwarded_publication.table_width == 6);
+    assert(forwarded_publication.num_input_buffers == 4);
+    assert(forwarded_publication.table_width == 10);
     assert(forwarded_publication.table_rows == 4);
     assert(forwarded_publication.a_idx_capacity == 3);
     assert(forwarded_buffers.router_computation_num_tokens() == 5);
@@ -650,7 +668,7 @@ int main() {
     assert(forwarded_buffers.nvlink_receive_buffer_for_source(
                1, 1).expert_token_indices_device.ptr != nullptr);
     assert(forwarded_buffers.nvlink_receive_buffer_for_source(
-               0, 0).expert_token_indices_device.ptr == nullptr);
+               0, 0).expert_token_indices_device.ptr != nullptr);
     forwarded_buffers.begin_router_notification_iteration(0);
     // Python can enqueue the end event before the first table flush reaches
     // the publication thread; GPU execution still orders the persistent

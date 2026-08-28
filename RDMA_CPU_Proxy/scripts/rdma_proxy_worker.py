@@ -480,6 +480,7 @@ def build_proxy_argv(
         generated_args.extend(
             [
                 "--router_computation_forwarded_inputs_only=true",
+                "--router_local_input_staging_enabled=true",
                 f"--expert_gemm_m_tile={args.expert_gemm_m_tile}",
                 f"--expert_gemm_n_tile={args.expert_gemm_n_tile}",
                 f"--expert_gemm_dimension={args.expert_gemm_dimension}",

@@ -13,6 +13,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <nvtx3/nvToolsExt.h>
+#include "expert_token_idx_standalone.hpp"
 #endif
 
 namespace rdma_proxy {
@@ -480,6 +481,62 @@ const NvlinkReceiveBuffer& CudaBuffers::nvlink_receive_buffer_for_source(
     return *it;
 }
 
+void CudaBuffers::stage_local_router_input(
+    const std::vector<std::size_t>& source_token_indices,
+    const int32_t* device_source_token_indices) {
+    if (!config_.router_local_input_staging_enabled ||
+        !config_.router_routing_enabled || !config_.nvlink_forwarding_enabled) {
+        throw std::runtime_error("local router input staging is not enabled");
+    }
+    auto it = std::find_if(
+        nvlink_recv_buffers_.begin(), nvlink_recv_buffers_.end(),
+        [&](const NvlinkReceiveBuffer& entry) {
+            return entry.source_node_rank == config_.node_rank &&
+                entry.source_gpu_index == config_.local_gpu_index;
+        });
+    if (it == nvlink_recv_buffers_.end() || !it->recv.ptr || !router_send_buffer_.ptr) {
+        throw std::runtime_error("local router staging buffers are not initialized");
+    }
+    const auto row_bytes = config_.token_dimension * dtype_size(config_.dtype);
+    if (source_token_indices.size() > config_.num_tokens ||
+        source_token_indices.size() * row_bytes > it->recv.bytes ||
+        std::any_of(
+            source_token_indices.begin(), source_token_indices.end(),
+            [&](std::size_t index) { return index >= config_.num_tokens; })) {
+        throw std::runtime_error("local router x3 exceeds the staging buffer");
+    }
+    if (config_.mock_mode) {
+        for (std::size_t row = 0; row < source_token_indices.size(); ++row) {
+            std::memcpy(
+                static_cast<uint8_t*>(it->recv.ptr) + row * row_bytes,
+                static_cast<const uint8_t*>(router_send_buffer_.ptr) +
+                    source_token_indices[row] * row_bytes,
+                row_bytes);
+        }
+        return;
+    }
+#if RDMA_PROXY_HAVE_CUDA
+    if (!device_source_token_indices) {
+        throw std::runtime_error("local router device x3 is not initialized");
+    }
+    if (source_token_indices.size() >
+        static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("local router x3 row count exceeds CUDA launch range");
+    }
+    gather_token_rows_cuda_raw(
+        it->recv.ptr,
+        router_send_buffer_.ptr,
+        device_source_token_indices,
+        static_cast<int>(source_token_indices.size()),
+        row_bytes,
+        nullptr);
+    check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize local router staging");
+#else
+    (void)device_source_token_indices;
+    throw std::runtime_error("local router input staging requested without CUDA support");
+#endif
+}
+
 void CudaBuffers::install_expert_metadata(RouterExpertMetadata metadata) {
     if (!config_.router_routing_enabled || !config_.nvlink_forwarding_enabled) {
         throw std::runtime_error(
@@ -596,7 +653,8 @@ bool CudaBuffers::is_router_computation_input(
     const NvlinkReceiveBuffer& buffer) const {
     if (!config_.router_computation_forwarded_inputs_only) return true;
     return buffer.source_node_rank >= 0 &&
-        buffer.source_node_rank != config_.node_rank &&
+        (buffer.source_node_rank != config_.node_rank ||
+         config_.router_local_input_staging_enabled) &&
         buffer.source_gpu_index >= 0;
 }
 

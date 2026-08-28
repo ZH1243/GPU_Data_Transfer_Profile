@@ -213,6 +213,12 @@ private:
         std::size_t batch_index_in_iteration,
         std::size_t batch_start_token,
         std::size_t batch_tokens);
+    void issue_local_router_forwarding_batch(
+        uint64_t iteration,
+        std::size_t batch_index_in_iteration,
+        std::size_t batch_start_token,
+        std::size_t batch_tokens);
+    void process_local_router_forwarding_iteration(uint64_t iteration);
     void forwarding_ready_loop();
     void record_out_of_order_forwarding_arrival(std::size_t peer_index, std::size_t chunk_index);
     void wait_for_forwarding_iteration(uint64_t iteration);
@@ -275,6 +281,13 @@ private:
     std::vector<ForwardDestinationState> forwarding_destinations_;
     std::vector<ForwardNotificationDestinationState> forwarding_notification_destinations_;
     std::vector<ForwardingIterationStats> forwarding_iteration_stats_;
+    std::vector<ChunkDescriptor> local_router_forwarding_chunks_;
+    std::vector<uint8_t> local_router_forwarding_routing_table_;
+    std::vector<std::size_t> local_router_next_destination_token_;
+    const GpuBuffer* local_router_staging_buffer_{nullptr};
+    std::mutex forwarding_stream_mutex_;
+    std::atomic<uint64_t> local_router_forwarding_completed_iterations_{0};
+    bool local_router_input_staged_{false};
     std::string forwarding_error_;
     std::atomic<uint64_t> forwarding_batch_available_calls_{0};
     std::atomic<uint64_t> forwarding_batch_available_total_ns_{0};

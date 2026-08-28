@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 
 // Torch-free launch API for embedding the demo kernels in C++ applications.
 // All pointers refer to CUDA device memory; stream is a cudaStream_t cast to
@@ -50,4 +51,15 @@ void get_expert_token_idx_node_mask_cuda_raw(
     int32_t* node_mask_offsets,
     int32_t* reordered_chunk_counts,
     int32_t* reordered_chunk_prefixes,
+    void* stream);
+
+// Gather complete token rows into the contiguous node-level x3 order. All
+// pointers refer to device memory. One CTA owns one destination row so a
+// sufficiently large token list can occupy the full GPU.
+void gather_token_rows_cuda_raw(
+    void* destination,
+    const void* source,
+    const int32_t* source_token_indices,
+    int num_rows,
+    std::size_t row_bytes,
     void* stream);

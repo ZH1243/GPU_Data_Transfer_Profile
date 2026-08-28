@@ -645,6 +645,36 @@ __global__ void build_node_token_indices_fallback_kernel(
   }
 }
 
+__global__ void gather_token_rows_vectorized_kernel(
+    uint4* __restrict__ destination,
+    const uint4* __restrict__ source,
+    const int32_t* __restrict__ source_token_indices,
+    int vectors_per_row) {
+  int destination_row = blockIdx.x;
+  int source_row = source_token_indices[destination_row];
+  int64_t destination_base =
+      static_cast<int64_t>(destination_row) * vectors_per_row;
+  int64_t source_base = static_cast<int64_t>(source_row) * vectors_per_row;
+  for (int vector = threadIdx.x; vector < vectors_per_row; vector += blockDim.x) {
+    destination[destination_base + vector] = source[source_base + vector];
+  }
+}
+
+__global__ void gather_token_rows_bytes_kernel(
+    uint8_t* __restrict__ destination,
+    const uint8_t* __restrict__ source,
+    const int32_t* __restrict__ source_token_indices,
+    std::size_t row_bytes) {
+  int destination_row = blockIdx.x;
+  int source_row = source_token_indices[destination_row];
+  std::size_t destination_base =
+      static_cast<std::size_t>(destination_row) * row_bytes;
+  std::size_t source_base = static_cast<std::size_t>(source_row) * row_bytes;
+  for (std::size_t byte = threadIdx.x; byte < row_bytes; byte += blockDim.x) {
+    destination[destination_base + byte] = source[source_base + byte];
+  }
+}
+
 // Count experts and destination GPUs in chunks of the reordered per-node x3
 // lists.  These prefixes allow all x3 chunks to be scattered in parallel.
 __global__ void count_reordered_node_chunks_kernel(
@@ -1103,6 +1133,43 @@ void generate_r_cuda_raw(
   generate_r_kernel<<<blocks, kBlockThreads, 0, stream>>>(
       r, num_tokens, top_k, num_experts, seed);
   check_cuda_status(cudaGetLastError(), "generate_r_kernel launch");
+}
+
+void gather_token_rows_cuda_raw(
+    void* destination,
+    const void* source,
+    const int32_t* source_token_indices,
+    int num_rows,
+    std::size_t row_bytes,
+    void* stream_pointer) {
+  if (num_rows < 0 || row_bytes == 0 ||
+      (num_rows != 0 &&
+       (!destination || !source || !source_token_indices))) {
+    throw std::runtime_error("invalid gather_token_rows_cuda_raw arguments");
+  }
+  if (num_rows == 0) {
+    return;
+  }
+  constexpr int threads = 256;
+  auto stream = reinterpret_cast<cudaStream_t>(stream_pointer);
+  if (row_bytes % sizeof(uint4) == 0) {
+    const auto vectors_per_row = row_bytes / sizeof(uint4);
+    if (vectors_per_row > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+      throw std::runtime_error("gather token row is too wide");
+    }
+    gather_token_rows_vectorized_kernel<<<num_rows, threads, 0, stream>>>(
+        static_cast<uint4*>(destination),
+        static_cast<const uint4*>(source),
+        source_token_indices,
+        static_cast<int>(vectors_per_row));
+  } else {
+    gather_token_rows_bytes_kernel<<<num_rows, threads, 0, stream>>>(
+        static_cast<uint8_t*>(destination),
+        static_cast<const uint8_t*>(source),
+        source_token_indices,
+        row_bytes);
+  }
+  check_cuda_status(cudaGetLastError(), "gather_token_rows kernel launch");
 }
 
 void get_expert_token_idx_node_mask_x3_cuda_raw(
