@@ -48,13 +48,16 @@ struct alignas(64) Proxy::LocalIterationSyncSlot {
     uint64_t iteration_start{0};
     uint64_t iteration_done{0};
     uint64_t nvlink_forward_batch_iteration{0};
+    uint64_t nvlink_forward_batch_phase{0};
     uint64_t nvlink_forward_batch_round{0};
     uint64_t nvlink_forward_batch_chunks{0};
     uint64_t nvlink_forward_batch_selected_iteration{0};
+    uint64_t nvlink_forward_batch_selected_phase{0};
     uint64_t nvlink_forward_batch_selected_round{0};
     uint64_t nvlink_forward_batch_selected_chunks{0};
-    uint64_t nvlink_forward_completed_iteration{0};
-    char padding[48]{};
+    uint64_t nvlink_local_staging_completed_iteration{0};
+    uint64_t nvlink_remote_forward_completed_iteration{0};
+    char padding[24]{};
 };
 
 struct alignas(64) Proxy::NvlinkForwardNotification {
@@ -108,7 +111,7 @@ struct Proxy::NvlinkForwardNotificationDispatchState {
 namespace {
 
 constexpr uint64_t kLocalIterationSyncMagic = 0x52444d415053594eULL;  // "RDMAPSyn"
-constexpr uint32_t kLocalIterationSyncVersion = 4;
+constexpr uint32_t kLocalIterationSyncVersion = 5;
 constexpr uint64_t kNvlinkForwardNotificationMagic = 0x52444d414e464e51ULL;  // "RDMANFNQ"
 constexpr uint32_t kNvlinkForwardNotificationVersion = 3;
 constexpr uint32_t kNvlinkForwardRoundRobinFlag = 1U;
@@ -865,12 +868,15 @@ void Proxy::initialize_local_iteration_sync() {
     atomic_store_u64(&slot->iteration_start, 0);
     atomic_store_u64(&slot->iteration_done, 0);
     atomic_store_u64(&slot->nvlink_forward_batch_iteration, 0);
+    atomic_store_u64(&slot->nvlink_forward_batch_phase, 0);
     atomic_store_u64(&slot->nvlink_forward_batch_round, 0);
     atomic_store_u64(&slot->nvlink_forward_batch_chunks, 0);
     atomic_store_u64(&slot->nvlink_forward_batch_selected_iteration, 0);
+    atomic_store_u64(&slot->nvlink_forward_batch_selected_phase, 0);
     atomic_store_u64(&slot->nvlink_forward_batch_selected_round, 0);
     atomic_store_u64(&slot->nvlink_forward_batch_selected_chunks, 0);
-    atomic_store_u64(&slot->nvlink_forward_completed_iteration, 0);
+    atomic_store_u64(&slot->nvlink_local_staging_completed_iteration, 0);
+    atomic_store_u64(&slot->nvlink_remote_forward_completed_iteration, 0);
     atomic_store_i32(&slot->pid, current_process_id());
 
     RDMA_PROXY_LOG_DEBUG("mapped local iteration shared memory local_rank=", config_.node_rank,
@@ -1793,7 +1799,8 @@ void Proxy::synchronize_local_iteration_phase(const std::string& phase, uint64_t
     }
 }
 
-std::size_t Proxy::synchronize_local_nvlink_forward_batch_start(
+std::size_t Proxy::synchronize_local_nvlink_batch_start(
+    LocalNvlinkBatchSyncPhase phase,
     uint64_t iteration,
     std::size_t batch_index_in_iteration,
     uint64_t batch_round,
@@ -1807,11 +1814,20 @@ std::size_t Proxy::synchronize_local_nvlink_forward_batch_start(
 
     auto* local_slot = local_iteration_sync_slot(config_.local_gpu_index);
     const uint64_t iteration_marker = iteration + 1;
+    const uint64_t phase_marker = static_cast<uint64_t>(phase) + 1;
+    const char* phase_name = phase == LocalNvlinkBatchSyncPhase::kLocalInputStaging ?
+        "local-input-staging" : "remote-forwarding";
+    const auto completed_iteration_for_slot = [&](const LocalIterationSyncSlot* slot) {
+        return phase == LocalNvlinkBatchSyncPhase::kLocalInputStaging ?
+            atomic_load_u64(&slot->nvlink_local_staging_completed_iteration) :
+            atomic_load_u64(&slot->nvlink_remote_forward_completed_iteration);
+    };
     atomic_store_i32(&local_slot->gpu_index, config_.local_gpu_index);
     atomic_store_i32(&local_slot->pid, current_process_id());
     atomic_store_u64(&local_slot->nvlink_forward_batch_chunks,
                      static_cast<uint64_t>(available_batch_chunks));
     atomic_store_u64(&local_slot->nvlink_forward_batch_round, batch_round);
+    atomic_store_u64(&local_slot->nvlink_forward_batch_phase, phase_marker);
     atomic_store_u64(&local_slot->nvlink_forward_batch_iteration, iteration_marker);
 
     const auto deadline = std::chrono::steady_clock::now() +
@@ -1820,6 +1836,7 @@ std::size_t Proxy::synchronize_local_nvlink_forward_batch_start(
                          " waiting for local NVLink forwarding batch-start barrier"
                          " local_rank=", config_.node_rank,
                          " local_gpu=", config_.local_gpu_index,
+                         " phase=", phase_name,
                          " batch=", batch_index_in_iteration,
                          " round=", batch_round,
                          " chunks=", available_batch_chunks,
@@ -1839,16 +1856,19 @@ std::size_t Proxy::synchronize_local_nvlink_forward_batch_start(
                 complete = false;
                 break;
             }
-            const auto completed_iteration =
-                atomic_load_u64(&slot->nvlink_forward_completed_iteration);
+            const auto completed_iteration = completed_iteration_for_slot(slot);
             if (completed_iteration >= iteration_marker) {
                 continue;
             }
             const auto ready_iteration =
                 atomic_load_u64(&slot->nvlink_forward_batch_iteration);
+            const auto ready_phase =
+                atomic_load_u64(&slot->nvlink_forward_batch_phase);
             const auto ready_round =
                 atomic_load_u64(&slot->nvlink_forward_batch_round);
-            if (ready_iteration != iteration_marker || ready_round < batch_round) {
+            if (ready_iteration != iteration_marker ||
+                ready_phase != phase_marker ||
+                ready_round < batch_round) {
                 complete = false;
                 break;
             }
@@ -1866,6 +1886,7 @@ std::size_t Proxy::synchronize_local_nvlink_forward_batch_start(
             atomic_store_u64(&local_slot->nvlink_forward_batch_selected_chunks,
                              static_cast<uint64_t>(selected_batch_chunks));
             atomic_store_u64(&local_slot->nvlink_forward_batch_selected_round, batch_round);
+            atomic_store_u64(&local_slot->nvlink_forward_batch_selected_phase, phase_marker);
             atomic_store_u64(
                 &local_slot->nvlink_forward_batch_selected_iteration,
                 iteration_marker);
@@ -1877,6 +1898,7 @@ std::size_t Proxy::synchronize_local_nvlink_forward_batch_start(
             std::ostringstream out;
             out << "timed out waiting for local NVLink forwarding batch-start barrier"
                 << " iteration=" << iteration
+                << " phase=" << phase_name
                 << " batch=" << batch_index_in_iteration
                 << " round=" << batch_round
                 << " local_rank=" << config_.node_rank
@@ -1891,18 +1913,22 @@ std::size_t Proxy::synchronize_local_nvlink_forward_batch_start(
                 } else if (slot_gpu != gpu) {
                     out << " gpu" << gpu << "=metadata mismatch";
                 } else {
-                    const auto completed_iteration =
-                        atomic_load_u64(&slot->nvlink_forward_completed_iteration);
+                    const auto completed_iteration = completed_iteration_for_slot(slot);
                     const auto ready_iteration =
                         atomic_load_u64(&slot->nvlink_forward_batch_iteration);
+                    const auto ready_phase =
+                        atomic_load_u64(&slot->nvlink_forward_batch_phase);
                     const auto ready_round =
                         atomic_load_u64(&slot->nvlink_forward_batch_round);
                     if (completed_iteration < iteration_marker &&
-                        (ready_iteration != iteration_marker || ready_round < batch_round)) {
+                        (ready_iteration != iteration_marker ||
+                         ready_phase != phase_marker ||
+                         ready_round < batch_round)) {
                         out << " gpu" << gpu << "="
                             << (process_is_alive(pid) ? "waiting" : "process not alive")
                             << " completed_iteration=" << completed_iteration
                             << " ready_iteration=" << ready_iteration
+                            << " ready_phase=" << ready_phase
                             << " ready_round=" << ready_round;
                     }
                 }
@@ -1923,16 +1949,19 @@ std::size_t Proxy::synchronize_local_nvlink_forward_batch_start(
                 complete = false;
                 break;
             }
-            const auto completed_iteration =
-                atomic_load_u64(&slot->nvlink_forward_completed_iteration);
+            const auto completed_iteration = completed_iteration_for_slot(slot);
             if (completed_iteration >= iteration_marker) {
                 continue;
             }
             const auto selected_iteration =
                 atomic_load_u64(&slot->nvlink_forward_batch_selected_iteration);
+            const auto selected_phase =
+                atomic_load_u64(&slot->nvlink_forward_batch_selected_phase);
             const auto selected_round =
                 atomic_load_u64(&slot->nvlink_forward_batch_selected_round);
-            if (selected_iteration != iteration_marker || selected_round < batch_round) {
+            if (selected_iteration != iteration_marker ||
+                selected_phase != phase_marker ||
+                selected_round < batch_round) {
                 complete = false;
                 break;
             }
@@ -1942,6 +1971,7 @@ std::size_t Proxy::synchronize_local_nvlink_forward_batch_start(
                                  " local NVLink forwarding batch-start barrier complete"
                                  " local_rank=", config_.node_rank,
                                  " local_gpu=", config_.local_gpu_index,
+                                 " phase=", phase_name,
                                  " batch=", batch_index_in_iteration,
                                  " round=", batch_round,
                                  " selected_chunks=", selected_batch_chunks);
@@ -1953,6 +1983,7 @@ std::size_t Proxy::synchronize_local_nvlink_forward_batch_start(
             std::ostringstream out;
             out << "timed out waiting for local NVLink forwarding batch-selected barrier"
                 << " iteration=" << iteration
+                << " phase=" << phase_name
                 << " batch=" << batch_index_in_iteration
                 << " round=" << batch_round
                 << " local_rank=" << config_.node_rank
@@ -1967,18 +1998,22 @@ std::size_t Proxy::synchronize_local_nvlink_forward_batch_start(
                 } else if (slot_gpu != gpu) {
                     out << " gpu" << gpu << "=metadata mismatch";
                 } else {
-                    const auto completed_iteration =
-                        atomic_load_u64(&slot->nvlink_forward_completed_iteration);
+                    const auto completed_iteration = completed_iteration_for_slot(slot);
                     const auto selected_iteration =
                         atomic_load_u64(&slot->nvlink_forward_batch_selected_iteration);
+                    const auto selected_phase =
+                        atomic_load_u64(&slot->nvlink_forward_batch_selected_phase);
                     const auto selected_round =
                         atomic_load_u64(&slot->nvlink_forward_batch_selected_round);
                     if (completed_iteration < iteration_marker &&
-                        (selected_iteration != iteration_marker || selected_round < batch_round)) {
+                        (selected_iteration != iteration_marker ||
+                         selected_phase != phase_marker ||
+                         selected_round < batch_round)) {
                         out << " gpu" << gpu << "="
                             << (process_is_alive(pid) ? "waiting" : "process not alive")
                             << " completed_iteration=" << completed_iteration
                             << " selected_iteration=" << selected_iteration
+                            << " selected_phase=" << selected_phase
                             << " selected_round=" << selected_round;
                     }
                 }
@@ -1989,7 +2024,9 @@ std::size_t Proxy::synchronize_local_nvlink_forward_batch_start(
     }
 }
 
-void Proxy::mark_local_nvlink_forward_iteration_complete(uint64_t iteration) const {
+void Proxy::mark_local_nvlink_batch_phase_complete(
+    LocalNvlinkBatchSyncPhase phase,
+    uint64_t iteration) const {
     if (!config_.nvlink_forward_local_batch_sync_enabled ||
         config_.num_gpus_per_node <= 1) {
         return;
@@ -2002,10 +2039,17 @@ void Proxy::mark_local_nvlink_forward_iteration_complete(uint64_t iteration) con
     auto* local_slot = local_iteration_sync_slot(config_.local_gpu_index);
     atomic_store_i32(&local_slot->gpu_index, config_.local_gpu_index);
     atomic_store_i32(&local_slot->pid, current_process_id());
-    atomic_store_u64(&local_slot->nvlink_forward_completed_iteration, iteration + 1);
+    auto* completed_iteration =
+        phase == LocalNvlinkBatchSyncPhase::kLocalInputStaging ?
+        &local_slot->nvlink_local_staging_completed_iteration :
+        &local_slot->nvlink_remote_forward_completed_iteration;
+    atomic_store_u64(completed_iteration, iteration + 1);
+    const char* phase_name = phase == LocalNvlinkBatchSyncPhase::kLocalInputStaging ?
+        "local-input-staging" : "remote-forwarding";
     RDMA_PROXY_LOG_DEBUG(
         "iteration=", iteration,
-        " retired from local NVLink forwarding batch barriers local_rank=",
+        " phase=", phase_name,
+        " retired from local NVLink batch barriers local_rank=",
         config_.node_rank,
         " local_gpu=", config_.local_gpu_index);
 }
@@ -3283,9 +3327,20 @@ void Proxy::process_local_router_forwarding_iteration(uint64_t iteration) {
         std::size_t next_chunk = 0;
         std::size_t batch_index = 0;
         while (next_chunk < local_router_forwarding_chunks_.size()) {
-            const auto batch_chunks = std::min(
+            auto batch_chunks = std::min(
                 config_.nvlink_forward_max_threshold_chunks,
                 local_router_forwarding_chunks_.size() - next_chunk);
+            batch_chunks = synchronize_local_nvlink_batch_start(
+                LocalNvlinkBatchSyncPhase::kLocalInputStaging,
+                iteration,
+                batch_index,
+                batch_index + 1,
+                batch_chunks);
+            if (batch_chunks == 0 ||
+                batch_chunks > local_router_forwarding_chunks_.size() - next_chunk) {
+                throw std::runtime_error(
+                    "local NVLink staging batch synchronization selected an invalid batch size");
+            }
             const auto batch_start_token =
                 local_router_forwarding_chunks_[next_chunk].start_token;
             const auto& last_chunk = local_router_forwarding_chunks_[
@@ -3294,16 +3349,23 @@ void Proxy::process_local_router_forwarding_iteration(uint64_t iteration) {
                 last_chunk.start_token + last_chunk.num_tokens;
             issue_local_router_forwarding_batch(
                 iteration,
-                batch_index++,
+                batch_index,
                 batch_start_token,
                 batch_end_token - batch_start_token);
             next_chunk += batch_chunks;
+            ++batch_index;
         }
     } else {
         const auto threshold = effective_nvlink_forward_threshold_tokens(config_);
         for (std::size_t start = 0, batch = 0;
              start < forwarding_tokens;
              start += threshold, ++batch) {
+            synchronize_local_nvlink_batch_start(
+                LocalNvlinkBatchSyncPhase::kLocalInputStaging,
+                iteration,
+                batch,
+                batch + 1,
+                0);
             issue_local_router_forwarding_batch(
                 iteration,
                 batch,
@@ -3311,6 +3373,9 @@ void Proxy::process_local_router_forwarding_iteration(uint64_t iteration) {
                 std::min(threshold, forwarding_tokens - start));
         }
     }
+    mark_local_nvlink_batch_phase_complete(
+        LocalNvlinkBatchSyncPhase::kLocalInputStaging,
+        iteration);
     local_router_forwarding_completed_iterations_.store(iteration + 1);
 }
 
@@ -3668,9 +3733,14 @@ void Proxy::forwarding_loop() {
                     if (chunk_in_iteration + batch_chunks > chunks_per_iteration) {
                         throw std::runtime_error("NVLink out-of-order forwarding batch crosses iteration boundary");
                     }
+                    if (config_.router_local_input_staging_enabled &&
+                        local_router_forwarding_completed_iterations_.load() < iteration + 1) {
+                        continue;
+                    }
 
                     if (config_.nvlink_forward_local_batch_sync_enabled) {
-                        batch_chunks = synchronize_local_nvlink_forward_batch_start(
+                        batch_chunks = synchronize_local_nvlink_batch_start(
+                            LocalNvlinkBatchSyncPhase::kRemoteForwarding,
                             iteration,
                             chunk_in_iteration,
                             next_local_batch_sync_round(iteration),
@@ -3692,10 +3762,6 @@ void Proxy::forwarding_loop() {
                     const auto batch_end_token =
                         chunks[last_chunk].start_token + chunks[last_chunk].num_tokens;
                     const auto batch_tokens = batch_end_token - batch_start_token;
-                    if (config_.router_local_input_staging_enabled &&
-                        local_router_forwarding_completed_iterations_.load() < iteration + 1) {
-                        continue;
-                    }
 
                     if (config_.nvlink_forward_log_batches) {
                         RDMA_PROXY_LOG_INFO("nvlink_forward_out_of_order_batch_ready iteration=", iteration,
@@ -3761,9 +3827,14 @@ void Proxy::forwarding_loop() {
                     if (batch_chunks == 0) {
                         continue;
                     }
+                    if (config_.router_local_input_staging_enabled &&
+                        local_router_forwarding_completed_iterations_.load() < iteration + 1) {
+                        continue;
+                    }
 
                     if (config_.nvlink_forward_local_batch_sync_enabled) {
-                        batch_chunks = synchronize_local_nvlink_forward_batch_start(
+                        batch_chunks = synchronize_local_nvlink_batch_start(
+                            LocalNvlinkBatchSyncPhase::kRemoteForwarding,
                             iteration,
                             chunk_in_iteration,
                             next_local_batch_sync_round(iteration),
@@ -3779,10 +3850,6 @@ void Proxy::forwarding_loop() {
                     const auto batch_end_token =
                         chunks[last_chunk].start_token + chunks[last_chunk].num_tokens;
                     const auto batch_tokens = batch_end_token - batch_start_token;
-                    if (config_.router_local_input_staging_enabled &&
-                        local_router_forwarding_completed_iterations_.load() < iteration + 1) {
-                        continue;
-                    }
 
                     if (config_.nvlink_forward_log_batches) {
                         RDMA_PROXY_LOG_INFO("nvlink_forward_dynamic_batch_ready iteration=", iteration,
@@ -3844,7 +3911,8 @@ void Proxy::forwarding_loop() {
                                             " batch_tokens=", batch_tokens);
                     }
                     if (config_.nvlink_forward_local_batch_sync_enabled) {
-                        synchronize_local_nvlink_forward_batch_start(
+                        synchronize_local_nvlink_batch_start(
+                            LocalNvlinkBatchSyncPhase::kRemoteForwarding,
                             iteration,
                             batch_in_iteration,
                             next_local_batch_sync_round(iteration),
@@ -3928,7 +3996,9 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
             if (config_.nvlink_forward_synchronize_iteration) {
                 synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
             }
-            mark_local_nvlink_forward_iteration_complete(iteration);
+            mark_local_nvlink_batch_phase_complete(
+                LocalNvlinkBatchSyncPhase::kRemoteForwarding,
+                iteration);
             ForwardingIterationStats stats;
             if (config_.nvlink_forward_synchronize_batches) {
                 std::lock_guard<std::mutex> lock(forwarding_mutex_);

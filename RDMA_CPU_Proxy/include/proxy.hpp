@@ -108,6 +108,10 @@ private:
 
     struct LocalIterationSyncHeader;
     struct LocalIterationSyncSlot;
+    enum class LocalNvlinkBatchSyncPhase : uint64_t {
+        kLocalInputStaging,
+        kRemoteForwarding,
+    };
     struct NvlinkForwardNotification;
     struct NvlinkForwardNotificationHeader;
     struct NvlinkForwardNotificationQueue;
@@ -156,12 +160,15 @@ private:
         const NvlinkForwardNotification& notification,
         uint64_t dequeue_timestamp_ns);
     void flush_nvlink_forward_notification_log_queue();
-    std::size_t synchronize_local_nvlink_forward_batch_start(
+    std::size_t synchronize_local_nvlink_batch_start(
+        LocalNvlinkBatchSyncPhase phase,
         uint64_t iteration,
         std::size_t batch_index_in_iteration,
         uint64_t batch_round,
         std::size_t available_batch_chunks) const;
-    void mark_local_nvlink_forward_iteration_complete(uint64_t iteration) const;
+    void mark_local_nvlink_batch_phase_complete(
+        LocalNvlinkBatchSyncPhase phase,
+        uint64_t iteration) const;
     void run_iteration(uint64_t iteration);
     void synchronize_iteration_start(uint64_t iteration) const;
     void synchronize_iteration(uint64_t iteration) const;
