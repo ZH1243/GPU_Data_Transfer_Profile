@@ -159,8 +159,9 @@ private:
     std::size_t synchronize_local_nvlink_forward_batch_start(
         uint64_t iteration,
         std::size_t batch_index_in_iteration,
-        uint64_t batch_sequence,
+        uint64_t batch_round,
         std::size_t available_batch_chunks) const;
+    void mark_local_nvlink_forward_iteration_complete(uint64_t iteration) const;
     void run_iteration(uint64_t iteration);
     void synchronize_iteration_start(uint64_t iteration) const;
     void synchronize_iteration(uint64_t iteration) const;

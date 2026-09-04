@@ -221,6 +221,134 @@ int main() {
     }
 
     {
+        auto config0 = make_config();
+        config0.num_gpus_per_node = 2;
+        config0.num_tokens = 65;
+        config0.tokens_per_chunk = 4;
+        config0.num_iterations = 2;
+        config0.router_routing_enabled = true;
+        config0.router_num_experts = 4;
+        config0.router_top_k = 1;
+        config0.nvlink_forwarding_enabled = true;
+        config0.nvlink_forward_threshold_tokens = 8;
+        config0.nvlink_forward_chunk_tokens = 1;
+        config0.nvlink_forward_synchronize_batches = true;
+        config0.nvlink_forward_local_batch_sync_enabled = true;
+        config0.local_iteration_sync_run_id =
+            "test_measured_run_router_unequal_batch_sync";
+        config0.local_gpu_index = 0;
+        config0.cuda_device_id = 0;
+
+        auto config1 = config0;
+        config1.local_gpu_index = 1;
+        config1.cuda_device_id = 1;
+
+        struct RouterBatchShape {
+            uint64_t seed{0};
+            std::size_t tokens{0};
+            std::size_t batches{0};
+            std::size_t forwarded_to_other_gpu{0};
+        };
+        const auto routing_shape = [](ProxyConfig config, uint64_t seed) {
+            config.router_seed = seed;
+            RouterRouting routing(config);
+            routing.initialize();
+            const auto& tokens = routing.token_indices_for_node(1);
+            const auto& masks = routing.token_masks_for_node(1);
+            const int other_gpu = (config.local_gpu_index + 1) % config.num_gpus_per_node;
+            int bit = config.local_gpu_index - other_gpu;
+            if (bit < 0) bit += config.num_gpus_per_node;
+            const auto other_gpu_mask = static_cast<uint8_t>(1U << bit);
+            const auto forwarded = static_cast<std::size_t>(std::count_if(
+                masks.begin(), masks.end(),
+                [&](uint8_t mask) { return (mask & other_gpu_mask) != 0; }));
+            return RouterBatchShape{
+                seed,
+                tokens.size(),
+                (tokens.size() + config.nvlink_forward_threshold_tokens - 1) /
+                    config.nvlink_forward_threshold_tokens,
+                forwarded};
+        };
+
+        RouterBatchShape shape0;
+        RouterBatchShape shape1;
+        bool found_unequal_batch_counts = false;
+        for (uint64_t seed0 = 1; seed0 < 128 && !found_unequal_batch_counts; ++seed0) {
+            const auto candidate0 = routing_shape(config0, seed0);
+            if (candidate0.forwarded_to_other_gpu == 0) continue;
+            for (uint64_t seed1 = 128; seed1 < 512; ++seed1) {
+                const auto candidate1 = routing_shape(config1, seed1);
+                if (candidate1.forwarded_to_other_gpu != 0 &&
+                    candidate0.batches != candidate1.batches) {
+                    shape0 = candidate0;
+                    shape1 = candidate1;
+                    found_unequal_batch_counts = true;
+                    break;
+                }
+            }
+        }
+        if (!found_unequal_batch_counts) {
+            std::cerr << "could not construct unequal router batch counts for local sync test\n";
+            return 1;
+        }
+        config0.router_seed = shape0.seed;
+        config1.router_seed = shape1.seed;
+
+        const auto destination_bytes =
+            config0.num_tokens * config0.token_dimension * dtype_size(config0.dtype);
+        std::vector<uint8_t> destination0(destination_bytes, 0);
+        std::vector<uint8_t> destination1(destination_bytes, 0);
+        config0.nvlink_forward_destinations.push_back(
+            NvlinkForwardDestination{
+                1,
+                1,
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(destination0.data())),
+                destination0.size()});
+        config1.nvlink_forward_destinations.push_back(
+            NvlinkForwardDestination{
+                0,
+                0,
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(destination1.data())),
+                destination1.size()});
+
+        validate_config(config0);
+        validate_config(config1);
+
+        std::exception_ptr error0;
+        std::exception_ptr error1;
+        std::thread gpu0([&] {
+            try {
+                Proxy proxy(config0);
+                proxy.initialize();
+                proxy.run();
+                proxy.shutdown();
+            } catch (...) {
+                error0 = std::current_exception();
+            }
+        });
+        std::thread gpu1([&] {
+            try {
+                Proxy proxy(config1);
+                proxy.initialize();
+                proxy.run();
+                proxy.shutdown();
+            } catch (...) {
+                error1 = std::current_exception();
+            }
+        });
+        gpu0.join();
+        gpu1.join();
+        if (error0) std::rethrow_exception(error0);
+        if (error1) std::rethrow_exception(error1);
+
+        if (!std::any_of(destination0.begin(), destination0.end(), [](uint8_t v) { return v != 0; }) ||
+            !std::any_of(destination1.begin(), destination1.end(), [](uint8_t v) { return v != 0; })) {
+            std::cerr << "router unequal-batch local synchronization did not forward data\n";
+            return 1;
+        }
+    }
+
+    {
         auto config = make_config();
         config.num_nodes = 4;
         config.num_iterations = 1;

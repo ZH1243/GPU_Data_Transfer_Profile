@@ -262,6 +262,11 @@ int main(int argc, char** argv) {
     router_nvlink_config.nvlink_forward_chunk_tokens = 100;
     rdma_proxy::validate_config(router_nvlink_config);
 
+    auto router_local_batch_sync_config = router_nvlink_config;
+    router_local_batch_sync_config.nvlink_forward_synchronize_batches = true;
+    router_local_batch_sync_config.nvlink_forward_local_batch_sync_enabled = true;
+    rdma_proxy::validate_config(router_local_batch_sync_config);
+
     auto valid_flush_only_config = router_nvlink_config;
     valid_flush_only_config.nvlink_forward_synchronize_batches = true;
     valid_flush_only_config.nvlink_forward_completion_notifications_enabled = true;
