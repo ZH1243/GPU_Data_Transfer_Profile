@@ -72,6 +72,8 @@ int main(int argc, char** argv) {
     assert(!config.nvlink_forward_notification_log_enabled);
     assert(config.nvlink_forward_notification_log_dir == "/tmp/rdma_cpu_proxy_nvlink_notifications");
     assert(!config.nvlink_forward_local_batch_sync_enabled);
+    assert(!config.nvlink_forward_ping_pong_enabled);
+    assert(config.nvlink_forward_ping_pong_handoff_copy == 1);
     assert(config.nvlink_forward_synchronize_iteration);
     assert(!config.nvlink_forward_log_batches);
     assert(!config.log_qp_reports);
@@ -165,6 +167,8 @@ int main(int argc, char** argv) {
         "--log_qp_reports=true",
         "--log_marker_wait_reports=true",
         "--nvlink_forward_local_batch_sync_enabled=false",
+        "--nvlink_forward_ping_pong_enabled=false",
+        "--nvlink_forward_ping_pong_handoff_copy=5",
         "--local_iteration_sync_enabled=true",
         "--local_iteration_sync_dir=/tmp/rdma_cpu_proxy_test_local_sync",
         "--local_iteration_sync_run_id=test_cli",
@@ -182,7 +186,9 @@ int main(int argc, char** argv) {
         "--nvlink_forward_notification_flag_update_mode=memcpy",
         "--cpu_affinity=0-95,192-287",
     };
-    const auto peer_port_config = rdma_proxy::load_config(28, const_cast<char**>(peer_port_args));
+    const auto peer_port_config = rdma_proxy::load_config(
+        static_cast<int>(sizeof(peer_port_args) / sizeof(peer_port_args[0])),
+        const_cast<char**>(peer_port_args));
     for (const auto& peer : peer_port_config.peers) {
         assert(peer.port == 18521);
     }
@@ -199,6 +205,8 @@ int main(int argc, char** argv) {
     assert(peer_port_config.rdma_bandwidth_summary_dir == "/tmp/rdma_cpu_proxy_test_results");
     assert(peer_port_config.nvlink_forward_threshold_chunks == 5);
     assert(peer_port_config.nvlink_forward_min_threshold_chunks == 2);
+    assert(!peer_port_config.nvlink_forward_ping_pong_enabled);
+    assert(peer_port_config.nvlink_forward_ping_pong_handoff_copy == 5);
     assert(peer_port_config.nvlink_forward_max_threshold_chunks == 6);
     assert(peer_port_config.nvlink_forward_out_of_order_chunks_enabled);
     assert(peer_port_config.expert_gemm_m_tile == 64);
@@ -266,6 +274,45 @@ int main(int argc, char** argv) {
     router_local_batch_sync_config.nvlink_forward_synchronize_batches = true;
     router_local_batch_sync_config.nvlink_forward_local_batch_sync_enabled = true;
     rdma_proxy::validate_config(router_local_batch_sync_config);
+
+    auto ping_pong_config = router_local_batch_sync_config;
+    ping_pong_config.nvlink_forward_completion_notifications_enabled = true;
+    ping_pong_config.nvlink_forward_ping_pong_enabled = true;
+    ping_pong_config.nvlink_forward_ping_pong_handoff_copy = 3;
+    rdma_proxy::validate_config(ping_pong_config);
+    const auto ping_pong_summary = rdma_proxy::config_summary(ping_pong_config);
+    assert(ping_pong_summary.find("nvlink_forward_ping_pong_enabled=true") != std::string::npos);
+    assert(ping_pong_summary.find("nvlink_forward_ping_pong_handoff_copy=3") != std::string::npos);
+    const char* ping_pong_args[] = {
+        "test_config", "--config", argv[1],
+        "--router_routing_enabled=true", "--nvlink_forwarding_enabled=true",
+        "--nvlink_forward_use_round_robin=false", "--nvlink_forward_use_batch_api=true",
+        "--nvlink_forward_synchronize_batches=true",
+        "--nvlink_forward_local_batch_sync_enabled=true",
+        "--nvlink_forward_completion_notifications_enabled=true",
+        "--nvlink_forward_ping_pong_enabled=true",
+        "--nvlink_forward_ping_pong_handoff_copy=3",
+    };
+    const auto parsed_ping_pong = rdma_proxy::load_config(
+        static_cast<int>(sizeof(ping_pong_args) / sizeof(ping_pong_args[0])),
+        const_cast<char**>(ping_pong_args));
+    assert(parsed_ping_pong.nvlink_forward_ping_pong_enabled);
+    assert(parsed_ping_pong.nvlink_forward_ping_pong_handoff_copy == 3);
+    for (int invalid = 0; invalid < 8; ++invalid) {
+        auto bad = ping_pong_config;
+        if (invalid == 0) bad.nvlink_forward_ping_pong_handoff_copy = 0;
+        if (invalid == 1) bad.router_routing_enabled = false;
+        if (invalid == 2) bad.nvlink_forward_use_round_robin = true;
+        if (invalid == 3) bad.nvlink_forward_out_of_order_chunks_enabled = true;
+        if (invalid == 4) bad.nvlink_forward_use_batch_api = false;
+        if (invalid == 5) bad.nvlink_forward_local_batch_sync_enabled = false;
+        if (invalid == 6) bad.nvlink_forward_completion_notifications_enabled = false;
+        if (invalid == 7) bad.nvlink_forward_synchronize_batches = false;
+        bool rejected = false;
+        try { rdma_proxy::validate_config(bad); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+    }
 
     auto valid_flush_only_config = router_nvlink_config;
     valid_flush_only_config.nvlink_forward_synchronize_batches = true;
@@ -399,6 +446,8 @@ int main(int argc, char** argv) {
   "nvlink_forward_notification_log_enabled": false,
   "nvlink_forward_notification_log_dir": "/tmp/rdma_cpu_proxy_test_notifications",
   "nvlink_forward_local_batch_sync_enabled": false,
+  "nvlink_forward_ping_pong_enabled": false,
+  "nvlink_forward_ping_pong_handoff_copy": 7,
   "nvlink_forward_synchronize_iteration": true,
   "nvlink_forward_log_batches": true,
   "log_qp_reports": true,
@@ -423,6 +472,8 @@ int main(int argc, char** argv) {
     const auto nvlink_config = rdma_proxy::load_config_file(nvlink_config_path);
     assert(nvlink_config.nvlink_forwarding_enabled);
     assert(!nvlink_config.nvlink_forward_local_batch_sync_enabled);
+    assert(!nvlink_config.nvlink_forward_ping_pong_enabled);
+    assert(nvlink_config.nvlink_forward_ping_pong_handoff_copy == 7);
     assert(nvlink_config.nvlink_forward_log_batches);
     assert(nvlink_config.nvlink_forward_threshold_tokens == 0);
     assert(nvlink_config.nvlink_forward_threshold_chunks == 12);

@@ -120,6 +120,16 @@ if(RDMA_PROXY_BUILD_TESTS)
   add_executable(test_c_api tests/test_c_api.cpp)
   target_link_libraries(test_c_api PRIVATE rdma_cpu_proxy_shared)
   add_test(NAME test_c_api COMMAND test_c_api ${CMAKE_CURRENT_SOURCE_DIR}/config/example_config.json)
+
+  add_executable(test_forward_events tests/test_forward_events.cpp)
+  target_link_libraries(test_forward_events PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_forward_events COMMAND test_forward_events)
+  set_tests_properties(test_forward_events PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
+
+  add_executable(test_ping_pong tests/test_ping_pong.cpp)
+  target_link_libraries(test_ping_pong PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_ping_pong COMMAND test_ping_pong)
+  set_tests_properties(test_ping_pong PROPERTIES TIMEOUT 120)
 endif()
 
 message(STATUS "RDMA_PROXY_HAVE_CUDA=${RDMA_PROXY_HAVE_CUDA}")

@@ -105,6 +105,10 @@ struct ProxyConfig {
     bool nvlink_forward_notification_log_enabled{false};
     std::string nvlink_forward_notification_log_dir{"/tmp/rdma_cpu_proxy_nvlink_notifications"};
     bool nvlink_forward_local_batch_sync_enabled{false};
+    // Alternate remote router batches between two submitters on one stream.
+    bool nvlink_forward_ping_pong_enabled{false};
+    // One-based index of the copy API call that triggers the next submitter.
+    std::size_t nvlink_forward_ping_pong_handoff_copy{1};
     bool nvlink_forward_synchronize_iteration{true};
     bool nvlink_forward_log_batches{false};
     bool log_qp_reports{false};

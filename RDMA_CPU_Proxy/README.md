@@ -189,13 +189,88 @@ Set `nvlink_forward_log_batches=true` to emit per-batch/per-copy forwarding trac
 
 When `nvlink_forward_synchronize_batches=true`, each forwarding batch is timed from before its copy operations are enqueued until after `cudaStreamSynchronize()` returns. If `nvlink_forward_log_batches=true`, each synchronized batch also logs `elapsed_us`, `bandwidth_GBps`, and `bandwidth_gbps`. At iteration completion, zero-byte batches are counted as synchronized batches but excluded from bandwidth samples. The proxy reports the arithmetic mean of non-empty synchronized batch bandwidths as `average_batch_bandwidth_GBps` / `average_batch_bandwidth_gbps` and the aggregate `total_forwarded_bytes / non_empty_synchronized_seconds` as `aggregate_synchronized_bandwidth_GBps` / `aggregate_synchronized_bandwidth_gbps`.
 
-Set `nvlink_forward_completion_notifications_enabled=true` to let a source GPU proxy notify destination GPU proxies after synchronized forwarding batches complete. This feature requires both `nvlink_forwarding_enabled=true` and `nvlink_forward_synchronize_batches=true`. Each receiver GPU proxy creates one POSIX shared-memory segment with one single-producer/single-consumer queue for every local source GPU, including itself. With 8 GPUs per node, each proxy therefore owns 8 inbound queues. After the sender's `cudaStreamSynchronize()` returns for a forwarding batch, the forwarding thread enqueues notification records into an in-process handoff queue and can continue to later forwarding batches. A sender-side notification dispatch thread polls that handoff queue and pushes notifications into the receiver queues for the GPUs that received forwarded bytes. In router mode it also pushes a self-notification for the newly complete direct-RDMA `x3` range without issuing an NVLink copy. A receiver-side polling thread dequeues all notifications through the same path. Before publishing direct-input work, the sender calls `cuFlushGPUDirectRDMAWrites(...TO_OWNER)` so the already-running GroupedGEMM can safely consume the RDMA-written rows. CUDA builds wrap that call in an NVTX range named `RDMA proxy: cuFlushGPUDirectRDMAWrites(TO_OWNER), cuda_device=N`; collect with `--trace=nvtx` and inspect the forwarding CPU thread's NVTX row.
+Set `nvlink_forward_completion_notifications_enabled=true` to let a source GPU proxy notify destination GPU proxies after synchronized forwarding batches complete. This feature requires both `nvlink_forwarding_enabled=true` and `nvlink_forward_synchronize_batches=true`. Each receiver GPU proxy creates one POSIX shared-memory segment with one single-producer/single-consumer queue for every local source GPU, including itself. With 8 GPUs per node, each proxy therefore owns 8 inbound queues. With ping-pong forwarding disabled, after the sender's `cudaStreamSynchronize()` returns for a forwarding batch, the forwarding thread enqueues notification records into an in-process handoff queue and can continue to later forwarding batches. A sender-side notification dispatch thread polls that handoff queue and pushes notifications into the receiver queues for the GPUs that received forwarded bytes. In router mode it also pushes a self-notification for the newly complete direct-RDMA `x3` range without issuing an NVLink copy. A receiver-side polling thread dequeues all notifications through the same path. Before publishing direct-input work, the sender calls `cuFlushGPUDirectRDMAWrites(...TO_OWNER)` so the already-running GroupedGEMM can safely consume the RDMA-written rows. CUDA builds wrap that call in an NVTX range named `RDMA proxy: cuFlushGPUDirectRDMAWrites(TO_OWNER), cuda_device=N`; collect with `--trace=nvtx` and inspect the forwarding CPU thread's NVTX row.
 
 Each notification includes the source GPU, destination GPU, remote peer rank/slot, iteration, batch index, destination `start_token`, `num_tokens`, byte offset, and byte length. The `start_token` and `num_tokens` identify the continuous ready span inside the receiver's NVLink receive buffer for that source GPU and peer-node slot. Use `nvlink_forward_notification_queue_depth` to size each per-source queue.
 
 Set `nvlink_forward_notification_log_enabled=true` to record receiver-side notification dequeue events to files. This mode requires `nvlink_forward_completion_notifications_enabled=true`. When the receiver notification thread dequeues an entry, it formats the notification into a single text line with `dequeue_timestamp_ns` and appends that line to an in-process log queue. During shutdown, each GPU proxy drains its log queue and writes one file under `nvlink_forward_notification_log_dir`, named `nvlink_forward_notifications_rank_<rank>_gpu_<gpu>.log`.
 
-Set `nvlink_forward_local_batch_sync_enabled=true` to add a same-node GPU-proxy barrier before every synchronized NVLink forwarding batch. The barrier is keyed by phase, iteration, and batch round. Router local-input staging and remote receive-buffer forwarding use separate phases, so completing the staging phase does not prevent a proxy from participating in remote forwarding. Once a proxy has observed that its next batch is ready, it publishes that round in shared memory and waits until every local proxy is either ready for the same round or has completed that phase for the iteration. A completed proxy retires from later rounds in that phase, allowing router-driven proxies with shorter `x3`/`x4` arrays to stop participating while the remaining proxies continue together. Because each forwarding path reaches the next batch-start barrier only after the previous batch's `cudaStreamSynchronize()` has returned, active proxies still start each round together. This option requires `nvlink_forward_synchronize_batches=true` and uses the same local shared-memory run identity as `local_iteration_sync_run_id`.
+Set `nvlink_forward_local_batch_sync_enabled=true` to add a same-node GPU-proxy barrier before every synchronized NVLink forwarding batch. The barrier is keyed by phase, iteration, and batch round. Router local-input staging and remote receive-buffer forwarding use separate phases, so completing the staging phase does not prevent a proxy from participating in remote forwarding. Once a proxy has observed that its next batch is ready, it publishes that round in shared memory and waits until every local proxy is either ready for the same round or has completed that phase for the iteration. A completed proxy retires from later rounds in that phase, allowing router-driven proxies with shorter `x3`/`x4` arrays to stop participating while the remaining proxies continue together. With ping-pong forwarding disabled, each forwarding path reaches the next batch-start barrier only after the previous batch's `cudaStreamSynchronize()` has returned, so active proxies still start each round together. This option requires `nvlink_forward_synchronize_batches=true` and uses the same local shared-memory run identity as `local_iteration_sync_run_id`.
+
+### Opt-in ping-pong forwarding
+
+Set `nvlink_forward_ping_pong_enabled=true` to alternate remote RDMA forwarding
+batches between two CPU threads, A and B, on the existing forwarding stream.
+The default is `false`, which keeps the original batch synchronization and
+notification behavior. Local router staging continues to use its original path.
+
+The mode requires router routing, ordered chunks, the batch copy API, local batch
+synchronization, and completion notifications. Keep
+`nvlink_forward_synchronize_batches=true`; in this mode remote batches use
+batch-end events for their completion waits instead of `cudaStreamSynchronize`.
+Round-robin forwarding and out-of-order chunks are not supported by this mode.
+Enable the same mode on every local proxy; mismatched notification protocols are
+rejected during initialization.
+
+`nvlink_forward_ping_pong_handoff_copy` is the one-based index of the nonempty
+`cudaMemcpyBatchAsync` call that triggers the next forwarding thread (default
+`1`). A remote batch submits one call per nonempty destination, with multiple
+copy runs inside each call. The trigger event is recorded at that stream position,
+but its handle is released to the other thread only after all copies, notification
+events, notification entries, and compaction/submission cursors are committed.
+The next thread waits for that event and for its next RDMA range to be ready,
+then participates in the next local batch barrier, including the existing
+minimum-available-chunk selection. It can submit while the preceding batch is
+still copying; execution remains ordered by the shared stream.
+
+If a batch has fewer calls than the configured index, its batch-end event is the
+handoff event. A batch requiring no NVLink copies also records an end marker and
+passes the turn. Each iteration starts with A. Proxies with no remaining remote
+work retire from the phase, so uneven and empty workloads do not require a
+nonexistent successor event.
+
+Each copied destination range is enqueued immediately with an event recorded
+behind its copy call. The dispatcher waits at the FIFO head before publishing;
+later entries, including direct-input entries without an event, cannot overtake
+it. Direct inputs retain the GPUDirect RDMA visibility flush before enqueueing.
+Event handles remain inside the source process. In this mode
+`nvlink_forward_notification_queue_depth` also bounds the pending in-process
+remote notification queue. Iteration completion waits for submitted batches to
+finish and for all local sources' iteration notifications to be consumed before
+returning to the embedding caller.
+
+For the checked-in launchers, append the local-sync override explicitly because
+the scripts default it to false:
+
+```bash
+# Node 0
+RDMA_CPU_Proxy/scripts/run_node0_torchrun.sh --concurrent-kernel \
+  --nvlink_forward_local_batch_sync_enabled=true \
+  --nvlink_forward_ping_pong_enabled=true \
+  --nvlink_forward_ping_pong_handoff_copy=1
+
+# Node 1
+RDMA_CPU_Proxy/scripts/run_node1_torchrun.sh --concurrent-kernel \
+  --nvlink_forward_local_batch_sync_enabled=true \
+  --nvlink_forward_ping_pong_enabled=true \
+  --nvlink_forward_ping_pong_handoff_copy=1
+```
+
+The overlap can hide the barrier only when enough GPU copy work remains after
+the handoff becomes usable. It coordinates CPU submissions; actual batch start
+times can differ between GPUs. Profile the copy timeline and GroupedGEMM
+throughput on Hopper when tuning the handoff index. With
+`nvlink_forward_log_batches=true`, completion logs identify the A/B lane.
+Per-batch host elapsed times can overlap in this mode, so their summed durations
+are not an iteration wall-clock bandwidth measurement.
+
+`test_ping_pong` exercises legacy and ping-pong mock paths, unequal workloads,
+dynamic tails, direct-only batches, empty remote phases, and queue backpressure.
+`test_forward_events` checks event lifetime guards locally and additionally checks
+asynchronous stream-prefix completion in a CUDA build with an available GPU.
+Run it on a remote CUDA node with
+`ctest --test-dir RDMA_CPU_Proxy/build-hopper -R test_forward_events --output-on-failure`.
+This event test does not require an RDMA NIC.
 
 ## RDMA and GPUDirect RDMA
 
@@ -484,6 +559,8 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_notification_log_enabled`
 - `nvlink_forward_notification_log_dir`
 - `nvlink_forward_local_batch_sync_enabled`
+- `nvlink_forward_ping_pong_enabled`
+- `nvlink_forward_ping_pong_handoff_copy`
 - `nvlink_forward_synchronize_iteration`
 - `nvlink_forward_log_batches`
 - `local_iteration_sync_enabled`

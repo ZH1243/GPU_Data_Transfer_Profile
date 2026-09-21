@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cerrno>
 #include <cstring>
+#include <condition_variable>
 #include <deque>
 #include <filesystem>
 #include <functional>
@@ -83,7 +84,8 @@ struct alignas(64) Proxy::NvlinkForwardNotificationQueue {
     uint64_t tail{0};
     uint64_t dropped{0};
     uint64_t sender_done{0};
-    char padding[24]{};
+    uint64_t completed_iteration{0};
+    char padding[16]{};
 };
 
 struct alignas(64) Proxy::NvlinkForwardNotificationHeader {
@@ -104,8 +106,31 @@ struct alignas(64) Proxy::NvlinkForwardNotificationHeader {
 };
 
 struct Proxy::NvlinkForwardNotificationDispatchState {
+    struct Entry {
+        NvlinkForwardNotification notification;
+        std::shared_ptr<CudaForwardEvent> event;
+    };
     std::mutex mutex;
-    std::deque<NvlinkForwardNotification> pending;
+    std::deque<Entry> pending;
+};
+
+struct Proxy::ForwardingBatchCompletion {
+    std::shared_ptr<CudaForwardEvent> handoff;
+    std::shared_ptr<CudaForwardEvent> end;
+    std::chrono::steady_clock::time_point start;
+    uint64_t iteration{0};
+    std::size_t bytes{0};
+};
+
+struct Proxy::ForwardingPingPongState {
+    std::mutex mutex;
+    std::condition_variable changed;
+    int turn{0};
+    std::shared_ptr<CudaForwardEvent> handoff;
+    // Only the owner of turn accesses these. Both lanes use the same barrier
+    // generation, and only one lane may enter a local-proxy barrier at a time.
+    uint64_t iteration{std::numeric_limits<uint64_t>::max()};
+    uint64_t round{0};
 };
 
 namespace {
@@ -1070,7 +1095,9 @@ void Proxy::initialize_nvlink_forward_notifications() {
     header->queue_bytes = static_cast<uint32_t>(sizeof(NvlinkForwardNotificationQueue));
     header->notification_bytes = static_cast<uint32_t>(sizeof(NvlinkForwardNotification));
     header->entry_bytes = static_cast<uint32_t>(entry_bytes);
-    header->reserved = 0;
+    // Bit 0 opts into the iteration watermark stored in queue padding. Legacy
+    // mode retains its wire layout and rejects mixed-mode local participants.
+    header->reserved = config_.nvlink_forward_ping_pong_enabled ? 1U : 0U;
 
     auto* queues = reinterpret_cast<NvlinkForwardNotificationQueue*>(
         reinterpret_cast<char*>(mapping) + sizeof(NvlinkForwardNotificationHeader));
@@ -1084,6 +1111,7 @@ void Proxy::initialize_nvlink_forward_notifications() {
         atomic_store_u64(&queue->tail, 0);
         atomic_store_u64(&queue->dropped, 0);
         atomic_store_u64(&queue->sender_done, 0);
+        atomic_store_u64(&queue->completed_iteration, 0);
     }
     atomic_store_i32(&header->pid, current_process_id());
     atomic_store_u32(&header->initialized, 1);
@@ -1219,7 +1247,7 @@ void Proxy::prepare_forwarding_notification_destinations() {
                 header->queue_bytes != sizeof(NvlinkForwardNotificationQueue) ||
                 header->notification_bytes != sizeof(NvlinkForwardNotification) ||
                 header->entry_bytes != entry_bytes ||
-                header->reserved != 0) {
+                header->reserved != (config_.nvlink_forward_ping_pong_enabled ? 1U : 0U)) {
                 last_wait_reason = "metadata incomplete or mismatched";
                 munmap(mapping, expected_size);
                 close(fd);
@@ -1271,7 +1299,7 @@ void Proxy::enqueue_forward_completion_notifications(
     {
         std::lock_guard<std::mutex> lock(nvlink_forward_notification_dispatch_->mutex);
         for (auto& notification : notifications) {
-            nvlink_forward_notification_dispatch_->pending.push_back(std::move(notification));
+            nvlink_forward_notification_dispatch_->pending.push_back({std::move(notification), {}});
         }
     }
     nvlink_forward_notifications_enqueued_.fetch_add(notifications.size());
@@ -1279,6 +1307,73 @@ void Proxy::enqueue_forward_completion_notifications(
         RDMA_PROXY_LOG_INFO("nvlink_forward_notifications_enqueued local_rank=", config_.node_rank,
                             " src_gpu=", config_.local_gpu_index,
                             " count=", notifications.size());
+    }
+}
+
+void Proxy::enqueue_forward_completion_notification(
+    const NvlinkForwardNotification& notification,
+    std::shared_ptr<CudaForwardEvent> event) {
+    if (!nvlink_forward_notification_dispatch_) {
+        throw std::runtime_error("NVLink completion notification dispatch queue is not initialized");
+    }
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(config_.completion_timeout_ms);
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lock(nvlink_forward_notification_dispatch_->mutex);
+            if (nvlink_forward_notification_dispatch_->pending.size() <
+                config_.nvlink_forward_notification_queue_depth) {
+                nvlink_forward_notification_dispatch_->pending.push_back({notification, std::move(event)});
+                nvlink_forward_notifications_enqueued_.fetch_add(1);
+                return;
+            }
+        }
+        check_forwarding_error();
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw std::runtime_error("timed out waiting for NVLink event dispatch queue space");
+        }
+        cpu_relax();
+    }
+}
+
+void Proxy::wait_for_forward_event(const std::shared_ptr<CudaForwardEvent>& event) const {
+    if (!event) return;
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(config_.completion_timeout_ms);
+    while (!event->ready()) {
+        check_forwarding_error();
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw std::runtime_error("timed out waiting for NVLink forwarding CUDA event");
+        }
+        cpu_relax();
+    }
+}
+
+void Proxy::drain_forwarding_iteration_notifications(uint64_t iteration) {
+    // Called after all local batch submissions/completions and phase retirement.
+    // Publish a watermark only after the dispatcher has sent the entire prefix.
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(config_.completion_timeout_ms);
+    auto poll = [&] {
+        check_forwarding_error();
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw std::runtime_error("timed out draining NVLink iteration notifications");
+        }
+        cpu_relax();
+    };
+    const auto required = nvlink_forward_notifications_enqueued_.load();
+    while (nvlink_forward_notifications_sent_.load() < required) poll();
+    for (const auto& dst : forwarding_notification_destinations_) {
+        auto* queue = nvlink_forward_notification_queue_for_source(dst.header, config_.local_gpu_index);
+        atomic_store_u64(&queue->completed_iteration, iteration + 1);
+    }
+    for (int source = 0; source < config_.num_gpus_per_node; ++source) {
+        auto* queue = nvlink_forward_notification_queue_for_source(
+            nvlink_forward_notification_header_, source);
+        while (atomic_load_u64(&queue->completed_iteration) < iteration + 1 ||
+               atomic_load_u64(&queue->tail) != atomic_load_u64(&queue->head)) {
+            poll();
+        }
     }
 }
 
@@ -1375,20 +1470,26 @@ bool Proxy::nvlink_forward_notification_queues_complete() const {
 void Proxy::nvlink_forward_notification_dispatch_loop() {
     try {
         if (!nvlink_forward_notification_dispatch_) return;
+        if (config_.nvlink_forward_ping_pong_enabled) {
+            select_cuda_device_for_thread(config_.cuda_device_id, config_.mock_mode);
+        }
         while (true) {
-            NvlinkForwardNotification notification;
+            NvlinkForwardNotificationDispatchState::Entry entry;
             bool have_notification = false;
             {
                 std::lock_guard<std::mutex> lock(nvlink_forward_notification_dispatch_->mutex);
                 if (!nvlink_forward_notification_dispatch_->pending.empty()) {
-                    notification = std::move(nvlink_forward_notification_dispatch_->pending.front());
+                    entry = std::move(nvlink_forward_notification_dispatch_->pending.front());
                     nvlink_forward_notification_dispatch_->pending.pop_front();
                     have_notification = true;
                 }
             }
 
             if (have_notification) {
-                publish_forward_completion_notification(notification);
+                // Hold the FIFO head outside the mutex while waiting. In
+                // particular, later no-copy entries cannot overtake this one.
+                wait_for_forward_event(entry.event);
+                publish_forward_completion_notification(entry.notification);
                 continue;
             }
             if (nvlink_forward_notification_dispatch_stop_.load()) {
@@ -2377,6 +2478,10 @@ void Proxy::start_forwarding_thread() {
     forwarding_batch_available_calls_.store(0);
     forwarding_batch_available_total_ns_.store(0);
     forwarding_batches_issued_.store(0);
+    forwarding_batches_in_flight_.store(0);
+    if (config_.nvlink_forward_ping_pong_enabled) {
+        forwarding_ping_pong_.reset(new ForwardingPingPongState);
+    }
     forwarding_stop_.store(false);
     if (config_.nvlink_forward_completion_notifications_enabled) {
         nvlink_forward_notification_dispatch_thread_ =
@@ -2385,7 +2490,10 @@ void Proxy::start_forwarding_thread() {
             std::thread(&Proxy::nvlink_forward_notification_loop, this);
     }
     forwarding_ready_thread_ = std::thread(&Proxy::forwarding_ready_loop, this);
-    forwarding_thread_ = std::thread(&Proxy::forwarding_loop, this);
+    forwarding_thread_ = std::thread(&Proxy::forwarding_loop, this, 0);
+    if (config_.nvlink_forward_ping_pong_enabled) {
+        forwarding_second_thread_ = std::thread(&Proxy::forwarding_loop, this, 1);
+    }
     const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config_);
     RDMA_PROXY_LOG_INFO("NVLink forwarding thread started local_rank=", config_.node_rank,
                         " local_gpu=", config_.local_gpu_index,
@@ -2400,8 +2508,10 @@ void Proxy::start_forwarding_thread() {
 
 void Proxy::stop_forwarding_thread() {
     forwarding_stop_.store(true);
+    if (forwarding_ping_pong_) forwarding_ping_pong_->changed.notify_all();
     if (forwarding_ready_thread_.joinable()) forwarding_ready_thread_.join();
     if (forwarding_thread_.joinable()) forwarding_thread_.join();
+    if (forwarding_second_thread_.joinable()) forwarding_second_thread_.join();
     nvlink_forward_notification_dispatch_stop_.store(true);
     if (nvlink_forward_notification_dispatch_thread_.joinable()) {
         nvlink_forward_notification_dispatch_thread_.join();
@@ -2448,6 +2558,7 @@ void Proxy::stop_forwarding_thread() {
     forwarding_compaction_next_destination_token_by_peer_.clear();
     forwarding_out_of_order_peer_states_.clear();
     nvlink_forward_notification_dispatch_.reset();
+    forwarding_ping_pong_.reset();
     release_nvlink_forward_notifications();
     destroy_cuda_stream(forwarding_stream_, config_.mock_mode);
     forwarding_stream_ = nullptr;
@@ -2852,7 +2963,7 @@ bool Proxy::forwarding_chunk_available(
     return total >= required_count;
 }
 
-void Proxy::issue_forwarding_batch(
+Proxy::ForwardingBatchCompletion Proxy::issue_forwarding_batch(
     const PeerState& peer,
     const PeerGpuBuffers& buffers,
     uint64_t iteration,
@@ -2864,6 +2975,24 @@ void Proxy::issue_forwarding_batch(
     const auto batch_timing_start = std::chrono::steady_clock::now();
     std::size_t batch_bytes = 0;
     std::vector<NvlinkForwardNotification> completed_notifications;
+    ForwardingBatchCompletion completion;
+    completion.start = batch_timing_start;
+    completion.iteration = iteration;
+    std::size_t copy_calls = 0;
+    auto notify_copy = [&](const NvlinkForwardNotification& notification) {
+        if (!config_.nvlink_forward_ping_pong_enabled) {
+            completed_notifications.push_back(notification);
+            return;
+        }
+        auto event = std::make_shared<CudaForwardEvent>(config_.mock_mode);
+        event->record(forwarding_stream_);
+        ++copy_calls;
+        if (copy_calls == config_.nvlink_forward_ping_pong_handoff_copy) {
+            completion.handoff = std::make_shared<CudaForwardEvent>(config_.mock_mode);
+            completion.handoff->record(forwarding_stream_);
+        }
+        enqueue_forward_completion_notification(notification, std::move(event));
+    };
     if (batch_start_token + batch_tokens > forwarding_tokens_for_peer(peer)) {
         throw std::runtime_error("NVLink forwarding batch exceeds token range");
     }
@@ -2897,7 +3026,13 @@ void Proxy::issue_forwarding_batch(
         notification.destination_gpu = config_.local_gpu_index;
         notification.peer_rank = peer.peer_rank;
         notification.flags = kDirectRdmaInputFlag;
-        completed_notifications.push_back(notification);
+        if (config_.nvlink_forward_ping_pong_enabled) {
+            // No copy/event orders this direct input against persistent GEMM.
+            flush_gpudirect_rdma_writes(config_.cuda_device_id, config_.mock_mode);
+            enqueue_forward_completion_notification(notification, {});
+        } else {
+            completed_notifications.push_back(notification);
+        }
     }
     if (compact_router_destinations) {
         if (peer_slot >= forwarding_compaction_iteration_by_peer_.size() ||
@@ -2988,7 +3123,7 @@ void Proxy::issue_forwarding_batch(
                 notification.destination_gpu = dst_gpu;
                 notification.peer_rank = peer.peer_rank;
                 notification.flags = kNvlinkForwardRoundRobinFlag;
-                completed_notifications.push_back(notification);
+                notify_copy(notification);
             }
         }
     } else {
@@ -3117,12 +3252,22 @@ void Proxy::issue_forwarding_batch(
                 notification.destination_gpu = dst.gpu_index;
                 notification.peer_rank = peer.peer_rank;
                 notification.flags = 0;
-                completed_notifications.push_back(notification);
+                notify_copy(notification);
             }
         }
         if (compact_router_destinations) {
             forwarding_compaction_next_source_token_by_peer_[peer_slot] += batch_tokens;
         }
+    }
+    if (config_.nvlink_forward_ping_pong_enabled) {
+        completion.end = std::make_shared<CudaForwardEvent>(config_.mock_mode);
+        completion.end->record(forwarding_stream_);
+        // Short batches use their end event, including batches with zero copies.
+        // The end marker still captures previous work in the shared stream.
+        if (!completion.handoff) completion.handoff = completion.end;
+        completion.bytes = batch_bytes;
+        forwarding_batches_in_flight_.fetch_add(1);
+        return completion;
     }
     if (config_.nvlink_forward_synchronize_batches) {
         synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
@@ -3168,6 +3313,7 @@ void Proxy::issue_forwarding_batch(
                                 " bandwidth_gbps=", std::fixed, std::setprecision(3), batch_gbits_per_sec);
         }
     }
+    return completion;
 }
 
 void Proxy::issue_local_router_forwarding_batch(
@@ -3623,15 +3769,61 @@ void Proxy::record_out_of_order_forwarding_arrival(
     state.chunk_status[global_chunk].compare_exchange_strong(expected, 0);
 }
 
-void Proxy::forwarding_loop() {
+void Proxy::forwarding_loop(int lane) {
     try {
         select_cuda_device_for_thread(config_.cuda_device_id, config_.mock_mode);
         const auto peer_order = nvlink_forward_peer_order();
         const bool dynamic_threshold = nvlink_forward_dynamic_threshold_enabled(config_);
         const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config_);
         const bool finite_iterations = config_.num_iterations != 0;
-        uint64_t local_batch_sync_iteration = std::numeric_limits<uint64_t>::max();
-        uint64_t local_batch_sync_round = 0;
+        uint64_t legacy_sync_iteration = std::numeric_limits<uint64_t>::max();
+        uint64_t legacy_sync_round = 0;
+        auto& local_batch_sync_iteration = forwarding_ping_pong_ ?
+            forwarding_ping_pong_->iteration : legacy_sync_iteration;
+        auto& local_batch_sync_round = forwarding_ping_pong_ ?
+            forwarding_ping_pong_->round : legacy_sync_round;
+        auto pass_turn = [&](std::shared_ptr<CudaForwardEvent> event, int next_lane) {
+            auto& state = *forwarding_ping_pong_;
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                state.handoff = std::move(event);
+                state.turn = next_lane;
+            }
+            state.changed.notify_all();
+        };
+        auto complete_batch = [&](ForwardingBatchCompletion completion) {
+            if (!forwarding_ping_pong_) return;
+            // All copies, events, notifications, and source/destination cursors
+            // are committed before releasing the next producer.
+            pass_turn(std::move(completion.handoff), 1 - lane);
+            wait_for_forward_event(completion.end);
+            const auto seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - completion.start).count();
+            {
+                std::lock_guard<std::mutex> lock(forwarding_mutex_);
+                if (forwarding_iteration_stats_.size() <= completion.iteration) {
+                    forwarding_iteration_stats_.resize(completion.iteration + 1);
+                }
+                auto& stats = forwarding_iteration_stats_[completion.iteration];
+                ++stats.batch_count;
+                stats.total_bytes += completion.bytes;
+                if (completion.bytes != 0) {
+                    ++stats.bandwidth_sample_count;
+                    stats.total_seconds += seconds;
+                    const double gbps = seconds > 0 ? completion.bytes / seconds / 1.0e9 : 0.0;
+                    stats.sum_batch_bandwidth_gbytes_per_sec += gbps;
+                    stats.sum_batch_bandwidth_gbits_per_sec += gbps * 8.0;
+                }
+            }
+            forwarding_batches_in_flight_.fetch_sub(1);
+            if (config_.nvlink_forward_log_batches) {
+                RDMA_PROXY_LOG_INFO("nvlink_forward_ping_pong_batch_complete iteration=", completion.iteration,
+                                    " local_gpu=", config_.local_gpu_index,
+                                    " lane=", lane == 0 ? "A" : "B",
+                                    " bytes=", completion.bytes,
+                                    " elapsed_us=", static_cast<uint64_t>(seconds * 1.0e6));
+            }
+        };
         auto next_local_batch_sync_round = [&](uint64_t iteration) {
             if (iteration != local_batch_sync_iteration) {
                 if (local_batch_sync_iteration != std::numeric_limits<uint64_t>::max() &&
@@ -3647,6 +3839,20 @@ void Proxy::forwarding_loop() {
 
         while (!forwarding_stop_.load()) {
             check_forwarding_error();
+            if (forwarding_ping_pong_) {
+                auto& state = *forwarding_ping_pong_;
+                std::shared_ptr<CudaForwardEvent> handoff;
+                {
+                    std::unique_lock<std::mutex> lock(state.mutex);
+                    state.changed.wait_for(lock, std::chrono::milliseconds(1), [&] {
+                        return forwarding_stop_.load() || state.turn == lane;
+                    });
+                    if (forwarding_stop_.load()) return;
+                    if (state.turn != lane) continue;
+                    handoff = std::move(state.handoff);
+                }
+                wait_for_forward_event(handoff);
+            }
             bool progressed = false;
             for (const auto peer_index : peer_order) {
                 if (peer_index >= forwarding_ready_peer_count_) {
@@ -3738,6 +3944,15 @@ void Proxy::forwarding_loop() {
                         continue;
                     }
 
+                    // Every iteration starts with lane A even when proxies
+                    // retired after different numbers of batches last time.
+                    if (forwarding_ping_pong_ && lane != 0 &&
+                        iteration != local_batch_sync_iteration) {
+                        pass_turn({}, 0);
+                        progressed = true;
+                        break;
+                    }
+
                     if (config_.nvlink_forward_local_batch_sync_enabled) {
                         batch_chunks = synchronize_local_nvlink_batch_start(
                             LocalNvlinkBatchSyncPhase::kRemoteForwarding,
@@ -3776,7 +3991,7 @@ void Proxy::forwarding_loop() {
                                             " batch_start_token=", batch_start_token,
                                             " batch_tokens=", batch_tokens);
                     }
-                    issue_forwarding_batch(
+                    auto completion = issue_forwarding_batch(
                         peer,
                         cuda_buffers_.peer_buffers()[peer_index],
                         iteration,
@@ -3789,6 +4004,7 @@ void Proxy::forwarding_loop() {
                     }
                     forwarding_out_of_order_issued_chunks_by_peer_[peer_index].fetch_add(batch_chunks);
                     forwarding_batches_issued_.fetch_add(1);
+                    complete_batch(std::move(completion));
                     progressed = true;
                 } else if (dynamic_threshold) {
                     std::size_t next_chunk = 0;
@@ -3832,6 +4048,15 @@ void Proxy::forwarding_loop() {
                         continue;
                     }
 
+                    // Every iteration starts with lane A even when proxies
+                    // retired after different numbers of batches last time.
+                    if (forwarding_ping_pong_ && lane != 0 &&
+                        iteration != local_batch_sync_iteration) {
+                        pass_turn({}, 0);
+                        progressed = true;
+                        break;
+                    }
+
                     if (config_.nvlink_forward_local_batch_sync_enabled) {
                         batch_chunks = synchronize_local_nvlink_batch_start(
                             LocalNvlinkBatchSyncPhase::kRemoteForwarding,
@@ -3862,7 +4087,7 @@ void Proxy::forwarding_loop() {
                                             " batch_start_token=", batch_start_token,
                                             " batch_tokens=", batch_tokens);
                     }
-                    issue_forwarding_batch(
+                    auto completion = issue_forwarding_batch(
                         peer,
                         cuda_buffers_.peer_buffers()[peer_index],
                         iteration,
@@ -3874,6 +4099,7 @@ void Proxy::forwarding_loop() {
                         forwarding_next_chunk_by_peer_.at(peer_index) = next_chunk + batch_chunks;
                     }
                     forwarding_batches_issued_.fetch_add(1);
+                    complete_batch(std::move(completion));
                     progressed = true;
                 } else {
                     std::size_t next_batch = 0;
@@ -3910,6 +4136,15 @@ void Proxy::forwarding_loop() {
                                             " batch_start_token=", batch_start_token,
                                             " batch_tokens=", batch_tokens);
                     }
+                    // Every iteration starts with lane A even when proxies
+                    // retired after different numbers of batches last time.
+                    if (forwarding_ping_pong_ && lane != 0 &&
+                        iteration != local_batch_sync_iteration) {
+                        pass_turn({}, 0);
+                        progressed = true;
+                        break;
+                    }
+
                     if (config_.nvlink_forward_local_batch_sync_enabled) {
                         synchronize_local_nvlink_batch_start(
                             LocalNvlinkBatchSyncPhase::kRemoteForwarding,
@@ -3918,7 +4153,7 @@ void Proxy::forwarding_loop() {
                             next_local_batch_sync_round(iteration),
                             0);
                     }
-                    issue_forwarding_batch(
+                    auto completion = issue_forwarding_batch(
                         peer,
                         cuda_buffers_.peer_buffers()[peer_index],
                         iteration,
@@ -3930,8 +4165,10 @@ void Proxy::forwarding_loop() {
                         forwarding_next_batch_by_peer_.at(peer_index) = next_batch + 1;
                     }
                     forwarding_batches_issued_.fetch_add(1);
+                    complete_batch(std::move(completion));
                     progressed = true;
                 }
+                if (forwarding_ping_pong_ && progressed) break;
             }
             if (!progressed) {
                 std::this_thread::sleep_for(std::chrono::microseconds(10));
@@ -3992,6 +4229,10 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
                 }
             }
         }
+        if (complete && config_.nvlink_forward_ping_pong_enabled &&
+            forwarding_batches_in_flight_.load() != 0) {
+            complete = false;
+        }
         if (complete) {
             if (config_.nvlink_forward_synchronize_iteration) {
                 synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
@@ -3999,6 +4240,9 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
             mark_local_nvlink_batch_phase_complete(
                 LocalNvlinkBatchSyncPhase::kRemoteForwarding,
                 iteration);
+            if (config_.nvlink_forward_ping_pong_enabled) {
+                drain_forwarding_iteration_notifications(iteration);
+            }
             ForwardingIterationStats stats;
             if (config_.nvlink_forward_synchronize_batches) {
                 std::lock_guard<std::mutex> lock(forwarding_mutex_);
@@ -4088,7 +4332,9 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
 
 void Proxy::set_forwarding_error(const std::string& error) {
     std::lock_guard<std::mutex> lock(forwarding_mutex_);
+    if (config_.nvlink_forward_ping_pong_enabled && !forwarding_error_.empty()) return;
     forwarding_error_ = error;
+    if (forwarding_ping_pong_) forwarding_ping_pong_->changed.notify_all();
 }
 
 void Proxy::check_forwarding_error() const {

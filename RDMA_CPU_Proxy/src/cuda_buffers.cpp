@@ -1632,6 +1632,53 @@ void synchronize_cuda_stream(void* stream, bool mock_mode) {
 #endif
 }
 
+CudaForwardEvent::CudaForwardEvent(bool mock_mode) : mock_mode_(mock_mode) {
+    if (mock_mode_) return;
+#if RDMA_PROXY_HAVE_CUDA
+    cudaEvent_t event = nullptr;
+    check_cuda(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "cudaEventCreate forwarding");
+    event_ = reinterpret_cast<void*>(event);
+#else
+    throw std::runtime_error("CUDA forwarding event requested without CUDA support");
+#endif
+}
+
+CudaForwardEvent::~CudaForwardEvent() {
+#if RDMA_PROXY_HAVE_CUDA
+    if (event_) {
+        const auto status = cudaEventDestroy(reinterpret_cast<cudaEvent_t>(event_));
+        if (status != cudaSuccess) {
+            RDMA_PROXY_LOG_WARN("cudaEventDestroy forwarding: ", cudaGetErrorString(status));
+        }
+    }
+#endif
+}
+
+void CudaForwardEvent::record(void* stream) {
+    if (recorded_) throw std::runtime_error("forwarding event was already recorded");
+#if RDMA_PROXY_HAVE_CUDA
+    if (!mock_mode_) {
+        check_cuda(cudaEventRecord(reinterpret_cast<cudaEvent_t>(event_),
+                                   reinterpret_cast<cudaStream_t>(stream)),
+                   "cudaEventRecord forwarding");
+    }
+#else
+    (void)stream;
+#endif
+    recorded_ = true;
+}
+
+bool CudaForwardEvent::ready() const {
+    if (!recorded_) throw std::runtime_error("forwarding event queried before recording");
+    if (mock_mode_) return true;
+#if RDMA_PROXY_HAVE_CUDA
+    const auto status = cudaEventQuery(reinterpret_cast<cudaEvent_t>(event_));
+    if (status == cudaErrorNotReady) return false;
+    check_cuda(status, "cudaEventQuery forwarding");
+#endif
+    return true;
+}
+
 void enable_cuda_peer_access(int cuda_device_id, int peer_cuda_device_id, bool mock_mode) {
     if (mock_mode || cuda_device_id == peer_cuda_device_id) return;
 #if RDMA_PROXY_HAVE_CUDA

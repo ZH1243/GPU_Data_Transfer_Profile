@@ -403,6 +403,12 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "nvlink_forward_notification_log_dir") {
         config.nvlink_forward_notification_log_dir = value;
     }
+    else if (key == "nvlink_forward_ping_pong_enabled") {
+        config.nvlink_forward_ping_pong_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_ping_pong_handoff_copy") {
+        config.nvlink_forward_ping_pong_handoff_copy = static_cast<std::size_t>(std::stoull(value));
+    }
     else if (key == "nvlink_forward_local_batch_sync_enabled") {
         config.nvlink_forward_local_batch_sync_enabled = (value == "1" || value == "true" || value == "yes");
     }
@@ -651,6 +657,10 @@ ProxyConfig load_config_file(const std::string& path) {
         object,
         "nvlink_forward_notification_log_dir",
         config.nvlink_forward_notification_log_dir);
+    config.nvlink_forward_ping_pong_enabled = get_bool(
+        object, "nvlink_forward_ping_pong_enabled", config.nvlink_forward_ping_pong_enabled);
+    config.nvlink_forward_ping_pong_handoff_copy = number_as<std::size_t>(
+        object, "nvlink_forward_ping_pong_handoff_copy", config.nvlink_forward_ping_pong_handoff_copy);
     config.nvlink_forward_local_batch_sync_enabled = get_bool(
         object, "nvlink_forward_local_batch_sync_enabled", config.nvlink_forward_local_batch_sync_enabled);
     config.nvlink_forward_synchronize_iteration = get_bool(
@@ -811,6 +821,21 @@ void validate_config(const ProxyConfig& config) {
     if (config.local_iteration_sync_enabled && config.local_iteration_sync_dir.empty()) {
         throw std::runtime_error(
             "local_iteration_sync_dir must be non-empty when local iteration synchronization is enabled");
+    }
+    if (config.nvlink_forward_ping_pong_enabled) {
+        if (!config.router_routing_enabled || config.nvlink_forward_use_round_robin ||
+            config.nvlink_forward_out_of_order_chunks_enabled ||
+            !config.nvlink_forward_use_batch_api ||
+            !config.nvlink_forward_local_batch_sync_enabled ||
+            !config.nvlink_forward_completion_notifications_enabled) {
+            throw std::runtime_error(
+                "nvlink_forward_ping_pong_enabled requires ordered router forwarding, "
+                "nvlink_forward_use_batch_api=true, nvlink_forward_local_batch_sync_enabled=true, "
+                "and nvlink_forward_completion_notifications_enabled=true");
+        }
+        if (config.nvlink_forward_ping_pong_handoff_copy == 0) {
+            throw std::runtime_error("nvlink_forward_ping_pong_handoff_copy must be > 0");
+        }
     }
     if (config.nvlink_forward_local_batch_sync_enabled) {
         if (!config.nvlink_forwarding_enabled) {
@@ -1111,6 +1136,9 @@ std::string config_summary(const ProxyConfig& config) {
         << (config.nvlink_forward_notification_log_enabled ? "true" : "false")
         << " nvlink_forward_notification_log_dir="
         << config.nvlink_forward_notification_log_dir
+        << " nvlink_forward_ping_pong_enabled="
+        << (config.nvlink_forward_ping_pong_enabled ? "true" : "false")
+        << " nvlink_forward_ping_pong_handoff_copy=" << config.nvlink_forward_ping_pong_handoff_copy
         << " nvlink_forward_local_batch_sync_enabled="
         << (config.nvlink_forward_local_batch_sync_enabled ? "true" : "false")
         << " nvlink_forward_synchronize_iteration="

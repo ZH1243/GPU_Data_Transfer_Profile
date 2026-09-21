@@ -261,6 +261,22 @@ void select_cuda_device_for_thread(int cuda_device_id, bool mock_mode);
 void flush_gpudirect_rdma_writes(int cuda_device_id, bool mock_mode);
 void destroy_cuda_stream(void* stream, bool mock_mode);
 void synchronize_cuda_stream(void* stream, bool mock_mode);
+// A recorded stream prefix. Share ownership between CPU consumers, but never
+// re-record an event while a consumer can still query the previous recording.
+class CudaForwardEvent {
+public:
+    explicit CudaForwardEvent(bool mock_mode);
+    ~CudaForwardEvent();
+    CudaForwardEvent(const CudaForwardEvent&) = delete;
+    CudaForwardEvent& operator=(const CudaForwardEvent&) = delete;
+    void record(void* stream);
+    bool ready() const;
+
+private:
+    void* event_{nullptr};
+    bool mock_mode_{false};
+    bool recorded_{false};
+};
 void enable_cuda_peer_access(int cuda_device_id, int peer_cuda_device_id, bool mock_mode);
 void launch_cuda_forward_copy_batch_async(
     const CudaForwardCopy& copy,

@@ -116,6 +116,8 @@ private:
     struct NvlinkForwardNotificationHeader;
     struct NvlinkForwardNotificationQueue;
     struct NvlinkForwardNotificationDispatchState;
+    struct ForwardingBatchCompletion;
+    struct ForwardingPingPongState;
     struct ForwardNotificationDestinationState {
         int gpu_index{-1};
         NvlinkForwardNotificationHeader* header{nullptr};
@@ -147,6 +149,11 @@ private:
     void initialize_nvlink_forward_notification_dispatch();
     void enqueue_forward_completion_notifications(
         std::vector<NvlinkForwardNotification>&& notifications);
+    void enqueue_forward_completion_notification(
+        const NvlinkForwardNotification& notification,
+        std::shared_ptr<CudaForwardEvent> event);
+    void wait_for_forward_event(const std::shared_ptr<CudaForwardEvent>& event) const;
+    void drain_forwarding_iteration_notifications(uint64_t iteration);
     void publish_forward_completion_notification(const NvlinkForwardNotification& notification);
     void mark_forward_notification_senders_done();
     bool nvlink_forward_notification_queues_complete() const;
@@ -201,7 +208,7 @@ private:
         const ForwardDestinationState& destination,
         int source_node_rank) const;
     std::string nvlink_exchange_file(int gpu_index) const;
-    void forwarding_loop();
+    void forwarding_loop(int lane = 0);
     std::vector<std::size_t> nvlink_forward_peer_order() const;
     std::size_t forwarding_tokens_for_peer(const PeerState& peer) const;
     bool forwarding_batch_available(
@@ -214,7 +221,7 @@ private:
         const PeerState& peer,
         const ChunkDescriptor& chunk,
         uint64_t required_count) const;
-    void issue_forwarding_batch(
+    ForwardingBatchCompletion issue_forwarding_batch(
         const PeerState& peer,
         const PeerGpuBuffers& buffers,
         uint64_t iteration,
@@ -258,6 +265,9 @@ private:
     std::vector<PeerState> peers_;
     std::atomic<bool> forwarding_stop_{false};
     std::thread forwarding_thread_;
+    std::thread forwarding_second_thread_;
+    std::unique_ptr<ForwardingPingPongState> forwarding_ping_pong_;
+    std::atomic<std::size_t> forwarding_batches_in_flight_{0};
     std::thread forwarding_ready_thread_;
     void* forwarding_stream_{nullptr};
     mutable std::mutex forwarding_mutex_;
