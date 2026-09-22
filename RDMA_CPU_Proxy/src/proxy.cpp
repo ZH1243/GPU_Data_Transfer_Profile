@@ -3054,10 +3054,6 @@ Proxy::ForwardingBatchCompletion Proxy::issue_forwarding_batch(
         notification.destination_gpu = config_.local_gpu_index;
         notification.peer_rank = peer.peer_rank;
         notification.flags = kDirectRdmaInputFlag;
-        if (config_.nvlink_forward_ping_pong_enabled) {
-            // No copy/event orders this direct input against persistent GEMM.
-            flush_gpudirect_rdma_writes(config_.cuda_device_id, config_.mock_mode);
-        }
         completed_notifications.push_back(notification);
     }
     if (compact_router_destinations) {
@@ -3286,6 +3282,13 @@ Proxy::ForwardingBatchCompletion Proxy::issue_forwarding_batch(
         }
     }
     if (config_.nvlink_forward_ping_pong_enabled) {
+        if (compact_router_destinations &&
+            config_.nvlink_forward_completion_notifications_enabled) {
+            // Submit all destination copies before flushing direct same-GPU
+            // RDMA input visibility. Keep the flush before notification enqueue
+            // and turn handoff, including batches with no destination copies.
+            flush_gpudirect_rdma_writes(config_.cuda_device_id, config_.mock_mode);
+        }
         completion.end = acquire_event();
         completion.end->record(forwarding_stream_);
         // Short batches use their end event, including batches with zero copies.

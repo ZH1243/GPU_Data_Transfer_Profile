@@ -236,7 +236,8 @@ an ordered notification vector: direct same-GPU RDMA input first, then nonempty
 destinations in copy-submission order. The dispatcher waits once for the batch-end
 event, then publishes the entire vector before popping the next batch. There are
 no per-destination notification events. Direct inputs retain the GPUDirect RDMA
-visibility flush before enqueueing. Local-staging batches use the same vector
+visibility flush after all destination copy submissions and before recording the
+batch-end event and enqueueing notifications. Local-staging batches use the same vector
 dispatch path with no event because their copies are already synchronized.
 Batch-end gating reduces event overhead but delays early destinations and direct
 inputs until all copies in the batch complete, which can affect GEMM overlap.
