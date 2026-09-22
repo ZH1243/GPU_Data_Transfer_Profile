@@ -22,6 +22,10 @@
 #include <thread>
 #include <unordered_map>
 
+#if RDMA_PROXY_HAVE_CUDA
+#include <nvtx3/nvToolsExt.h>
+#endif
+
 #if defined(__unix__) || defined(__APPLE__)
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -134,6 +138,19 @@ struct Proxy::ForwardingPingPongState {
 };
 
 namespace {
+
+#if RDMA_PROXY_HAVE_CUDA
+class ScopedHandoffWaitRange {
+public:
+    explicit ScopedHandoffWaitRange(int lane) {
+        nvtxRangePushA(lane == 0 ? "nvlink_handoff_event_wait_A" :
+                                 "nvlink_handoff_event_wait_B");
+    }
+    ~ScopedHandoffWaitRange() { nvtxRangePop(); }
+    ScopedHandoffWaitRange(const ScopedHandoffWaitRange&) = delete;
+    ScopedHandoffWaitRange& operator=(const ScopedHandoffWaitRange&) = delete;
+};
+#endif
 
 constexpr uint64_t kLocalIterationSyncMagic = 0x52444d415053594eULL;  // "RDMAPSyn"
 constexpr uint32_t kLocalIterationSyncVersion = 5;
@@ -3869,7 +3886,18 @@ void Proxy::forwarding_loop(int lane) {
                     if (state.turn != lane) continue;
                     handoff = std::move(state.handoff);
                 }
-                wait_for_forward_event(handoff);
+                if (handoff) {
+                    check_forwarding_error();
+                    {
+#if RDMA_PROXY_HAVE_CUDA
+                        ScopedHandoffWaitRange range(lane);
+#endif
+                        // Includes waiting for the shared event's mutex, or
+                        // observing completion already established by dispatch.
+                        handoff->synchronize();
+                    }
+                    check_forwarding_error();
+                }
             }
             bool progressed = false;
             for (const auto peer_index : peer_order) {
