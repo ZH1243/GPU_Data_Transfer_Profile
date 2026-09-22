@@ -216,8 +216,10 @@ rejected during initialization.
 `cudaMemcpyBatchAsync` call that triggers the next forwarding thread (default
 `1`). A remote batch submits one call per nonempty destination, with multiple
 copy runs inside each call. The trigger event is recorded at that stream position,
-but its handle is released to the other thread only after all copies, notification
-events, notification entries, and compaction/submission cursors are committed.
+but its handle is released to the other thread only after all copies, the batch-end
+event, the complete notification batch, and compaction/submission cursors are committed.
+The submitting thread then waits for batch-end completion outside the forwarding-stream
+mutex before waiting for the other thread to return the turn.
 The next thread waits for that event and for its next RDMA range to be ready,
 then participates in the next local batch barrier, including the existing
 minimum-available-chunk selection. It can submit while the preceding batch is
@@ -229,15 +231,21 @@ passes the turn. Each iteration starts with A. Proxies with no remaining remote
 work retire from the phase, so uneven and empty workloads do not require a
 nonexistent successor event.
 
-Each copied destination range is enqueued immediately with an event recorded
-behind its copy call. The dispatcher waits at the FIFO head before publishing;
-later entries, including direct-input entries without an event, cannot overtake
-it. Direct inputs retain the GPUDirect RDMA visibility flush before enqueueing.
+Each remote batch enqueues one dispatch entry containing its batch-end event and
+an ordered notification vector: direct same-GPU RDMA input first, then nonempty
+destinations in copy-submission order. The dispatcher waits once for the batch-end
+event, then publishes the entire vector before popping the next batch. There are
+no per-destination notification events. Direct inputs retain the GPUDirect RDMA
+visibility flush before enqueueing. Local-staging batches use the same vector
+dispatch path with no event because their copies are already synchronized.
+Batch-end gating reduces event overhead but delays early destinations and direct
+inputs until all copies in the batch complete, which can affect GEMM overlap.
 Forwarding events are preallocated during initialization in a fixed pool of
 `2 * num_gpus_per_node` events per proxy (14 for the seven-GPU torchrun scripts).
-A producer reserves `num_gpus_per_node` slots before submitting a batch: at most
-one per nonempty destination plus one batch-end marker. The selected destination's
-notification and handoff share one event. Unused reservations are returned.
+A producer reserves two slots before submitting a batch: one handoff marker and
+one batch-end marker. The submitting thread and dispatcher share the batch-end
+event. Short or zero-copy batches share that event with the next thread too, and
+return the unused handoff reservation.
 Dispatcher backlog can retain older events, so exhaustion waits for capacity
 with `completion_timeout_ms`; shutdown or a forwarding error wakes pool waiters.
 The pool never grows during forwarding. Recorded events return only after
@@ -245,7 +253,8 @@ successful completion and release of every consumer reference; failed or
 unconfirmed recordings remain quarantined until shutdown.
 
 The dispatcher, next producer, and submitting producer use `cudaEventSynchronize`
-at their existing destination, handoff, and batch-end wait locations. There is
+at their batch-end, handoff, and batch-end wait locations, respectively.
+Shared-event completion is cached, so concurrent consumers do not repeat the CUDA wait. There is
 no per-copy wait in the submitting producer. Events retain `cudaEventDisableTiming`
 without `cudaEventBlockingSync`, so CUDA may busy-wait internally. A CUDA event
 synchronization has no timeout or cancellation; unlike the former query loop,
@@ -253,7 +262,8 @@ synchronization has no timeout or cancellation; unlike the former query loop,
 
 Event handles remain inside the source process. In this mode
 `nvlink_forward_notification_queue_depth` also bounds the pending in-process
-remote notification queue. Iteration completion waits for submitted batches to
+notification queue in units of batches; shared-memory receiver queues still count
+individual notifications. Iteration completion waits for submitted batches to
 finish and for all local sources' iteration notifications to be consumed before
 returning to the embedding caller.
 

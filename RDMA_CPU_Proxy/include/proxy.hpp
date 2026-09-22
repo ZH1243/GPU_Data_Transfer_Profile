@@ -148,10 +148,8 @@ private:
     void prepare_forwarding_notification_destinations();
     void initialize_nvlink_forward_notification_dispatch();
     void enqueue_forward_completion_notifications(
-        std::vector<NvlinkForwardNotification>&& notifications);
-    void enqueue_forward_completion_notification(
-        const NvlinkForwardNotification& notification,
-        std::shared_ptr<CudaForwardEvent> event);
+        std::vector<NvlinkForwardNotification>&& notifications,
+        std::shared_ptr<CudaForwardEvent> event = {});
     void wait_for_forward_event(const std::shared_ptr<CudaForwardEvent>& event) const;
     void drain_forwarding_iteration_notifications(uint64_t iteration);
     void publish_forward_completion_notification(const NvlinkForwardNotification& notification);

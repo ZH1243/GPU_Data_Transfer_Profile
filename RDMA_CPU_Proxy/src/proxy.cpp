@@ -111,7 +111,7 @@ struct alignas(64) Proxy::NvlinkForwardNotificationHeader {
 
 struct Proxy::NvlinkForwardNotificationDispatchState {
     struct Entry {
-        NvlinkForwardNotification notification;
+        std::vector<NvlinkForwardNotification> notifications;
         std::shared_ptr<CudaForwardEvent> event;
     };
     std::mutex mutex;
@@ -1312,48 +1312,40 @@ void Proxy::initialize_nvlink_forward_notification_dispatch() {
 }
 
 void Proxy::enqueue_forward_completion_notifications(
-    std::vector<NvlinkForwardNotification>&& notifications) {
-    if (!config_.nvlink_forward_completion_notifications_enabled || notifications.empty()) return;
-    if (!nvlink_forward_notification_dispatch_) {
-        throw std::runtime_error("NVLink completion notification dispatch queue is not initialized");
-    }
-    {
-        std::lock_guard<std::mutex> lock(nvlink_forward_notification_dispatch_->mutex);
-        for (auto& notification : notifications) {
-            nvlink_forward_notification_dispatch_->pending.push_back({std::move(notification), {}});
-        }
-    }
-    nvlink_forward_notifications_enqueued_.fetch_add(notifications.size());
-    if (config_.nvlink_forward_log_batches) {
-        RDMA_PROXY_LOG_INFO("nvlink_forward_notifications_enqueued local_rank=", config_.node_rank,
-                            " src_gpu=", config_.local_gpu_index,
-                            " count=", notifications.size());
-    }
-}
-
-void Proxy::enqueue_forward_completion_notification(
-    const NvlinkForwardNotification& notification,
+    std::vector<NvlinkForwardNotification>&& notifications,
     std::shared_ptr<CudaForwardEvent> event) {
+    if (!config_.nvlink_forward_completion_notifications_enabled ||
+        (notifications.empty() && !event)) return;
     if (!nvlink_forward_notification_dispatch_) {
         throw std::runtime_error("NVLink completion notification dispatch queue is not initialized");
     }
     const auto deadline = std::chrono::steady_clock::now() +
         std::chrono::milliseconds(config_.completion_timeout_ms);
+    const auto count = notifications.size();
     while (true) {
         {
             std::lock_guard<std::mutex> lock(nvlink_forward_notification_dispatch_->mutex);
-            if (nvlink_forward_notification_dispatch_->pending.size() <
+            if (!config_.nvlink_forward_ping_pong_enabled ||
+                nvlink_forward_notification_dispatch_->pending.size() <
                 config_.nvlink_forward_notification_queue_depth) {
-                nvlink_forward_notification_dispatch_->pending.push_back({notification, std::move(event)});
-                nvlink_forward_notifications_enqueued_.fetch_add(1);
-                return;
+                // Dispatch capacity counts batches; receiver ring capacity and
+                // iteration-drain counters still count individual notifications.
+                nvlink_forward_notification_dispatch_->pending.push_back(
+                    {std::move(notifications), std::move(event)});
+                nvlink_forward_notifications_enqueued_.fetch_add(count);
+                break;
             }
         }
         check_forwarding_error();
         if (std::chrono::steady_clock::now() >= deadline) {
-            throw std::runtime_error("timed out waiting for NVLink event dispatch queue space");
+            throw std::runtime_error("timed out waiting for NVLink batch dispatch queue space");
         }
         cpu_relax();
+    }
+    if (config_.nvlink_forward_log_batches) {
+        RDMA_PROXY_LOG_INFO("nvlink_forward_notifications_enqueued local_rank=", config_.node_rank,
+                            " src_gpu=", config_.local_gpu_index,
+                            " count=", count);
     }
 }
 
@@ -1501,10 +1493,13 @@ void Proxy::nvlink_forward_notification_dispatch_loop() {
             }
 
             if (have_notification) {
-                // Hold the FIFO head outside the mutex while waiting. In
-                // particular, later no-copy entries cannot overtake this one.
+                // Hold the entire FIFO batch outside the mutex while waiting
+                // and publishing. Later batches cannot interleave, including
+                // already-completed local-staging batches with no event.
                 wait_for_forward_event(entry.event);
-                publish_forward_completion_notification(entry.notification);
+                for (const auto& notification : entry.notifications) {
+                    publish_forward_completion_notification(notification);
+                }
                 continue;
             }
             if (nvlink_forward_notification_dispatch_stop_.load()) {
@@ -2998,7 +2993,7 @@ Proxy::ForwardingBatchCompletion Proxy::issue_forwarding_batch(
     std::vector<std::shared_ptr<CudaForwardEvent>> events;
     if (config_.nvlink_forward_ping_pong_enabled) {
         events = forwarding_event_pool_->acquire_batch(
-            static_cast<std::size_t>(config_.num_gpus_per_node),
+            2,
             std::chrono::milliseconds(config_.completion_timeout_ms));
     }
     auto acquire_event = [&] {
@@ -3016,17 +3011,15 @@ Proxy::ForwardingBatchCompletion Proxy::issue_forwarding_batch(
     completion.iteration = iteration;
     std::size_t copy_calls = 0;
     auto notify_copy = [&](const NvlinkForwardNotification& notification) {
+        completed_notifications.push_back(notification);
         if (!config_.nvlink_forward_ping_pong_enabled) {
-            completed_notifications.push_back(notification);
             return;
         }
-        auto event = acquire_event();
-        event->record(forwarding_stream_);
         ++copy_calls;
         if (copy_calls == config_.nvlink_forward_ping_pong_handoff_copy) {
-            completion.handoff = event;
+            completion.handoff = acquire_event();
+            completion.handoff->record(forwarding_stream_);
         }
-        enqueue_forward_completion_notification(notification, std::move(event));
     };
     if (batch_start_token + batch_tokens > forwarding_tokens_for_peer(peer)) {
         throw std::runtime_error("NVLink forwarding batch exceeds token range");
@@ -3064,10 +3057,8 @@ Proxy::ForwardingBatchCompletion Proxy::issue_forwarding_batch(
         if (config_.nvlink_forward_ping_pong_enabled) {
             // No copy/event orders this direct input against persistent GEMM.
             flush_gpudirect_rdma_writes(config_.cuda_device_id, config_.mock_mode);
-            enqueue_forward_completion_notification(notification, {});
-        } else {
-            completed_notifications.push_back(notification);
         }
+        completed_notifications.push_back(notification);
     }
     if (compact_router_destinations) {
         if (peer_slot >= forwarding_compaction_iteration_by_peer_.size() ||
@@ -3300,6 +3291,11 @@ Proxy::ForwardingBatchCompletion Proxy::issue_forwarding_batch(
         // Short batches use their end event, including batches with zero copies.
         // The end marker still captures previous work in the shared stream.
         if (!completion.handoff) completion.handoff = completion.end;
+        // Commit one complete notification batch before complete_batch() can
+        // pass the turn. Both dispatcher and submitting lane retain the end
+        // event; the pool cannot reuse it until both release their leases.
+        enqueue_forward_completion_notifications(
+            std::move(completed_notifications), completion.end);
         completion.bytes = batch_bytes;
         forwarding_batches_in_flight_.fetch_add(1);
         return completion;
