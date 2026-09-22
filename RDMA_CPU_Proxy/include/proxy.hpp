@@ -270,6 +270,7 @@ private:
     std::atomic<std::size_t> forwarding_batches_in_flight_{0};
     std::thread forwarding_ready_thread_;
     void* forwarding_stream_{nullptr};
+    std::unique_ptr<CudaForwardEventPool> forwarding_event_pool_;
     mutable std::mutex forwarding_mutex_;
     std::vector<std::size_t> forwarding_next_batch_by_peer_;
     std::vector<std::size_t> forwarding_next_chunk_by_peer_;

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <condition_variable>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -1655,7 +1656,10 @@ CudaForwardEvent::~CudaForwardEvent() {
 }
 
 void CudaForwardEvent::record(void* stream) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (recorded_) throw std::runtime_error("forwarding event was already recorded");
+    recorded_ = true;
+    failed_ = true;
 #if RDMA_PROXY_HAVE_CUDA
     if (!mock_mode_) {
         check_cuda(cudaEventRecord(reinterpret_cast<cudaEvent_t>(event_),
@@ -1665,18 +1669,134 @@ void CudaForwardEvent::record(void* stream) {
 #else
     (void)stream;
 #endif
-    recorded_ = true;
+    failed_ = false;
 }
 
 bool CudaForwardEvent::ready() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!recorded_) throw std::runtime_error("forwarding event queried before recording");
-    if (mock_mode_) return true;
+    if (failed_) throw std::runtime_error("forwarding event previously failed");
 #if RDMA_PROXY_HAVE_CUDA
-    const auto status = cudaEventQuery(reinterpret_cast<cudaEvent_t>(event_));
-    if (status == cudaErrorNotReady) return false;
-    check_cuda(status, "cudaEventQuery forwarding");
+    if (!mock_mode_) {
+        const auto status = cudaEventQuery(reinterpret_cast<cudaEvent_t>(event_));
+        if (status == cudaErrorNotReady) return false;
+        if (status != cudaSuccess) failed_ = true;
+        check_cuda(status, "cudaEventQuery forwarding");
+    }
 #endif
+    completed_ = true;
     return true;
+}
+
+void CudaForwardEvent::synchronize() const {
+    // Serialize the two consumers' bookkeeping. Never re-record a live lease.
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!recorded_) throw std::runtime_error("forwarding event synchronized before recording");
+    if (failed_) throw std::runtime_error("forwarding event previously failed");
+    if (completed_) return;
+#if RDMA_PROXY_HAVE_CUDA
+    if (!mock_mode_) {
+        const auto status = cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(event_));
+        if (status != cudaSuccess) failed_ = true;
+        check_cuda(status, "cudaEventSynchronize forwarding");
+    }
+#endif
+    completed_ = true;
+}
+
+bool CudaForwardEvent::recyclable() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !failed_ && (!recorded_ || completed_);
+}
+
+void CudaForwardEvent::reset_for_acquisition() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (failed_ || (recorded_ && !completed_)) {
+        throw std::runtime_error("unsafe forwarding event reuse");
+    }
+    recorded_ = completed_ = failed_ = false;
+}
+
+struct CudaForwardEventPool::State {
+    int device;
+    bool mock;
+    bool stopped{false};
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::vector<std::unique_ptr<CudaForwardEvent>> events;
+    std::vector<CudaForwardEvent*> free;
+    State(int device_id, bool mock_mode) : device(device_id), mock(mock_mode) {}
+    ~State() {
+        try { select_cuda_device_for_thread(device, mock); }
+        catch (const std::exception& error) {
+            RDMA_PROXY_LOG_WARN("selecting CUDA device for event pool cleanup: ", error.what());
+        }
+        events.clear();
+    }
+};
+
+CudaForwardEventPool::CudaForwardEventPool(
+    std::size_t capacity, int cuda_device_id, bool mock_mode)
+    : state_(std::make_shared<State>(cuda_device_id, mock_mode)) {
+    if (capacity == 0) throw std::runtime_error("forwarding event pool capacity must be positive");
+    select_cuda_device_for_thread(cuda_device_id, mock_mode);
+    state_->events.reserve(capacity);
+    state_->free.reserve(capacity);
+    for (std::size_t i = 0; i < capacity; ++i) {
+        state_->events.emplace_back(new CudaForwardEvent(mock_mode));
+        state_->free.push_back(state_->events.back().get());
+    }
+}
+
+std::vector<std::shared_ptr<CudaForwardEvent>> CudaForwardEventPool::acquire_batch(
+    std::size_t count, std::chrono::milliseconds timeout) {
+    const auto state = state_;
+    if (count > state->events.size()) throw std::runtime_error("forwarding event reservation exceeds pool capacity");
+    std::vector<CudaForwardEvent*> reserved;
+    std::vector<std::shared_ptr<CudaForwardEvent>> leases;
+    reserved.reserve(count);
+    leases.reserve(count);
+    {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        if (!state->changed.wait_for(lock, timeout, [&] {
+                return state->stopped || state->free.size() >= count;
+            })) throw std::runtime_error("timed out waiting for forwarding event pool capacity");
+        if (state->stopped) throw std::runtime_error("forwarding event pool stopped");
+        for (std::size_t i = 0; i < count; ++i) {
+            reserved.push_back(state->free.back());
+            state->free.pop_back();
+        }
+    }
+    auto release = [state](CudaForwardEvent* event) {
+        // Unknown/failed recordings are quarantined until pool destruction.
+        if (!event->recyclable()) return;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->free.push_back(event);
+        }
+        state->changed.notify_all();
+    };
+    std::size_t next = 0;
+    try {
+        while (next < reserved.size()) {
+            auto* event = reserved[next];
+            event->reset_for_acquisition();
+            ++next; // shared_ptr invokes release even if control-block allocation fails.
+            leases.emplace_back(event, release);
+        }
+    } catch (...) {
+        while (next < reserved.size()) release(reserved[next++]);
+        throw;
+    }
+    return leases;
+}
+
+void CudaForwardEventPool::stop() {
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        state_->stopped = true;
+    }
+    state_->changed.notify_all();
 }
 
 void enable_cuda_peer_access(int cuda_device_id, int peer_cuda_device_id, bool mock_mode) {

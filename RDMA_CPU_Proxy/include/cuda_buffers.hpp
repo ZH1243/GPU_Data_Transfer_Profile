@@ -3,9 +3,11 @@
 #include "config.hpp"
 #include "protocol.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -262,7 +264,7 @@ void flush_gpudirect_rdma_writes(int cuda_device_id, bool mock_mode);
 void destroy_cuda_stream(void* stream, bool mock_mode);
 void synchronize_cuda_stream(void* stream, bool mock_mode);
 // A recorded stream prefix. Share ownership between CPU consumers, but never
-// re-record an event while a consumer can still query the previous recording.
+// re-record an event while a consumer still owns the previous recording.
 class CudaForwardEvent {
 public:
     explicit CudaForwardEvent(bool mock_mode);
@@ -271,11 +273,31 @@ public:
     CudaForwardEvent& operator=(const CudaForwardEvent&) = delete;
     void record(void* stream);
     bool ready() const;
+    void synchronize() const;
 
 private:
+    friend class CudaForwardEventPool;
+    void reset_for_acquisition();
+    bool recyclable() const;
     void* event_{nullptr};
     bool mock_mode_{false};
     bool recorded_{false};
+    mutable bool completed_{false};
+    mutable bool failed_{false};
+    mutable std::mutex mutex_;
+};
+
+// Fixed capacity. Leases keep storage alive and return a slot only after the
+// final reference disappears and its recording has successfully completed.
+class CudaForwardEventPool {
+public:
+    CudaForwardEventPool(std::size_t capacity, int cuda_device_id, bool mock_mode);
+    std::vector<std::shared_ptr<CudaForwardEvent>> acquire_batch(
+        std::size_t count, std::chrono::milliseconds timeout);
+    void stop();
+private:
+    struct State;
+    std::shared_ptr<State> state_;
 };
 void enable_cuda_peer_access(int cuda_device_id, int peer_cuda_device_id, bool mock_mode);
 void launch_cuda_forward_copy_batch_async(

@@ -233,6 +233,24 @@ Each copied destination range is enqueued immediately with an event recorded
 behind its copy call. The dispatcher waits at the FIFO head before publishing;
 later entries, including direct-input entries without an event, cannot overtake
 it. Direct inputs retain the GPUDirect RDMA visibility flush before enqueueing.
+Forwarding events are preallocated during initialization in a fixed pool of
+`2 * num_gpus_per_node` events per proxy (14 for the seven-GPU torchrun scripts).
+A producer reserves `num_gpus_per_node` slots before submitting a batch: at most
+one per nonempty destination plus one batch-end marker. The selected destination's
+notification and handoff share one event. Unused reservations are returned.
+Dispatcher backlog can retain older events, so exhaustion waits for capacity
+with `completion_timeout_ms`; shutdown or a forwarding error wakes pool waiters.
+The pool never grows during forwarding. Recorded events return only after
+successful completion and release of every consumer reference; failed or
+unconfirmed recordings remain quarantined until shutdown.
+
+The dispatcher, next producer, and submitting producer use `cudaEventSynchronize`
+at their existing destination, handoff, and batch-end wait locations. There is
+no per-copy wait in the submitting producer. Events retain `cudaEventDisableTiming`
+without `cudaEventBlockingSync`, so CUDA may busy-wait internally. A CUDA event
+synchronization has no timeout or cancellation; unlike the former query loop,
+`completion_timeout_ms` cannot interrupt it, and a stuck GPU can delay shutdown.
+
 Event handles remain inside the source process. In this mode
 `nvlink_forward_notification_queue_depth` also bounds the pending in-process
 remote notification queue. Iteration completion waits for submitted batches to

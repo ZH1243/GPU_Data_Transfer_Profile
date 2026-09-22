@@ -312,7 +312,10 @@ Proxy::Proxy(ProxyConfig config)
       connection_manager_(config_) {}
 
 Proxy::~Proxy() {
-    shutdown();
+    try { shutdown(); }
+    catch (const std::exception& error) {
+        RDMA_PROXY_LOG_WARN("proxy shutdown: ", error.what());
+    }
 }
 
 void Proxy::set_external_device_buffer_allocator(
@@ -468,6 +471,7 @@ void Proxy::shutdown() {
     iteration_prepared_ = false;
     local_router_input_staged_ = false;
     initialized_ = false;
+    check_forwarding_error();
 }
 
 PeerConnectionInfo Proxy::make_local_peer_info(const PeerState& peer) const {
@@ -1338,15 +1342,9 @@ void Proxy::enqueue_forward_completion_notification(
 
 void Proxy::wait_for_forward_event(const std::shared_ptr<CudaForwardEvent>& event) const {
     if (!event) return;
-    const auto deadline = std::chrono::steady_clock::now() +
-        std::chrono::milliseconds(config_.completion_timeout_ms);
-    while (!event->ready()) {
-        check_forwarding_error();
-        if (std::chrono::steady_clock::now() >= deadline) {
-            throw std::runtime_error("timed out waiting for NVLink forwarding CUDA event");
-        }
-        cpu_relax();
-    }
+    check_forwarding_error();
+    event->synchronize();
+    check_forwarding_error();
 }
 
 void Proxy::drain_forwarding_iteration_notifications(uint64_t iteration) {
@@ -2348,6 +2346,11 @@ void Proxy::start_forwarding_thread() {
         config_.cuda_device_id,
         config_.nvlink_forward_stream_nonblocking,
         config_.mock_mode);
+    if (config_.nvlink_forward_ping_pong_enabled) {
+        forwarding_event_pool_.reset(new CudaForwardEventPool(
+            2 * static_cast<std::size_t>(config_.num_gpus_per_node),
+            config_.cuda_device_id, config_.mock_mode));
+    }
     initialize_nvlink_forward_notifications();
     publish_local_nvlink_receive_buffers();
     prepare_forwarding_destinations();
@@ -2508,6 +2511,7 @@ void Proxy::start_forwarding_thread() {
 
 void Proxy::stop_forwarding_thread() {
     forwarding_stop_.store(true);
+    if (forwarding_event_pool_) forwarding_event_pool_->stop();
     if (forwarding_ping_pong_) forwarding_ping_pong_->changed.notify_all();
     if (forwarding_ready_thread_.joinable()) forwarding_ready_thread_.join();
     if (forwarding_thread_.joinable()) forwarding_thread_.join();
@@ -2520,7 +2524,11 @@ void Proxy::stop_forwarding_thread() {
     if (nvlink_forward_notification_thread_.joinable()) {
         nvlink_forward_notification_thread_.join();
     }
-    check_forwarding_error();
+    // Release all event consumers before any later cleanup can throw. Failed
+    // or unconfirmed recordings have remained quarantined until this point.
+    nvlink_forward_notification_dispatch_.reset();
+    forwarding_ping_pong_.reset();
+    forwarding_event_pool_.reset();
     flush_nvlink_forward_notification_log_queue();
     for (auto& dst : forwarding_destinations_) {
         for (auto& source_buffer : dst.source_buffers) {
@@ -2557,8 +2565,6 @@ void Proxy::stop_forwarding_thread() {
     forwarding_compaction_next_source_token_by_peer_.clear();
     forwarding_compaction_next_destination_token_by_peer_.clear();
     forwarding_out_of_order_peer_states_.clear();
-    nvlink_forward_notification_dispatch_.reset();
-    forwarding_ping_pong_.reset();
     release_nvlink_forward_notifications();
     destroy_cuda_stream(forwarding_stream_, config_.mock_mode);
     forwarding_stream_ = nullptr;
@@ -2970,6 +2976,19 @@ Proxy::ForwardingBatchCompletion Proxy::issue_forwarding_batch(
     std::size_t batch_index_in_iteration,
     std::size_t batch_start_token,
     std::size_t batch_tokens) {
+    // Reserve a whole batch before submitting any copies. Dispatcher progress
+    // can free old leases without needing the stream or ping-pong mutex.
+    std::vector<std::shared_ptr<CudaForwardEvent>> events;
+    if (config_.nvlink_forward_ping_pong_enabled) {
+        events = forwarding_event_pool_->acquire_batch(
+            static_cast<std::size_t>(config_.num_gpus_per_node),
+            std::chrono::milliseconds(config_.completion_timeout_ms));
+    }
+    auto acquire_event = [&] {
+        auto event = std::move(events.back());
+        events.pop_back();
+        return event;
+    };
     std::lock_guard<std::mutex> stream_lock(forwarding_stream_mutex_);
     const auto token_bytes = config_.token_dimension * dtype_size(config_.dtype);
     const auto batch_timing_start = std::chrono::steady_clock::now();
@@ -2984,12 +3003,11 @@ Proxy::ForwardingBatchCompletion Proxy::issue_forwarding_batch(
             completed_notifications.push_back(notification);
             return;
         }
-        auto event = std::make_shared<CudaForwardEvent>(config_.mock_mode);
+        auto event = acquire_event();
         event->record(forwarding_stream_);
         ++copy_calls;
         if (copy_calls == config_.nvlink_forward_ping_pong_handoff_copy) {
-            completion.handoff = std::make_shared<CudaForwardEvent>(config_.mock_mode);
-            completion.handoff->record(forwarding_stream_);
+            completion.handoff = event;
         }
         enqueue_forward_completion_notification(notification, std::move(event));
     };
@@ -3260,7 +3278,7 @@ Proxy::ForwardingBatchCompletion Proxy::issue_forwarding_batch(
         }
     }
     if (config_.nvlink_forward_ping_pong_enabled) {
-        completion.end = std::make_shared<CudaForwardEvent>(config_.mock_mode);
+        completion.end = acquire_event();
         completion.end->record(forwarding_stream_);
         // Short batches use their end event, including batches with zero copies.
         // The end marker still captures previous work in the shared stream.
@@ -4334,6 +4352,7 @@ void Proxy::set_forwarding_error(const std::string& error) {
     std::lock_guard<std::mutex> lock(forwarding_mutex_);
     if (config_.nvlink_forward_ping_pong_enabled && !forwarding_error_.empty()) return;
     forwarding_error_ = error;
+    if (forwarding_event_pool_) forwarding_event_pool_->stop();
     if (forwarding_ping_pong_) forwarding_ping_pong_->changed.notify_all();
 }
 
