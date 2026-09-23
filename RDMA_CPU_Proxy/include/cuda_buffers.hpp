@@ -260,6 +260,8 @@ private:
 void launch_copy_tokens(void* dst, const void* src, std::size_t bytes, bool mock_mode);
 void* create_cuda_stream(int cuda_device_id, bool nonblocking, bool mock_mode);
 void select_cuda_device_for_thread(int cuda_device_id, bool mock_mode);
+// Query once during initialization; true means TO_OWNER requires an explicit flush.
+bool gpudirect_rdma_writes_need_owner_flush(int cuda_device_id, bool mock_mode);
 void flush_gpudirect_rdma_writes(int cuda_device_id, bool mock_mode);
 void destroy_cuda_stream(void* stream, bool mock_mode);
 void synchronize_cuda_stream(void* stream, bool mock_mode);

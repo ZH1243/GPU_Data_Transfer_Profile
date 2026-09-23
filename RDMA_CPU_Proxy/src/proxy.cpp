@@ -2354,6 +2354,11 @@ void Proxy::start_forwarding_thread() {
     if (!config_.nvlink_forwarding_enabled) return;
     if (forwarding_thread_.joinable()) return;
 
+    forwarding_rdma_owner_flush_required_ =
+        config_.router_routing_enabled && !config_.nvlink_forward_use_round_robin &&
+        config_.nvlink_forward_completion_notifications_enabled &&
+        gpudirect_rdma_writes_need_owner_flush(config_.cuda_device_id, config_.mock_mode);
+
     forwarding_stream_ = create_cuda_stream(
         config_.cuda_device_id,
         config_.nvlink_forward_stream_nonblocking,
@@ -3282,8 +3287,7 @@ Proxy::ForwardingBatchCompletion Proxy::issue_forwarding_batch(
         }
     }
     if (config_.nvlink_forward_ping_pong_enabled) {
-        if (compact_router_destinations &&
-            config_.nvlink_forward_completion_notifications_enabled) {
+        if (forwarding_rdma_owner_flush_required_) {
             // Submit all destination copies before flushing direct same-GPU
             // RDMA input visibility. Keep the flush before notification enqueue
             // and turn handoff, including batches with no destination copies.
@@ -3305,8 +3309,7 @@ Proxy::ForwardingBatchCompletion Proxy::issue_forwarding_batch(
     }
     if (config_.nvlink_forward_synchronize_batches) {
         synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
-        if (compact_router_destinations &&
-            config_.nvlink_forward_completion_notifications_enabled) {
+        if (forwarding_rdma_owner_flush_required_) {
             // Unlike forwarded inputs, the direct same-local-GPU input has no
             // CUDA copy submission between CQ readiness and consumption by the
             // already-running GroupedGEMM. Make GPUDirect writes visible before

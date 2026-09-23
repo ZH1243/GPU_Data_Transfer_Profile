@@ -1591,6 +1591,31 @@ void select_cuda_device_for_thread(int cuda_device_id, bool mock_mode) {
 #endif
 }
 
+bool gpudirect_rdma_writes_need_owner_flush(int cuda_device_id, bool mock_mode) {
+    if (mock_mode) return false;
+#if RDMA_PROXY_HAVE_CUDA
+    select_cuda_device_for_thread(cuda_device_id, mock_mode);
+    CUdevice device;
+    check_cuda_driver(cuDeviceGet(&device, cuda_device_id), "cuDeviceGet RDMA ordering");
+    int ordering = 0;
+    check_cuda_driver(
+        cuDeviceGetAttribute(
+            &ordering, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING, device),
+        "cuDeviceGetAttribute GPUDirect RDMA writes ordering");
+    // CUDA defines these scopes numerically: native ordering covering the
+    // requested scope makes cuFlushGPUDirectRDMAWrites a removable no-op.
+    const bool required =
+        ordering < static_cast<int>(CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER);
+    RDMA_PROXY_LOG_INFO("GPUDirect RDMA ordering cuda_device=", cuda_device_id,
+                        " ordering=", ordering,
+                        " owner_flush_required=", required ? "true" : "false");
+    return required;
+#else
+    (void)cuda_device_id;
+    throw std::runtime_error("GPUDirect RDMA ordering query requested without CUDA support");
+#endif
+}
+
 void flush_gpudirect_rdma_writes(int cuda_device_id, bool mock_mode) {
     if (mock_mode) return;
 #if RDMA_PROXY_HAVE_CUDA
