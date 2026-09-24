@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -221,7 +222,7 @@ int main() {
         }
     }
 
-    {
+    for (int sync_mode = 0; sync_mode < 3; ++sync_mode) {
         auto config0 = make_config();
         config0.num_gpus_per_node = 2;
         config0.num_tokens = 65;
@@ -235,7 +236,14 @@ int main() {
         config0.nvlink_forward_threshold_tokens = 8;
         config0.nvlink_forward_chunk_tokens = 1;
         config0.nvlink_forward_synchronize_batches = true;
-        config0.nvlink_forward_local_batch_sync_enabled = true;
+        config0.nvlink_forward_local_batch_sync_enabled = sync_mode == 0;
+        config0.nvlink_forward_local_first_batch_sync_enabled = sync_mode != 0;
+        config0.local_forwarding_rdma_overlap_enabled = true;
+        config0.sequential_peer_transfers = true;
+        if (sync_mode == 2) {
+            config0.nvlink_forward_min_threshold_chunks = 1;
+            config0.nvlink_forward_max_threshold_chunks = 2;
+        }
         config0.nvlink_forward_completion_notifications_enabled = true;
         config0.router_local_input_staging_enabled = true;
         config0.fill_test_data = false;
@@ -324,6 +332,10 @@ int main() {
         validate_config(config0);
         validate_config(config1);
 
+        // Capture the actual barrier completions across both proxies/phases.
+        std::ostringstream barrier_log;
+        auto* previous_log = std::cerr.rdbuf(barrier_log.rdbuf());
+        Logger::instance().set_level(LogLevel::kDebug);
         std::exception_ptr error0;
         std::exception_ptr error1;
         std::thread gpu0([&] {
@@ -348,8 +360,29 @@ int main() {
         });
         gpu0.join();
         gpu1.join();
+        Logger::instance().set_level(LogLevel::kError);
+        std::cerr.rdbuf(previous_log);
         if (error0) std::rethrow_exception(error0);
         if (error1) std::rethrow_exception(error1);
+        if (sync_mode != 0) {
+            std::istringstream lines(barrier_log.str());
+            std::string line;
+            std::size_t barriers = 0;
+            while (std::getline(lines, line)) {
+                if (line.find("local NVLink forwarding batch-start barrier complete") ==
+                    std::string::npos) continue;
+                ++barriers;
+                if (line.find(" round=1 ") == std::string::npos) {
+                    std::cerr << "first-batch mode synchronized a later batch: " << line << '\n';
+                    return 1;
+                }
+            }
+            // Two proxies, two iterations, local and remote phases.
+            if (barriers != 8) {
+                std::cerr << "expected 8 first-batch barriers, got " << barriers << '\n';
+                return 1;
+            }
+        }
     }
 
     {

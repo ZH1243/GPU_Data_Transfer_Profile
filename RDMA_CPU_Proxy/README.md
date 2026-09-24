@@ -197,6 +197,26 @@ Set `nvlink_forward_notification_log_enabled=true` to record receiver-side notif
 
 Set `nvlink_forward_local_batch_sync_enabled=true` to add a same-node GPU-proxy barrier before every synchronized NVLink forwarding batch. The barrier is keyed by phase, iteration, and batch round. Router local-input staging and remote receive-buffer forwarding use separate phases, so completing the staging phase does not prevent a proxy from participating in remote forwarding. Once a proxy has observed that its next batch is ready, it publishes that round in shared memory and waits until every local proxy is either ready for the same round or has completed that phase for the iteration. A completed proxy retires from later rounds in that phase, allowing router-driven proxies with shorter `x3`/`x4` arrays to stop participating while the remaining proxies continue together. With ping-pong forwarding disabled, each forwarding path reaches the next batch-start barrier only after the previous batch's `cudaStreamSynchronize()` has returned, so active proxies still start each round together. This option requires `nvlink_forward_synchronize_batches=true` and uses the same local shared-memory run identity as `local_iteration_sync_run_id`.
 
+Set `nvlink_forward_local_first_batch_sync_enabled=true` with
+`nvlink_forward_local_batch_sync_enabled=false` to synchronize local GPU proxies only
+before the first forwarding batch of each iteration **in each phase** (local
+router-input staging and remote receive-buffer forwarding). Later batches do
+not enter a cross-proxy batch barrier. Proxies with no work retire from the phase
+without blocking the others. This option defaults to false and requires
+`nvlink_forwarding_enabled=true` and `nvlink_forward_synchronize_batches=true`.
+Each batch still waits for its own CUDA stream to complete and publishes its
+completion notifications as usual. Existing iteration synchronization is unchanged.
+With dynamic thresholds, the first batch uses the minimum candidate chunk count
+among active local proxies; later batches choose their sizes independently.
+Use the same synchronization mode on every proxy on a node.
+
+For either torchrun launch script, append:
+
+```bash
+--nvlink_forward_local_batch_sync_enabled=false \
+--nvlink_forward_local_first_batch_sync_enabled=true
+```
+
 ### Opt-in ping-pong forwarding
 
 Set `nvlink_forward_ping_pong_enabled=true` to alternate remote RDMA forwarding
@@ -595,6 +615,7 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_notification_log_enabled`
 - `nvlink_forward_notification_log_dir`
 - `nvlink_forward_local_batch_sync_enabled`
+- `nvlink_forward_local_first_batch_sync_enabled`
 - `nvlink_forward_ping_pong_enabled`
 - `nvlink_forward_ping_pong_handoff_copy`
 - `nvlink_forward_synchronize_iteration`
