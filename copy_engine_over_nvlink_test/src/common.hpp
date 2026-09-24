@@ -52,18 +52,19 @@ inline size_t bytes(const std::string& s) {
     return checked_mul(n, scale);
 }
 struct Layout {
-    std::vector<size_t> sizes, prefix;
-    size_t batches, batch_bytes = 0, source_bytes;
+    std::vector<size_t> sizes;
+    size_t batches, batch_bytes = 0, source_stride = 0, source_bytes, sent_bytes;
     Layout(std::vector<size_t> s, size_t b) : sizes(std::move(s)), batches(b) {
         if (!b || sizes.empty()) throw std::runtime_error("empty layout");
         for (auto n : sizes) {
             if (!n) throw std::runtime_error("zero copy size");
-            prefix.push_back(batch_bytes);
+            source_stride = std::max(source_stride, n);
             batch_bytes = checked_add(batch_bytes, n);
         }
-        source_bytes = checked_mul(batch_bytes, batches);
+        source_bytes = checked_mul(source_stride, batches);
+        sent_bytes = checked_mul(batch_bytes, batches);
     }
-    size_t src(size_t batch, size_t step) const { return batch * batch_bytes + prefix.at(step - 1); }
+    size_t src(size_t batch) const { return batch * source_stride; }
     size_t dst(size_t batch, size_t step) const { return batch * sizes.at(step - 1); }
     size_t receive(size_t step) const { return checked_mul(batches, sizes.at(step - 1)); }
 };

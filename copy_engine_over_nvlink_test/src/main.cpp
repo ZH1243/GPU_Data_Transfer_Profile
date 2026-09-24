@@ -109,8 +109,8 @@ cudaError_t copy_one(Fn fn, void* dst, void* src, size_t size, cudaStream_t stre
         return fn(&const_dst, &const_src, &size, 1, &attrs, &index, 1, stream);
     }
 }
-unsigned char pattern(int sender, size_t batch, size_t step) {
-    return static_cast<unsigned char>(1 + (sender * 37 + (batch % 251) * 17 + step * 11) % 251);
+unsigned char pattern(int sender, size_t batch) {
+    return static_cast<unsigned char>(1 + (sender * 37 + (batch % 251) * 17) % 251);
 }
 using Clock = std::chrono::steady_clock;
 double seconds(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double>(b-a).count(); }
@@ -146,10 +146,10 @@ void worker(const Config& c, const Layout& l, Shared& s, int rank) {
         CUDA(cudaMemsetAsync(receive[sender], 0, l.receive(step), stream));
         CUDA(cudaIpcGetMemHandle(&s.handles[rank][sender], receive[sender]));
     }
+    // All destinations read prefixes of this same window; initialize it once.
     for (size_t b = 0; b < c.batches; ++b)
-        for (int step = 1; step < n; ++step)
-            CUDA(cudaMemsetAsync(static_cast<char*>(source) + l.src(b, step),
-                 pattern(rank, b, step), l.sizes[step-1], stream));
+        CUDA(cudaMemsetAsync(static_cast<char*>(source) + l.src(b),
+             pattern(rank, b), l.source_stride, stream));
     CUDA(cudaStreamSynchronize(stream));
     barrier.wait(); // Publish handles and finish all allocation/initialization.
     for (int peer = 0; peer < n; ++peer) if (peer != rank)
@@ -166,7 +166,7 @@ void worker(const Config& c, const Layout& l, Shared& s, int rank) {
                 int peer = (rank + step) % n;
                 CUDA(copy_one(&cudaMemcpyBatchAsync,
                     static_cast<char*>(remote[peer]) + l.dst(b, step),
-                    static_cast<char*>(source) + l.src(b, step), l.sizes[step-1], stream));
+                    static_cast<char*>(source) + l.src(b), l.sizes[step-1], stream));
             }
             CUDA(cudaStreamSynchronize(stream));
             auto done = Clock::now();
@@ -185,7 +185,7 @@ void worker(const Config& c, const Layout& l, Shared& s, int rank) {
                     CUDA(cudaMemcpy(host.data(), static_cast<char*>(receive[sender]) + l.dst(b, step) + off,
                                     len, cudaMemcpyDeviceToHost));
                     if (!std::all_of(host.begin(), host.begin() + len,
-                        [&](unsigned char v) { return v == pattern(sender, b, step); }))
+                        [&](unsigned char v) { return v == pattern(sender, b); }))
                         throw std::runtime_error("verification failed: sender=" + std::to_string(sender) + " batch=" + std::to_string(b));
                     off += len;
                 }
@@ -203,9 +203,9 @@ void worker(const Config& c, const Layout& l, Shared& s, int rank) {
         if (rank == turn) {
             std::printf("# rank=%d device=%d name=%s verification=%s\n", rank, c.devices[rank], prop.name, c.verify ? "PASS" : "disabled");
             for (size_t it = 0; it < c.iterations; ++it)
-                std::printf("%d,%zu,%zu,%.6f,%.6f,%.6f\n", rank, it, l.source_bytes,
+                std::printf("%d,%zu,%zu,%.6f,%.6f,%.6f\n", rank, it, l.sent_bytes,
                     results[it].copy * 1000, results[it].wall * 1000,
-                    static_cast<double>(l.source_bytes) / results[it].wall / 1e9);
+                    static_cast<double>(l.sent_bytes) / results[it].wall / 1e9);
             std::fflush(stdout);
         }
         barrier.wait();
@@ -223,8 +223,8 @@ int main(int argc, char** argv) {
             if (__atomic_exchange_n(&s.claimed[rank], 1U, __ATOMIC_ACQ_REL))
                 throw std::runtime_error("duplicate proxy rank");
             if (rank == 0) {
-                std::printf("# ranks=%zu batches=%zu iterations=%zu src_bytes_per_gpu=%zu recv_bytes_per_gpu=%zu\n",
-                    c.devices.size(), c.batches, c.iterations, l.source_bytes, l.source_bytes);
+                std::printf("# ranks=%zu batches=%zu iterations=%zu src_bytes_per_gpu=%zu recv_bytes_per_gpu=%zu source_window_bytes=%zu sent_bytes_per_iteration=%zu\n",
+                    c.devices.size(), c.batches, c.iterations, l.source_bytes, l.sent_bytes, l.source_stride, l.sent_bytes);
                 std::printf("rank,iteration,sent_bytes,submit_and_sync_ms,iteration_with_barriers_ms,sent_GBps\n");
                 std::fflush(stdout);
             }

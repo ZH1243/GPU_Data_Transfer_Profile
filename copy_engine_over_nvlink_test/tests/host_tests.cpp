@@ -21,10 +21,11 @@ int main() {
         rejects([] { checked_add(SIZE_MAX, 1); });
         rejects([] { checked_mul(SIZE_MAX, 2); });
         Layout example({16000000,12000000,8000000,8000000,6000000,4000000,2000000}, 5);
-        require(example.source_bytes == 280000000);
-        require(example.src(4, 7) == 278000000 && example.dst(4, 7) == 8000000);
-        // Exhaust every directed pair for unequal sizes and verify contiguous,
-        // non-overlapping source and per-sender destination coverage.
+        require(example.source_bytes == 80000000);
+        require(example.sent_bytes == 280000000 && example.source_stride == 16000000);
+        require(example.src(4) == 64000000 && example.dst(4, 7) == 8000000);
+        // Exhaust directed pairs, including largest size last, and verify shared
+        // source prefixes fit each window and destination coverage is unchanged.
         for (int n = 2; n <= max_ranks; ++n) {
             std::vector<size_t> sizes;
             for (int k = 1; k < n; ++k) sizes.push_back(13 * k + 3);
@@ -35,14 +36,30 @@ int main() {
                     int receiver = (sender + k) % n;
                     int incoming_step = (receiver - sender + n) % n;
                     require(incoming_step == k);
-                    require(l.src(b, k) == cursor);
+                    require(l.src(b) == b * sizes.back());
+                    require(l.src(b) + sizes[k-1] <= (b + 1) * l.source_stride);
+                    require(l.src(b) + sizes[k-1] <= l.source_bytes);
                     cursor += sizes[k-1];
                     require(l.dst(b, k) + sizes[k-1] <= l.receive(incoming_step));
                     if (b + 1 == l.batches) require(l.dst(b, k) + sizes[k-1] == l.receive(incoming_step));
                 }
-                require(cursor == l.source_bytes);
+                require(cursor == l.sent_bytes);
+                require(l.source_bytes == l.batches * sizes.back());
             }
         }
+        Layout small({16, 12, 8, 8, 6, 4, 2}, 5);
+        std::vector<unsigned char> source(small.source_bytes);
+        for (size_t i = 0; i < source.size(); ++i) source[i] = static_cast<unsigned char>(i);
+        for (size_t step = 1; step <= small.sizes.size(); ++step) {
+            std::vector<unsigned char> dest(small.receive(step), 255);
+            for (size_t b = 0; b < small.batches; ++b)
+                std::copy_n(source.begin() + small.src(b), small.sizes[step-1],
+                            dest.begin() + small.dst(b, step));
+            for (size_t b = 0; b < small.batches; ++b)
+                for (size_t off = 0; off < small.sizes[step-1]; ++off)
+                    require(dest[b * small.sizes[step-1] + off] == b * 16 + off);
+        }
+        rejects([] { Layout({SIZE_MAX / 2, SIZE_MAX / 2}, 2); }); // Sent-byte overflow.
         auto* memory = mmap(nullptr, sizeof(BarrierState), PROT_READ | PROT_WRITE,
                             MAP_SHARED | MAP_ANONYMOUS, -1, 0);
         require(memory != MAP_FAILED);

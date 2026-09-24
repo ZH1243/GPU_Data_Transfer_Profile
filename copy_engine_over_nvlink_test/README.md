@@ -36,8 +36,9 @@ may remap them. All children inherit the same visible GPU list. The list length
 sets n (2..32); provide exactly n-1 sizes. Eight GPUs and the illustrated sizes
 are defaults; batches default to 5 and iterations to 10. Positive integer sizes
 accept bytes or B/KB/MB/GB (decimal) and KiB/MiB/GiB (binary). Thus the example
-uses **280 MB**, not 330 MB, for the source on each GPU, plus 280 MB total receive
-storage (560 MB of payload allocations per GPU).
+uses **80 MB** (5 × 16 MB) for the source on each GPU, plus 280 MB total receive
+storage (360 MB of payload allocations per GPU). Each GPU still sends 280 MB
+per iteration because destinations reuse prefixes of each source window.
 
 Optional `--cpus 0,1,2,3,4,5,6,7` pins one proxy to each listed logical CPU. Choose
 available CPUs near their GPUs using your node's topology and job CPU allocation;
@@ -81,13 +82,19 @@ the executable without `--rank` and `--shared-file` reports a usage error.
 ## Exact copy and synchronization schedule
 
 Let `S[k]` be the size for relative destination k, with k=1..n-1,
-`T=sum(S)`, and B be batches per iteration. Rank i sends to `(i+k)%n`.
+`T=sum(S)`, `M=max(S)`, and B be batches per iteration. Rank i sends to `(i+k)%n`.
 
-- Source allocation: B*T bytes.
-- Source offset in zero-based batch b: `b*T + sum(S[1..k-1])`.
+- Source allocation: `B*M` bytes.
+- Source offset in zero-based batch b: `b*M`, identical for every destination.
+- Peer k reads the first `S[k]` bytes of the window `[b*M, (b+1)*M)`.
 - Destination allocation on rank j dedicated to sender i:
   `B*S[(j-i+n)%n]` bytes.
 - Destination offset: `b*S[k]`.
+- Sent bytes per iteration: `B*T`, independent of the smaller source allocation.
+
+For the example, batch b sends 16, 12, 8, 8, 6, 4 and 2 MB prefixes of the
+same 16 MB window. Batch indices run from 0 to B-1 in every iteration. This
+models source reuse across destinations; it does not reproduce RDMA routing masks.
 
 Every iteration starts with a shared-memory barrier. Every batch submits n-1
 **separate** `cudaMemcpyBatchAsync` calls, each containing exactly one source,
@@ -104,8 +111,8 @@ reduces wake-up overhead but cannot guarantee identical start timestamps under
 OS scheduling. There is no CPU or GPU barrier between individual peer copies.
 
 Initialization, IPC setup and verification occur outside the timed loop. Receive
-buffers are zeroed; source segments get a nonzero pattern dependent on sender,
-batch and relative destination. By default every received byte is checked after
+buffers are zeroed; each source window is initialized once with a nonzero pattern
+dependent on sender and batch. All destinations receive prefixes of that pattern. By default every received byte is checked after
 the final iteration using a bounded host staging buffer. `--no-verify` skips this
 check. Iterations deliberately reuse identical source data; final verification
 checks routing and offsets, not whether every preceding iteration executed.
