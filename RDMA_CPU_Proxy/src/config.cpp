@@ -412,9 +412,6 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "nvlink_forward_local_batch_sync_enabled") {
         config.nvlink_forward_local_batch_sync_enabled = (value == "1" || value == "true" || value == "yes");
     }
-    else if (key == "nvlink_forward_local_first_batch_sync_enabled") {
-        config.nvlink_forward_local_first_batch_sync_enabled = (value == "1" || value == "true" || value == "yes");
-    }
     else if (key == "nvlink_forward_synchronize_iteration") {
         config.nvlink_forward_synchronize_iteration = (value == "1" || value == "true" || value == "yes");
     }
@@ -666,8 +663,6 @@ ProxyConfig load_config_file(const std::string& path) {
         object, "nvlink_forward_ping_pong_handoff_copy", config.nvlink_forward_ping_pong_handoff_copy);
     config.nvlink_forward_local_batch_sync_enabled = get_bool(
         object, "nvlink_forward_local_batch_sync_enabled", config.nvlink_forward_local_batch_sync_enabled);
-    config.nvlink_forward_local_first_batch_sync_enabled = get_bool(
-        object, "nvlink_forward_local_first_batch_sync_enabled", config.nvlink_forward_local_first_batch_sync_enabled);
     config.nvlink_forward_synchronize_iteration = get_bool(
         object, "nvlink_forward_synchronize_iteration", config.nvlink_forward_synchronize_iteration);
     config.nvlink_forward_log_batches = get_bool(
@@ -840,21 +835,6 @@ void validate_config(const ProxyConfig& config) {
         }
         if (config.nvlink_forward_ping_pong_handoff_copy == 0) {
             throw std::runtime_error("nvlink_forward_ping_pong_handoff_copy must be > 0");
-        }
-    }
-    if (config.nvlink_forward_local_first_batch_sync_enabled) {
-        if (config.nvlink_forward_local_batch_sync_enabled) {
-            throw std::runtime_error(
-                "nvlink_forward_local_first_batch_sync_enabled requires nvlink_forward_local_batch_sync_enabled=false");
-        }
-        if (!config.nvlink_forwarding_enabled || !config.nvlink_forward_synchronize_batches) {
-            throw std::runtime_error(
-                "nvlink_forward_local_first_batch_sync_enabled requires nvlink_forwarding_enabled=true "
-                "and nvlink_forward_synchronize_batches=true");
-        }
-        if (config.local_iteration_sync_dir.empty()) {
-            throw std::runtime_error(
-                "local_iteration_sync_dir must be non-empty when NVLink first-batch synchronization is enabled");
         }
     }
     if (config.nvlink_forward_local_batch_sync_enabled) {
@@ -1161,8 +1141,6 @@ std::string config_summary(const ProxyConfig& config) {
         << " nvlink_forward_ping_pong_handoff_copy=" << config.nvlink_forward_ping_pong_handoff_copy
         << " nvlink_forward_local_batch_sync_enabled="
         << (config.nvlink_forward_local_batch_sync_enabled ? "true" : "false")
-        << " nvlink_forward_local_first_batch_sync_enabled="
-        << (config.nvlink_forward_local_first_batch_sync_enabled ? "true" : "false")
         << " nvlink_forward_synchronize_iteration="
         << (config.nvlink_forward_synchronize_iteration ? "true" : "false")
         << " nvlink_forward_log_batches=" << (config.nvlink_forward_log_batches ? "true" : "false")

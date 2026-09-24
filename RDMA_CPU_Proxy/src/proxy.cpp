@@ -809,8 +809,7 @@ Proxy::LocalIterationSyncSlot* Proxy::local_iteration_sync_slot(int gpu_index) c
 
 void Proxy::initialize_local_iteration_sync() {
     const bool sync_required =
-        config_.local_iteration_sync_enabled || config_.nvlink_forward_local_batch_sync_enabled ||
-        config_.nvlink_forward_local_first_batch_sync_enabled;
+        config_.local_iteration_sync_enabled || config_.nvlink_forward_local_batch_sync_enabled;
     if (!sync_required || config_.num_gpus_per_node <= 1) return;
     if (local_iteration_sync_header_) return;
 
@@ -1917,9 +1916,7 @@ std::size_t Proxy::synchronize_local_nvlink_batch_start(
     std::size_t batch_index_in_iteration,
     uint64_t batch_round,
     std::size_t available_batch_chunks) const {
-    const bool synchronize_batch = config_.nvlink_forward_local_batch_sync_enabled ||
-        (config_.nvlink_forward_local_first_batch_sync_enabled && batch_round == 1);
-    if (!synchronize_batch || config_.num_gpus_per_node <= 1) {
+    if (!config_.nvlink_forward_local_batch_sync_enabled || config_.num_gpus_per_node <= 1) {
         return available_batch_chunks;
     }
     if (!local_iteration_sync_header_) {
@@ -2141,8 +2138,7 @@ std::size_t Proxy::synchronize_local_nvlink_batch_start(
 void Proxy::mark_local_nvlink_batch_phase_complete(
     LocalNvlinkBatchSyncPhase phase,
     uint64_t iteration) const {
-    if ((!config_.nvlink_forward_local_batch_sync_enabled &&
-         !config_.nvlink_forward_local_first_batch_sync_enabled) ||
+    if (!config_.nvlink_forward_local_batch_sync_enabled ||
         config_.num_gpus_per_node <= 1) {
         return;
     }
@@ -4005,8 +4001,7 @@ void Proxy::forwarding_loop(int lane) {
                         break;
                     }
 
-                    if (config_.nvlink_forward_local_batch_sync_enabled ||
-                        config_.nvlink_forward_local_first_batch_sync_enabled) {
+                    if (config_.nvlink_forward_local_batch_sync_enabled) {
                         batch_chunks = synchronize_local_nvlink_batch_start(
                             LocalNvlinkBatchSyncPhase::kRemoteForwarding,
                             iteration,
@@ -4110,8 +4105,7 @@ void Proxy::forwarding_loop(int lane) {
                         break;
                     }
 
-                    if (config_.nvlink_forward_local_batch_sync_enabled ||
-                        config_.nvlink_forward_local_first_batch_sync_enabled) {
+                    if (config_.nvlink_forward_local_batch_sync_enabled) {
                         batch_chunks = synchronize_local_nvlink_batch_start(
                             LocalNvlinkBatchSyncPhase::kRemoteForwarding,
                             iteration,
@@ -4199,8 +4193,7 @@ void Proxy::forwarding_loop(int lane) {
                         break;
                     }
 
-                    if (config_.nvlink_forward_local_batch_sync_enabled ||
-                        config_.nvlink_forward_local_first_batch_sync_enabled) {
+                    if (config_.nvlink_forward_local_batch_sync_enabled) {
                         synchronize_local_nvlink_batch_start(
                             LocalNvlinkBatchSyncPhase::kRemoteForwarding,
                             iteration,

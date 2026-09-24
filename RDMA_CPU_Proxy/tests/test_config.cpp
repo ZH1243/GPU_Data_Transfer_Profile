@@ -3,7 +3,6 @@
 #include <cassert>
 #include <fstream>
 #include <iostream>
-#include <iterator>
 #include <stdexcept>
 
 int main(int argc, char** argv) {
@@ -73,7 +72,6 @@ int main(int argc, char** argv) {
     assert(!config.nvlink_forward_notification_log_enabled);
     assert(config.nvlink_forward_notification_log_dir == "/tmp/rdma_cpu_proxy_nvlink_notifications");
     assert(!config.nvlink_forward_local_batch_sync_enabled);
-    assert(!config.nvlink_forward_local_first_batch_sync_enabled);
     assert(!config.nvlink_forward_ping_pong_enabled);
     assert(config.nvlink_forward_ping_pong_handoff_copy == 1);
     assert(config.nvlink_forward_synchronize_iteration);
@@ -525,52 +523,6 @@ int main(int argc, char** argv) {
     valid_batch_sync_config.nvlink_forward_local_batch_sync_enabled = true;
     valid_batch_sync_config.nvlink_forward_synchronize_batches = true;
     rdma_proxy::validate_config(valid_batch_sync_config);
-
-    auto first_batch_config = valid_batch_sync_config;
-    first_batch_config.nvlink_forward_local_batch_sync_enabled = false;
-    first_batch_config.nvlink_forward_local_first_batch_sync_enabled = true;
-    rdma_proxy::validate_config(first_batch_config);
-    for (int invalid = 0; invalid < 4; ++invalid) {
-        auto bad = first_batch_config;
-        if (invalid == 0) bad.nvlink_forward_local_batch_sync_enabled = true;
-        if (invalid == 1) bad.nvlink_forwarding_enabled = false;
-        if (invalid == 2) bad.nvlink_forward_synchronize_batches = false;
-        if (invalid == 3) bad.local_iteration_sync_dir.clear();
-        bool rejected = false;
-        try {
-            rdma_proxy::validate_config(bad);
-        } catch (const std::runtime_error&) {
-            rejected = true;
-        }
-        assert(rejected);
-    }
-    const char* first_batch_args[] = {
-        "test_config", "--config", argv[1],
-        "--nvlink_forwarding_enabled=true",
-        "--nvlink_forward_synchronize_batches=true",
-        "--nvlink_forward_local_batch_sync_enabled=false",
-        "--nvlink_forward_local_first_batch_sync_enabled=true",
-        "--num_tokens=5600",
-    };
-    const auto parsed_first_batch = rdma_proxy::load_config(
-        sizeof(first_batch_args) / sizeof(first_batch_args[0]),
-        const_cast<char**>(first_batch_args));
-    assert(parsed_first_batch.nvlink_forward_local_first_batch_sync_enabled);
-    const char* first_batch_json = "/tmp/rdma_proxy_first_batch_config.json";
-    {
-        std::ofstream out(first_batch_json);
-        std::ifstream input(nvlink_config_path);
-        std::string json((std::istreambuf_iterator<char>(input)),
-                         std::istreambuf_iterator<char>());
-        const std::string disabled = "\"nvlink_forward_synchronize_batches\": false";
-        json.replace(json.find(disabled), disabled.size(),
-                     "\"nvlink_forward_synchronize_batches\": true");
-        json.insert(json.find('{') + 1,
-                    "\"nvlink_forward_local_first_batch_sync_enabled\": true,");
-        out << json;
-    }
-    assert(rdma_proxy::load_config_file(first_batch_json).
-        nvlink_forward_local_first_batch_sync_enabled);
 
     auto invalid_notification_config = nvlink_config;
     invalid_notification_config.nvlink_forward_completion_notifications_enabled = true;

@@ -58,7 +58,6 @@
   "nvlink_forward_notification_log_enabled": false,
   "nvlink_forward_notification_log_dir": "/tmp/rdma_cpu_proxy_nvlink_notifications",
   "nvlink_forward_local_batch_sync_enabled": false,
-  "nvlink_forward_local_first_batch_sync_enabled": false,
   "nvlink_forward_ping_pong_enabled": false,
   "nvlink_forward_ping_pong_handoff_copy": 1,
   "nvlink_forward_synchronize_iteration": true,
