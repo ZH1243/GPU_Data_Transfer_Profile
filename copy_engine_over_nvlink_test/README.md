@@ -1,7 +1,8 @@
 # Multiprocess NVLink all-to-all copy benchmark
 
-Linux C++17 project for a single node. One launcher forks one proxy process per
-selected GPU **before any CUDA initialization**. Each proxy owns one CUDA context,
+Linux C++17 project for a single node. The `run.sh` shell launcher starts one instance of
+`nvlink_all_to_all` per selected GPU. The executable runs exactly one proxy and
+never creates other processes. Each proxy owns one CUDA context,
 one nonblocking stream, one source allocation, and one receive allocation per
 sender. CUDA IPC exposes receive allocations directly to peer processes. No MPI,
 NCCL, Python, or custom GPU copy kernels are used.
@@ -18,7 +19,7 @@ cd copy_engine_over_nvlink_test
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCUDAToolkit_ROOT=/usr/local/cuda
 cmake --build build -j
 ctest --test-dir build --output-on-failure
-./build/nvlink_all_to_all \
+./run.sh \
   --devices 0,1,2,3,4,5,6,7 \
   --sizes 16MB,12MB,8MB,8MB,6MB,4MB,2MB \
   --batches 5 --iterations 100
@@ -27,7 +28,7 @@ ctest --test-dir build --output-on-failure
 For a small initial correctness run:
 
 ```bash
-./build/nvlink_all_to_all --devices 0,1 --sizes 1MiB --batches 3 --iterations 2
+./run.sh --devices 0,1 --sizes 1MiB --batches 3 --iterations 2
 ```
 
 `--devices` specifies CUDA-visible ordinals in rank order; `CUDA_VISIBLE_DEVICES`
@@ -43,8 +44,39 @@ available CPUs near their GPUs using your node's topology and job CPU allocation
 reserve a distinct CPU per proxy for tight spin barriers. `--timeout-seconds 120`
 sets the timeout of each barrier. A proxy failure aborts the job; the launcher
 reaps children and terminates remaining proxies. SIGINT/SIGTERM to the launcher
-also terminates them. Shared memory is anonymous and leaves no named SHM files.
+also terminates them. The script creates a private, unique directory in `/dev/shm`
+for a file mapped with `MAP_SHARED` by all proxies. Rank 0 initializes the file
+and atomically publishes it before peers attach. The script removes the shared
+file and directory after all proxies exit. Concurrent runs use separate directories.
+`NVLINK_SHM_DIR` overrides `/dev/shm` (use a local memory-backed filesystem);
+`NVLINK_PROXY_BIN` overrides the default `build/nvlink_all_to_all` executable.
+SIGKILL to the launcher cannot run its cleanup trap; in that case, terminate its
+remaining proxies and remove its `/dev/shm/nvlink-a2a.*` directory manually.
 The timeout covers barrier waits, not a driver call hung inside CUDA.
+
+## One executable invocation = one proxy
+
+The script launches commands equivalent to these for two GPUs:
+
+```bash
+run_dir=$(mktemp -d /dev/shm/nvlink-a2a.XXXXXXXX)
+./build/nvlink_all_to_all --rank 0 --shared-file "$run_dir/shared" \
+  --devices 0,1 --sizes 1MiB --batches 3 --iterations 2 &
+p0=$!
+./build/nvlink_all_to_all --rank 1 --shared-file "$run_dir/shared" \
+  --devices 0,1 --sizes 1MiB --batches 3 --iterations 2 &
+p1=$!
+wait "$p0" "$p1"
+rm -f -- "$run_dir/shared" "$run_dir/shared.initial"
+rmdir -- "$run_dir"
+```
+
+Prefer `run.sh` for automatic failure monitoring and signal cleanup. For manual
+launches, use a fresh directory for each run, identical benchmark options and
+GPU visibility for all ranks, one unique rank in `[0,n)`, and the same absolute
+`--shared-file` path. Rank r controls `devices[r]`. Nonzero ranks may start first;
+they wait up to `--timeout-seconds` for rank 0 to publish shared memory. Running
+the executable without `--rank` and `--shared-file` reports a usage error.
 
 ## Exact copy and synchronization schedule
 
@@ -90,7 +122,7 @@ not establish that a path uses NVLink rather than PCIe. Check the actual node:
 ```bash
 nvidia-smi topo -m
 nsys profile --trace=cuda,osrt --wait=all --force-overwrite=true \
-  -o nvlink_all_to_all ./build/nvlink_all_to_all \
+  -o nvlink_all_to_all ./run.sh \
   --devices 0,1,2,3,4,5,6,7 \
   --sizes 16MB,12MB,8MB,8MB,6MB,4MB,2MB --batches 5 --iterations 10
 ```
@@ -121,5 +153,13 @@ ctest --test-dir build-host --output-on-failure
 ```
 
 These check size parsing/overflow, asymmetric directed layouts for 2..32 ranks,
-10,000 barriers across four actual processes, and barrier abort/timeout behavior.
+10,000 barriers across four actual processes, barrier abort/timeout behavior,
+and independently opened shared-memory mappings with delayed rank-0 startup.
 They do not validate CUDA IPC, the GPU API calls, engine selection or NVLink traffic.
+
+The shell launcher's rank assignment, argument forwarding, failure handling and
+signal cleanup can also be tested without CUDA using Python 3:
+
+```bash
+python3 tests/test_launcher.py
+```

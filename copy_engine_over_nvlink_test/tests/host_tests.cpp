@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "shared_mapping.hpp"
 #include <cstdio>
 #include <new>
 #include <sys/mman.h>
@@ -79,6 +80,32 @@ int main() {
         require(aborted(*state));
         state->~BarrierState();
         munmap(memory, sizeof(BarrierState));
+        char directory[] = "/tmp/nvlink-mapping-test.XXXXXX";
+        require(mkdtemp(directory) != nullptr);
+        std::string path = std::string(directory) + "/shared";
+        auto peer = fork();
+        require(peer >= 0);
+        if (peer == 0) {
+            try {
+                SharedMapping<BarrierState> mapping(path, false, 5);
+                Barrier barrier(mapping.get(), 1, 2, 5);
+                for (int i = 0; i < 1000; ++i) barrier.wait();
+                _exit(0);
+            } catch (...) { _exit(1); }
+        }
+        usleep(20000); // Peer starts before the shared file exists.
+        {
+            SharedMapping<BarrierState> mapping(path, true, 5);
+            Barrier barrier(mapping.get(), 0, 2, 5);
+            for (int i = 0; i < 1000; ++i) barrier.wait();
+            rejects([&] { SharedMapping<BarrierState> duplicate(path, true, 1); });
+        }
+        int peer_status;
+        require(waitpid(peer, &peer_status, 0) == peer);
+        require(WIFEXITED(peer_status) && WEXITSTATUS(peer_status) == 0);
+        require(unlink(path.c_str()) == 0);
+        rejects([&] { SharedMapping<BarrierState> missing(path, false, 1); });
+        require(rmdir(directory) == 0);
         std::puts("PASS: parsing, overflow, directed layouts, 10000 process barriers, abort and timeout");
     } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
 }

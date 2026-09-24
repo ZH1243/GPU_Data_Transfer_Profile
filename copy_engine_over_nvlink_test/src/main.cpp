@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "shared_mapping.hpp"
 #include <cuda_runtime_api.h>
 #include <cerrno>
 #include <csignal>
@@ -12,8 +13,6 @@
 #include <type_traits>
 #include <sched.h>
 #include <sys/mman.h>
-#include <sys/prctl.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #define CUDA(call) do { auto e = (call); if (e != cudaSuccess) throw std::runtime_error( \
@@ -24,6 +23,8 @@ struct Config {
     size_t batches = 5, iterations = 10;
     unsigned timeout = 120;
     bool verify = true;
+    int rank = -1;
+    std::string shared_file;
 };
 std::vector<int> integers(const std::string& s) {
     std::vector<int> out;
@@ -40,7 +41,8 @@ Config parse(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help") {
-            std::cout << "Usage: nvlink_all_to_all [options]\n"
+            std::cout << "Usage: nvlink_all_to_all --rank R --shared-file PATH [options]\n"
+                "  One process controls one GPU. Normally launch with run.sh.\n"
                 "  --devices 0,1,2,3,4,5,6,7  CUDA-visible device ordinals in rank order\n"
                 "  --sizes 16MB,12MB,8MB,8MB,6MB,4MB,2MB  Exactly n-1 positive sizes\n"
                 "  --batches 5 --iterations 10 --timeout-seconds 120\n"
@@ -52,7 +54,13 @@ Config parse(int argc, char** argv) {
         if (arg == "--no-verify") { c.verify = false; continue; }
         if (++i == argc) throw std::runtime_error("missing value for " + arg);
         std::string value = argv[i];
-        if (arg == "--devices") c.devices = integers(value);
+        if (arg == "--rank") {
+            auto rank = number(value);
+            if (rank >= max_ranks) throw std::runtime_error("rank out of range");
+            c.rank = static_cast<int>(rank);
+        }
+        else if (arg == "--shared-file") c.shared_file = value;
+        else if (arg == "--devices") c.devices = integers(value);
         else if (arg == "--cpus") c.cpus = integers(value);
         else if (arg == "--sizes") {
             c.sizes.clear();
@@ -68,6 +76,8 @@ Config parse(int argc, char** argv) {
     auto n = c.devices.size();
     if (n < 2 || n > max_ranks || c.sizes.size() != n - 1)
         throw std::runtime_error("require 2..32 devices and exactly n-1 sizes");
+    if (c.rank < 0 || static_cast<size_t>(c.rank) >= n || c.shared_file.empty())
+        throw std::runtime_error("require --rank in [0,n) and --shared-file PATH; normally use run.sh");
     if (!c.batches || !c.iterations) throw std::runtime_error("batches and iterations must be positive");
     if (!c.cpus.empty() && c.cpus.size() != n) throw std::runtime_error("need one CPU per rank");
     for (auto cpu : c.cpus) if (cpu >= CPU_SETSIZE) throw std::runtime_error("CPU exceeds CPU_SETSIZE");
@@ -76,6 +86,7 @@ Config parse(int argc, char** argv) {
 }
 struct Shared {
     BarrierState barrier;
+    uint32_t claimed[max_ranks]{};
     cudaIpcMemHandle_t handles[max_ranks][max_ranks]{}; // [receiver][sender]
 };
 // CUDA releases expose signatures with and without failIdx; select at compile time.
@@ -200,62 +211,31 @@ void worker(const Config& c, const Layout& l, Shared& s, int rank) {
         barrier.wait();
     }
 }
-volatile sig_atomic_t interrupted = 0;
-void signal_handler(int) { interrupted = 1; }
 int main(int argc, char** argv) {
+    int rank = -1;
     try {
         auto c = parse(argc, argv);
+        rank = c.rank;
         Layout l(c.sizes, c.batches);
-        void* mem = mmap(nullptr, sizeof(Shared), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-        if (mem == MAP_FAILED) throw std::runtime_error("mmap failed");
-        auto* s = new(mem) Shared{};
-        std::printf("# ranks=%zu batches=%zu iterations=%zu src_bytes_per_gpu=%zu recv_bytes_per_gpu=%zu\n",
-            c.devices.size(), c.batches, c.iterations, l.source_bytes, l.source_bytes);
-        std::printf("rank,iteration,sent_bytes,submit_and_sync_ms,iteration_with_barriers_ms,sent_GBps\n");
-        std::fflush(stdout);
-        std::signal(SIGINT, signal_handler); std::signal(SIGTERM, signal_handler);
-        std::vector<pid_t> children;
-        children.reserve(c.devices.size());
-        pid_t parent = getpid();
-        bool failed = false;
-        // Parent never initializes CUDA: each child creates its own CUDA context.
-        for (size_t rank = 0; rank < c.devices.size(); ++rank) {
-            pid_t pid = fork();
-            if (pid < 0) { failed = true; break; }
-            if (pid == 0) {
-                std::signal(SIGINT, SIG_DFL); std::signal(SIGTERM, SIG_DFL);
-                if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parent) _exit(1);
-                try { worker(c, l, *s, static_cast<int>(rank)); _exit(0); }
-                catch (const std::exception& e) {
-                    std::fprintf(stderr, "rank %zu: %s\n", rank, e.what());
-                    abort_all(s->barrier); _exit(1);
-                }
+        SharedMapping<Shared> mapping(c.shared_file, rank == 0, c.timeout);
+        auto& s = mapping.get();
+        try {
+            if (__atomic_exchange_n(&s.claimed[rank], 1U, __ATOMIC_ACQ_REL))
+                throw std::runtime_error("duplicate proxy rank");
+            if (rank == 0) {
+                std::printf("# ranks=%zu batches=%zu iterations=%zu src_bytes_per_gpu=%zu recv_bytes_per_gpu=%zu\n",
+                    c.devices.size(), c.batches, c.iterations, l.source_bytes, l.source_bytes);
+                std::printf("rank,iteration,sent_bytes,submit_and_sync_ms,iteration_with_barriers_ms,sent_GBps\n");
+                std::fflush(stdout);
             }
-            children.push_back(pid);
+            worker(c, l, s, rank);
+        } catch (...) {
+            abort_all(s.barrier);
+            throw;
         }
-        size_t remaining = children.size();
-        bool killed = false;
-        while (remaining) {
-            if (failed || interrupted || aborted(s->barrier)) {
-                failed = true;
-                if (!killed) {
-                    abort_all(s->barrier);
-                    for (pid_t p : children) if (p > 0) kill(p, SIGKILL);
-                    killed = true;
-                }
-            }
-            for (auto& p : children) if (p > 0) {
-                int status = 0;
-                pid_t done = waitpid(p, &status, WNOHANG);
-                if (done == p) {
-                    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) failed = true;
-                    p = -1; --remaining;
-                } else if (done < 0 && errno != EINTR) { failed = true; p = -1; --remaining; }
-            }
-            if (remaining) std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-        s->~Shared(); munmap(mem, sizeof(Shared));
-        if (failed || interrupted) { std::fprintf(stderr, "benchmark failed\n"); return 1; }
         return 0;
-    } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "rank %d: %s\n", rank, e.what());
+        return 1;
+    }
 }
