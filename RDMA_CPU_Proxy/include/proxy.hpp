@@ -49,6 +49,7 @@ public:
     router_notification_publication_buffers() const;
 
 private:
+    friend struct PreparedForwardingTestAccess;
     struct PeerState {
         int peer_rank{-1};
         int remote_gpu_index{-1};
@@ -118,6 +119,14 @@ private:
     struct NvlinkForwardNotificationDispatchState;
     struct ForwardingBatchCompletion;
     struct ForwardingPingPongState;
+    struct PreparedForwardingBatch;
+    struct PreparedForwardingState;
+    void initialize_prepared_forwarding();
+    void prepare_forwarding_batch(PreparedForwardingBatch& batch, std::size_t peer_index,
+                                 uint64_t iteration, std::size_t first_chunk, std::size_t chunks);
+    void prepared_forwarding_ready_loop();
+    void prepared_forwarding_loop();
+    void enqueue_prepared_notifications(const NvlinkForwardNotification* notifications, std::size_t count);
     struct ForwardNotificationDestinationState {
         int gpu_index{-1};
         NvlinkForwardNotificationHeader* header{nullptr};
@@ -262,6 +271,7 @@ private:
     ConnectionManager connection_manager_;
     std::vector<PeerState> peers_;
     std::atomic<bool> forwarding_stop_{false};
+    std::unique_ptr<PreparedForwardingState> prepared_forwarding_;
     std::thread forwarding_thread_;
     std::thread forwarding_second_thread_;
     std::unique_ptr<ForwardingPingPongState> forwarding_ping_pong_;
@@ -275,7 +285,8 @@ private:
     std::vector<std::size_t> forwarding_next_batch_by_peer_;
     std::vector<std::size_t> forwarding_next_chunk_by_peer_;
     // Router-driven forwarding compacts each destination independently. These
-    // cursors are owned by the forwarding thread and reset at iteration
+    // cursors are owned by the forwarding thread (preparation thread in the
+    // opt-in prepared mode) and reset at iteration
     // boundaries; keeping the source cursor as well makes ordered forwarding
     // an explicit invariant instead of an assumption of the copy layout.
     std::vector<uint64_t> forwarding_compaction_iteration_by_peer_;

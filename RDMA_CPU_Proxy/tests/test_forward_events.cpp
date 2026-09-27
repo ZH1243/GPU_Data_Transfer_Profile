@@ -142,6 +142,42 @@ int main() {
             return 77;
         }
         check(cudaSetDevice(0));
+        // The prepared path uses the final arrays directly, including a single
+        // attribute index shared by multiple independent segments.
+        {
+            struct DeviceCopies {
+                int* src{nullptr};
+                int* dst{nullptr};
+                ~DeviceCopies() { if (src) cudaFree(src); if (dst) cudaFree(dst); }
+            } memory;
+            check(cudaMalloc(reinterpret_cast<void**>(&memory.src), 4 * sizeof(int)));
+            check(cudaMalloc(reinterpret_cast<void**>(&memory.dst), 2 * sizeof(int)));
+            const int input[] = {11, 22, 33, 44};
+            check(cudaMemcpy(memory.src, input, sizeof(input), cudaMemcpyHostToDevice));
+            rdma_proxy::CudaPreparedForwardBatch batch;
+            std::exception_ptr preparation_error;
+            std::thread prepare([&] {
+                try {
+                    batch.reserve(2);
+                    batch.append(memory.dst, memory.src + 1, sizeof(int));
+                    batch.append(memory.dst + 1, memory.src + 3, sizeof(int));
+                } catch (...) { preparation_error = std::current_exception(); }
+            });
+            prepare.join();
+            if (preparation_error) std::rethrow_exception(preparation_error);
+            auto* stream = rdma_proxy::create_cuda_stream(0, true, false);
+            try {
+                rdma_proxy::launch_cuda_prepared_forward_batch_async(batch, stream, false);
+                rdma_proxy::synchronize_cuda_stream(stream, false);
+                int output[2]{};
+                check(cudaMemcpy(output, memory.dst, sizeof(output), cudaMemcpyDeviceToHost));
+                require(output[0] == 22 && output[1] == 44, "prepared CUDA batch payload mismatch");
+            } catch (...) {
+                rdma_proxy::destroy_cuda_stream(stream, false);
+                throw;
+            }
+            rdma_proxy::destroy_cuda_stream(stream, false);
+        }
         rdma_proxy::CudaForwardEventPool gpu_pool(2, 0, false);
         auto gpu_leases = gpu_pool.acquire_batch(2, 100ms);
         auto& prefix = *gpu_leases[0];

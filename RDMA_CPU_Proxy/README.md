@@ -577,6 +577,9 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_threshold_chunks`
 - `nvlink_forward_min_threshold_chunks`
 - `nvlink_forward_max_threshold_chunks`
+- `nvlink_forward_preparation_enabled`
+- `nvlink_forward_prepared_batch_chunks`
+- `nvlink_forward_prepared_queue_depth`
 - `nvlink_forward_out_of_order_chunks_enabled`
 - `nvlink_forward_chunk_tokens`
 - `nvlink_forward_use_batch_api`
@@ -613,6 +616,68 @@ Required parameters are represented in `config/example_config.json`:
 - `cpu_affinity`
 
 Command-line overrides use `--key=value`. `--listen_port=value` also updates every `peers[].port`, matching the common launch convention where GPU `k` uses the same metadata port on every node. You can also use `--peer_port=value` to update every peer port explicitly. `--peer_host=value` is supported only when the config has exactly one peer.
+
+## Opt-in NVLink preparation pipeline
+
+`nvlink_forward_preparation_enabled` defaults to `false`; disabling it retains
+legacy readiness counters, batching, barrier size negotiation, and submission.
+Enable it on **all local proxies** with an explicit fixed chunk count:
+
+```bash
+# Example n=32; choose/tune this value on the Hopper nodes.
+RDMA_CPU_Proxy/scripts/run_node0_torchrun.sh \
+  --local_forwarding_rdma_overlap_enabled=true \
+  --nvlink_forward_local_batch_sync_enabled=true \
+  --nvlink_forward_preparation_enabled=true \
+  --nvlink_forward_prepared_batch_chunks=32 \
+  --nvlink_forward_prepared_queue_depth=2
+```
+
+Use the same options with `run_node1_torchrun.sh` on node 1. Both CLI overrides
+and JSON configuration support these settings:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `nvlink_forward_preparation_enabled` | `false` | Enable CPU preparation on the readiness thread. |
+| `nvlink_forward_prepared_batch_chunks` | `0` | Required explicit positive `n` when enabled; no automatically chosen batch size. |
+| `nvlink_forward_prepared_queue_depth` | `2` | Reusable slots per proxy, including the slot being submitted; minimum 2. |
+
+The mode requires router routing, ordered chunks, batch API submission,
+completion notifications, local batch synchronization, and synchronization of
+all destination copies after each batch. Round-robin and ping-pong must be off.
+These conditions are validated at startup.
+
+In this mode the legacy token/chunk/min/max thresholds are ignored. Each remote
+peer's iteration is divided into exactly `n` received chunks per batch, except
+for its shorter final batch; the last chunk may itself contain fewer tokens.
+Local staging also uses `n` chunks plus a tail, but remains on the iteration
+coordinator thread. Both phases use the two-stage local batch-start handshake
+without negotiating chunk counts. Finished proxies retire from their phase;
+active proxies submit their own batch unchanged even when tails differ.
+
+The readiness thread scans immutable routing metadata, compacts destination
+positions, and builds the final CUDA pointer/size/attribute arrays directly in
+bounded reusable heap slots. It alone advances remote preparation cursors.
+The forwarding thread waits for local staging, enters the start barrier,
+submits once per nonempty destination, synchronizes the stream, performs any
+required GPUDirect visibility flush, and copies the prepared notifications into
+separate bounded reusable dispatch storage before releasing the slot. Batches
+with no outgoing copies still publish the direct same-GPU input notification.
+
+Remote preparation can overlap local staging and earlier remote copies; remote
+submission cannot precede local staging completion. Iteration completion tracks
+completed chunks, not prepared chunks, and drains notification publication and
+receiver processing before iteration reuse. Queue waits respond to stop/error
+signals; failed partial submissions retain argument storage through stream
+cleanup. Existing cross-process barrier timeouts still apply if another proxy
+fails or never participates.
+
+The shared-library C ABI and Python worker require no changes. CPU-only tests
+exercise mock copies, compaction, unequal tails, slot reuse, notification drain,
+and multiple iterations/peers. CUDA/GPUDirect behavior and performance require
+building and profiling on the remote Hopper systems. Compare identical fixed
+batch sizes when measuring preparation time, queue starvation, barrier time,
+submission gaps, and stream wait time.
 
 ## Current Limitations and TODOs
 

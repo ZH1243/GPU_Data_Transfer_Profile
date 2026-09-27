@@ -74,6 +74,11 @@ struct ProxyConfig {
     // completion of the local source.
     bool local_forwarding_rdma_overlap_enabled{false};
     bool nvlink_forwarding_enabled{false};
+    // Opt-in CPU preparation pipeline. n must be chosen explicitly; legacy
+    // thresholds are ignored in this mode (including local staging batches).
+    bool nvlink_forward_preparation_enabled{false};
+    std::size_t nvlink_forward_prepared_batch_chunks{0};
+    std::size_t nvlink_forward_prepared_queue_depth{2};
     std::size_t nvlink_forward_threshold_tokens{0};
     std::size_t nvlink_forward_threshold_chunks{0};
     std::size_t nvlink_forward_min_threshold_chunks{0};
@@ -101,7 +106,7 @@ struct ProxyConfig {
     std::size_t expert_gemm_dimension{8192};
     std::size_t expert_gemm_cluster_m{1};
     std::size_t expert_gemm_max_swizzle_size{8};
-    // Receiver ring entries; also pending dispatch batches in ping-pong mode.
+    // Receiver ring entries; also pending dispatch batches in ping-pong/prepared modes.
     std::size_t nvlink_forward_notification_queue_depth{1024};
     bool nvlink_forward_notification_log_enabled{false};
     std::string nvlink_forward_notification_log_dir{"/tmp/rdma_cpu_proxy_nvlink_notifications"};

@@ -3,6 +3,7 @@
 #include <cassert>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 int main(int argc, char** argv) {
@@ -313,6 +314,78 @@ int main(int argc, char** argv) {
         catch (const std::runtime_error&) { rejected = true; }
         assert(rejected);
     }
+
+    assert(!config.nvlink_forward_preparation_enabled);
+    assert(config.nvlink_forward_prepared_batch_chunks == 0);
+    assert(config.nvlink_forward_prepared_queue_depth == 2);
+    auto prepared_config = ping_pong_config;
+    prepared_config.nvlink_forward_ping_pong_enabled = false;
+    prepared_config.nvlink_forward_preparation_enabled = true;
+    prepared_config.nvlink_forward_prepared_batch_chunks = 3;
+    // No legacy thresholds are needed, and n may exceed the total chunk count.
+    prepared_config.nvlink_forward_threshold_tokens = 0;
+    prepared_config.nvlink_forward_threshold_chunks = 0;
+    prepared_config.nvlink_forward_min_threshold_chunks = 0;
+    prepared_config.nvlink_forward_max_threshold_chunks = 0;
+    prepared_config.nvlink_forward_chunk_tokens = 0;
+    rdma_proxy::validate_config(prepared_config);
+    auto large_prepared = prepared_config;
+    large_prepared.nvlink_forward_prepared_batch_chunks = large_prepared.num_tokens + 1;
+    rdma_proxy::validate_config(large_prepared);
+    for (int invalid = 0; invalid < 12; ++invalid) {
+        auto bad = prepared_config;
+        if (invalid == 0) bad.nvlink_forward_prepared_batch_chunks = 0;
+        if (invalid == 1) bad.nvlink_forward_prepared_queue_depth = 1;
+        if (invalid == 2) bad.nvlink_forward_ping_pong_enabled = true;
+        if (invalid == 3) bad.nvlink_forward_out_of_order_chunks_enabled = true;
+        if (invalid == 4) bad.nvlink_forward_use_round_robin = true;
+        if (invalid == 5) bad.nvlink_forward_use_batch_api = false;
+        if (invalid == 6) bad.nvlink_forward_synchronize_batches = false;
+        if (invalid == 7) bad.nvlink_forward_completion_notifications_enabled = false;
+        if (invalid == 8) bad.nvlink_forward_local_batch_sync_enabled = false;
+        if (invalid == 9) bad.router_routing_enabled = false;
+        if (invalid == 10) bad.nvlink_forwarding_enabled = false;
+        if (invalid == 11) bad.nvlink_forward_prepared_batch_chunks = std::numeric_limits<std::size_t>::max();
+        bool rejected = false;
+        try { rdma_proxy::validate_config(bad); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+    }
+    const char* prepared_args[] = {
+        "test_config", "--config", argv[1],
+        "--router_routing_enabled=true", "--nvlink_forwarding_enabled=true",
+        "--nvlink_forward_use_round_robin=false", "--nvlink_forward_use_batch_api=true",
+        "--nvlink_forward_synchronize_batches=true",
+        "--nvlink_forward_local_batch_sync_enabled=true",
+        "--nvlink_forward_completion_notifications_enabled=true",
+        "--nvlink_forward_preparation_enabled=true",
+        "--nvlink_forward_prepared_batch_chunks=17",
+        "--nvlink_forward_prepared_queue_depth=3",
+    };
+    const auto parsed_prepared = rdma_proxy::load_config(
+        static_cast<int>(sizeof(prepared_args) / sizeof(prepared_args[0])),
+        const_cast<char**>(prepared_args));
+    assert(parsed_prepared.nvlink_forward_preparation_enabled);
+    assert(parsed_prepared.nvlink_forward_prepared_batch_chunks == 17);
+    assert(parsed_prepared.nvlink_forward_prepared_queue_depth == 3);
+    assert(rdma_proxy::config_summary(parsed_prepared).find(
+        "nvlink_forward_prepared_batch_chunks=17") != std::string::npos);
+    {
+        std::ofstream json("prepared_forwarding_config.json");
+        json << R"json({"num_tokens":65, "token_dimension":8, "tokens_per_chunk":4,
+                       "num_gpus_per_node":2, "router_routing_enabled":true,
+                       "num_experts":2, "top_k":1, "nvlink_forwarding_enabled":true,
+                       "nvlink_forward_synchronize_batches":true,
+                       "nvlink_forward_completion_notifications_enabled":true,
+                       "nvlink_forward_local_batch_sync_enabled":true,
+                       "nvlink_forward_preparation_enabled":true,
+                       "nvlink_forward_prepared_batch_chunks":19,
+                       "nvlink_forward_prepared_queue_depth":4})json";
+    }
+    const auto json_prepared = rdma_proxy::load_config_file("prepared_forwarding_config.json");
+    assert(json_prepared.nvlink_forward_preparation_enabled);
+    assert(json_prepared.nvlink_forward_prepared_batch_chunks == 19);
+    assert(json_prepared.nvlink_forward_prepared_queue_depth == 4);
 
     auto valid_flush_only_config = router_nvlink_config;
     valid_flush_only_config.nvlink_forward_synchronize_batches = true;

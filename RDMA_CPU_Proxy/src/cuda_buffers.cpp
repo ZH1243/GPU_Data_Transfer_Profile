@@ -1848,6 +1848,55 @@ void enable_cuda_peer_access(int cuda_device_id, int peer_cuda_device_id, bool m
 #endif
 }
 
+void CudaPreparedForwardBatch::reserve(std::size_t capacity) {
+    dsts.reserve(capacity);
+    srcs.reserve(capacity);
+    sizes.reserve(capacity);
+#if RDMA_PROXY_HAVE_CUDA
+    attributes = {};
+    attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+#endif
+    attribute_index = 0;
+    attribute_count = 1;
+}
+
+void CudaPreparedForwardBatch::clear() {
+    dsts.clear();
+    srcs.clear();
+    sizes.clear();
+}
+
+void CudaPreparedForwardBatch::append(void* dst, const void* src, std::size_t bytes) {
+    if (!dst || !src || bytes == 0) {
+        throw std::runtime_error("invalid prepared NVLink copy");
+    }
+    dsts.push_back(dst);
+    srcs.push_back(const_cast<void*>(src));
+    sizes.push_back(bytes);
+}
+
+void launch_cuda_prepared_forward_batch_async(
+    CudaPreparedForwardBatch& batch, void* stream, bool mock_mode) {
+    if (batch.sizes.empty()) return;
+    if (mock_mode) {
+        for (std::size_t i = 0; i < batch.sizes.size(); ++i) {
+            std::memcpy(batch.dsts[i], batch.srcs[i], batch.sizes[i]);
+        }
+        return;
+    }
+#if RDMA_PROXY_HAVE_CUDA
+    std::size_t fail_idx = 0;
+    check_cuda(cudaMemcpyBatchAsync(
+                   batch.dsts.data(), batch.srcs.data(), batch.sizes.data(),
+                   batch.sizes.size(), &batch.attributes, &batch.attribute_index,
+                   batch.attribute_count, &fail_idx, reinterpret_cast<cudaStream_t>(stream)),
+               "cudaMemcpyBatchAsync prepared forwarding");
+#else
+    (void)stream;
+    throw std::runtime_error("prepared CUDA forwarding requested without CUDA support");
+#endif
+}
+
 void launch_cuda_forward_copy_batch_async(
     const CudaForwardCopy& copy,
     void* stream,

@@ -126,6 +126,11 @@ if(RDMA_PROXY_BUILD_TESTS)
   add_test(NAME test_forward_events COMMAND test_forward_events)
   set_tests_properties(test_forward_events PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
 
+  add_executable(test_prepared_forwarding tests/test_prepared_forwarding.cpp)
+  target_link_libraries(test_prepared_forwarding PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_prepared_forwarding COMMAND test_prepared_forwarding)
+  set_tests_properties(test_prepared_forwarding PROPERTIES TIMEOUT 120)
+
   add_executable(test_ping_pong tests/test_ping_pong.cpp)
   target_link_libraries(test_ping_pong PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_ping_pong COMMAND test_ping_pong)

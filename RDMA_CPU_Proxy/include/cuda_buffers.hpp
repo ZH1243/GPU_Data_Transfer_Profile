@@ -3,6 +3,10 @@
 #include "config.hpp"
 #include "protocol.hpp"
 
+#if RDMA_PROXY_HAVE_CUDA
+#include <cuda_runtime_api.h>
+#endif
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -133,6 +137,25 @@ struct CudaForwardCopy {
     const void* src{nullptr};
     std::size_t bytes{0};
 };
+
+// Final host arguments, filled by the preparation thread and retained until
+// stream completion. No conversion or allocation is needed at submission.
+struct CudaPreparedForwardBatch {
+    std::vector<void*> dsts;
+    std::vector<void*> srcs;
+    std::vector<std::size_t> sizes;
+#if RDMA_PROXY_HAVE_CUDA
+    cudaMemcpyAttributes attributes{};
+#endif
+    std::size_t attribute_index{0};
+    std::size_t attribute_count{1};
+
+    void reserve(std::size_t capacity);
+    void clear();
+    void append(void* dst, const void* src, std::size_t bytes);
+};
+void launch_cuda_prepared_forward_batch_async(
+    CudaPreparedForwardBatch& batch, void* stream, bool mock_mode);
 
 struct CudaIpcMemoryHandle {
     std::string handle_hex;
