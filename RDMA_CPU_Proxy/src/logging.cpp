@@ -14,17 +14,17 @@ Logger& Logger::instance() {
 
 void Logger::set_level(LogLevel level) {
     std::lock_guard<std::mutex> lock(mutex_);
-    level_ = level;
+    level_.store(level, std::memory_order_relaxed);
 }
 
 LogLevel Logger::level() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return level_;
+    return level_.load(std::memory_order_relaxed);
 }
 
 void Logger::log(LogLevel level, const std::string& message) {
+    if (!enabled(level)) return;
     std::lock_guard<std::mutex> lock(mutex_);
-    if (static_cast<int>(level) < static_cast<int>(level_)) {
+    if (!enabled(level)) {
         return;
     }
 
