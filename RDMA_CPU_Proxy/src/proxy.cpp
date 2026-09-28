@@ -180,6 +180,30 @@ struct Proxy::ForwardingPingPongState {
 
 namespace {
 
+// Static labels avoid formatting/allocation in the inter-batch timing path.
+// end() lets lock-acquisition ranges stop while the lock remains held.
+class ScopedPreparedRange {
+public:
+    explicit ScopedPreparedRange(const char* name) {
+#if RDMA_PROXY_HAVE_CUDA
+        nvtxRangePushA(name);
+#else
+        (void)name;
+#endif
+    }
+    ~ScopedPreparedRange() { end(); }
+    void end() {
+#if RDMA_PROXY_HAVE_CUDA
+        if (active_) nvtxRangePop();
+#endif
+        active_ = false;
+    }
+    ScopedPreparedRange(const ScopedPreparedRange&) = delete;
+    ScopedPreparedRange& operator=(const ScopedPreparedRange&) = delete;
+private:
+    bool active_{true};
+};
+
 #if RDMA_PROXY_HAVE_CUDA
 class ScopedHandoffWaitRange {
 public:
@@ -1410,7 +1434,9 @@ void Proxy::enqueue_prepared_notifications(
     auto& dispatch = *nvlink_forward_notification_dispatch_;
     const auto deadline = std::chrono::steady_clock::now() +
         std::chrono::milliseconds(config_.completion_timeout_ms);
+    ScopedPreparedRange acquire("nvlink_prepared/notification_lock");
     std::unique_lock<std::mutex> lock(dispatch.mutex);
+    acquire.end();
     while (dispatch.prepared_count == dispatch.prepared.size()) {
         if (forwarding_stop_.load() || prepared_forwarding_->failed.load()) {
             throw std::runtime_error("prepared notification enqueue cancelled");
@@ -1418,8 +1444,10 @@ void Proxy::enqueue_prepared_notifications(
         if (std::chrono::steady_clock::now() >= deadline) {
             throw std::runtime_error("timed out waiting for prepared notification dispatch space");
         }
+        ScopedPreparedRange wait("nvlink_prepared/notification_queue_full_wait");
         dispatch.changed.wait_for(lock, std::chrono::milliseconds(1));
     }
+    ScopedPreparedRange publish("nvlink_prepared/notification_publish_and_wake");
     auto& entry = dispatch.prepared[dispatch.prepared_head];
     std::copy_n(notifications, count, entry.notifications.begin());
     entry.count = count;
@@ -3917,13 +3945,17 @@ void Proxy::prepared_forwarding_ready_loop() {
                         if (std::chrono::steady_clock::now() >= deadline) {
                             throw std::runtime_error("timed out waiting for a free prepared forwarding slot");
                         }
+                        ScopedPreparedRange wait("nvlink_prepare/queue_full_wait");
                         state.changed.wait_for(lock, std::chrono::milliseconds(1));
                     }
                     if (cancelled()) return;
                     slot_index = state.produced % state.slots.size();
                 }
                 // No queue or stream lock while scanning metadata.
+                ScopedPreparedRange prepare("nvlink_prepare/build_batch");
                 prepare_forwarding_batch(state.slots[slot_index], p, iteration, next_chunk[p], count);
+                prepare.end();
+                ScopedPreparedRange publish("nvlink_prepare/publish_batch");
                 {
                     std::lock_guard<std::mutex> lock(state.mutex);
                     ++state.produced; // mutex release publishes all argument arrays
@@ -3933,7 +3965,10 @@ void Proxy::prepared_forwarding_ready_loop() {
                 progressed = true;
             }
             if (all_prepared) break;
-            if (!progressed) std::this_thread::sleep_for(std::chrono::microseconds(10));
+            if (!progressed) {
+                ScopedPreparedRange backoff("nvlink_prepare/no_ready_batch_backoff");
+                std::this_thread::sleep_for(std::chrono::microseconds(10));
+            }
         }
     }
 }
@@ -3947,41 +3982,64 @@ void Proxy::prepared_forwarding_loop() {
     while (!cancelled()) {
         PreparedForwardingBatch* batch;
         {
+            ScopedPreparedRange acquire("nvlink_prepared/acquire_next_batch");
+            ScopedPreparedRange queue_lock("nvlink_prepared/queue_lock");
             std::unique_lock<std::mutex> lock(state.mutex);
+            queue_lock.end();
             while (!cancelled() && state.produced == state.consumed) {
+                ScopedPreparedRange wait("nvlink_prepared/queue_empty_wait");
                 state.changed.wait_for(lock, std::chrono::milliseconds(1));
             }
             if (cancelled()) return;
             batch = &state.slots[state.consumed % state.slots.size()];
             while (!cancelled() && config_.router_local_input_staging_enabled &&
                    local_router_forwarding_completed_iterations_.load() < batch->iteration + 1) {
+                ScopedPreparedRange wait("nvlink_prepared/local_staging_wait");
                 state.changed.wait_for(lock, std::chrono::milliseconds(1));
             }
             if (cancelled()) return;
         }
+        ScopedPreparedRange setup("nvlink_prepared/iteration_bookkeeping");
         if (current_iteration != batch->iteration) {
             current_iteration = batch->iteration;
             round = 0;
         }
+        setup.end();
         // Start-only in this mode: the immutable prepared range is never shrunk.
+        ScopedPreparedRange barrier("nvlink_prepared/local_batch_barrier");
         synchronize_local_nvlink_batch_start(LocalNvlinkBatchSyncPhase::kRemoteForwarding,
             batch->iteration, batch->batch_index, ++round, batch->chunk_count);
+        barrier.end();
         const auto start = std::chrono::steady_clock::now();
         {
+            ScopedPreparedRange stream_acquire("nvlink_prepared/stream_lock");
             std::lock_guard<std::mutex> stream_lock(forwarding_stream_mutex_);
+            stream_acquire.end();
+            ScopedPreparedRange submit("nvlink_prepared/submit_copies");
             for (auto& destination : batch->destinations) {
                 launch_cuda_prepared_forward_batch_async(destination, forwarding_stream_, config_.mock_mode);
             }
+            submit.end();
+            ScopedPreparedRange sync("nvlink_prepared/stream_sync");
             synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
+            sync.end();
             if (forwarding_rdma_owner_flush_required_) {
+                ScopedPreparedRange flush("nvlink_prepared/rdma_owner_flush");
                 flush_gpudirect_rdma_writes(config_.cuda_device_id, config_.mock_mode);
             }
         }
+        ScopedPreparedRange completion("nvlink_prepared/completion_bookkeeping");
         const auto seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - start).count();
+        completion.end();
+        ScopedPreparedRange notifications("nvlink_prepared/notification_handoff");
         enqueue_prepared_notifications(batch->notifications.data(), batch->notification_count);
+        notifications.end();
         {
+            ScopedPreparedRange stats_range("nvlink_prepared/completion_stats");
+            ScopedPreparedRange stats_lock("nvlink_prepared/stats_lock");
             std::lock_guard<std::mutex> lock(forwarding_mutex_);
+            stats_lock.end();
             auto& stats = forwarding_iteration_stats_.at(batch->iteration);
             ++stats.batch_count;
             stats.total_bytes += batch->bytes;
@@ -3995,6 +4053,7 @@ void Proxy::prepared_forwarding_loop() {
             // These remain COMPLETED chunks, never preparation progress.
             forwarding_next_chunk_by_peer_[batch->peer_index] += batch->chunk_count;
         }
+        ScopedPreparedRange logging("nvlink_prepared/batch_counter_and_log");
         forwarding_batches_issued_.fetch_add(1);
         if (config_.nvlink_forward_log_batches) {
             RDMA_PROXY_LOG_INFO("nvlink_forward_prepared_batch_complete iteration=", batch->iteration,
@@ -4002,10 +4061,16 @@ void Proxy::prepared_forwarding_loop() {
                 " batch=", batch->batch_index, " chunks=", batch->chunk_count,
                 " bytes=", batch->bytes);
         }
+        logging.end();
+        ScopedPreparedRange release("nvlink_prepared/release_slot");
         {
+            ScopedPreparedRange queue_lock("nvlink_prepared/release_slot_lock");
             std::lock_guard<std::mutex> lock(state.mutex);
+            queue_lock.end();
             ++state.consumed;
         }
+        release.end();
+        ScopedPreparedRange wake("nvlink_prepared/wake_producer");
         state.changed.notify_all();
     }
 }

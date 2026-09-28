@@ -707,6 +707,52 @@ building and profiling on the remote Hopper systems. Compare identical fixed
 batch sizes when measuring preparation time, queue starvation, barrier time,
 submission gaps, and stream wait time.
 
+### Profiling the prepared forwarding inter-batch gap
+
+CUDA builds emit static-label NVTX ranges automatically in the shared library;
+no additional proxy flag is needed. Rebuild `rdma_cpu_proxy_shared` in the
+Hopper build directory on both nodes, then profile the same torchrun commands
+with CUDA and NVTX tracing enabled (`nsys profile --trace=cuda,nvtx ...`).
+Inspect the forwarding CPU thread in each torchrun worker process. These are
+CPU wall-time ranges, not GPU execution durations.
+
+Between the end of `nvlink_prepared/stream_sync` and the next
+`nvlink_prepared/submit_copies`, the ranges follow this order (all labels below
+have the `nvlink_prepared/` prefix):
+
+| Range | Work measured |
+| --- | --- |
+| `rdma_owner_flush` | Optional GPUDirect owner visibility flush, including device selection and the existing nested flush range. Absent when native ordering suffices. |
+| `completion_bookkeeping` | Compute elapsed batch time. |
+| `notification_handoff` | Enqueue completed notifications for the dispatcher; nested `notification_lock`, `notification_queue_full_wait`, and `notification_publish_and_wake` separate contention, backpressure, and publication/wakeup. |
+| `completion_stats` | Update completed chunks and bandwidth statistics; nested `stats_lock` measures mutex acquisition. |
+| `batch_counter_and_log` | Increment batch count and optionally log. |
+| `release_slot` | Return the completed argument slot; nested `release_slot_lock` measures queue mutex acquisition. |
+| `wake_producer` | Notify the preparation thread that queue capacity is available. |
+| `acquire_next_batch` | Acquire the next published slot; nested `queue_lock`, `queue_empty_wait`, and `local_staging_wait` separate mutex contention, missing prepared work, and unfinished local staging. |
+| `iteration_bookkeeping` | Maintain the iteration and barrier round. |
+| `local_batch_barrier` | Publish arrival and check/wait for other local proxies. Even the last arrival must execute the barrier's stores and peer scan. |
+| `stream_lock` | Acquire the forwarding stream mutex before submission. |
+
+`submit_copies` covers the whole destination loop, with no extra NVTX calls
+between consecutive `cudaMemcpyBatchAsync` submissions. Empty destinations
+are skipped, so a batch with no outgoing copies has no CUDA copy call.
+
+The preparation thread additionally emits `nvlink_prepare/build_batch`,
+`publish_batch`, `queue_full_wait`, and `no_ready_batch_backoff` (each with the
+`nvlink_prepare/` prefix). The last range wraps the existing 10 microsecond
+sleep when no batch progresses; OS scheduling can extend that sleep. Correlate
+it with a forwarding-thread `queue_empty_wait` before attributing a gap to it.
+Queue depth 2 includes the in-use slot, so it allows at most one additional
+prepared batch while that slot is retained.
+
+Condition-variable wait ranges include wakeup scheduling and mutex
+reacquisition. Short gaps between ranges include loop control, unlocks, and
+instrumentation itself; CPU descheduling can extend any range. NVTX adds
+measurement overhead, so compare instrumented timings with the earlier trace.
+The presence of an approximately 10 microsecond gap alone does not identify
+its cause, even on the slowest proxy.
+
 ## Current Limitations and TODOs
 
 - Metadata exchange is a minimal TCP exchange intended to make QP bring-up concrete. Production deployments usually replace this with an existing control plane.
