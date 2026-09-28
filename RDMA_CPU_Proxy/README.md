@@ -580,6 +580,7 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_preparation_enabled`
 - `nvlink_forward_prepared_batch_chunks`
 - `nvlink_forward_prepared_queue_depth`
+- `nvlink_forward_prepared_nvtx_enabled`
 - `nvlink_forward_out_of_order_chunks_enabled`
 - `nvlink_forward_chunk_tokens`
 - `nvlink_forward_use_batch_api`
@@ -641,6 +642,7 @@ and JSON configuration support these settings:
 | `nvlink_forward_preparation_enabled` | `false` | Enable CPU preparation on the readiness thread. |
 | `nvlink_forward_prepared_batch_chunks` | `0` | Required explicit positive `n` when enabled; no automatically chosen batch size. |
 | `nvlink_forward_prepared_queue_depth` | `2` | Reusable slots per proxy, including the slot being submitted; minimum 2. |
+| `nvlink_forward_prepared_nvtx_enabled` | `false` | Enable detailed prepared forwarding/preparation NVTX ranges in CUDA builds. |
 
 The mode requires router routing, ordered chunks, batch API submission, and
 synchronization of all destination copies after each batch. Round-robin and ping-pong must be off.
@@ -709,10 +711,15 @@ submission gaps, and stream wait time.
 
 ### Profiling the prepared forwarding inter-batch gap
 
-CUDA builds emit static-label NVTX ranges automatically in the shared library;
-no additional proxy flag is needed. Rebuild `rdma_cpu_proxy_shared` in the
-Hopper build directory on both nodes, then profile the same torchrun commands
-with CUDA and NVTX tracing enabled (`nsys profile --trace=cuda,nvtx ...`).
+Set `--nvlink_forward_prepared_nvtx_enabled=true` on both torchrun commands to
+emit the detailed static-label NVTX ranges in CUDA builds. The same boolean
+key is supported in JSON configuration. It defaults to `false`: none of the
+new `nvlink_prepared/*` or `nvlink_prepare/*` ranges call NVTX, and forwarding,
+queueing, and synchronization behavior remains unchanged. Existing NVTX
+markings (such as the GPUDirect flush range) retain their original behavior.
+Rebuild `rdma_cpu_proxy_shared` in the Hopper build directory on both nodes,
+then profile with CUDA and NVTX tracing enabled
+(`nsys profile --trace=cuda,nvtx ...`).
 Inspect the forwarding CPU thread in each torchrun worker process. These are
 CPU wall-time ranges, not GPU execution durations.
 

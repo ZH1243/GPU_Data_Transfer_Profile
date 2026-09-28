@@ -330,6 +330,9 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "nvlink_forward_preparation_enabled") {
         config.nvlink_forward_preparation_enabled = (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "nvlink_forward_prepared_nvtx_enabled") {
+        config.nvlink_forward_prepared_nvtx_enabled = (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "nvlink_forward_prepared_batch_chunks") {
         config.nvlink_forward_prepared_batch_chunks = static_cast<std::size_t>(std::stoull(value));
     }
@@ -608,6 +611,8 @@ ProxyConfig load_config_file(const std::string& path) {
         object, "nvlink_forwarding_enabled", config.nvlink_forwarding_enabled);
     config.nvlink_forward_preparation_enabled = get_bool(
         object, "nvlink_forward_preparation_enabled", config.nvlink_forward_preparation_enabled);
+    config.nvlink_forward_prepared_nvtx_enabled = get_bool(
+        object, "nvlink_forward_prepared_nvtx_enabled", config.nvlink_forward_prepared_nvtx_enabled);
     config.nvlink_forward_prepared_batch_chunks = number_as<std::size_t>(
         object, "nvlink_forward_prepared_batch_chunks", config.nvlink_forward_prepared_batch_chunks);
     config.nvlink_forward_prepared_queue_depth = number_as<std::size_t>(
@@ -1162,6 +1167,7 @@ std::string config_summary(const ProxyConfig& config) {
         << (config.local_forwarding_rdma_overlap_enabled ? "true" : "false")
         << " nvlink_forwarding_enabled=" << (config.nvlink_forwarding_enabled ? "true" : "false")
         << " nvlink_forward_preparation_enabled=" << (config.nvlink_forward_preparation_enabled ? "true" : "false")
+        << " nvlink_forward_prepared_nvtx_enabled=" << (config.nvlink_forward_prepared_nvtx_enabled ? "true" : "false")
         << " nvlink_forward_prepared_batch_chunks=" << config.nvlink_forward_prepared_batch_chunks
         << " nvlink_forward_prepared_queue_depth=" << config.nvlink_forward_prepared_queue_depth
         << " nvlink_forward_threshold_tokens=" << config.nvlink_forward_threshold_tokens
