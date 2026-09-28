@@ -845,15 +845,26 @@ void validate_config(const ProxyConfig& config) {
             "local_iteration_sync_dir must be non-empty when local iteration synchronization is enabled");
     }
     if (config.nvlink_forward_preparation_enabled) {
-        if (!config.nvlink_forwarding_enabled || !config.router_routing_enabled ||
-            config.nvlink_forward_use_round_robin || config.nvlink_forward_out_of_order_chunks_enabled ||
-            config.nvlink_forward_ping_pong_enabled || !config.nvlink_forward_use_batch_api ||
-            !config.nvlink_forward_synchronize_batches ||
-            !config.nvlink_forward_completion_notifications_enabled) {
+        std::string conflicts;
+        const auto require_flag = [&](const char* name, bool actual, bool required) {
+            if (actual == required) return;
+            if (!conflicts.empty()) conflicts += "; ";
+            conflicts += std::string(name) + "=" + (actual ? "true" : "false") +
+                " (requires " + (required ? "true" : "false") + ")";
+        };
+        require_flag("nvlink_forwarding_enabled", config.nvlink_forwarding_enabled, true);
+        require_flag("router_routing_enabled", config.router_routing_enabled, true);
+        require_flag("nvlink_forward_use_round_robin", config.nvlink_forward_use_round_robin, false);
+        require_flag("nvlink_forward_out_of_order_chunks_enabled",
+                     config.nvlink_forward_out_of_order_chunks_enabled, false);
+        require_flag("nvlink_forward_ping_pong_enabled", config.nvlink_forward_ping_pong_enabled, false);
+        require_flag("nvlink_forward_use_batch_api", config.nvlink_forward_use_batch_api, true);
+        require_flag("nvlink_forward_synchronize_batches", config.nvlink_forward_synchronize_batches, true);
+        require_flag("nvlink_forward_completion_notifications_enabled",
+                     config.nvlink_forward_completion_notifications_enabled, true);
+        if (!conflicts.empty()) {
             throw std::runtime_error(
-                "nvlink_forward_preparation_enabled requires ordered router NVLink forwarding, "
-                "batch API, synchronized batches and completion notifications; "
-                "round-robin, out-of-order and ping-pong must be disabled");
+                "nvlink_forward_preparation_enabled=true has incompatible settings: " + conflicts);
         }
         if (config.nvlink_forward_prepared_batch_chunks == 0 ||
             config.nvlink_forward_prepared_batch_chunks >

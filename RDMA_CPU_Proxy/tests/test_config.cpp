@@ -332,6 +332,20 @@ int main(int argc, char** argv) {
     auto unsynchronized_prepared = prepared_config;
     unsynchronized_prepared.nvlink_forward_local_batch_sync_enabled = false;
     rdma_proxy::validate_config(unsynchronized_prepared);
+    // Report all conflicting flags even when the optional batch barrier is off.
+    auto conflicting_prepared = unsynchronized_prepared;
+    conflicting_prepared.nvlink_forward_synchronize_batches = false;
+    conflicting_prepared.nvlink_forward_completion_notifications_enabled = false;
+    bool conflicts_reported = false;
+    try { rdma_proxy::validate_config(conflicting_prepared); }
+    catch (const std::runtime_error& error) {
+        const std::string message = error.what();
+        assert(message.find("nvlink_forward_synchronize_batches=false (requires true)") != std::string::npos);
+        assert(message.find("nvlink_forward_completion_notifications_enabled=false (requires true)") != std::string::npos);
+        assert(message.find("nvlink_forward_local_batch_sync_enabled") == std::string::npos);
+        conflicts_reported = true;
+    }
+    assert(conflicts_reported);
     auto large_prepared = prepared_config;
     large_prepared.nvlink_forward_prepared_batch_chunks = large_prepared.num_tokens + 1;
     rdma_proxy::validate_config(large_prepared);
