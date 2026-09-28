@@ -174,6 +174,9 @@ private:
         const NvlinkForwardNotification& notification,
         uint64_t dequeue_timestamp_ns);
     void flush_nvlink_forward_notification_log_queue();
+    std::size_t synchronize_prepared_nvlink_batch_start(
+        LocalNvlinkBatchSyncPhase phase, uint64_t iteration,
+        uint64_t batch_round, std::size_t batch_chunks) const;
     std::size_t synchronize_local_nvlink_batch_start(
         LocalNvlinkBatchSyncPhase phase,
         uint64_t iteration,

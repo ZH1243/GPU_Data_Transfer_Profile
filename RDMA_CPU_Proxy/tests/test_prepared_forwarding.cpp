@@ -14,6 +14,59 @@
 namespace rdma_proxy {
 // Test access stays outside the public embedding ABI.
 struct PreparedForwardingTestAccess {
+    static void test_barrier_generations() {
+        ProxyConfig config;
+        config.mock_mode = true;
+        config.num_gpus_per_node = 2;
+        config.nvlink_forward_preparation_enabled = true;
+        config.nvlink_forward_local_batch_sync_enabled = true;
+        config.completion_timeout_ms = 5000;
+        config.local_iteration_sync_run_id = "test_prepared_barrier_" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        std::array<std::unique_ptr<Proxy>, 2> proxies;
+        for (int gpu = 0; gpu < 2; ++gpu) {
+            config.local_gpu_index = gpu;
+            proxies[gpu] = std::make_unique<Proxy>(config);
+            proxies[gpu]->initialize_local_iteration_sync();
+        }
+        std::atomic<uint64_t> progress[2][2]{};
+        std::array<std::exception_ptr, 2> errors;
+        auto run = [&](int gpu) {
+            try {
+                auto& proxy = *proxies[gpu];
+                // No iteration barrier: deliberately let faster participants
+                // change phases/iterations while peers still observe old ones.
+                for (uint64_t iteration = 0; iteration < 100; ++iteration) {
+                    for (int phase = 0; phase < 2; ++phase) {
+                        const auto kind = static_cast<Proxy::LocalNvlinkBatchSyncPhase>(phase);
+                        const uint64_t rounds = (iteration + gpu + phase) % 3 == 0 ? 0 :
+                            gpu == phase ? 1 : 19;
+                        for (uint64_t round = 1; round <= rounds; ++round) {
+                            progress[gpu][phase].store(iteration * 100 + round);
+                            if ((iteration + round + gpu) % 3 == 0) std::this_thread::yield();
+                            const std::size_t chunks = gpu == 0 ? 32 : 7;
+                            if (proxy.synchronize_local_nvlink_batch_start(
+                                    kind, iteration, round - 1, round, chunks) != chunks) {
+                                throw std::runtime_error("prepared barrier negotiated batch size");
+                            }
+                            if (progress[1 - gpu][phase].load() < iteration * 100 + round) {
+                                throw std::runtime_error("prepared barrier passed before peer arrival");
+                            }
+                        }
+                        progress[gpu][phase].store(iteration * 100 + 99);
+                        proxy.mark_local_nvlink_batch_phase_complete(kind, iteration);
+                    }
+                }
+            } catch (...) {
+                errors[gpu] = std::current_exception();
+                for (auto& proxy : proxies) proxy->forwarding_stop_.store(true);
+            }
+        };
+        std::thread a(run, 0), b(run, 1);
+        a.join(); b.join();
+        for (auto error : errors) if (error) std::rethrow_exception(error);
+    }
+
     static void fill_source(Proxy& proxy, uint64_t iteration) {
         for (auto& peer : proxy.cuda_buffers_.peer_buffers()) {
             auto* bytes = static_cast<unsigned char*>(peer.send.ptr);
@@ -99,6 +152,7 @@ struct PreparedForwardingTestAccess {
 int main() {
     using namespace rdma_proxy;
     Logger::instance().set_level(LogLevel::kError);
+    PreparedForwardingTestAccess::test_barrier_generations();
     // Two-entry ring is exercised over many batches/iterations; one-entry
     // notification rings force dispatch backpressure. n=1 includes empty-copy
     // batches; n=3 gives unequal tails; large n gives a single short batch.

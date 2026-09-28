@@ -651,9 +651,16 @@ peer's iteration is divided into exactly `n` received chunks per batch, except
 for its shorter final batch; the last chunk may itself contain fewer tokens.
 Local staging also uses `n` chunks plus a tail, but remains on the iteration
 coordinator thread. With `nvlink_forward_local_batch_sync_enabled=true`, both
-phases use the two-stage local batch-start handshake without negotiating chunk
-counts. Finished proxies retire from their phase; active proxies submit their
-own batch unchanged even when tails differ.
+phases use a one-stage local batch-start barrier without negotiating chunk
+counts or waiting for a second acknowledgment round. Each proxy publishes its
+arrival and waits for every active local proxy to arrive or retire. Independent
+arrival state for each phase prevents remote forwarding from overwriting local
+staging readiness. Finished proxies retire from their phase; active proxies
+submit their own batch unchanged even when tails differ. The non-prepared path
+retains its two-stage batch-size negotiation barrier.
+
+Rebuild all local proxies together when upgrading: the local synchronization
+shared-memory layout is versioned and has changed for this barrier.
 
 Set `nvlink_forward_local_batch_sync_enabled=false` on all local proxies to
 skip the batch-start handshake in both phases. Each proxy then submits its
