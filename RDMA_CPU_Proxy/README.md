@@ -741,6 +741,31 @@ have the `nvlink_prepared/` prefix):
 | `local_batch_barrier` | Publish arrival and check/wait for other local proxies. Even the last arrival must execute the barrier's stores and peer scan. |
 | `stream_lock` | Acquire the forwarding stream mutex before submission. |
 
+With the same NVTX flag enabled, prepared barriers also emit:
+
+- `nvlink_prepared/barrier_publish_arrival`: the arrival stores and the following marker.
+- `nvlink_prepared/barrier_arrival_published`: an instant marker immediately after
+  the stores, labeled with node, local GPU, phase (`local` staging or `remote`
+  forwarding), zero-based iteration, and one-based barrier round.
+- `nvlink_prepared/barrier_exit`: one instant marker on successful completion,
+  with the same identity plus `polls` (including the successful scan) and
+  `error_lock_acquire_ns` (accumulated error-check mutex acquisition time).
+
+Match identities across proxies on the same node. An arrival marker proves
+publication has already happened, but a thread can be descheduled between the
+stores and the marker. These diagnostics also cover local-staging barriers,
+which run on the iteration coordinator rather than the remote forwarding thread.
+
+The enabled path reads the CPU steady clock before and immediately after each
+error-check mutex acquisition, without NVTX calls inside the polling loop.
+Acquisition time includes uncontended locking, timestamp overhead, and any
+CPU descheduling in that interval; it is not a pure measure of lock contention.
+Correlate with CPU scheduling to distinguish those causes. Label formatting
+and marker emission also add overhead to the enclosing barrier range. Disabled
+or non-CUDA builds skip the added timestamps, formatting, and markers and use
+the original error-check call. Cancellation/error exits do not emit a successful
+`barrier_exit` marker.
+
 `submit_copies` covers the whole destination loop, with no extra NVTX calls
 between consecutive `cudaMemcpyBatchAsync` submissions. Empty destinations
 are skipped, so a batch with no outgoing copies has no CUDA copy call.

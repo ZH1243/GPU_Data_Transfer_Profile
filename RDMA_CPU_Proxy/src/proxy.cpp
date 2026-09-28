@@ -8,6 +8,7 @@
 #include <cctype>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cerrno>
 #include <cstring>
 #include <condition_variable>
@@ -2068,17 +2069,52 @@ std::size_t Proxy::synchronize_prepared_nvlink_batch_start(
     const auto marker = iteration + 1;
     auto* local = local_iteration_sync_slot(config_.local_gpu_index);
     auto& arrival = local->prepared_arrivals[phase_index];
+    const bool diagnostics = RDMA_PROXY_HAVE_CUDA && config_.nvlink_forward_prepared_nvtx_enabled;
+    uint64_t error_lock_acquire_ns = 0;
+#if RDMA_PROXY_HAVE_CUDA
+    // Format before publishing so there is no formatting between the arrival
+    // stores and the marker. Both phases can use the same iteration/round.
+    char arrival_label[256];
+    if (diagnostics) {
+        std::snprintf(arrival_label, sizeof(arrival_label),
+            "nvlink_prepared/barrier_arrival_published node=%d gpu=%d phase=%s iteration=%llu round=%llu",
+            config_.node_rank, config_.local_gpu_index,
+            phase == LocalNvlinkBatchSyncPhase::kLocalInputStaging ? "local" : "remote",
+            static_cast<unsigned long long>(iteration),
+            static_cast<unsigned long long>(batch_round));
+    }
+#endif
     // Publish the round before the iteration. Acquiring a new iteration then
     // guarantees that its first round is visible. Within an iteration rounds
     // only increase; a later iteration also proves arrival at every old round.
-    atomic_store_u64(&arrival.round, batch_round);
-    atomic_store_u64(&arrival.iteration, marker);
+    {
+        ScopedPreparedRange publication(diagnostics, "nvlink_prepared/barrier_publish_arrival");
+        atomic_store_u64(&arrival.round, batch_round);
+        atomic_store_u64(&arrival.iteration, marker);
+#if RDMA_PROXY_HAVE_CUDA
+        if (diagnostics) nvtxMarkA(arrival_label);
+#endif
+    }
 
     const auto deadline = std::chrono::steady_clock::now() +
         std::chrono::milliseconds(config_.completion_timeout_ms);
     uint64_t polls = 0;
     while (true) {
-        check_forwarding_error();
+        if (diagnostics) {
+            // Same lock and error semantics as check_forwarding_error(). Time
+            // acquisition only; do not emit NVTX events in this polling loop.
+            const auto lock_start = std::chrono::steady_clock::now();
+            std::unique_lock<std::mutex> lock(forwarding_mutex_);
+            const auto lock_acquired = std::chrono::steady_clock::now();
+            error_lock_acquire_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    lock_acquired - lock_start).count());
+            if (!forwarding_error_.empty()) {
+                throw std::runtime_error("NVLink forwarding failed: " + forwarding_error_);
+            }
+        } else {
+            check_forwarding_error();
+        }
         if (forwarding_stop_.load()) throw std::runtime_error("prepared batch barrier cancelled");
         bool complete = true;
         for (int gpu = 0; gpu < config_.num_gpus_per_node; ++gpu) {
@@ -2099,7 +2135,23 @@ std::size_t Proxy::synchronize_prepared_nvlink_batch_start(
             complete = false;
             break;
         }
-        if (complete) return batch_chunks;
+        if (complete) {
+#if RDMA_PROXY_HAVE_CUDA
+            if (diagnostics) {
+                char summary[384];
+                std::snprintf(summary, sizeof(summary),
+                    "nvlink_prepared/barrier_exit node=%d gpu=%d phase=%s iteration=%llu round=%llu polls=%llu error_lock_acquire_ns=%llu",
+                    config_.node_rank, config_.local_gpu_index,
+                    phase == LocalNvlinkBatchSyncPhase::kLocalInputStaging ? "local" : "remote",
+                    static_cast<unsigned long long>(iteration),
+                    static_cast<unsigned long long>(batch_round),
+                    static_cast<unsigned long long>(polls + 1),
+                    static_cast<unsigned long long>(error_lock_acquire_ns));
+                nvtxMarkA(summary);
+            }
+#endif
+            return batch_chunks;
+        }
         if ((++polls & 0x3ffULL) == 0 && std::chrono::steady_clock::now() >= deadline) {
             std::ostringstream out;
             out << "timed out waiting for prepared NVLink batch-start barrier"
