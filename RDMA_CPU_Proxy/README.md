@@ -643,7 +643,7 @@ and JSON configuration support these settings:
 | `nvlink_forward_prepared_queue_depth` | `2` | Reusable slots per proxy, including the slot being submitted; minimum 2. |
 
 The mode requires router routing, ordered chunks, batch API submission,
-completion notifications, local batch synchronization, and synchronization of
+completion notifications and synchronization of
 all destination copies after each batch. Round-robin and ping-pong must be off.
 These conditions are validated at startup.
 
@@ -651,14 +651,22 @@ In this mode the legacy token/chunk/min/max thresholds are ignored. Each remote
 peer's iteration is divided into exactly `n` received chunks per batch, except
 for its shorter final batch; the last chunk may itself contain fewer tokens.
 Local staging also uses `n` chunks plus a tail, but remains on the iteration
-coordinator thread. Both phases use the two-stage local batch-start handshake
-without negotiating chunk counts. Finished proxies retire from their phase;
-active proxies submit their own batch unchanged even when tails differ.
+coordinator thread. With `nvlink_forward_local_batch_sync_enabled=true`, both
+phases use the two-stage local batch-start handshake without negotiating chunk
+counts. Finished proxies retire from their phase; active proxies submit their
+own batch unchanged even when tails differ.
+
+Set `nvlink_forward_local_batch_sync_enabled=false` on all local proxies to
+skip the batch-start handshake in both phases. Each proxy then submits its
+prepared batches independently as they become ready. Per-batch CUDA stream
+synchronization, completion notifications, and the wait for that proxy's local
+staging to finish remain in place. This does not disable
+`local_iteration_sync_enabled` or iteration-end notification draining.
 
 The readiness thread scans immutable routing metadata, compacts destination
 positions, and builds the final CUDA pointer/size/attribute arrays directly in
 bounded reusable heap slots. It alone advances remote preparation cursors.
-The forwarding thread waits for local staging, enters the start barrier,
+The forwarding thread waits for local staging, enters the start barrier if enabled,
 submits once per nonempty destination, synchronizes the stream, performs any
 required GPUDirect visibility flush, and copies the prepared notifications into
 separate bounded reusable dispatch storage before releasing the slot. Batches

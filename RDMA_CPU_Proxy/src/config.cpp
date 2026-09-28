@@ -849,11 +849,10 @@ void validate_config(const ProxyConfig& config) {
             config.nvlink_forward_use_round_robin || config.nvlink_forward_out_of_order_chunks_enabled ||
             config.nvlink_forward_ping_pong_enabled || !config.nvlink_forward_use_batch_api ||
             !config.nvlink_forward_synchronize_batches ||
-            !config.nvlink_forward_completion_notifications_enabled ||
-            !config.nvlink_forward_local_batch_sync_enabled) {
+            !config.nvlink_forward_completion_notifications_enabled) {
             throw std::runtime_error(
                 "nvlink_forward_preparation_enabled requires ordered router NVLink forwarding, "
-                "batch API, synchronized batches, completion notifications and local batch sync; "
+                "batch API, synchronized batches and completion notifications; "
                 "round-robin, out-of-order and ping-pong must be disabled");
         }
         if (config.nvlink_forward_prepared_batch_chunks == 0 ||

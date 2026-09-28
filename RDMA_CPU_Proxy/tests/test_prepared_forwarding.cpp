@@ -93,8 +93,12 @@ int main() {
     // Two-entry ring is exercised over many batches/iterations; one-entry
     // notification rings force dispatch backpressure. n=1 includes empty-copy
     // batches; n=3 gives unequal tails; large n gives a single short batch.
-    for (int mode = 0; mode < 9; ++mode) {
-        std::cerr << "prepared forwarding test mode=" << mode << '\n';
+    // Run every scenario with and without the cross-proxy batch barrier.
+    for (int scenario = 0; scenario < 18; ++scenario) {
+        const int mode = scenario % 9;
+        const bool local_batch_sync = scenario < 9;
+        std::cerr << "prepared forwarding test mode=" << mode
+                  << " local_batch_sync=" << local_batch_sync << '\n';
         ProxyConfig config;
         config.node_rank = 0;
         config.num_nodes = mode == 4 ? 3 : 2;
@@ -117,7 +121,7 @@ int main() {
         config.nvlink_forward_prepared_queue_depth = 2;
         config.nvlink_forward_synchronize_batches = true;
         config.nvlink_forward_synchronize_iteration = false;
-        config.nvlink_forward_local_batch_sync_enabled = true;
+        config.nvlink_forward_local_batch_sync_enabled = local_batch_sync;
         config.nvlink_forward_completion_notifications_enabled = true;
         config.nvlink_forward_notification_queue_depth = 1;
         config.local_iteration_sync_enabled = true;
