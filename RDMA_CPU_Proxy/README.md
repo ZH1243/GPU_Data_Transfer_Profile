@@ -642,9 +642,8 @@ and JSON configuration support these settings:
 | `nvlink_forward_prepared_batch_chunks` | `0` | Required explicit positive `n` when enabled; no automatically chosen batch size. |
 | `nvlink_forward_prepared_queue_depth` | `2` | Reusable slots per proxy, including the slot being submitted; minimum 2. |
 
-The mode requires router routing, ordered chunks, batch API submission,
-completion notifications and synchronization of
-all destination copies after each batch. Round-robin and ping-pong must be off.
+The mode requires router routing, ordered chunks, batch API submission, and
+synchronization of all destination copies after each batch. Round-robin and ping-pong must be off.
 These conditions are validated at startup.
 
 In this mode the legacy token/chunk/min/max thresholds are ignored. Each remote
@@ -663,26 +662,40 @@ synchronization, completion notifications, and the wait for that proxy's local
 staging to finish remain in place. This does not disable
 `local_iteration_sync_enabled` or iteration-end notification draining.
 
+For a forwarding-only benchmark, set
+`nvlink_forward_completion_notifications_enabled=false` on all local proxies.
+Prepared forwarding and local input staging still copy the same data, but skip
+notification construction, enqueueing, dispatch/receiver threads, and draining.
+This mode requires `local_iteration_sync_enabled=true` so all local sources
+finish copying before destination buffers can be reused by the next iteration.
+Per-batch CUDA synchronization remains required; local batch synchronization
+can be either enabled or disabled. Notification logging and notification flush
+options must be disabled. Expert readiness and gather-table publication do not
+advance, so `--concurrent-kernel` cannot be used in this mode.
+
 The readiness thread scans immutable routing metadata, compacts destination
 positions, and builds the final CUDA pointer/size/attribute arrays directly in
 bounded reusable heap slots. It alone advances remote preparation cursors.
 The forwarding thread waits for local staging, enters the start barrier if enabled,
 submits once per nonempty destination, synchronizes the stream, performs any
-required GPUDirect visibility flush, and copies the prepared notifications into
+required GPUDirect visibility flush, and, when notifications are enabled, copies them into
 separate bounded reusable dispatch storage before releasing the slot. Batches
-with no outgoing copies still publish the direct same-GPU input notification.
+with no outgoing copies still publish the direct same-GPU input notification
+when notifications are enabled.
 
 Remote preparation can overlap local staging and earlier remote copies; remote
 submission cannot precede local staging completion. Iteration completion tracks
-completed chunks, not prepared chunks, and drains notification publication and
-receiver processing before iteration reuse. Queue waits respond to stop/error
+completed chunks, not prepared chunks, and, when notifications are enabled,
+drains notification publication and receiver processing before iteration reuse.
+Queue waits respond to stop/error
 signals; failed partial submissions retain argument storage through stream
 cleanup. Existing cross-process barrier timeouts still apply if another proxy
 fails or never participates.
 
 The shared-library C ABI and Python worker require no changes. CPU-only tests
 exercise mock copies, compaction, unequal tails, slot reuse, notification drain,
-and multiple iterations/peers. CUDA/GPUDirect behavior and performance require
+and multiple iterations/peers with notifications and batch barriers on and off.
+CUDA/GPUDirect behavior and performance require
 building and profiling on the remote Hopper systems. Compare identical fixed
 batch sizes when measuring preparation time, queue starvation, barrier time,
 submission gaps, and stream wait time.

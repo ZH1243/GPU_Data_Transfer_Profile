@@ -860,8 +860,11 @@ void validate_config(const ProxyConfig& config) {
         require_flag("nvlink_forward_ping_pong_enabled", config.nvlink_forward_ping_pong_enabled, false);
         require_flag("nvlink_forward_use_batch_api", config.nvlink_forward_use_batch_api, true);
         require_flag("nvlink_forward_synchronize_batches", config.nvlink_forward_synchronize_batches, true);
-        require_flag("nvlink_forward_completion_notifications_enabled",
-                     config.nvlink_forward_completion_notifications_enabled, true);
+        // Without notification draining, the iteration barrier protects local
+        // destination buffers from reuse while another source is still copying.
+        if (!config.nvlink_forward_completion_notifications_enabled) {
+            require_flag("local_iteration_sync_enabled", config.local_iteration_sync_enabled, true);
+        }
         if (!conflicts.empty()) {
             throw std::runtime_error(
                 "nvlink_forward_preparation_enabled=true has incompatible settings: " + conflicts);
@@ -987,10 +990,12 @@ void validate_config(const ProxyConfig& config) {
                 "router_local_input_staging_enabled requires router_routing_enabled=true "
                 "and nvlink_forwarding_enabled=true");
         }
-        if (!config.nvlink_forward_completion_notifications_enabled) {
+        if (!config.nvlink_forward_completion_notifications_enabled &&
+            !config.nvlink_forward_preparation_enabled) {
             throw std::runtime_error(
                 "router_local_input_staging_enabled requires "
-                "nvlink_forward_completion_notifications_enabled=true");
+                "nvlink_forward_completion_notifications_enabled=true or "
+                "nvlink_forward_preparation_enabled=true");
         }
         if (config.fill_test_data) {
             throw std::runtime_error(

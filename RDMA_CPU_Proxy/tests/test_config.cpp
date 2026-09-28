@@ -335,13 +335,13 @@ int main(int argc, char** argv) {
     // Report all conflicting flags even when the optional batch barrier is off.
     auto conflicting_prepared = unsynchronized_prepared;
     conflicting_prepared.nvlink_forward_synchronize_batches = false;
-    conflicting_prepared.nvlink_forward_completion_notifications_enabled = false;
+    conflicting_prepared.nvlink_forward_use_batch_api = false;
     bool conflicts_reported = false;
     try { rdma_proxy::validate_config(conflicting_prepared); }
     catch (const std::runtime_error& error) {
         const std::string message = error.what();
         assert(message.find("nvlink_forward_synchronize_batches=false (requires true)") != std::string::npos);
-        assert(message.find("nvlink_forward_completion_notifications_enabled=false (requires true)") != std::string::npos);
+        assert(message.find("nvlink_forward_use_batch_api=false (requires true)") != std::string::npos);
         assert(message.find("nvlink_forward_local_batch_sync_enabled") == std::string::npos);
         conflicts_reported = true;
     }
@@ -358,7 +358,10 @@ int main(int argc, char** argv) {
         if (invalid == 4) bad.nvlink_forward_use_round_robin = true;
         if (invalid == 5) bad.nvlink_forward_use_batch_api = false;
         if (invalid == 6) bad.nvlink_forward_synchronize_batches = false;
-        if (invalid == 7) bad.nvlink_forward_completion_notifications_enabled = false;
+        if (invalid == 7) {
+            bad.nvlink_forward_completion_notifications_enabled = false;
+            bad.local_iteration_sync_enabled = false;
+        }
         if (invalid == 8) bad.router_routing_enabled = false;
         if (invalid == 9) bad.nvlink_forwarding_enabled = false;
         if (invalid == 10) bad.nvlink_forward_prepared_batch_chunks = std::numeric_limits<std::size_t>::max();
@@ -373,7 +376,8 @@ int main(int argc, char** argv) {
         "--nvlink_forward_use_round_robin=false", "--nvlink_forward_use_batch_api=true",
         "--nvlink_forward_synchronize_batches=true",
         "--nvlink_forward_local_batch_sync_enabled=false",
-        "--nvlink_forward_completion_notifications_enabled=true",
+        "--nvlink_forward_completion_notifications_enabled=false",
+        "--local_iteration_sync_enabled=true",
         "--nvlink_forward_preparation_enabled=true",
         "--nvlink_forward_prepared_batch_chunks=17",
         "--nvlink_forward_prepared_queue_depth=3",
@@ -383,6 +387,7 @@ int main(int argc, char** argv) {
         const_cast<char**>(prepared_args));
     assert(parsed_prepared.nvlink_forward_preparation_enabled);
     assert(!parsed_prepared.nvlink_forward_local_batch_sync_enabled);
+    assert(!parsed_prepared.nvlink_forward_completion_notifications_enabled);
     rdma_proxy::validate_config(parsed_prepared);
     assert(parsed_prepared.nvlink_forward_prepared_batch_chunks == 17);
     assert(parsed_prepared.nvlink_forward_prepared_queue_depth == 3);
@@ -394,7 +399,8 @@ int main(int argc, char** argv) {
                        "num_gpus_per_node":2, "router_routing_enabled":true,
                        "num_experts":2, "top_k":1, "nvlink_forwarding_enabled":true,
                        "nvlink_forward_synchronize_batches":true,
-                       "nvlink_forward_completion_notifications_enabled":true,
+                       "nvlink_forward_completion_notifications_enabled":false,
+                       "local_iteration_sync_enabled":true,
                        "nvlink_forward_local_batch_sync_enabled":false,
                        "nvlink_forward_preparation_enabled":true,
                        "nvlink_forward_prepared_batch_chunks":19,
@@ -403,6 +409,7 @@ int main(int argc, char** argv) {
     const auto json_prepared = rdma_proxy::load_config_file("prepared_forwarding_config.json");
     assert(json_prepared.nvlink_forward_preparation_enabled);
     assert(!json_prepared.nvlink_forward_local_batch_sync_enabled);
+    assert(!json_prepared.nvlink_forward_completion_notifications_enabled);
     rdma_proxy::validate_config(json_prepared);
     assert(json_prepared.nvlink_forward_prepared_batch_chunks == 19);
     assert(json_prepared.nvlink_forward_prepared_queue_depth == 4);

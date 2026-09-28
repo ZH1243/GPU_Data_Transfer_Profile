@@ -249,6 +249,11 @@ class GroupedGemmRunner:
     ) -> None:
         self.torch = torch_module
         self.cuda_device_id = cuda_device_id
+        if not device_buffers.tensors_of_kind(DEVICE_BUFFER_GATHER_READY_ROWS):
+            raise RuntimeError(
+                "--concurrent-kernel requires the notification-driven router scheduler; "
+                "set --nvlink_forward_completion_notifications_enabled=true"
+            )
         capability = torch_module.cuda.get_device_capability(cuda_device_id)
         if capability[0] != 9:
             raise RuntimeError(

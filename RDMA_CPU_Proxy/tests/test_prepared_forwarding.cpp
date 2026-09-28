@@ -25,6 +25,14 @@ struct PreparedForwardingTestAccess {
 
     static void verify(Proxy& source, Proxy& receiver, uint64_t iteration) {
         const auto& config = source.config_;
+        if (!config.nvlink_forward_completion_notifications_enabled &&
+            (source.nvlink_forward_notification_dispatch_ ||
+             source.nvlink_forward_notification_header_ ||
+             source.nvlink_forward_notification_dispatch_thread_.joinable() ||
+             source.nvlink_forward_notification_thread_.joinable() ||
+             source.nvlink_forward_notifications_enqueued_.load() != 0)) {
+            throw std::runtime_error("disabled notifications still allocated or published");
+        }
         const auto token_bytes = config.token_dimension * dtype_size(config.dtype);
         std::size_t remote_batches = 0;
         auto check_input = [&](int node, const void* input, const std::vector<uint8_t>& masks) {
@@ -43,6 +51,7 @@ struct PreparedForwardingTestAccess {
                 }
                 ++compacted;
             }
+            if (!config.nvlink_forward_completion_notifications_enabled) return;
             const auto head = receiver.router_expert_token_head_state_for_source(node, config.local_gpu_index);
             if (head.received_token_frontier != compacted || (compacted && head.iteration != iteration)) {
                 throw std::runtime_error("prepared forwarding returned before notifications drained");
@@ -93,12 +102,14 @@ int main() {
     // Two-entry ring is exercised over many batches/iterations; one-entry
     // notification rings force dispatch backpressure. n=1 includes empty-copy
     // batches; n=3 gives unequal tails; large n gives a single short batch.
-    // Run every scenario with and without the cross-proxy batch barrier.
-    for (int scenario = 0; scenario < 18; ++scenario) {
+    // Exercise both notification modes with and without the batch barrier.
+    for (int scenario = 0; scenario < 36; ++scenario) {
         const int mode = scenario % 9;
-        const bool local_batch_sync = scenario < 9;
+        const bool local_batch_sync = (scenario / 9) % 2 == 0;
+        const bool notifications = scenario < 18;
         std::cerr << "prepared forwarding test mode=" << mode
-                  << " local_batch_sync=" << local_batch_sync << '\n';
+                  << " local_batch_sync=" << local_batch_sync
+                  << " notifications=" << notifications << '\n';
         ProxyConfig config;
         config.node_rank = 0;
         config.num_nodes = mode == 4 ? 3 : 2;
@@ -122,7 +133,7 @@ int main() {
         config.nvlink_forward_synchronize_batches = true;
         config.nvlink_forward_synchronize_iteration = false;
         config.nvlink_forward_local_batch_sync_enabled = local_batch_sync;
-        config.nvlink_forward_completion_notifications_enabled = true;
+        config.nvlink_forward_completion_notifications_enabled = notifications;
         config.nvlink_forward_notification_queue_depth = 1;
         config.local_iteration_sync_enabled = true;
         config.router_local_input_staging_enabled = mode < 5;

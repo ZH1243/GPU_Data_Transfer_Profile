@@ -1394,6 +1394,7 @@ void Proxy::enqueue_forward_completion_notifications(
 
 void Proxy::enqueue_prepared_notifications(
     const NvlinkForwardNotification* notifications, std::size_t count) {
+    if (!config_.nvlink_forward_completion_notifications_enabled) return;
     if (count == 0) return;
     if (count > 8) throw std::runtime_error("too many prepared notifications");
     auto& dispatch = *nvlink_forward_notification_dispatch_;
@@ -1427,6 +1428,7 @@ void Proxy::wait_for_forward_event(const std::shared_ptr<CudaForwardEvent>& even
 }
 
 void Proxy::drain_forwarding_iteration_notifications(uint64_t iteration) {
+    if (!config_.nvlink_forward_completion_notifications_enabled) return;
     // Called after all local batch submissions/completions and phase retirement.
     // Publish a watermark only after the dispatcher has sent the entire prefix.
     const auto deadline = std::chrono::steady_clock::now() +
@@ -3512,19 +3514,21 @@ void Proxy::issue_local_router_forwarding_batch(
     // The source GPU consumes the complete local-node x3 sequence directly
     // from its staging buffer, just as it consumes a remote same-index RDMA
     // receive buffer directly.
-    NvlinkForwardNotification direct;
-    direct.iteration = iteration;
-    direct.batch_index = batch_index_in_iteration;
-    direct.peer_slot = peers_.size();
-    direct.start_token = batch_start_token;
-    direct.num_tokens = batch_tokens;
-    direct.byte_offset = batch_start_token * token_bytes;
-    direct.bytes = batch_tokens * token_bytes;
-    direct.source_gpu = config_.local_gpu_index;
-    direct.destination_gpu = config_.local_gpu_index;
-    direct.peer_rank = config_.node_rank;
-    direct.flags = kDirectRdmaInputFlag;
-    completed_notifications.push_back(direct);
+    if (config_.nvlink_forward_completion_notifications_enabled) {
+        NvlinkForwardNotification direct;
+        direct.iteration = iteration;
+        direct.batch_index = batch_index_in_iteration;
+        direct.peer_slot = peers_.size();
+        direct.start_token = batch_start_token;
+        direct.num_tokens = batch_tokens;
+        direct.byte_offset = batch_start_token * token_bytes;
+        direct.bytes = batch_tokens * token_bytes;
+        direct.source_gpu = config_.local_gpu_index;
+        direct.destination_gpu = config_.local_gpu_index;
+        direct.peer_rank = config_.node_rank;
+        direct.flags = kDirectRdmaInputFlag;
+        completed_notifications.push_back(direct);
+    }
 
     for (std::size_t destination_index = 0;
          destination_index < forwarding_destinations_.size();
@@ -3587,19 +3591,21 @@ void Proxy::issue_local_router_forwarding_batch(
             config_.nvlink_forward_use_batch_api,
             config_.mock_mode);
 
-        NvlinkForwardNotification notification;
-        notification.iteration = iteration;
-        notification.batch_index = batch_index_in_iteration;
-        notification.peer_slot = peers_.size();
-        notification.start_token = destination_start_token;
-        notification.num_tokens = routed_tokens;
-        notification.byte_offset = destination_base_offset;
-        notification.bytes = bytes;
-        notification.source_gpu = config_.local_gpu_index;
-        notification.destination_gpu = dst.gpu_index;
-        notification.peer_rank = config_.node_rank;
-        notification.flags = 0;
-        completed_notifications.push_back(notification);
+        if (config_.nvlink_forward_completion_notifications_enabled) {
+            NvlinkForwardNotification notification;
+            notification.iteration = iteration;
+            notification.batch_index = batch_index_in_iteration;
+            notification.peer_slot = peers_.size();
+            notification.start_token = destination_start_token;
+            notification.num_tokens = routed_tokens;
+            notification.byte_offset = destination_base_offset;
+            notification.bytes = bytes;
+            notification.source_gpu = config_.local_gpu_index;
+            notification.destination_gpu = dst.gpu_index;
+            notification.peer_rank = config_.node_rank;
+            notification.flags = 0;
+            completed_notifications.push_back(notification);
+        }
     }
 
     // Completion notifications are enabled only with synchronized batches, so
@@ -3750,6 +3756,7 @@ void Proxy::prepare_forwarding_batch(
     batch.notification_count = 0;
     auto notify = [&](int gpu, std::size_t token_start, std::size_t tokens,
                       std::size_t byte_offset, uint32_t flags) {
+        if (!config_.nvlink_forward_completion_notifications_enabled) return;
         auto& entry = batch.notifications.at(batch.notification_count++);
         entry = {};
         entry.iteration = iteration;
