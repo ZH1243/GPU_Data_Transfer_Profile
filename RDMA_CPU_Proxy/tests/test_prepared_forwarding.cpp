@@ -14,11 +14,12 @@
 namespace rdma_proxy {
 // Test access stays outside the public embedding ABI.
 struct PreparedForwardingTestAccess {
-    static void test_barrier_generations() {
+    static void test_barrier_generations(bool ping_pong2 = false) {
         ProxyConfig config;
         config.mock_mode = true;
         config.num_gpus_per_node = 2;
         config.nvlink_forward_preparation_enabled = true;
+        config.nvlink_forward_ping_pong2_enabled = ping_pong2;
         config.nvlink_forward_local_batch_sync_enabled = true;
         config.completion_timeout_ms = 5000;
         config.local_iteration_sync_run_id = "test_prepared_barrier_" +
@@ -45,8 +46,12 @@ struct PreparedForwardingTestAccess {
                             progress[gpu][phase].store(iteration * 100 + round);
                             if ((iteration + round + gpu) % 3 == 0) std::this_thread::yield();
                             const std::size_t chunks = gpu == 0 ? 32 : 7;
-                            if (proxy.synchronize_local_nvlink_batch_start(
-                                    kind, iteration, round - 1, round, chunks) != chunks) {
+                            const auto result = ping_pong2 && phase == 1 ?
+                                proxy.synchronize_prepared_nvlink_batch_start(
+                                    kind, iteration, (round - 1) / 2 + 1, chunks, (round - 1) % 2) :
+                                proxy.synchronize_local_nvlink_batch_start(
+                                    kind, iteration, round - 1, round, chunks);
+                            if (result != chunks) {
                                 throw std::runtime_error("prepared barrier negotiated batch size");
                             }
                             if (progress[1 - gpu][phase].load() < iteration * 100 + round) {
@@ -65,6 +70,49 @@ struct PreparedForwardingTestAccess {
         std::thread a(run, 0), b(run, 1);
         a.join(); b.join();
         for (auto error : errors) if (error) std::rethrow_exception(error);
+    }
+
+    static void test_ping_pong2_dispatch_order() {
+        ProxyConfig config;
+        config.mock_mode = true;
+        config.nvlink_forward_preparation_enabled = true;
+        config.nvlink_forward_ping_pong2_enabled = true;
+        config.nvlink_forward_completion_notifications_enabled = true;
+        config.nvlink_forward_notification_queue_depth = 1;
+        config.completion_timeout_ms = 5000;
+        Proxy proxy(config);
+        proxy.initialize_prepared_forwarding();
+        proxy.initialize_nvlink_forward_notification_dispatch();
+        // Zero-record envelopes still occupy an ordered batch position. No
+        // CUDA or shared-memory destination is needed for this dispatch test.
+        proxy.enqueue_prepared_notifications(nullptr, 0, 1, 1);
+        proxy.nvlink_forward_notification_dispatch_thread_ =
+            std::thread(&Proxy::nvlink_forward_notification_dispatch_loop, &proxy);
+        std::atomic<bool> started{false}, enqueued{false};
+        std::exception_ptr error;
+        std::thread producer([&] {
+            try {
+                started.store(true);
+                proxy.enqueue_prepared_notifications(nullptr, 0, 1, 3);
+                enqueued.store(true);
+            } catch (...) { error = std::current_exception(); }
+        });
+        while (!started.load()) std::this_thread::yield();
+        // B's queue must stay full until the missing A envelope arrives,
+        // even though B has already completed its later batch.
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        const bool overtook = enqueued.load();
+        proxy.enqueue_prepared_notifications(nullptr, 0, 0, 0);
+        producer.join();
+        if (error) std::rethrow_exception(error);
+        proxy.enqueue_prepared_notifications(nullptr, 0, 0, 2);
+        proxy.enqueue_prepared_notifications(nullptr, 0, 0, 4);
+        // An odd iteration tail is followed by A again, not B. The global
+        // dispatch sequence must survive this lane-parity reset.
+        proxy.enqueue_prepared_notifications(nullptr, 0, 0, 5);
+        proxy.stop_forwarding_thread();
+        proxy.check_forwarding_error();
+        if (overtook) throw std::runtime_error("dispatch overtook the missing batch");
     }
 
     static void fill_source(Proxy& proxy, uint64_t iteration) {
@@ -149,20 +197,25 @@ struct PreparedForwardingTestAccess {
 };
 } // namespace rdma_proxy
 
-int main() {
+int main(int argc, char** argv) {
     using namespace rdma_proxy;
     Logger::instance().set_level(LogLevel::kError);
-    PreparedForwardingTestAccess::test_barrier_generations();
+    const bool ping_pong2_only = argc == 2 && std::string(argv[1]) == "--ping-pong2-only";
+    if (argc != 1 && !ping_pong2_only) throw std::runtime_error("unknown test argument");
+    PreparedForwardingTestAccess::test_barrier_generations(ping_pong2_only);
+    if (ping_pong2_only) PreparedForwardingTestAccess::test_ping_pong2_dispatch_order();
     // Two-entry ring is exercised over many batches/iterations; one-entry
     // notification rings force dispatch backpressure. n=1 includes empty-copy
     // batches; n=3 gives unequal tails; large n gives a single short batch.
     // Exercise both notification modes with and without the batch barrier.
-    for (int scenario = 0; scenario < 36; ++scenario) {
+    for (int scenario = ping_pong2_only ? 36 : 0; scenario < (ping_pong2_only ? 72 : 36); ++scenario) {
         const int mode = scenario % 9;
         const bool local_batch_sync = (scenario / 9) % 2 == 0;
-        const bool notifications = scenario < 18;
+        const bool notifications = scenario % 36 < 18;
+        const bool ping_pong2 = scenario >= 36;
         std::cerr << "prepared forwarding test mode=" << mode
                   << " local_batch_sync=" << local_batch_sync
+                  << " ping_pong2=" << ping_pong2
                   << " notifications=" << notifications << '\n';
         ProxyConfig config;
         config.node_rank = 0;
@@ -182,6 +235,7 @@ int main() {
         config.router_top_k = 1;
         config.nvlink_forwarding_enabled = true;
         config.nvlink_forward_preparation_enabled = true;
+        config.nvlink_forward_ping_pong2_enabled = ping_pong2;
         config.nvlink_forward_prepared_batch_chunks = mode == 0 ? 1 : mode == 2 ? 1000 : 3;
         config.nvlink_forward_prepared_queue_depth = 2;
         config.nvlink_forward_synchronize_batches = true;

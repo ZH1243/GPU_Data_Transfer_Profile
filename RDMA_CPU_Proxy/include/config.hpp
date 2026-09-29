@@ -77,6 +77,7 @@ struct ProxyConfig {
     // Opt-in CPU preparation pipeline. n must be chosen explicitly; legacy
     // thresholds are ignored in this mode (including local staging batches).
     bool nvlink_forward_preparation_enabled{false};
+    bool nvlink_forward_ping_pong2_enabled{false};
     bool nvlink_forward_prepared_nvtx_enabled{false};
     std::size_t nvlink_forward_prepared_batch_chunks{0};
     std::size_t nvlink_forward_prepared_queue_depth{2};

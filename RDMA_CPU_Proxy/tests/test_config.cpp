@@ -346,6 +346,15 @@ int main(int argc, char** argv) {
         conflicts_reported = true;
     }
     assert(conflicts_reported);
+    assert(!prepared_config.nvlink_forward_ping_pong2_enabled);
+    auto ping_pong2 = prepared_config;
+    ping_pong2.nvlink_forward_ping_pong2_enabled = true;
+    rdma_proxy::validate_config(ping_pong2);
+    ping_pong2.nvlink_forward_preparation_enabled = false;
+    bool ping_pong2_rejected = false;
+    try { rdma_proxy::validate_config(ping_pong2); }
+    catch (const std::runtime_error&) { ping_pong2_rejected = true; }
+    assert(ping_pong2_rejected);
     auto large_prepared = prepared_config;
     large_prepared.nvlink_forward_prepared_batch_chunks = large_prepared.num_tokens + 1;
     rdma_proxy::validate_config(large_prepared);
@@ -379,6 +388,7 @@ int main(int argc, char** argv) {
         "--nvlink_forward_completion_notifications_enabled=false",
         "--local_iteration_sync_enabled=true",
         "--nvlink_forward_preparation_enabled=true",
+        "--nvlink_forward_ping_pong2_enabled=true",
         "--nvlink_forward_prepared_batch_chunks=17",
         "--nvlink_forward_prepared_queue_depth=3",
     };
@@ -386,6 +396,9 @@ int main(int argc, char** argv) {
         static_cast<int>(sizeof(prepared_args) / sizeof(prepared_args[0])),
         const_cast<char**>(prepared_args));
     assert(parsed_prepared.nvlink_forward_preparation_enabled);
+    assert(parsed_prepared.nvlink_forward_ping_pong2_enabled);
+    assert(rdma_proxy::config_summary(parsed_prepared).find(
+        "nvlink_forward_ping_pong2_enabled=true") != std::string::npos);
     assert(!parsed_prepared.nvlink_forward_local_batch_sync_enabled);
     assert(!parsed_prepared.nvlink_forward_completion_notifications_enabled);
     rdma_proxy::validate_config(parsed_prepared);
@@ -403,11 +416,13 @@ int main(int argc, char** argv) {
                        "local_iteration_sync_enabled":true,
                        "nvlink_forward_local_batch_sync_enabled":false,
                        "nvlink_forward_preparation_enabled":true,
+                       "nvlink_forward_ping_pong2_enabled":true,
                        "nvlink_forward_prepared_batch_chunks":19,
                        "nvlink_forward_prepared_queue_depth":4})json";
     }
     const auto json_prepared = rdma_proxy::load_config_file("prepared_forwarding_config.json");
     assert(json_prepared.nvlink_forward_preparation_enabled);
+    assert(json_prepared.nvlink_forward_ping_pong2_enabled);
     assert(!json_prepared.nvlink_forward_local_batch_sync_enabled);
     assert(!json_prepared.nvlink_forward_completion_notifications_enabled);
     rdma_proxy::validate_config(json_prepared);

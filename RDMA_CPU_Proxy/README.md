@@ -578,6 +578,7 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_min_threshold_chunks`
 - `nvlink_forward_max_threshold_chunks`
 - `nvlink_forward_preparation_enabled`
+- `nvlink_forward_ping_pong2_enabled` (default `false`)
 - `nvlink_forward_prepared_batch_chunks`
 - `nvlink_forward_prepared_queue_depth`
 - `nvlink_forward_prepared_nvtx_enabled`
@@ -784,6 +785,83 @@ instrumentation itself; CPU descheduling can extend any range. NVTX adds
 measurement overhead, so compare instrumented timings with the earlier trace.
 The presence of an approximately 10 microsecond gap alone does not identify
 its cause, even on the slowest proxy.
+
+### Opt-in ping-pong2 prepared forwarding
+
+Add `--nvlink_forward_ping_pong2_enabled=true` to **both** torchrun commands,
+keeping the preparation options, for example:
+
+```bash
+RDMA_CPU_Proxy/scripts/run_node0_torchrun.sh \
+  --local_forwarding_rdma_overlap_enabled=true \
+  --nvlink_forward_local_batch_sync_enabled=true \
+  --nvlink_forward_completion_notifications_enabled=false \
+  --nvlink_forward_preparation_enabled=true \
+  --nvlink_forward_prepared_batch_chunks=64 \
+  --nvlink_forward_prepared_queue_depth=2 \
+  --nvlink_forward_prepared_nvtx_enabled=true \
+  --nvlink_forward_ping_pong2_enabled=true
+```
+
+Use `run_node1_torchrun.sh` with the same options on node 1. The new flag is
+also accepted in JSON. Its default is `false`, which keeps the existing
+single-consumer prepared path and existing event-based ping-pong behavior.
+Ping-pong2 requires preparation and its existing prerequisites; it cannot be
+combined with `nvlink_forward_ping_pong_enabled=true`. It supports completion
+notifications and local batch synchronization independently enabled or disabled,
+subject to the existing preparation validation rules.
+
+One preparation thread assigns remote batches alternately to independent A/B
+queues. `nvlink_forward_prepared_queue_depth` is **per lane** in this mode,
+including each lane's retained batch: depth 2 allocates four slots total.
+Local-input staging remains on the coordinator thread. Every iteration starts
+on A, even after an odd number of batches in the preceding iteration.
+
+Each forwarding lane acquires its next prepared batch, waits for local staging,
+and then **busy-polls an atomic submission sequence**. Only the owner enters
+its local batch-start barrier and submits copies on the shared CUDA stream.
+A synchronizes with A on other local proxies; B synchronizes with B, using
+separate arrival slots and lane-specific rounds. A retired remote phase also
+satisfies subsequent rounds, so unequal tails and zero-batch proxies are allowed.
+After successful `cudaStreamSynchronize`, the owner releases the stream mutex
+and signals the next sequence before notification handoff, statistics, slot
+release, or producer wakeup. The other lane can execute while that cleanup runs.
+A failed synchronization does not pass ownership. Failure/stop flags and periodic
+timeout checks terminate handoff polling; successful barrier polls avoid the
+statistics/error mutex.
+
+Notifications use two bounded lane queues (each sized by
+`nvlink_forward_notification_queue_depth`) and the existing single dispatcher.
+The dispatcher publishes one complete batch envelope at a time in submission
+sequence order, even if a later lane enqueues first. Empty envelopes still advance
+the sequence. Local-staging notifications retain their existing queue and precede
+remote publication for that iteration. Any required direct-input GPUDirect owner
+flush runs after handoff but before the corresponding envelope is enqueued.
+The receiver and gather-table update path are unchanged. Iteration retirement
+waits for both lanes' copy, notification handoff, accounting, and slot release;
+notification draining still completes before iteration reuse.
+
+With `nvlink_forward_prepared_nvtx_enabled=true`, the existing prepared ranges
+appear on both forwarding threads, with additional ranges:
+
+- `nvlink_ping_pong2/handoff_wait_A` and `handoff_wait_B`: busy-polling for ownership.
+- `nvlink_ping_pong2/handoff_publish`: publishing ownership after releasing the stream mutex.
+
+Remote barrier markers include `lane=A` or `lane=B`; `round` is one-based within
+that lane and iteration. `error_lock_acquire_ns=0` in ping-pong2 reflects the
+atomic error-check path, rather than a measured lock acquisition. Batch timing
+ends at stream synchronization, excluding the overlapped notification/flush work.
+The remaining copy-to-copy gap includes handoff observation, barrier work, stream
+lock acquisition, and submission overhead. Queue starvation, CPU descheduling,
+or slow cleanup can still add latency. Existing CPU affinity chooses an allowed
+CPU set; it does not dedicate separate physical cores to the two spinning lanes.
+
+Rebuild the shared library on both Hopper nodes and upgrade all local workers
+together: the local synchronization shared-memory layout is now version 7.
+CPU mock tests cover both modes, unequal tails, empty inputs/copies, multiple
+peers and iterations, bounded queues, notification reordering, and shutdown/error
+paths. CUDA synchronization, GPUDirect visibility, and latency improvements must
+be validated on the remote Hopper systems.
 
 ## Current Limitations and TODOs
 

@@ -126,7 +126,10 @@ private:
                                  uint64_t iteration, std::size_t first_chunk, std::size_t chunks);
     void prepared_forwarding_ready_loop();
     void prepared_forwarding_loop();
-    void enqueue_prepared_notifications(const NvlinkForwardNotification* notifications, std::size_t count);
+    void ping_pong2_ready_loop();
+    void ping_pong2_forwarding_loop(int lane);
+    void enqueue_prepared_notifications(const NvlinkForwardNotification* notifications, std::size_t count,
+                                        int lane = -1, uint64_t sequence = 0);
     struct ForwardNotificationDestinationState {
         int gpu_index{-1};
         NvlinkForwardNotificationHeader* header{nullptr};
@@ -176,7 +179,7 @@ private:
     void flush_nvlink_forward_notification_log_queue();
     std::size_t synchronize_prepared_nvlink_batch_start(
         LocalNvlinkBatchSyncPhase phase, uint64_t iteration,
-        uint64_t batch_round, std::size_t batch_chunks) const;
+        uint64_t batch_round, std::size_t batch_chunks, int lane = -1) const;
     std::size_t synchronize_local_nvlink_batch_start(
         LocalNvlinkBatchSyncPhase phase,
         uint64_t iteration,
