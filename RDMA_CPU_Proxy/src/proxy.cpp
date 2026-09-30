@@ -144,6 +144,7 @@ struct Proxy::NvlinkForwardNotificationDispatchState {
 struct Proxy::PreparedForwardingBatch {
     uint64_t submission_sequence{0};
     uint64_t lane_round{0};
+    double copy_seconds{0}; // X writes before publishing completion to Y
     uint64_t iteration{0};
     std::size_t peer_index{0};
     std::size_t first_chunk{0};
@@ -164,11 +165,14 @@ struct Proxy::PreparedForwardingState {
     } lanes[2];
     // CPU ownership token: only the expected sequence may enter the barrier/CUDA.
     alignas(64) std::atomic<uint64_t> next_sequence{0};
+    // X publishes a completed prefix; Y retires slots via consumed under mutex.
+    alignas(64) std::atomic<std::size_t> copy_completed{0};
     std::mutex mutex;
     std::condition_variable changed;
     std::vector<PreparedForwardingBatch> slots;
     // Producer alone fills slots[produced % capacity]; consumer retains its
     // slot until completion and notification handoff, then advances consumed.
+    // In submit/epilogue mode X has a separate cursor; only Y advances consumed.
     std::size_t produced{0};
     std::size_t consumed{0};
     std::atomic<bool> failed{false};
@@ -2835,7 +2839,8 @@ void Proxy::start_forwarding_thread() {
     }
     forwarding_ready_thread_ = std::thread(&Proxy::forwarding_ready_loop, this);
     forwarding_thread_ = std::thread(&Proxy::forwarding_loop, this, 0);
-    if (config_.nvlink_forward_ping_pong_enabled || config_.nvlink_forward_ping_pong2_enabled) {
+    if (config_.nvlink_forward_ping_pong_enabled || config_.nvlink_forward_ping_pong2_enabled ||
+        config_.nvlink_forward_submit_epilogue_enabled) {
         forwarding_second_thread_ = std::thread(&Proxy::forwarding_loop, this, 1);
     }
     const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config_);
@@ -4076,6 +4081,9 @@ void Proxy::prepared_forwarding_ready_loop() {
                 ScopedPreparedRange publish(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepare/publish_batch");
                 {
                     std::lock_guard<std::mutex> lock(state.mutex);
+                    if (config_.nvlink_forward_submit_epilogue_enabled) {
+                        forwarding_batches_in_flight_.fetch_add(1);
+                    }
                     ++state.produced; // mutex release publishes all argument arrays
                 }
                 state.changed.notify_all();
@@ -4268,6 +4276,134 @@ void Proxy::prepared_forwarding_loop() {
         release.end();
         ScopedPreparedRange wake(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/wake_producer");
         state.changed.notify_all();
+    }
+}
+
+void Proxy::submit_forwarding_loop() {
+    select_cuda_device_for_thread(config_.cuda_device_id, config_.mock_mode);
+    auto& state = *prepared_forwarding_;
+    uint64_t current_iteration = std::numeric_limits<uint64_t>::max();
+    uint64_t round = 0;
+    std::size_t submitted = 0;
+    const auto cancelled = [&] { return forwarding_stop_.load() || state.failed.load(); };
+    while (!cancelled()) {
+        PreparedForwardingBatch* batch;
+        {
+            ScopedPreparedRange acquire(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/acquire_next_batch");
+            ScopedPreparedRange queue_lock(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/queue_lock");
+            std::unique_lock<std::mutex> lock(state.mutex);
+            queue_lock.end();
+            while (!cancelled() && state.produced == submitted) {
+                ScopedPreparedRange wait(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/queue_empty_wait");
+                state.changed.wait_for(lock, std::chrono::milliseconds(1));
+            }
+            if (cancelled()) return;
+            batch = &state.slots[submitted % state.slots.size()];
+            while (!cancelled() && config_.router_local_input_staging_enabled &&
+                   local_router_forwarding_completed_iterations_.load() < batch->iteration + 1) {
+                ScopedPreparedRange wait(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/local_staging_wait");
+                state.changed.wait_for(lock, std::chrono::milliseconds(1));
+            }
+            if (cancelled()) return;
+        }
+        ScopedPreparedRange setup(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/iteration_bookkeeping");
+        if (current_iteration != batch->iteration) {
+            current_iteration = batch->iteration;
+            round = 0;
+        }
+        setup.end();
+        // Start-only in this mode: the immutable prepared range is never shrunk.
+        ScopedPreparedRange barrier(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/local_batch_barrier");
+        synchronize_local_nvlink_batch_start(LocalNvlinkBatchSyncPhase::kRemoteForwarding,
+            batch->iteration, batch->batch_index, ++round, batch->chunk_count);
+        barrier.end();
+        const auto start = std::chrono::steady_clock::now();
+        {
+            ScopedPreparedRange stream_acquire(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/stream_lock");
+            std::lock_guard<std::mutex> stream_lock(forwarding_stream_mutex_);
+            stream_acquire.end();
+            ScopedPreparedRange submit(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/submit_copies");
+            for (auto& destination : batch->destinations) {
+                launch_cuda_prepared_forward_batch_async(destination, forwarding_stream_, config_.mock_mode);
+            }
+            submit.end();
+            ScopedPreparedRange sync(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/stream_sync");
+            synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
+            sync.end();
+        }
+        batch->copy_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start).count();
+        // This is the last access to the slot by X: Y can immediately retire it.
+        ScopedPreparedRange signal(config_.nvlink_forward_prepared_nvtx_enabled,
+                                   "nvlink_submit_epilogue/copy_done_publish");
+        state.copy_completed.store(++submitted, std::memory_order_release);
+    }
+}
+
+void Proxy::epilogue_forwarding_loop() {
+    auto& state = *prepared_forwarding_;
+    std::size_t retired = 0;
+    const auto cancelled = [&] { return forwarding_stop_.load() || state.failed.load(); };
+    while (!cancelled()) {
+        {
+            ScopedPreparedRange wait(config_.nvlink_forward_prepared_nvtx_enabled,
+                                     "nvlink_submit_epilogue/copy_done_wait");
+            while (state.copy_completed.load(std::memory_order_acquire) == retired) {
+                if (cancelled()) return;
+                cpu_relax();
+            }
+        }
+        if (cancelled()) return;
+        auto* batch = &state.slots[retired % state.slots.size()];
+        if (forwarding_rdma_owner_flush_required_) {
+            ScopedPreparedRange flush(config_.nvlink_forward_prepared_nvtx_enabled,
+                                      "nvlink_prepared/rdma_owner_flush");
+            flush_gpudirect_rdma_writes(config_.cuda_device_id, config_.mock_mode);
+        }
+        const auto seconds = batch->copy_seconds;
+        ScopedPreparedRange notifications(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/notification_handoff");
+        enqueue_prepared_notifications(batch->notifications.data(), batch->notification_count);
+        notifications.end();
+        {
+            ScopedPreparedRange stats_range(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/completion_stats");
+            ScopedPreparedRange stats_lock(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/stats_lock");
+            std::lock_guard<std::mutex> lock(forwarding_mutex_);
+            stats_lock.end();
+            auto& stats = forwarding_iteration_stats_.at(batch->iteration);
+            ++stats.batch_count;
+            stats.total_bytes += batch->bytes;
+            if (batch->bytes != 0) {
+                ++stats.bandwidth_sample_count;
+                stats.total_seconds += seconds;
+                const auto gbps = seconds > 0 ? batch->bytes / seconds / 1.0e9 : 0.0;
+                stats.sum_batch_bandwidth_gbytes_per_sec += gbps;
+                stats.sum_batch_bandwidth_gbits_per_sec += gbps * 8.0;
+            }
+            // These remain COMPLETED chunks, never preparation progress.
+            forwarding_next_chunk_by_peer_[batch->peer_index] += batch->chunk_count;
+        }
+        ScopedPreparedRange logging(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/batch_counter_and_log");
+        forwarding_batches_issued_.fetch_add(1);
+        if (config_.nvlink_forward_log_batches) {
+            RDMA_PROXY_LOG_INFO("nvlink_forward_prepared_batch_complete iteration=", batch->iteration,
+                " peer_rank=", peers_[batch->peer_index].peer_rank,
+                " batch=", batch->batch_index, " chunks=", batch->chunk_count,
+                " bytes=", batch->bytes);
+        }
+        logging.end();
+        ScopedPreparedRange release(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/release_slot");
+        {
+            ScopedPreparedRange queue_lock(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/release_slot_lock");
+            std::lock_guard<std::mutex> lock(state.mutex);
+            queue_lock.end();
+            ++state.consumed;
+        }
+        release.end();
+        ScopedPreparedRange wake(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/wake_producer");
+        state.changed.notify_all();
+        ++retired;
+        // Last: iteration completion must include notification enqueue and release.
+        forwarding_batches_in_flight_.fetch_sub(1);
     }
 }
 
@@ -4649,7 +4785,11 @@ void Proxy::record_out_of_order_forwarding_arrival(
 void Proxy::forwarding_loop(int lane) {
     try {
         if (config_.nvlink_forward_preparation_enabled) {
-            if (config_.nvlink_forward_ping_pong2_enabled) ping_pong2_forwarding_loop(lane);
+            if (config_.nvlink_forward_submit_epilogue_enabled) {
+                if (lane == 0) submit_forwarding_loop();
+                else epilogue_forwarding_loop();
+            }
+            else if (config_.nvlink_forward_ping_pong2_enabled) ping_pong2_forwarding_loop(lane);
             else prepared_forwarding_loop();
             return;
         }
@@ -5123,7 +5263,8 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
                 }
             }
         }
-        if (complete && (config_.nvlink_forward_ping_pong_enabled || config_.nvlink_forward_ping_pong2_enabled) &&
+        if (complete && (config_.nvlink_forward_ping_pong_enabled || config_.nvlink_forward_ping_pong2_enabled ||
+                         config_.nvlink_forward_submit_epilogue_enabled) &&
             forwarding_batches_in_flight_.load() != 0) {
             complete = false;
         }

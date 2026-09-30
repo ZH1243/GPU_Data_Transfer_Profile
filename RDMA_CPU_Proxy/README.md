@@ -579,6 +579,7 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_max_threshold_chunks`
 - `nvlink_forward_preparation_enabled`
 - `nvlink_forward_ping_pong2_enabled` (default `false`)
+- `nvlink_forward_submit_epilogue_enabled` (default `false`)
 - `nvlink_forward_prepared_batch_chunks`
 - `nvlink_forward_prepared_queue_depth`
 - `nvlink_forward_prepared_nvtx_enabled`
@@ -785,6 +786,68 @@ instrumentation itself; CPU descheduling can extend any range. NVTX adds
 measurement overhead, so compare instrumented timings with the earlier trace.
 The presence of an approximately 10 microsecond gap alone does not identify
 its cause, even on the slowest proxy.
+
+### Opt-in submit/epilogue prepared forwarding
+
+Set `--nvlink_forward_submit_epilogue_enabled=true` on both nodes to keep one
+remote-copy submitter X and one epilogue worker Y. The default is `false`, which
+preserves the existing forwarding paths. This mode requires preparation and its
+prerequisites, and rejects either ping-pong mode being enabled at the same time.
+Both CLI and JSON configuration accept the flag; the torchrun scripts pass it
+through to the embedded shared library.
+
+For example, after rebuilding the shared library on both Hopper nodes:
+
+```bash
+RDMA_CPU_Proxy/scripts/run_node0_torchrun.sh \
+  --num_experts=128 --top_k=128 \
+  --local_forwarding_rdma_overlap_enabled=true \
+  --nvlink_forward_local_batch_sync_enabled=true \
+  --nvlink_forward_completion_notifications_enabled=false \
+  --nvlink_forward_preparation_enabled=true \
+  --nvlink_forward_prepared_batch_chunks=64 \
+  --nvlink_forward_prepared_queue_depth=4 \
+  --nvlink_forward_prepared_nvtx_enabled=true \
+  --nvlink_forward_ping_pong_enabled=false \
+  --nvlink_forward_ping_pong2_enabled=false \
+  --nvlink_forward_submit_epilogue_enabled=true
+```
+
+Run `run_node1_torchrun.sh` with the same options on node 1.
+
+Preparation publishes immutable copy arguments and notification records into one
+shared ring. X waits for local staging, enters the ordinary prepared batch-start
+barrier with the other local X threads, submits the copies on the forwarding
+stream, and calls `cudaStreamSynchronize`. Only successful synchronization permits
+X to publish an atomic completed-prefix count with release ordering. X then
+continues to the next batch without waiting for Y.
+
+Y acquire-loads that count and handles completed batches in order: optional
+GPUDirect owner flush, notification enqueue, statistics/progress updates, and
+slot release. Notification enqueue copies records into the existing dispatch
+queue before release; actual delivery remains the dispatcher's responsibility.
+Without notifications, Y still updates progress and releases every slot. Failed
+submission or synchronization cancels the pipeline without publishing success.
+Iteration completion includes Y's retirement and the existing notification drain.
+Local staging continues to run on the coordinator thread.
+
+Queue depth is the **total number of shared slots**, with a minimum of two.
+Depth two allows X and Y to overlap; depth three or more also leaves room for
+preparation while both workers retain a slot. Depth four matches the total slot
+capacity of ping-pong2 with depth two per lane. A slow epilogue fills the bounded
+ring and eventually backpressures X through preparation.
+
+Y busy-polls completion with `cpu_relax`, so the completion signal from X needs
+no condition-variable wakeup. Both workers observe cancellation. Automatic CPU
+affinity only selects an allowed CPU set; it does not dedicate separate physical
+cores. Profile CPU contention when evaluating this mode.
+
+With prepared NVTX enabled, X retains `nvlink_prepared/submit_copies` and
+`nvlink_prepared/stream_sync`; Y owns the existing notification, statistics, and
+release ranges. Additional markers are `nvlink_submit_epilogue/copy_done_publish`
+and `nvlink_submit_epilogue/copy_done_wait`. Batch copy timing ends before the
+completion signal and excludes Y's epilogue. Performance improvement requires
+measurement on the target GPUs; mock tests verify ordering and lifecycle only.
 
 ### Opt-in ping-pong2 prepared forwarding
 

@@ -126,6 +126,8 @@ private:
                                  uint64_t iteration, std::size_t first_chunk, std::size_t chunks);
     void prepared_forwarding_ready_loop();
     void prepared_forwarding_loop();
+    void submit_forwarding_loop();
+    void epilogue_forwarding_loop();
     void ping_pong2_ready_loop();
     void ping_pong2_forwarding_loop(int lane);
     void enqueue_prepared_notifications(const NvlinkForwardNotification* notifications, std::size_t count,

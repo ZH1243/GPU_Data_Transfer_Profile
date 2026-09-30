@@ -355,6 +355,20 @@ int main(int argc, char** argv) {
     try { rdma_proxy::validate_config(ping_pong2); }
     catch (const std::runtime_error&) { ping_pong2_rejected = true; }
     assert(ping_pong2_rejected);
+    assert(!prepared_config.nvlink_forward_submit_epilogue_enabled);
+    auto submit_epilogue = prepared_config;
+    submit_epilogue.nvlink_forward_submit_epilogue_enabled = true;
+    rdma_proxy::validate_config(submit_epilogue);
+    for (int conflict = 0; conflict < 3; ++conflict) {
+        auto bad = submit_epilogue;
+        if (conflict == 0) bad.nvlink_forward_preparation_enabled = false;
+        if (conflict == 1) bad.nvlink_forward_ping_pong_enabled = true;
+        if (conflict == 2) bad.nvlink_forward_ping_pong2_enabled = true;
+        bool rejected = false;
+        try { rdma_proxy::validate_config(bad); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+    }
     auto large_prepared = prepared_config;
     large_prepared.nvlink_forward_prepared_batch_chunks = large_prepared.num_tokens + 1;
     rdma_proxy::validate_config(large_prepared);
@@ -406,6 +420,16 @@ int main(int argc, char** argv) {
     assert(parsed_prepared.nvlink_forward_prepared_queue_depth == 3);
     assert(rdma_proxy::config_summary(parsed_prepared).find(
         "nvlink_forward_prepared_batch_chunks=17") != std::string::npos);
+    // Exercise the new CLI flag without replacing coverage of the old mode.
+    std::vector<const char*> split_args(std::begin(prepared_args), std::end(prepared_args));
+    split_args.push_back("--nvlink_forward_ping_pong2_enabled=false");
+    split_args.push_back("--nvlink_forward_submit_epilogue_enabled=true");
+    const auto parsed_split = rdma_proxy::load_config(
+        static_cast<int>(split_args.size()), const_cast<char**>(split_args.data()));
+    assert(parsed_split.nvlink_forward_submit_epilogue_enabled);
+    rdma_proxy::validate_config(parsed_split);
+    assert(rdma_proxy::config_summary(parsed_split).find(
+        "nvlink_forward_submit_epilogue_enabled=true") != std::string::npos);
     {
         std::ofstream json("prepared_forwarding_config.json");
         json << R"json({"num_tokens":65, "token_dimension":8, "tokens_per_chunk":4,
@@ -428,6 +452,20 @@ int main(int argc, char** argv) {
     rdma_proxy::validate_config(json_prepared);
     assert(json_prepared.nvlink_forward_prepared_batch_chunks == 19);
     assert(json_prepared.nvlink_forward_prepared_queue_depth == 4);
+
+    {
+        std::ofstream json("submit_epilogue_config.json");
+        json << R"json({"num_tokens":65, "token_dimension":8, "tokens_per_chunk":4,
+                       "num_gpus_per_node":2, "router_routing_enabled":true,
+                       "num_experts":2, "top_k":1, "nvlink_forwarding_enabled":true,
+                       "nvlink_forward_synchronize_batches":true,
+                       "nvlink_forward_completion_notifications_enabled":false,
+                       "local_iteration_sync_enabled":true,
+                       "nvlink_forward_preparation_enabled":true,
+                       "nvlink_forward_prepared_batch_chunks":19,
+                       "nvlink_forward_submit_epilogue_enabled":true})json";
+    }
+    assert(rdma_proxy::load_config_file("submit_epilogue_config.json").nvlink_forward_submit_epilogue_enabled);
 
     auto valid_flush_only_config = router_nvlink_config;
     valid_flush_only_config.nvlink_forward_synchronize_batches = true;

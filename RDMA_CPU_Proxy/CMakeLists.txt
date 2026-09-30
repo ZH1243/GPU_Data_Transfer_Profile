@@ -130,6 +130,8 @@ if(RDMA_PROXY_BUILD_TESTS)
   target_link_libraries(test_prepared_forwarding PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_prepared_forwarding COMMAND test_prepared_forwarding)
   set_tests_properties(test_prepared_forwarding PROPERTIES TIMEOUT 120)
+  add_test(NAME test_submit_epilogue COMMAND test_prepared_forwarding --submit-epilogue-only)
+  set_tests_properties(test_submit_epilogue PROPERTIES TIMEOUT 120)
   add_test(NAME test_ping_pong2 COMMAND test_prepared_forwarding --ping-pong2-only)
   set_tests_properties(test_ping_pong2 PROPERTIES TIMEOUT 120)
 

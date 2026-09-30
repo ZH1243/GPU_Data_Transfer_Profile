@@ -201,7 +201,8 @@ int main(int argc, char** argv) {
     using namespace rdma_proxy;
     Logger::instance().set_level(LogLevel::kError);
     const bool ping_pong2_only = argc == 2 && std::string(argv[1]) == "--ping-pong2-only";
-    if (argc != 1 && !ping_pong2_only) throw std::runtime_error("unknown test argument");
+    const bool submit_epilogue_only = argc == 2 && std::string(argv[1]) == "--submit-epilogue-only";
+    if (argc != 1 && !ping_pong2_only && !submit_epilogue_only) throw std::runtime_error("unknown test argument");
     PreparedForwardingTestAccess::test_barrier_generations(ping_pong2_only);
     if (ping_pong2_only) PreparedForwardingTestAccess::test_ping_pong2_dispatch_order();
     // Two-entry ring is exercised over many batches/iterations; one-entry
@@ -216,6 +217,7 @@ int main(int argc, char** argv) {
         std::cerr << "prepared forwarding test mode=" << mode
                   << " local_batch_sync=" << local_batch_sync
                   << " ping_pong2=" << ping_pong2
+                  << " submit_epilogue=" << submit_epilogue_only
                   << " notifications=" << notifications << '\n';
         ProxyConfig config;
         config.node_rank = 0;
@@ -236,6 +238,7 @@ int main(int argc, char** argv) {
         config.nvlink_forwarding_enabled = true;
         config.nvlink_forward_preparation_enabled = true;
         config.nvlink_forward_ping_pong2_enabled = ping_pong2;
+        config.nvlink_forward_submit_epilogue_enabled = submit_epilogue_only;
         config.nvlink_forward_prepared_batch_chunks = mode == 0 ? 1 : mode == 2 ? 1000 : 3;
         config.nvlink_forward_prepared_queue_depth = 2;
         config.nvlink_forward_synchronize_batches = true;
