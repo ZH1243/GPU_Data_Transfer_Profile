@@ -580,6 +580,7 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_preparation_enabled`
 - `nvlink_forward_ping_pong2_enabled` (default `false`)
 - `nvlink_forward_submit_epilogue_enabled` (default `false`)
+- `nvlink_forward_prepared_atomic_ring_enabled` (default `false`; requires submit/epilogue mode)
 - `nvlink_forward_prepared_batch_chunks`
 - `nvlink_forward_prepared_queue_depth`
 - `nvlink_forward_prepared_nvtx_enabled`
@@ -848,6 +849,35 @@ release ranges. Additional markers are `nvlink_submit_epilogue/copy_done_publish
 and `nvlink_submit_epilogue/copy_done_wait`. Batch copy timing ends before the
 completion signal and excludes Y's epilogue. Performance improvement requires
 measurement on the target GPUs; mock tests verify ordering and lifecycle only.
+
+### Optional atomic prepared ring for submit/epilogue mode
+
+Add `--nvlink_forward_prepared_atomic_ring_enabled=true` to the submit/epilogue
+commands on both nodes. It requires `nvlink_forward_submit_epilogue_enabled=true`
+and is accepted in CLI and JSON configuration. Its default is `false`, preserving
+the mutex/condition-variable ring and all other existing forwarding paths.
+
+In this mode, preparation release-publishes a ready-batch counter after filling
+all descriptor fields. X acquire-loads that counter before reading the next slot;
+it continues to release-publish copy completion only after stream synchronization.
+Y acquire-loads completion, performs the epilogue, then release-publishes retirement.
+Preparation acquire-loads retirement before reusing a slot. These counters remain
+monotonic across iterations; iteration completion still waits for all epilogues
+and notification draining. The ring need not hold an entire iteration: depths
+of two or more retain bounded backpressure and safe slot reuse.
+
+There are no prepared-ring mutex acquisitions or condition-variable waits in
+preparation, X acquisition, or Y retirement when this flag is enabled. Empty/full
+ring waits, iteration activation, and local-staging waits poll with `cpu_relax`
+and check cancellation. The full-ring wait retains the completion timeout; the
+existing no-RDMA-ready-batch backoff remains. Stream, statistics/error, and
+notification queue mutexes retain their existing behavior.
+
+`nvlink_prepared/acquire_next_batch` remains visible, but its `queue_lock` child
+and Y's `release_slot_lock`/`wake_producer` ranges are absent. `queue_empty_wait`,
+`local_staging_wait`, and `nvlink_prepare/queue_full_wait` now represent polling
+when needed. Polling trades sleeping/wakeup overhead for CPU usage; measure on
+the Hopper nodes with appropriate CPU placement.
 
 ### Opt-in ping-pong2 prepared forwarding
 

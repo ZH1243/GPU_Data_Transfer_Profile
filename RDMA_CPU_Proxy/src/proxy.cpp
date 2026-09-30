@@ -167,6 +167,10 @@ struct Proxy::PreparedForwardingState {
     alignas(64) std::atomic<uint64_t> next_sequence{0};
     // X publishes a completed prefix; Y retires slots via consumed under mutex.
     alignas(64) std::atomic<std::size_t> copy_completed{0};
+    // Single-writer prefixes for the optional atomic ring. Published descriptors
+    // stay immutable until X finishes and Y release-publishes their retirement.
+    alignas(64) std::atomic<std::size_t> published{0};
+    alignas(64) std::atomic<std::size_t> retired{0};
     std::mutex mutex;
     std::condition_variable changed;
     std::vector<PreparedForwardingBatch> slots;
@@ -4027,13 +4031,20 @@ void Proxy::prepare_forwarding_batch(
 
 void Proxy::prepared_forwarding_ready_loop() {
     auto& state = *prepared_forwarding_;
+    const bool atomic_ring = config_.nvlink_forward_prepared_atomic_ring_enabled;
+    std::size_t published = 0;
     const auto order = nvlink_forward_peer_order();
     std::vector<std::size_t> next_chunk(peers_.size(), 0);
     const auto cancelled = [&] { return forwarding_stop_.load() || state.failed.load(); };
     for (uint64_t iteration = 0;
          !cancelled() && (config_.num_iterations == 0 || iteration < config_.num_iterations);
          ++iteration) {
-        {
+        if (atomic_ring) {
+            while (state.active_iteration.load(std::memory_order_acquire) < iteration + 1) {
+                if (cancelled()) return;
+                cpu_relax();
+            }
+        } else {
             std::unique_lock<std::mutex> lock(state.mutex);
             while (!cancelled() && state.active_iteration.load() < iteration + 1) {
                 state.changed.wait_for(lock, std::chrono::milliseconds(1));
@@ -4060,7 +4071,24 @@ void Proxy::prepared_forwarding_ready_loop() {
                 }
                 if (!ready) continue;
                 std::size_t slot_index;
-                {
+                if (atomic_ring) {
+                    const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(config_.completion_timeout_ms);
+                    if (published - state.retired.load(std::memory_order_acquire) == state.slots.size()) {
+                        ScopedPreparedRange wait(config_.nvlink_forward_prepared_nvtx_enabled,
+                                                 "nvlink_prepare/queue_full_wait");
+                        uint64_t polls = 0;
+                        while (published - state.retired.load(std::memory_order_acquire) == state.slots.size()) {
+                            if (cancelled()) return;
+                            if ((++polls & 0x3ffULL) == 0 && std::chrono::steady_clock::now() >= deadline) {
+                                throw std::runtime_error("timed out waiting for a free prepared forwarding slot");
+                            }
+                            cpu_relax();
+                        }
+                    }
+                    if (cancelled()) return;
+                    slot_index = published % state.slots.size();
+                } else {
                     std::unique_lock<std::mutex> lock(state.mutex);
                     const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(config_.completion_timeout_ms);
@@ -4079,14 +4107,18 @@ void Proxy::prepared_forwarding_ready_loop() {
                 prepare_forwarding_batch(state.slots[slot_index], p, iteration, next_chunk[p], count);
                 prepare.end();
                 ScopedPreparedRange publish(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepare/publish_batch");
-                {
+                if (atomic_ring) {
+                    // Account before X can observe the descriptor and Y can retire it.
+                    forwarding_batches_in_flight_.fetch_add(1);
+                    state.published.store(++published, std::memory_order_release);
+                } else {
                     std::lock_guard<std::mutex> lock(state.mutex);
                     if (config_.nvlink_forward_submit_epilogue_enabled) {
                         forwarding_batches_in_flight_.fetch_add(1);
                     }
                     ++state.produced; // mutex release publishes all argument arrays
                 }
-                state.changed.notify_all();
+                if (!atomic_ring) state.changed.notify_all();
                 next_chunk[p] += count;
                 progressed = true;
             }
@@ -4290,21 +4322,44 @@ void Proxy::submit_forwarding_loop() {
         PreparedForwardingBatch* batch;
         {
             ScopedPreparedRange acquire(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/acquire_next_batch");
-            ScopedPreparedRange queue_lock(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/queue_lock");
-            std::unique_lock<std::mutex> lock(state.mutex);
-            queue_lock.end();
-            while (!cancelled() && state.produced == submitted) {
-                ScopedPreparedRange wait(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/queue_empty_wait");
-                state.changed.wait_for(lock, std::chrono::milliseconds(1));
+            if (config_.nvlink_forward_prepared_atomic_ring_enabled) {
+                if (state.published.load(std::memory_order_acquire) == submitted) {
+                    ScopedPreparedRange wait(config_.nvlink_forward_prepared_nvtx_enabled,
+                                             "nvlink_prepared/queue_empty_wait");
+                    while (state.published.load(std::memory_order_acquire) == submitted) {
+                        if (cancelled()) return;
+                        cpu_relax();
+                    }
+                }
+                if (cancelled()) return;
+                batch = &state.slots[submitted % state.slots.size()];
+                if (config_.router_local_input_staging_enabled &&
+                    local_router_forwarding_completed_iterations_.load() < batch->iteration + 1) {
+                    ScopedPreparedRange wait(config_.nvlink_forward_prepared_nvtx_enabled,
+                                             "nvlink_prepared/local_staging_wait");
+                    while (local_router_forwarding_completed_iterations_.load() < batch->iteration + 1) {
+                        if (cancelled()) return;
+                        cpu_relax();
+                    }
+                }
+                if (cancelled()) return;
+            } else {
+                ScopedPreparedRange queue_lock(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/queue_lock");
+                std::unique_lock<std::mutex> lock(state.mutex);
+                queue_lock.end();
+                while (!cancelled() && state.produced == submitted) {
+                    ScopedPreparedRange wait(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/queue_empty_wait");
+                    state.changed.wait_for(lock, std::chrono::milliseconds(1));
+                }
+                if (cancelled()) return;
+                batch = &state.slots[submitted % state.slots.size()];
+                while (!cancelled() && config_.router_local_input_staging_enabled &&
+                       local_router_forwarding_completed_iterations_.load() < batch->iteration + 1) {
+                    ScopedPreparedRange wait(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/local_staging_wait");
+                    state.changed.wait_for(lock, std::chrono::milliseconds(1));
+                }
+                if (cancelled()) return;
             }
-            if (cancelled()) return;
-            batch = &state.slots[submitted % state.slots.size()];
-            while (!cancelled() && config_.router_local_input_staging_enabled &&
-                   local_router_forwarding_completed_iterations_.load() < batch->iteration + 1) {
-                ScopedPreparedRange wait(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/local_staging_wait");
-                state.changed.wait_for(lock, std::chrono::milliseconds(1));
-            }
-            if (cancelled()) return;
         }
         ScopedPreparedRange setup(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/iteration_bookkeeping");
         if (current_iteration != batch->iteration) {
@@ -4392,15 +4447,21 @@ void Proxy::epilogue_forwarding_loop() {
         }
         logging.end();
         ScopedPreparedRange release(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/release_slot");
-        {
+        if (config_.nvlink_forward_prepared_atomic_ring_enabled) {
+            // Last slot access precedes this store. Preparation acquire-loads it
+            // before overwriting either the descriptor or its argument arrays.
+            state.retired.store(retired + 1, std::memory_order_release);
+        } else {
             ScopedPreparedRange queue_lock(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/release_slot_lock");
             std::lock_guard<std::mutex> lock(state.mutex);
             queue_lock.end();
             ++state.consumed;
         }
         release.end();
-        ScopedPreparedRange wake(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/wake_producer");
-        state.changed.notify_all();
+        ScopedPreparedRange wake(config_.nvlink_forward_prepared_nvtx_enabled &&
+                                 !config_.nvlink_forward_prepared_atomic_ring_enabled,
+                                 "nvlink_prepared/wake_producer");
+        if (!config_.nvlink_forward_prepared_atomic_ring_enabled) state.changed.notify_all();
         ++retired;
         // Last: iteration completion must include notification enqueue and release.
         forwarding_batches_in_flight_.fetch_sub(1);

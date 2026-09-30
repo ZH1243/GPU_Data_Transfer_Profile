@@ -369,6 +369,15 @@ int main(int argc, char** argv) {
         catch (const std::runtime_error&) { rejected = true; }
         assert(rejected);
     }
+    assert(!submit_epilogue.nvlink_forward_prepared_atomic_ring_enabled);
+    auto atomic_ring = submit_epilogue;
+    atomic_ring.nvlink_forward_prepared_atomic_ring_enabled = true;
+    rdma_proxy::validate_config(atomic_ring);
+    atomic_ring.nvlink_forward_submit_epilogue_enabled = false;
+    bool atomic_ring_rejected = false;
+    try { rdma_proxy::validate_config(atomic_ring); }
+    catch (const std::runtime_error&) { atomic_ring_rejected = true; }
+    assert(atomic_ring_rejected);
     auto large_prepared = prepared_config;
     large_prepared.nvlink_forward_prepared_batch_chunks = large_prepared.num_tokens + 1;
     rdma_proxy::validate_config(large_prepared);
@@ -430,6 +439,16 @@ int main(int argc, char** argv) {
     rdma_proxy::validate_config(parsed_split);
     assert(rdma_proxy::config_summary(parsed_split).find(
         "nvlink_forward_submit_epilogue_enabled=true") != std::string::npos);
+    split_args.push_back("--nvlink_forward_prepared_atomic_ring_enabled=true");
+    const auto parsed_atomic = rdma_proxy::load_config(
+        static_cast<int>(split_args.size()), const_cast<char**>(split_args.data()));
+    assert(parsed_atomic.nvlink_forward_prepared_atomic_ring_enabled);
+    rdma_proxy::validate_config(parsed_atomic);
+    assert(rdma_proxy::config_summary(parsed_atomic).find(
+        "nvlink_forward_prepared_atomic_ring_enabled=true") != std::string::npos);
+    split_args.push_back("--nvlink_forward_prepared_atomic_ring_enabled=false");
+    assert(!rdma_proxy::load_config(static_cast<int>(split_args.size()),
+        const_cast<char**>(split_args.data())).nvlink_forward_prepared_atomic_ring_enabled);
     {
         std::ofstream json("prepared_forwarding_config.json");
         json << R"json({"num_tokens":65, "token_dimension":8, "tokens_per_chunk":4,
@@ -463,9 +482,13 @@ int main(int argc, char** argv) {
                        "local_iteration_sync_enabled":true,
                        "nvlink_forward_preparation_enabled":true,
                        "nvlink_forward_prepared_batch_chunks":19,
-                       "nvlink_forward_submit_epilogue_enabled":true})json";
+                       "nvlink_forward_submit_epilogue_enabled":true,
+                       "nvlink_forward_prepared_atomic_ring_enabled":true})json";
     }
-    assert(rdma_proxy::load_config_file("submit_epilogue_config.json").nvlink_forward_submit_epilogue_enabled);
+    const auto json_split = rdma_proxy::load_config_file("submit_epilogue_config.json");
+    assert(json_split.nvlink_forward_submit_epilogue_enabled);
+    assert(json_split.nvlink_forward_prepared_atomic_ring_enabled);
+    rdma_proxy::validate_config(json_split);
 
     auto valid_flush_only_config = router_nvlink_config;
     valid_flush_only_config.nvlink_forward_synchronize_batches = true;
