@@ -850,6 +850,30 @@ and `nvlink_submit_epilogue/copy_done_wait`. Batch copy timing ends before the
 completion signal and excludes Y's epilogue. Performance improvement requires
 measurement on the target GPUs; mock tests verify ordering and lifecycle only.
 
+### Optional stream-query completion for submit/epilogue mode
+
+Add `--nvlink_forward_completion_mode=stream_query` on both nodes to poll
+`cudaStreamQuery` in X after submitting each remote batch. The default is
+`stream_sync`, preserving the existing `cudaStreamSynchronize` path. Query mode
+requires `nvlink_forward_submit_epilogue_enabled=true` and works with either ring
+implementation. The option is supported by CLI and JSON configuration.
+
+Only `cudaSuccess` authorizes publication to Y. `cudaErrorNotReady` continues
+polling with `cpu_relax`; other CUDA errors propagate through forwarding error
+handling. Cancellation is checked every poll, and `completion_timeout_ms` is
+checked every 1024 unsuccessful polls. Cancellation, timeout, or CUDA failure
+does not publish that batch as complete. Shutdown still synchronizes the stream
+before releasing slots and device buffers. The stream mutex remains held across
+submission and polling. Local staging and iteration/shutdown synchronization are
+unchanged.
+
+The wait appears as `nvlink_prepared/stream_query` instead of
+`nvlink_prepared/stream_sync`. There are no per-poll NVTX markers, but Nsight CUDA
+tracing can record each query and affect timing. Polling consumes CPU and is not
+guaranteed to reduce latency: compare throughput and unprofiled host timings on
+the Hopper nodes. Mock copies complete synchronously, so mock tests cannot
+measure GPU polling latency or exercise device-side pending/error conditions.
+
 ### Optional atomic prepared ring for submit/epilogue mode
 
 Add `--nvlink_forward_prepared_atomic_ring_enabled=true` to the submit/epilogue

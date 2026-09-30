@@ -288,6 +288,8 @@ bool gpudirect_rdma_writes_need_owner_flush(int cuda_device_id, bool mock_mode);
 void flush_gpudirect_rdma_writes(int cuda_device_id, bool mock_mode);
 void destroy_cuda_stream(void* stream, bool mock_mode);
 void synchronize_cuda_stream(void* stream, bool mock_mode);
+// False only for cudaErrorNotReady; all other CUDA failures throw.
+bool query_cuda_stream(void* stream, bool mock_mode);
 // A recorded stream prefix. Share ownership between CPU consumers, but never
 // re-record an event while a consumer still owns the previous recording.
 class CudaForwardEvent {

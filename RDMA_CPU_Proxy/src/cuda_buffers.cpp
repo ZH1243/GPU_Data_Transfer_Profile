@@ -1648,6 +1648,19 @@ void destroy_cuda_stream(void* stream, bool mock_mode) {
 #endif
 }
 
+bool query_cuda_stream(void* stream, bool mock_mode) {
+    if (mock_mode) return true; // Mock copies execute synchronously on the CPU.
+#if RDMA_PROXY_HAVE_CUDA
+    const auto status = cudaStreamQuery(reinterpret_cast<cudaStream_t>(stream));
+    if (status == cudaErrorNotReady) return false;
+    check_cuda(status, "cudaStreamQuery forwarding");
+    return true;
+#else
+    (void)stream;
+    throw std::runtime_error("CUDA stream query requested but CUDA support was not built");
+#endif
+}
+
 void synchronize_cuda_stream(void* stream, bool mock_mode) {
     if (mock_mode) return;
 #if RDMA_PROXY_HAVE_CUDA

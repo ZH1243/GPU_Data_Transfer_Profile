@@ -336,6 +336,7 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "nvlink_forward_submit_epilogue_enabled") {
         config.nvlink_forward_submit_epilogue_enabled = (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "nvlink_forward_completion_mode") config.nvlink_forward_completion_mode = value;
     else if (key == "nvlink_forward_prepared_atomic_ring_enabled") {
         config.nvlink_forward_prepared_atomic_ring_enabled = (value == "1" || value == "true" || value == "yes");
     }
@@ -624,6 +625,8 @@ ProxyConfig load_config_file(const std::string& path) {
         object, "nvlink_forward_ping_pong2_enabled", config.nvlink_forward_ping_pong2_enabled);
     config.nvlink_forward_submit_epilogue_enabled = get_bool(
         object, "nvlink_forward_submit_epilogue_enabled", config.nvlink_forward_submit_epilogue_enabled);
+    config.nvlink_forward_completion_mode = get_string(
+        object, "nvlink_forward_completion_mode", config.nvlink_forward_completion_mode);
     config.nvlink_forward_prepared_atomic_ring_enabled = get_bool(
         object, "nvlink_forward_prepared_atomic_ring_enabled", config.nvlink_forward_prepared_atomic_ring_enabled);
     config.nvlink_forward_prepared_nvtx_enabled = get_bool(
@@ -866,6 +869,14 @@ void validate_config(const ProxyConfig& config) {
     }
     if (config.nvlink_forward_ping_pong2_enabled && !config.nvlink_forward_preparation_enabled) {
         throw std::runtime_error("nvlink_forward_ping_pong2_enabled requires nvlink_forward_preparation_enabled=true");
+    }
+    if (config.nvlink_forward_completion_mode != "stream_sync" &&
+        config.nvlink_forward_completion_mode != "stream_query") {
+        throw std::runtime_error("nvlink_forward_completion_mode must be stream_sync or stream_query");
+    }
+    if (config.nvlink_forward_completion_mode == "stream_query" &&
+        !config.nvlink_forward_submit_epilogue_enabled) {
+        throw std::runtime_error("stream_query completion requires nvlink_forward_submit_epilogue_enabled=true");
     }
     if (config.nvlink_forward_prepared_atomic_ring_enabled &&
         !config.nvlink_forward_submit_epilogue_enabled) {
@@ -1196,6 +1207,7 @@ std::string config_summary(const ProxyConfig& config) {
         << " nvlink_forward_preparation_enabled=" << (config.nvlink_forward_preparation_enabled ? "true" : "false")
         << " nvlink_forward_ping_pong2_enabled=" << (config.nvlink_forward_ping_pong2_enabled ? "true" : "false")
         << " nvlink_forward_submit_epilogue_enabled=" << (config.nvlink_forward_submit_epilogue_enabled ? "true" : "false")
+        << " nvlink_forward_completion_mode=" << config.nvlink_forward_completion_mode
         << " nvlink_forward_prepared_atomic_ring_enabled=" << (config.nvlink_forward_prepared_atomic_ring_enabled ? "true" : "false")
         << " nvlink_forward_prepared_nvtx_enabled=" << (config.nvlink_forward_prepared_nvtx_enabled ? "true" : "false")
         << " nvlink_forward_prepared_batch_chunks=" << config.nvlink_forward_prepared_batch_chunks

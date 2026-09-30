@@ -81,6 +81,7 @@ struct ProxyConfig {
     // One copy submitter and one ordered epilogue consumer; shared ring depth.
     bool nvlink_forward_submit_epilogue_enabled{false};
     bool nvlink_forward_prepared_atomic_ring_enabled{false};
+    std::string nvlink_forward_completion_mode{"stream_sync"};
     bool nvlink_forward_prepared_nvtx_enabled{false};
     std::size_t nvlink_forward_prepared_batch_chunks{0};
     std::size_t nvlink_forward_prepared_queue_depth{2};

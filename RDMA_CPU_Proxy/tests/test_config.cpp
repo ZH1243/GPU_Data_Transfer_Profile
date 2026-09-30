@@ -378,6 +378,19 @@ int main(int argc, char** argv) {
     try { rdma_proxy::validate_config(atomic_ring); }
     catch (const std::runtime_error&) { atomic_ring_rejected = true; }
     assert(atomic_ring_rejected);
+    assert(submit_epilogue.nvlink_forward_completion_mode == "stream_sync");
+    auto query_config = submit_epilogue;
+    query_config.nvlink_forward_completion_mode = "stream_query";
+    rdma_proxy::validate_config(query_config);
+    for (int invalid = 0; invalid < 2; ++invalid) {
+        auto bad = query_config;
+        if (invalid == 0) bad.nvlink_forward_completion_mode = "unknown";
+        else bad.nvlink_forward_submit_epilogue_enabled = false;
+        bool rejected = false;
+        try { rdma_proxy::validate_config(bad); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+    }
     auto large_prepared = prepared_config;
     large_prepared.nvlink_forward_prepared_batch_chunks = large_prepared.num_tokens + 1;
     rdma_proxy::validate_config(large_prepared);
@@ -449,6 +462,12 @@ int main(int argc, char** argv) {
     split_args.push_back("--nvlink_forward_prepared_atomic_ring_enabled=false");
     assert(!rdma_proxy::load_config(static_cast<int>(split_args.size()),
         const_cast<char**>(split_args.data())).nvlink_forward_prepared_atomic_ring_enabled);
+    split_args.push_back("--nvlink_forward_completion_mode=stream_query");
+    const auto parsed_query = rdma_proxy::load_config(
+        static_cast<int>(split_args.size()), const_cast<char**>(split_args.data()));
+    assert(parsed_query.nvlink_forward_completion_mode == "stream_query");
+    assert(rdma_proxy::config_summary(parsed_query).find(
+        "nvlink_forward_completion_mode=stream_query") != std::string::npos);
     {
         std::ofstream json("prepared_forwarding_config.json");
         json << R"json({"num_tokens":65, "token_dimension":8, "tokens_per_chunk":4,
@@ -483,9 +502,11 @@ int main(int argc, char** argv) {
                        "nvlink_forward_preparation_enabled":true,
                        "nvlink_forward_prepared_batch_chunks":19,
                        "nvlink_forward_submit_epilogue_enabled":true,
-                       "nvlink_forward_prepared_atomic_ring_enabled":true})json";
+                       "nvlink_forward_prepared_atomic_ring_enabled":true,
+                       "nvlink_forward_completion_mode":"stream_query"})json";
     }
     const auto json_split = rdma_proxy::load_config_file("submit_epilogue_config.json");
+    assert(json_split.nvlink_forward_completion_mode == "stream_query");
     assert(json_split.nvlink_forward_submit_epilogue_enabled);
     assert(json_split.nvlink_forward_prepared_atomic_ring_enabled);
     rdma_proxy::validate_config(json_split);

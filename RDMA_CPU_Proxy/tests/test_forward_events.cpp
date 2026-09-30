@@ -45,6 +45,7 @@ void CUDART_CB wait_at_gate(void* pointer) {
 
 int main() {
     try {
+        require(rdma_proxy::query_cuda_stream(nullptr, true), "mock stream must complete synchronously");
         rdma_proxy::CudaForwardEvent mock(true);
         bool rejected = false;
         try { (void)mock.ready(); }
@@ -206,10 +207,12 @@ int main() {
         gates.first.store(true);
         prefix.synchronize();
         require(!end.ready(), "later stream work unexpectedly completed");
-        require(cudaStreamQuery(gates.stream) == cudaErrorNotReady,
+        require(!rdma_proxy::query_cuda_stream(reinterpret_cast<void*>(gates.stream), false),
                 "test must leave later work pending after the prefix event completes");
         gates.second.store(true);
         check(cudaStreamSynchronize(gates.stream));
+        require(rdma_proxy::query_cuda_stream(reinterpret_cast<void*>(gates.stream), false),
+                "completed stream must query ready");
         end.synchronize();
         gpu_leases.clear();
         gpu_leases = gpu_pool.acquire_batch(2, 100ms);

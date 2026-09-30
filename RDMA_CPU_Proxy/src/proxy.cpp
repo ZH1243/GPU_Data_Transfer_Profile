@@ -4382,9 +4382,27 @@ void Proxy::submit_forwarding_loop() {
                 launch_cuda_prepared_forward_batch_async(destination, forwarding_stream_, config_.mock_mode);
             }
             submit.end();
-            ScopedPreparedRange sync(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/stream_sync");
-            synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
-            sync.end();
+            if (config_.nvlink_forward_completion_mode == "stream_query") {
+                ScopedPreparedRange query(config_.nvlink_forward_prepared_nvtx_enabled,
+                                          "nvlink_prepared/stream_query");
+                const auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(config_.completion_timeout_ms);
+                uint64_t polls = 0;
+                for (;;) {
+                    // Cancellation must not publish a successful completion to Y.
+                    // Shutdown still synchronizes before releasing buffers/slots.
+                    if (cancelled()) return;
+                    if (query_cuda_stream(forwarding_stream_, config_.mock_mode)) break;
+                    if ((++polls & 0x3ffULL) == 0 && std::chrono::steady_clock::now() >= deadline) {
+                        throw std::runtime_error("timed out querying prepared forwarding stream completion");
+                    }
+                    cpu_relax();
+                }
+            } else {
+                ScopedPreparedRange sync(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/stream_sync");
+                synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
+                sync.end();
+            }
         }
         batch->copy_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - start).count();

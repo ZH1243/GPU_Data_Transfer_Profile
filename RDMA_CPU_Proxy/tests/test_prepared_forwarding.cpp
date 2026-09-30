@@ -201,11 +201,13 @@ int main(int argc, char** argv) {
     using namespace rdma_proxy;
     Logger::instance().set_level(LogLevel::kError);
     const bool ping_pong2_only = argc == 2 && std::string(argv[1]) == "--ping-pong2-only";
+    const bool query_atomic = argc == 2 && std::string(argv[1]) == "--stream-query-atomic";
+    const bool query_mode = query_atomic || (argc == 2 && std::string(argv[1]) == "--stream-query");
     const bool atomic_ring_depth4 = argc == 2 && std::string(argv[1]) == "--atomic-ring-depth4";
-    const bool atomic_ring_only = atomic_ring_depth4 ||
+    const bool atomic_ring_only = query_atomic || atomic_ring_depth4 ||
         (argc == 2 && std::string(argv[1]) == "--atomic-ring-only");
     const bool submit_epilogue_only = argc == 2 && std::string(argv[1]) == "--submit-epilogue-only";
-    if (argc != 1 && !ping_pong2_only && !submit_epilogue_only && !atomic_ring_only) throw std::runtime_error("unknown test argument");
+    if (argc != 1 && !ping_pong2_only && !submit_epilogue_only && !atomic_ring_only && !query_mode) throw std::runtime_error("unknown test argument");
     PreparedForwardingTestAccess::test_barrier_generations(ping_pong2_only);
     if (ping_pong2_only) PreparedForwardingTestAccess::test_ping_pong2_dispatch_order();
     // Two-entry ring is exercised over many batches/iterations; one-entry
@@ -242,7 +244,8 @@ int main(int argc, char** argv) {
         config.nvlink_forwarding_enabled = true;
         config.nvlink_forward_preparation_enabled = true;
         config.nvlink_forward_ping_pong2_enabled = ping_pong2;
-        config.nvlink_forward_submit_epilogue_enabled = submit_epilogue_only || atomic_ring_only;
+        config.nvlink_forward_submit_epilogue_enabled = submit_epilogue_only || atomic_ring_only || query_mode;
+        config.nvlink_forward_completion_mode = query_mode ? "stream_query" : "stream_sync";
         config.nvlink_forward_prepared_atomic_ring_enabled = atomic_ring_only;
         config.nvlink_forward_prepared_batch_chunks = mode == 0 ? 1 : mode == 2 ? 1000 : 3;
         config.nvlink_forward_prepared_queue_depth = atomic_ring_depth4 ? 4 : 2;
