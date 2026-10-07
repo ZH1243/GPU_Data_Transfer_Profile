@@ -563,7 +563,7 @@ bool effective_rdma_discontinuous_token_payload_enabled(const ProxyConfig& confi
     return config.rdma_discontinuous_token_payload_enabled || config.router_routing_enabled;
 }
 
-ProxyConfig load_config_file(const std::string& path) {
+static ProxyConfig parse_config_file(const std::string& path) {
     std::ifstream input(path);
     if (!input) throw std::runtime_error("failed to open config file: " + path);
     std::ostringstream ss;
@@ -762,6 +762,11 @@ ProxyConfig load_config_file(const std::string& path) {
         }
     }
 
+    return config;
+}
+
+ProxyConfig load_config_file(const std::string& path) {
+    auto config = parse_config_file(path);
     validate_config(config);
     return config;
 }
@@ -778,7 +783,8 @@ ProxyConfig load_config(int argc, char** argv) {
         throw std::runtime_error("usage: rdma_cpu_proxy --config config/example_config.json [--key=value ...]");
     }
 
-    auto config = load_config_file(path);
+    // Validate the effective configuration only after applying all CLI overrides.
+    auto config = parse_config_file(path);
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
         if (arg == "--config" || arg == "-c") {
@@ -874,7 +880,13 @@ void validate_config(const ProxyConfig& config) {
     }
     if (config.nvlink_forward_local_staging_prepared_enabled &&
         (!config.nvlink_forward_submit_epilogue_enabled || !config.router_local_input_staging_enabled)) {
-        throw std::runtime_error("nvlink_forward_local_staging_prepared_enabled requires submit_epilogue=true and router_local_input_staging_enabled=true");
+        throw std::runtime_error(
+            std::string("nvlink_forward_local_staging_prepared_enabled requires ") +
+            "nvlink_forward_submit_epilogue_enabled=true and router_local_input_staging_enabled=true; got " +
+            "nvlink_forward_submit_epilogue_enabled=" +
+            (config.nvlink_forward_submit_epilogue_enabled ? "true" : "false") +
+            ", router_local_input_staging_enabled=" +
+            (config.router_local_input_staging_enabled ? "true" : "false"));
     }
     if (config.nvlink_forward_ping_pong2_enabled && !config.nvlink_forward_preparation_enabled) {
         throw std::runtime_error("nvlink_forward_ping_pong2_enabled requires nvlink_forward_preparation_enabled=true");

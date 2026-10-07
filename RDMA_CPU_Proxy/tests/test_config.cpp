@@ -536,6 +536,38 @@ int main(int argc, char** argv) {
         assert(rejected);
     }
 
+    // A JSON base may require CLI overrides to become valid. Standalone file
+    // loading must still reject it, while merged loading validates only at the end.
+    {
+        std::ifstream input("submit_epilogue_config.json");
+        std::string base((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        for (const auto* key : {"nvlink_forward_submit_epilogue_enabled", "router_local_input_staging_enabled"}) {
+            const auto token = std::string("\"") + key + "\":true";
+            const auto pos = base.find(token);
+            assert(pos != std::string::npos);
+            base.replace(pos, token.size(), std::string("\"") + key + "\":false");
+        }
+        std::ofstream output("local_staging_override_config.json");
+        output << base;
+    }
+    bool invalid_base_rejected = false;
+    try { (void)rdma_proxy::load_config_file("local_staging_override_config.json"); }
+    catch (const std::runtime_error&) { invalid_base_rejected = true; }
+    assert(invalid_base_rejected);
+    const char* local_override_args[] = {
+        "test_config", "--config", "local_staging_override_config.json",
+        "--nvlink_forward_submit_epilogue_enabled=true",
+        "--router_local_input_staging_enabled=true",
+    };
+    const auto merged_local = rdma_proxy::load_config(5, const_cast<char**>(local_override_args));
+    assert(merged_local.nvlink_forward_local_staging_prepared_enabled);
+    assert(merged_local.nvlink_forward_submit_epilogue_enabled);
+    assert(merged_local.router_local_input_staging_enabled);
+    bool invalid_merged_rejected = false;
+    try { (void)rdma_proxy::load_config(4, const_cast<char**>(local_override_args)); }
+    catch (const std::runtime_error&) { invalid_merged_rejected = true; }
+    assert(invalid_merged_rejected);
+
     auto valid_flush_only_config = router_nvlink_config;
     valid_flush_only_config.nvlink_forward_synchronize_batches = true;
     valid_flush_only_config.nvlink_forward_completion_notifications_enabled = true;
