@@ -124,6 +124,13 @@ struct PreparedForwardingTestAccess {
         }
     }
 
+    static void fill_local_source(Proxy& proxy, uint64_t iteration) {
+        auto& buffer = *proxy.local_router_staging_buffer_;
+        auto* bytes = static_cast<unsigned char*>(buffer.ptr);
+        for (std::size_t i = 0; i < buffer.bytes; ++i)
+            bytes[i] = static_cast<unsigned char>((i * 17 + iteration * 29 + proxy.config_.local_gpu_index) % 251);
+    }
+
     static void verify(Proxy& source, Proxy& receiver, uint64_t iteration) {
         const auto& config = source.config_;
         if (!config.nvlink_forward_completion_notifications_enabled &&
@@ -176,6 +183,8 @@ struct PreparedForwardingTestAccess {
         }
         std::size_t local_batches = 0;
         if (config.router_local_input_staging_enabled) {
+            if (source.local_router_forwarding_completed_iterations_.load() != iteration + 1)
+                throw std::runtime_error("local forwarding returned before epilogue completion");
             const auto chunks = source.local_router_forwarding_chunks_.size();
             local_batches = (chunks + config.nvlink_forward_prepared_batch_chunks - 1) /
                 config.nvlink_forward_prepared_batch_chunks;
@@ -200,14 +209,17 @@ struct PreparedForwardingTestAccess {
 int main(int argc, char** argv) {
     using namespace rdma_proxy;
     Logger::instance().set_level(LogLevel::kError);
+    const std::string mode_arg = argc == 2 ? argv[1] : "";
+    const bool unified = mode_arg == "--unified-local" || mode_arg == "--unified-local-atomic" ||
+        mode_arg == "--unified-local-query";
     const bool ping_pong2_only = argc == 2 && std::string(argv[1]) == "--ping-pong2-only";
     const bool query_atomic = argc == 2 && std::string(argv[1]) == "--stream-query-atomic";
-    const bool query_mode = query_atomic || (argc == 2 && std::string(argv[1]) == "--stream-query");
+    const bool query_mode = mode_arg == "--unified-local-query" || query_atomic || (argc == 2 && std::string(argv[1]) == "--stream-query");
     const bool atomic_ring_depth4 = argc == 2 && std::string(argv[1]) == "--atomic-ring-depth4";
-    const bool atomic_ring_only = query_atomic || atomic_ring_depth4 ||
+    const bool atomic_ring_only = mode_arg == "--unified-local-atomic" || query_atomic || atomic_ring_depth4 ||
         (argc == 2 && std::string(argv[1]) == "--atomic-ring-only");
     const bool submit_epilogue_only = argc == 2 && std::string(argv[1]) == "--submit-epilogue-only";
-    if (argc != 1 && !ping_pong2_only && !submit_epilogue_only && !atomic_ring_only && !query_mode) throw std::runtime_error("unknown test argument");
+    if (argc != 1 && !unified && !ping_pong2_only && !submit_epilogue_only && !atomic_ring_only && !query_mode) throw std::runtime_error("unknown test argument");
     PreparedForwardingTestAccess::test_barrier_generations(ping_pong2_only);
     if (ping_pong2_only) PreparedForwardingTestAccess::test_ping_pong2_dispatch_order();
     // Two-entry ring is exercised over many batches/iterations; one-entry
@@ -227,7 +239,7 @@ int main(int argc, char** argv) {
                   << " notifications=" << notifications << '\n';
         ProxyConfig config;
         config.node_rank = 0;
-        config.num_nodes = mode == 4 ? 3 : 2;
+        config.num_nodes = unified && mode == 5 ? 1 : mode == 4 ? 3 : 2;
         config.num_gpus_per_node = 2;
         config.num_tokens = mode == 3 ? 1 : 137;
         config.token_dimension = 8;
@@ -244,7 +256,8 @@ int main(int argc, char** argv) {
         config.nvlink_forwarding_enabled = true;
         config.nvlink_forward_preparation_enabled = true;
         config.nvlink_forward_ping_pong2_enabled = ping_pong2;
-        config.nvlink_forward_submit_epilogue_enabled = submit_epilogue_only || atomic_ring_only || query_mode;
+        config.nvlink_forward_local_staging_prepared_enabled = unified;
+        config.nvlink_forward_submit_epilogue_enabled = unified || submit_epilogue_only || atomic_ring_only || query_mode;
         config.nvlink_forward_completion_mode = query_mode ? "stream_query" : "stream_sync";
         config.nvlink_forward_prepared_atomic_ring_enabled = atomic_ring_only;
         config.nvlink_forward_prepared_batch_chunks = mode == 0 ? 1 : mode == 2 ? 1000 : 3;
@@ -255,9 +268,9 @@ int main(int argc, char** argv) {
         config.nvlink_forward_completion_notifications_enabled = notifications;
         config.nvlink_forward_notification_queue_depth = 1;
         config.local_iteration_sync_enabled = true;
-        config.router_local_input_staging_enabled = mode < 5;
+        config.router_local_input_staging_enabled = unified || mode < 5;
         config.sequential_peer_transfers = true;
-        config.local_forwarding_rdma_overlap_enabled = true;
+        config.local_forwarding_rdma_overlap_enabled = !unified || mode % 2 == 0;
         // Deliberately conflicting legacy settings are ignored in this mode.
         config.nvlink_forward_min_threshold_chunks = 32;
         config.nvlink_forward_max_threshold_chunks = 64;
@@ -299,6 +312,10 @@ int main(int argc, char** argv) {
                 if (mode == 8) PreparedForwardingTestAccess::invalidate_destination(proxy);
                 for (uint64_t i = 0; i < config.num_iterations; ++i) {
                     PreparedForwardingTestAccess::fill_source(proxy, i);
+                    if (unified) {
+                        proxy.prepare_iteration_step(i);
+                        PreparedForwardingTestAccess::fill_local_source(proxy, i);
+                    }
                     proxy.run_iteration_step(i);
                     PreparedForwardingTestAccess::verify(proxy, *proxies[1 - gpu], i);
                     checked.fetch_add(1);

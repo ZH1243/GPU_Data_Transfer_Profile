@@ -988,3 +988,47 @@ be validated on the remote Hopper systems.
 - CUDA copy staging currently uses a generic byte-copy kernel. Integrate the real token producer path if tokens are already in the registered send buffer.
 - Mock mode copies payload bytes locally and self-completes WQEs for development visibility; it does not simulate fabric ordering or remote process state.
 - Error recovery is fail-fast. Production use should add QP teardown/reconnect and health reporting.
+
+### Shared prepared pipeline for local staging (opt-in)
+
+Add `--nvlink_forward_local_staging_prepared_enabled=true` to both torchrun
+commands to forward locally staged tokens through the same preparation,
+submission, and epilogue threads as remote RDMA input. The default is `false`,
+which retains local forwarding on the calling/coordinator thread.
+
+This mode requires `router_local_input_staging_enabled=true`,
+`nvlink_forward_preparation_enabled=true`, and
+`nvlink_forward_submit_epilogue_enabled=true`, together with their existing
+prerequisites. Both ping-pong modes must remain disabled. It supports the mutex
+queue or atomic ring, `stream_sync` or `stream_query`, and notifications and
+local batch synchronization independently enabled or disabled.
+
+The preparation thread publishes all local batches before remote batches into
+one ring. Local data is already ready after staging completes, so no CQ checks
+are performed for this source. Batch size and queue depth apply to both sources;
+queue depth is the total shared capacity, not a separate capacity per source.
+The submission thread preserves separate local/remote batch-barrier phases.
+The epilogue publishes local notifications and local-phase completion before
+allowing remote submissions. Empty local sources publish a control descriptor
+so other local proxies can finish their barriers; it is excluded from data-batch
+statistics. Iteration completion includes local epilogues and notification drain.
+
+With `local_forwarding_rdma_overlap_enabled=true`, RDMA can progress while the
+shared pipeline forwards local input. When false, the coordinator waits for
+local forwarding before enqueueing RDMA transfers. No additional threads are
+created. Local source gathering still happens during iteration preparation;
+this mode moves forwarding of the staged buffer, not the gathering operation.
+
+For the prepared atomic-ring configuration, keep the existing options and add:
+
+```bash
+--nvlink_forward_local_staging_prepared_enabled=true
+```
+
+Mock coverage:
+
+```bash
+ctest --test-dir RDMA_CPU_Proxy/build -R test_unified_local --output-on-failure
+```
+
+Real CUDA/RDMA performance must be measured on the target GPU nodes.

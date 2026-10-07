@@ -80,6 +80,8 @@ struct ProxyConfig {
     bool nvlink_forward_ping_pong2_enabled{false};
     // One copy submitter and one ordered epilogue consumer; shared ring depth.
     bool nvlink_forward_submit_epilogue_enabled{false};
+    // Route local staging through the same prepared ring, before remote batches.
+    bool nvlink_forward_local_staging_prepared_enabled{false};
     bool nvlink_forward_prepared_atomic_ring_enabled{false};
     std::string nvlink_forward_completion_mode{"stream_sync"};
     bool nvlink_forward_prepared_nvtx_enabled{false};

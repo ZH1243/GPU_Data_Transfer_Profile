@@ -315,6 +315,7 @@ int main(int argc, char** argv) {
         assert(rejected);
     }
 
+    assert(!config.nvlink_forward_local_staging_prepared_enabled);
     assert(!config.nvlink_forward_preparation_enabled);
     assert(config.nvlink_forward_prepared_batch_chunks == 0);
     assert(config.nvlink_forward_prepared_queue_depth == 2);
@@ -452,6 +453,16 @@ int main(int argc, char** argv) {
     rdma_proxy::validate_config(parsed_split);
     assert(rdma_proxy::config_summary(parsed_split).find(
         "nvlink_forward_submit_epilogue_enabled=true") != std::string::npos);
+    split_args.push_back("--nvlink_forward_local_staging_prepared_enabled=true");
+    split_args.push_back("--router_local_input_staging_enabled=true");
+    split_args.push_back("--fill_test_data=false");
+    auto parsed_local = rdma_proxy::load_config(static_cast<int>(split_args.size()),
+        const_cast<char**>(split_args.data()));
+    assert(parsed_local.nvlink_forward_local_staging_prepared_enabled);
+    rdma_proxy::validate_config(parsed_local);
+    split_args.push_back("--nvlink_forward_local_staging_prepared_enabled=false");
+    assert(!rdma_proxy::load_config(static_cast<int>(split_args.size()),
+        const_cast<char**>(split_args.data())).nvlink_forward_local_staging_prepared_enabled);
     split_args.push_back("--nvlink_forward_prepared_atomic_ring_enabled=true");
     const auto parsed_atomic = rdma_proxy::load_config(
         static_cast<int>(split_args.size()), const_cast<char**>(split_args.data()));
@@ -503,6 +514,9 @@ int main(int argc, char** argv) {
                        "nvlink_forward_prepared_batch_chunks":19,
                        "nvlink_forward_submit_epilogue_enabled":true,
                        "nvlink_forward_prepared_atomic_ring_enabled":true,
+                       "nvlink_forward_local_staging_prepared_enabled":true,
+                       "router_local_input_staging_enabled":true,
+                       "fill_test_data":false,
                        "nvlink_forward_completion_mode":"stream_query"})json";
     }
     const auto json_split = rdma_proxy::load_config_file("submit_epilogue_config.json");
@@ -510,6 +524,17 @@ int main(int argc, char** argv) {
     assert(json_split.nvlink_forward_submit_epilogue_enabled);
     assert(json_split.nvlink_forward_prepared_atomic_ring_enabled);
     rdma_proxy::validate_config(json_split);
+
+    assert(json_split.nvlink_forward_local_staging_prepared_enabled);
+    for (int conflict = 0; conflict < 2; ++conflict) {
+        auto bad = json_split;
+        if (conflict == 0) bad.nvlink_forward_submit_epilogue_enabled = false;
+        else bad.router_local_input_staging_enabled = false;
+        bool rejected = false;
+        try { rdma_proxy::validate_config(bad); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+    }
 
     auto valid_flush_only_config = router_nvlink_config;
     valid_flush_only_config.nvlink_forward_synchronize_batches = true;

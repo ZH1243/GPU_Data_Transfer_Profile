@@ -141,6 +141,12 @@ if(RDMA_PROXY_BUILD_TESTS)
   add_test(NAME test_ping_pong2 COMMAND test_prepared_forwarding --ping-pong2-only)
   set_tests_properties(test_ping_pong2 PROPERTIES TIMEOUT 120)
 
+  add_test(NAME test_unified_local COMMAND test_prepared_forwarding --unified-local)
+  add_test(NAME test_unified_local_atomic COMMAND test_prepared_forwarding --unified-local-atomic)
+  add_test(NAME test_unified_local_query COMMAND test_prepared_forwarding --unified-local-query)
+  set_tests_properties(test_unified_local test_unified_local_atomic test_unified_local_query
+    PROPERTIES TIMEOUT 120)
+
   add_executable(test_ping_pong tests/test_ping_pong.cpp)
   target_link_libraries(test_ping_pong PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_ping_pong COMMAND test_ping_pong)
