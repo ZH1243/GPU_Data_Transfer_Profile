@@ -293,6 +293,61 @@ void test_paired_control(bool exhaust) {
     }
 }
 
+void test_large_router_metadata() {
+    auto a = config();
+    a.mock_mode = false;
+    a.router_routing_enabled = true;
+    a.num_tokens = 200000;
+    a.listen_port = unused_port();
+    auto b = a;
+    b.node_rank = 1;
+    const PeerAddress server{1, "::1", a.listen_port};
+    const PeerAddress client{0, "::1", a.listen_port};
+    ConnectionManager m0(a), m1(b);
+    RouterX3Metadata metadata;
+    metadata.source_node_rank = 0;
+    metadata.destination_node_rank = 1;
+    metadata.local_gpu_index = 0;
+    metadata.num_nodes = 2;
+    metadata.num_gpus_per_node = 2;
+    metadata.num_experts = 128;
+    metadata.top_k = 8;
+    metadata.num_tokens = a.num_tokens;
+    metadata.token_dimension = 4096;
+    metadata.element_bytes = 2;
+    metadata.tokens_per_chunk = 32;
+    metadata.token_masks.assign(a.num_tokens, 3);
+    for (std::size_t token = 0; token < a.num_tokens; ++token)
+        metadata.token_indices.push_back(token);
+    const auto large = serialize_router_x3_metadata(metadata);
+    require(large.size() > 1024 * 1024, "router regression payload must exceed old cap");
+    metadata.source_node_rank = 1;
+    metadata.destination_node_rank = 0;
+    metadata.token_indices.resize(3);
+    metadata.token_masks.resize(3);
+    const auto small = serialize_router_x3_metadata(metadata);
+    std::exception_ptr errors[2];
+    // Exercise both receive paths, and a large remote list with a tiny local list.
+    const auto run = [&](const ConnectionManager& manager, const PeerAddress& peer, int rank) {
+        try {
+            for (int round = 0; round < 2; ++round) {
+                const bool sending_large = rank == round;
+                const auto& own = sending_large ? large : small;
+                const auto& expected = sending_large ? small : large;
+                const auto received = manager.exchange_control_message(peer, own, 5000);
+                require(received == expected, "large asymmetric router metadata was corrupted");
+                const auto parsed = deserialize_router_x3_metadata(received, a.num_tokens);
+                require(parsed.token_indices.size() == (sending_large ? 3 : a.num_tokens),
+                        "large router metadata failed to deserialize");
+            }
+        } catch (...) { errors[rank] = std::current_exception(); }
+    };
+    std::thread t0(run, std::cref(m0), std::cref(server), 0);
+    std::thread t1(run, std::cref(m1), std::cref(client), 1);
+    t0.join(); t1.join();
+    for (const auto& error : errors) if (error) std::rethrow_exception(error);
+}
+
 void test_transport() {
     auto a = config();
     a.mock_mode = false;
@@ -346,6 +401,7 @@ int main(int argc, char** argv) {
     Logger::instance().set_level(LogLevel::kError);
     if (argc == 2 && std::string(argv[1]) == "--transport-only") {
         test_transport();
+        test_large_router_metadata();
         test_paired_control(false);
         test_paired_control(true);
         std::cout << "Calibration TCP tests passed\n";

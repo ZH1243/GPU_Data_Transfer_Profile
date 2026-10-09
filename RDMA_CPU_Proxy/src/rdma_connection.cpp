@@ -117,9 +117,27 @@ private:
     int fd_;
 };
 
+std::size_t calibration_control_payload_limit(const ProxyConfig& config) {
+    std::size_t limit = 1024 * 1024;
+    const auto include_capacity = [&](std::size_t count, std::size_t bytes_per_entry) {
+        constexpr std::size_t header_bytes = 4096;
+        if (count > (std::numeric_limits<std::size_t>::max() - header_bytes) / bytes_per_entry)
+            throw std::runtime_error("calibration control metadata capacity overflows size_t");
+        limit = std::max(limit, header_bytes + count * bytes_per_entry);
+    };
+    // This transport also carries initialization metadata. Router x3/x4 uses
+    // decimal text: up to 20 index digits + separator, then 3 mask digits +
+    // separator per token. Size against capacity, not the local routed count:
+    // the remote endpoint can have a larger destination-specific token list.
+    if (config.router_routing_enabled) include_capacity(config.num_tokens, 25);
+    if (config.num_qps_per_peer > 0)
+        include_capacity(static_cast<std::size_t>(config.num_qps_per_peer), 128);
+    return limit;
+}
+
 std::string exchange_calibration_payload(
     const PeerAddress& peer, uint16_t listen_port, bool client,
-    const std::string& payload, uint64_t timeout_ms) {
+    const std::string& payload, uint64_t timeout_ms, std::size_t maximum_payload_bytes) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     const auto check_deadline = [&] {
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -219,7 +237,11 @@ std::string exchange_calibration_payload(
         uint64_t length = 0;
         transfer(&length, sizeof(length), false);
         length = be64_to_host(length);
-        if (length > 1024 * 1024) throw std::runtime_error("calibration control payload exceeds 1 MiB");
+        if (length > maximum_payload_bytes) {
+            throw std::runtime_error("calibration control payload length=" + std::to_string(length) +
+                " exceeds configured limit=" + std::to_string(maximum_payload_bytes) +
+                " bytes from peer_rank=" + std::to_string(peer.node_rank));
+        }
         std::string received(static_cast<std::size_t>(length), '\0');
         transfer(received.data(), received.size(), false);
         return received;
@@ -801,7 +823,8 @@ PeerConnectionInfo ConnectionManager::exchange_peer_info(
     if (timeout_ms == 0) timeout_ms = config_.completion_timeout_ms;
     if (config_.rdma_qp_calibration_enabled) {
         remote_payload = exchange_calibration_payload(peer, config_.listen_port,
-            config_.node_rank < peer.node_rank, local_payload, timeout_ms);
+            config_.node_rank < peer.node_rank, local_payload, timeout_ms,
+            calibration_control_payload_limit(config_));
     } else if (config_.node_rank < peer.node_rank) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         remote_payload = exchange_payload_client(peer, local_payload, config_.completion_timeout_ms);
@@ -825,7 +848,8 @@ std::string ConnectionManager::exchange_control_message(
 
     if (config_.rdma_qp_calibration_enabled) {
         return exchange_calibration_payload(peer, config_.listen_port,
-            config_.node_rank < peer.node_rank, local_payload, timeout_ms);
+            config_.node_rank < peer.node_rank, local_payload, timeout_ms,
+            calibration_control_payload_limit(config_));
     }
     if (config_.node_rank < peer.node_rank) {
         return exchange_payload_client(peer, local_payload, timeout_ms);
