@@ -745,7 +745,7 @@ void Proxy::calibrate_rdma_qps() {
     for (const auto& chunk : chunks) bytes += chunk.length_bytes;
 
     std::ostringstream settings;
-    settings << std::setprecision(17) << "qp_calibration_v1 "
+    settings << std::setprecision(17) << "qp_calibration_v2 "
              << config_.min_bandwidth_gbps_needed << ' '
              << config_.rdma_qp_calibration_warmup_iterations << ' '
              << config_.rdma_qp_calibration_sample_iterations << ' '
@@ -763,6 +763,7 @@ void Proxy::calibrate_rdma_qps() {
         throw std::runtime_error("RDMA QP calibration requires nonempty traffic in both directions");
 
     int generations = 1;
+    bool qp_set_retained = false;
     bool confirming = false;
     uint64_t round = 0;
     std::ostringstream history;
@@ -811,6 +812,9 @@ void Proxy::calibrate_rdma_qps() {
             throw std::runtime_error("invalid calibration result from peer");
         const bool pass = median >= config_.min_bandwidth_gbps_needed &&
                           remote_median >= config_.min_bandwidth_gbps_needed;
+        // Once both endpoints have passed, keep this QP set for the rest of
+        // calibration, even if a later sample dips below the threshold.
+        qp_set_retained = qp_set_retained || pass;
         // Keep every round, including rounds that reused a passing QP set.
         // Appending this to the exception makes it visible through the C ABI
         // and Python RuntimeError even when informational logging is disabled.
@@ -820,14 +824,16 @@ void Proxy::calibrate_rdma_qps() {
                 << " local_median_gbps=" << median
                 << " remote_median_gbps=" << remote_median
                 << " pair_min_median_gbps=" << std::min(median, remote_median)
-                << " pair_pass=" << pass << " confirmation=" << confirming << '\n';
+                << " pair_pass=" << pass << " qp_set_retained=" << qp_set_retained
+                << " confirmation=" << confirming << '\n';
         RDMA_PROXY_LOG_INFO("qp_calibration round=", round, " generation=", generations,
                             " local_rank=", config_.node_rank, " local_gpu=", config_.local_gpu_index,
                             " payload_bytes=", bytes, " local_min_gbps=", samples.front(),
                             " local_max_gbps=", samples.back(),
                             " local_median_gbps=", median, " remote_median_gbps=", remote_median,
                             " threshold_gbps=", config_.min_bandwidth_gbps_needed,
-                            " pair_pass=", pass, " confirmation=", confirming);
+                            " pair_pass=", pass, " qp_set_retained=", qp_set_retained,
+                            " confirmation=", confirming);
         const bool all_pass = calibration_local_all(pass, signature);
         if (all_pass && confirming) {
             const std::string accepted = "qp_calibration_accepted " + std::to_string(round);
@@ -840,7 +846,7 @@ void Proxy::calibrate_rdma_qps() {
         }
         confirming = all_pass;
         // All ranks fail together when any pair exhausts its QP generations.
-        if (!calibration_local_all(pass || generations < config_.rdma_qp_calibration_max_attempts, signature)) {
+        if (!calibration_local_all(qp_set_retained || generations < config_.rdma_qp_calibration_max_attempts, signature)) {
             std::ostringstream error;
             error << "RDMA QP calibration exhausted max attempts; real iterations were not started";
             if (!pass) {
@@ -856,7 +862,7 @@ void Proxy::calibrate_rdma_qps() {
             }
             throw std::runtime_error(error.str());
         }
-        if (!pass) {
+        if (!qp_set_retained) {
             const std::string retry = "qp_calibration_recreate " + std::to_string(round);
             if (exchange(retry) != retry) throw std::runtime_error("calibration retry mismatch");
             recreate_peer_qps(peer);

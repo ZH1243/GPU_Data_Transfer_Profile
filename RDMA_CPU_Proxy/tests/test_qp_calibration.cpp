@@ -8,6 +8,8 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <iomanip>
+#include <sstream>
 #include <limits>
 #include <stdexcept>
 #include <thread>
@@ -293,6 +295,71 @@ void test_paired_control(bool exhaust) {
     }
 }
 
+void test_retained_qps_after_bandwidth_dip() {
+    auto c = config();
+    c.listen_port = unused_port();
+    c.peers[0] = {1, "::1", c.listen_port};
+    c.rdma_qp_calibration_max_attempts = 1;
+    Proxy proxy(c);
+    proxy.initialize();
+    QpCalibrationTestAccess::enable_tcp_control(proxy);
+    auto remote_config = c;
+    remote_config.node_rank = 1;
+    remote_config.mock_mode = false;
+    ConnectionManager remote(remote_config);
+    const PeerAddress client{0, "::1", c.listen_port};
+    std::exception_ptr remote_error;
+    std::thread server([&] {
+        try {
+            const auto exchange = [&](const std::string& message) {
+                return remote.exchange_control_message(client, message, 2000);
+            };
+            std::ostringstream settings;
+            settings << std::setprecision(17) << "qp_calibration_v2 "
+                     << c.min_bandwidth_gbps_needed << ' '
+                     << c.rdma_qp_calibration_warmup_iterations << ' '
+                     << c.rdma_qp_calibration_sample_iterations << ' '
+                     << c.rdma_qp_calibration_max_attempts << ' '
+                     << c.rdma_qp_calibration_timeout_ms << ' '
+                     << c.num_qps_per_peer << ' ' << c.num_gpus_per_node;
+            require(exchange(settings.str()) == settings.str(), "retention test handshake mismatch");
+            // Pass, dip, recover, confirm. With a single allowed QP generation,
+            // the dip must neither exhaust the budget nor recreate any QPs.
+            for (int round = 1; round <= 4; ++round) {
+                for (int sample = 0; sample < c.rdma_qp_calibration_warmup_iterations +
+                                             c.rdma_qp_calibration_sample_iterations; ++sample) {
+                    const auto phase = "qp_calibration_sample " + std::to_string(round) + " " + std::to_string(sample);
+                    require(exchange(phase) == phase, "retained pair unexpectedly recreated QPs");
+                    require(exchange(phase + " done") == phase + " done", "retention sample did not complete");
+                }
+                const auto prefix = "qp_calibration_result " + std::to_string(round) + " ";
+                require(exchange(prefix + (round == 2 ? "0" : "1")).find(prefix) == 0,
+                        "retention result exchange failed");
+            }
+            require(exchange("qp_calibration_accepted 4") == "qp_calibration_accepted 4",
+                    "retention bypassed final confirmation");
+            for (int iteration = 0; iteration < 2; ++iteration) {
+                for (const auto* phase : {"iteration_start", "iteration_done"}) {
+                    const auto own = std::string(phase) + " rank=1 gpu=0 iteration=" + std::to_string(iteration);
+                    require(exchange(own).find(phase) == 0, "real iteration phase mismatch after retention");
+                }
+            }
+        } catch (...) { remote_error = std::current_exception(); }
+    });
+    std::exception_ptr local_error;
+    try { proxy.run(); } catch (...) { local_error = std::current_exception(); }
+    server.join();
+    if (local_error) std::rethrow_exception(local_error);
+    if (remote_error) std::rethrow_exception(remote_error);
+    require(QpCalibrationTestAccess::complete(proxy) && QpCalibrationTestAccess::measured(proxy) == 2,
+            "retained QPs did not reach real iterations");
+    const auto expected_markers = 4 * (c.rdma_qp_calibration_warmup_iterations +
+                                      c.rdma_qp_calibration_sample_iterations) + 2;
+    require(QpCalibrationTestAccess::markers(proxy) == static_cast<uint64_t>(expected_markers),
+            "retained worker counters were reset by QP recreation");
+    proxy.shutdown();
+}
+
 void test_large_router_metadata() {
     auto a = config();
     a.mock_mode = false;
@@ -402,6 +469,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--transport-only") {
         test_transport();
         test_large_router_metadata();
+        test_retained_qps_after_bandwidth_dip();
         test_paired_control(false);
         test_paired_control(true);
         std::cout << "Calibration TCP tests passed\n";
