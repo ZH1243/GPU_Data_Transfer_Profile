@@ -43,11 +43,17 @@ TCP. A pair passes only when **both directions** reach the threshold; the
 threshold is the aggregate across the pair's QPs, not per-QP bandwidth and not
 the sum of transmit and receive bandwidth. `340` means **340 Gb/s (42.5 GB/s)**.
 
-Only failing pairs quiesce their workers and recreate their complete QP/CQ and
+Only pairs that have never passed quiesce their workers and recreate their complete QP/CQ and
 worker sets at both endpoints. Buffers, registered memory, and router metadata
-are retained. When every pair passes, another complete concurrent round must
-also pass before any real iteration starts. A previously passing pair that
-fails a later round is eligible for recreation. Sampling and confirmation do
+are retained. Calibration succeeds as soon as every pair has passed at least
+once and retained its QPs; pairs do not need to pass in the same round, and
+there is no additional confirmation round. Once a pair passes, its QP set is
+permanently retained during calibration, even if its bandwidth falls below the
+threshold in later rounds. It continues sampling under concurrent load. Logs
+show `pair_pass` for the current round and `qp_set_retained` for this persistent
+retention decision. Retained pairs cannot exhaust the QP-generation budget;
+the calibration timeout still applies while waiting for other pairs to pass.
+Calibration samples do
 not count toward `num_iterations` or the normal bandwidth summary; normal
 iteration completion baselines exclude calibration traffic. The real run uses
 the accepted QPs without reconnecting them.
@@ -74,7 +80,7 @@ On attempt exhaustion, each currently failing pair appends a
 `qp_calibration_history` block to its error (including the Python `RuntimeError`).
 It identifies both endpoints, the threshold, and payload size, then lists every
 round's QP generation, local minimum/maximum/median, remote median, pass decision,
-and confirmation status. `pair_min_median_gbps` is the smaller of the two endpoint
+and QP retention status. `pair_min_median_gbps` is the smaller of the two endpoint
 medians, so it can be compared directly with the threshold across generations.
 Pairs that passed the last round report that another pair exhausted its attempts.
 History is available even with informational logging disabled.
@@ -106,7 +112,7 @@ also supply the RDMA-only overrides:
 ```
 
 Logs beginning with `qp_calibration` report round, QP generation, local/remote
-median bandwidth, threshold, pair decision, and confirmation status. QP creation
+median bandwidth, threshold, pair decision, and QP retention status. QP creation
 logs include the QPNs of each replacement set. The score uses outgoing payload
 bytes divided by the elapsed sample time through observation of both local-send
 and remote-receive end markers, including software scheduling and CQ polling

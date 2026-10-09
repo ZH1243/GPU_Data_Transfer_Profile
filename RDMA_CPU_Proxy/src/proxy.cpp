@@ -745,7 +745,7 @@ void Proxy::calibrate_rdma_qps() {
     for (const auto& chunk : chunks) bytes += chunk.length_bytes;
 
     std::ostringstream settings;
-    settings << std::setprecision(17) << "qp_calibration_v2 "
+    settings << std::setprecision(17) << "qp_calibration_v3 "
              << config_.min_bandwidth_gbps_needed << ' '
              << config_.rdma_qp_calibration_warmup_iterations << ' '
              << config_.rdma_qp_calibration_sample_iterations << ' '
@@ -764,7 +764,6 @@ void Proxy::calibrate_rdma_qps() {
 
     int generations = 1;
     bool qp_set_retained = false;
-    bool confirming = false;
     uint64_t round = 0;
     std::ostringstream history;
     history << std::fixed << std::setprecision(3);
@@ -824,18 +823,16 @@ void Proxy::calibrate_rdma_qps() {
                 << " local_median_gbps=" << median
                 << " remote_median_gbps=" << remote_median
                 << " pair_min_median_gbps=" << std::min(median, remote_median)
-                << " pair_pass=" << pass << " qp_set_retained=" << qp_set_retained
-                << " confirmation=" << confirming << '\n';
+                << " pair_pass=" << pass << " qp_set_retained=" << qp_set_retained << '\n';
         RDMA_PROXY_LOG_INFO("qp_calibration round=", round, " generation=", generations,
                             " local_rank=", config_.node_rank, " local_gpu=", config_.local_gpu_index,
                             " payload_bytes=", bytes, " local_min_gbps=", samples.front(),
                             " local_max_gbps=", samples.back(),
                             " local_median_gbps=", median, " remote_median_gbps=", remote_median,
                             " threshold_gbps=", config_.min_bandwidth_gbps_needed,
-                            " pair_pass=", pass, " qp_set_retained=", qp_set_retained,
-                            " confirmation=", confirming);
-        const bool all_pass = calibration_local_all(pass, signature);
-        if (all_pass && confirming) {
+                            " pair_pass=", pass, " qp_set_retained=", qp_set_retained);
+        const bool all_retained = calibration_local_all(qp_set_retained, signature);
+        if (all_retained) {
             const std::string accepted = "qp_calibration_accepted " + std::to_string(round);
             if (exchange(accepted) != accepted) throw std::runtime_error("calibration acceptance mismatch");
             calibration_local_all(true, signature);
@@ -844,7 +841,6 @@ void Proxy::calibrate_rdma_qps() {
                                 " generations=", generations, " rounds=", round);
             return;
         }
-        confirming = all_pass;
         // All ranks fail together when any pair exhausts its QP generations.
         if (!calibration_local_all(qp_set_retained || generations < config_.rdma_qp_calibration_max_attempts, signature)) {
             std::ostringstream error;

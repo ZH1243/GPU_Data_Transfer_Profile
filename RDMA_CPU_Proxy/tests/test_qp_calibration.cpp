@@ -28,6 +28,9 @@ struct QpCalibrationTestAccess {
         c.mock_mode = false;
         proxy.connection_manager_ = ConnectionManager(c);
     }
+    static PeerConnectionInfo peer_info(const Proxy& proxy) {
+        return proxy.make_local_peer_info(proxy.peers_.front());
+    }
     static bool complete(const Proxy& proxy) { return proxy.rdma_qp_calibration_complete_; }
     static std::size_t measured(const Proxy& proxy) { return proxy.rdma_iteration_bandwidth_gbps_.size(); }
     static uint64_t markers(const Proxy& proxy) { return proxy.peers_[0].workers[0]->send_marker_completions(); }
@@ -128,7 +131,7 @@ void test_run(bool enabled) {
     require(QpCalibrationTestAccess::complete(p) == enabled, "calibration did not run at preparation");
     require(QpCalibrationTestAccess::measured(p) == 0, "calibration polluted iteration statistics");
     const auto markers = QpCalibrationTestAccess::markers(p);
-    require(markers == (enabled ? 6 : 0), "expected sampling plus confirmation, or no calibration");
+    require(markers == (enabled ? 3 : 0), "expected one passing round, or no calibration");
     p.run_iteration_step(0);
     p.run_iteration_step(1);
     require(QpCalibrationTestAccess::markers(p) == markers + 2, "calibration repeated on later iterations");
@@ -296,68 +299,100 @@ void test_paired_control(bool exhaust) {
 }
 
 void test_retained_qps_after_bandwidth_dip() {
-    auto c = config();
-    c.listen_port = unused_port();
-    c.peers[0] = {1, "::1", c.listen_port};
-    c.rdma_qp_calibration_max_attempts = 1;
-    Proxy proxy(c);
-    proxy.initialize();
-    QpCalibrationTestAccess::enable_tcp_control(proxy);
-    auto remote_config = c;
-    remote_config.node_rank = 1;
-    remote_config.mock_mode = false;
-    ConnectionManager remote(remote_config);
-    const PeerAddress client{0, "::1", c.listen_port};
-    std::exception_ptr remote_error;
-    std::thread server([&] {
-        try {
-            const auto exchange = [&](const std::string& message) {
-                return remote.exchange_control_message(client, message, 2000);
-            };
-            std::ostringstream settings;
-            settings << std::setprecision(17) << "qp_calibration_v2 "
-                     << c.min_bandwidth_gbps_needed << ' '
-                     << c.rdma_qp_calibration_warmup_iterations << ' '
-                     << c.rdma_qp_calibration_sample_iterations << ' '
-                     << c.rdma_qp_calibration_max_attempts << ' '
-                     << c.rdma_qp_calibration_timeout_ms << ' '
-                     << c.num_qps_per_peer << ' ' << c.num_gpus_per_node;
-            require(exchange(settings.str()) == settings.str(), "retention test handshake mismatch");
-            // Pass, dip, recover, confirm. With a single allowed QP generation,
-            // the dip must neither exhaust the budget nor recreate any QPs.
-            for (int round = 1; round <= 4; ++round) {
-                for (int sample = 0; sample < c.rdma_qp_calibration_warmup_iterations +
-                                             c.rdma_qp_calibration_sample_iterations; ++sample) {
-                    const auto phase = "qp_calibration_sample " + std::to_string(round) + " " + std::to_string(sample);
-                    require(exchange(phase) == phase, "retained pair unexpectedly recreated QPs");
-                    require(exchange(phase + " done") == phase + " done", "retention sample did not complete");
+    auto base = config();
+    base.num_gpus_per_node = 2;
+    base.local_iteration_sync_run_id = "retained_once_" + std::to_string(getpid());
+    std::vector<std::unique_ptr<Proxy>> proxies;
+    std::vector<ProxyConfig> configs;
+    std::vector<PeerConnectionInfo> remote_infos;
+    for (int gpu = 0; gpu < 2; ++gpu) {
+        auto c = base;
+        c.local_gpu_index = gpu;
+        c.listen_port = unused_port();
+        c.peers[0] = {1, "::1", c.listen_port};
+        configs.push_back(c);
+        proxies.emplace_back(new Proxy(c));
+        proxies.back()->initialize();
+        remote_infos.push_back(QpCalibrationTestAccess::peer_info(*proxies.back()));
+        QpCalibrationTestAccess::enable_tcp_control(*proxies.back());
+    }
+    require(configs[0].listen_port != configs[1].listen_port, "test selected duplicate ports");
+    std::exception_ptr remote_errors[2], local_errors[2];
+    std::vector<std::thread> servers, clients;
+    for (int gpu = 0; gpu < 2; ++gpu) {
+        servers.emplace_back([&, gpu] {
+            try {
+                const auto& c = configs[gpu];
+                auto remote_config = c;
+                remote_config.node_rank = 1;
+                remote_config.mock_mode = false;
+                ConnectionManager remote(remote_config);
+                const PeerAddress client{0, "::1", c.listen_port};
+                const auto exchange = [&](const std::string& message) {
+                    return remote.exchange_control_message(client, message, 2000);
+                };
+                std::ostringstream settings;
+                settings << std::setprecision(17) << "qp_calibration_v3 "
+                         << c.min_bandwidth_gbps_needed << ' '
+                         << c.rdma_qp_calibration_warmup_iterations << ' '
+                         << c.rdma_qp_calibration_sample_iterations << ' '
+                         << c.rdma_qp_calibration_max_attempts << ' '
+                         << c.rdma_qp_calibration_timeout_ms << ' '
+                         << c.num_qps_per_peer << ' ' << c.num_gpus_per_node;
+                require(exchange(settings.str()) == settings.str(), "retention test handshake mismatch");
+                // GPU 0 passes only round 1; GPU 1 passes only round 2. There is
+                // no round where both pass, yet both must finish after round 2.
+                for (int round = 1; round <= 2; ++round) {
+                    for (int sample = 0; sample < c.rdma_qp_calibration_warmup_iterations +
+                                                 c.rdma_qp_calibration_sample_iterations; ++sample) {
+                        const auto phase = "qp_calibration_sample " + std::to_string(round) + " " + std::to_string(sample);
+                        require(exchange(phase) == phase, "retained pair unexpectedly recreated QPs");
+                        require(exchange(phase + " done") == phase + " done", "retention sample did not complete");
+                    }
+                    const auto prefix = "qp_calibration_result " + std::to_string(round) + " ";
+                    require(exchange(prefix + (round == gpu + 1 ? "1" : "0")).find(prefix) == 0,
+                            "retention result exchange failed");
+                    if (gpu == 1 && round == 1) {
+                        require(exchange("qp_calibration_recreate 1") == "qp_calibration_recreate 1",
+                                "never-passing pair did not retry");
+                        auto info = remote_infos[gpu];
+                        info.node_rank = 1;
+                        // Reuse this proxy's mock MR so payload validation stays
+                        // loopback while QP connection metadata uses real TCP.
+                        remote.exchange_peer_info(client, info, 2000);
+                        require(exchange("qp_calibration_recreated_ready") == "qp_calibration_recreated_ready",
+                                "replacement QPs did not become ready");
+                    }
                 }
-                const auto prefix = "qp_calibration_result " + std::to_string(round) + " ";
-                require(exchange(prefix + (round == 2 ? "0" : "1")).find(prefix) == 0,
-                        "retention result exchange failed");
-            }
-            require(exchange("qp_calibration_accepted 4") == "qp_calibration_accepted 4",
-                    "retention bypassed final confirmation");
-            for (int iteration = 0; iteration < 2; ++iteration) {
-                for (const auto* phase : {"iteration_start", "iteration_done"}) {
-                    const auto own = std::string(phase) + " rank=1 gpu=0 iteration=" + std::to_string(iteration);
-                    require(exchange(own).find(phase) == 0, "real iteration phase mismatch after retention");
+                require(exchange("qp_calibration_accepted 2") == "qp_calibration_accepted 2",
+                        "calibration required an extra confirmation round");
+                for (int iteration = 0; iteration < 2; ++iteration) {
+                    for (const auto* phase : {"iteration_start", "iteration_done"}) {
+                        const auto own = std::string(phase) + " rank=1 gpu=" + std::to_string(gpu) +
+                                         " iteration=" + std::to_string(iteration);
+                        require(exchange(own).find(phase) == 0, "real iteration phase mismatch after retention");
+                    }
                 }
-            }
-        } catch (...) { remote_error = std::current_exception(); }
-    });
-    std::exception_ptr local_error;
-    try { proxy.run(); } catch (...) { local_error = std::current_exception(); }
-    server.join();
-    if (local_error) std::rethrow_exception(local_error);
-    if (remote_error) std::rethrow_exception(remote_error);
-    require(QpCalibrationTestAccess::complete(proxy) && QpCalibrationTestAccess::measured(proxy) == 2,
-            "retained QPs did not reach real iterations");
-    const auto expected_markers = 4 * (c.rdma_qp_calibration_warmup_iterations +
-                                      c.rdma_qp_calibration_sample_iterations) + 2;
-    require(QpCalibrationTestAccess::markers(proxy) == static_cast<uint64_t>(expected_markers),
-            "retained worker counters were reset by QP recreation");
-    proxy.shutdown();
+            } catch (...) { remote_errors[gpu] = std::current_exception(); }
+        });
+        clients.emplace_back([&, gpu] {
+            try { proxies[gpu]->run(); } catch (...) { local_errors[gpu] = std::current_exception(); }
+        });
+    }
+    for (auto& thread : clients) thread.join();
+    for (auto& thread : servers) thread.join();
+    for (int gpu = 0; gpu < 2; ++gpu) {
+        if (local_errors[gpu]) std::rethrow_exception(local_errors[gpu]);
+        if (remote_errors[gpu]) std::rethrow_exception(remote_errors[gpu]);
+        const auto& p = *proxies[gpu];
+        require(QpCalibrationTestAccess::complete(p) && QpCalibrationTestAccess::measured(p) == 2,
+                "retained QPs did not reach real iterations");
+        const auto expected_markers = (gpu == 0 ? 2 : 1) *
+            (base.rdma_qp_calibration_warmup_iterations + base.rdma_qp_calibration_sample_iterations) + 2;
+        require(QpCalibrationTestAccess::markers(p) == static_cast<uint64_t>(expected_markers),
+                "retained QPs were recreated or an extra round ran");
+        proxies[gpu]->shutdown();
+    }
 }
 
 void test_large_router_metadata() {
