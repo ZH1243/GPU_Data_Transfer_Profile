@@ -70,6 +70,15 @@ control exchanges, local barriers, and completion waits. Exhaustion or timeout
 fails the run; it does not silently start with a below-threshold QP set. Fatal
 peer failures are propagated through control-exchange/barrier timeouts.
 
+On attempt exhaustion, each currently failing pair appends a
+`qp_calibration_history` block to its error (including the Python `RuntimeError`).
+It identifies both endpoints, the threshold, and payload size, then lists every
+round's QP generation, local minimum/maximum/median, remote median, pass decision,
+and confirmation status. `pair_min_median_gbps` is the smaller of the two endpoint
+medians, so it can be compared directly with the threshold across generations.
+Pairs that passed the last round report that another pair exhausted its attempts.
+History is available even with informational logging disabled.
+
 Rebuild `rdma_cpu_proxy_shared` on both remote nodes. Append the following to
 **each of your existing RDMA-only torchrun commands**:
 

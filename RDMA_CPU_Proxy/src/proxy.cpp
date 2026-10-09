@@ -765,6 +765,8 @@ void Proxy::calibrate_rdma_qps() {
     int generations = 1;
     bool confirming = false;
     uint64_t round = 0;
+    std::ostringstream history;
+    history << std::fixed << std::setprecision(3);
     for (;;) {
         ++round;
         std::vector<double> samples;
@@ -809,6 +811,16 @@ void Proxy::calibrate_rdma_qps() {
             throw std::runtime_error("invalid calibration result from peer");
         const bool pass = median >= config_.min_bandwidth_gbps_needed &&
                           remote_median >= config_.min_bandwidth_gbps_needed;
+        // Keep every round, including rounds that reused a passing QP set.
+        // Appending this to the exception makes it visible through the C ABI
+        // and Python RuntimeError even when informational logging is disabled.
+        history << "  round=" << round << " generation=" << generations
+                << " local_min_gbps=" << samples.front()
+                << " local_max_gbps=" << samples.back()
+                << " local_median_gbps=" << median
+                << " remote_median_gbps=" << remote_median
+                << " pair_min_median_gbps=" << std::min(median, remote_median)
+                << " pair_pass=" << pass << " confirmation=" << confirming << '\n';
         RDMA_PROXY_LOG_INFO("qp_calibration round=", round, " generation=", generations,
                             " local_rank=", config_.node_rank, " local_gpu=", config_.local_gpu_index,
                             " payload_bytes=", bytes, " local_min_gbps=", samples.front(),
@@ -828,8 +840,22 @@ void Proxy::calibrate_rdma_qps() {
         }
         confirming = all_pass;
         // All ranks fail together when any pair exhausts its QP generations.
-        if (!calibration_local_all(pass || generations < config_.rdma_qp_calibration_max_attempts, signature))
-            throw std::runtime_error("RDMA QP calibration exhausted max attempts; real iterations were not started");
+        if (!calibration_local_all(pass || generations < config_.rdma_qp_calibration_max_attempts, signature)) {
+            std::ostringstream error;
+            error << "RDMA QP calibration exhausted max attempts; real iterations were not started";
+            if (!pass) {
+                error << "\nqp_calibration_history local_rank=" << config_.node_rank
+                      << " local_gpu=" << config_.local_gpu_index
+                      << " remote_rank=" << peer.peer_rank
+                      << " remote_gpu=" << peer.remote_gpu_index
+                      << " threshold_gbps=" << config_.min_bandwidth_gbps_needed
+                      << " payload_bytes=" << bytes << '\n'
+                      << history.str();
+            } else {
+                error << "\nThis GPU pair passed the current round; another pair exhausted its attempts.";
+            }
+            throw std::runtime_error(error.str());
+        }
         if (!pass) {
             const std::string retry = "qp_calibration_recreate " + std::to_string(round);
             if (exchange(retry) != retry) throw std::runtime_error("calibration retry mismatch");

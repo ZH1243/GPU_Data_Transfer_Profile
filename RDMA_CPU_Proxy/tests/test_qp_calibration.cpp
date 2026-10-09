@@ -145,7 +145,21 @@ void test_exhaustion() {
     p.initialize();
     bool rejected = false;
     try { p.run(); }
-    catch (const std::runtime_error& e) { rejected = std::string(e.what()).find("exhausted") != std::string::npos; }
+    catch (const std::runtime_error& e) {
+        const std::string message = e.what();
+        rejected = message.find("exhausted") != std::string::npos;
+        require(message.find("qp_calibration_history local_rank=0 local_gpu=0 remote_rank=1") != std::string::npos,
+                "exhaustion diagnostic omitted GPU pair identity");
+        require(message.find("round=1 generation=1") != std::string::npos &&
+                message.find("round=2 generation=2") != std::string::npos,
+                "exhaustion diagnostic omitted previous QP generations");
+        require(message.find("local_min_gbps=") != std::string::npos &&
+                message.find("local_max_gbps=") != std::string::npos &&
+                message.find("local_median_gbps=") != std::string::npos &&
+                message.find("remote_median_gbps=") != std::string::npos &&
+                message.find("pair_min_median_gbps=") != std::string::npos,
+                "exhaustion diagnostic omitted bandwidth history");
+    }
     require(rejected, "unattainable threshold did not exhaust attempts");
     require(!QpCalibrationTestAccess::complete(p) && QpCalibrationTestAccess::measured(p) == 0,
             "real run started after failed calibration");
@@ -265,6 +279,12 @@ void test_paired_control(bool exhaust) {
             catch (const std::runtime_error& e) {
                 require(std::string(e.what()).find("exhausted") != std::string::npos,
                         "paired retry failed before coordinated exhaustion");
+                const std::string message = e.what();
+                require(message.find("qp_calibration_history local_rank=" + std::to_string(rank / 2) +
+                            " local_gpu=" + std::to_string(rank % 2)) != std::string::npos &&
+                        message.find("round=1 generation=1") != std::string::npos &&
+                        message.find("round=2 generation=2") != std::string::npos,
+                        "paired exhaustion did not report each failing pair's history");
             }
             require(QpCalibrationTestAccess::measured(p) == 0 && QpCalibrationTestAccess::markers(p) == 3,
                     "paired retry did not recreate QPs or started real iterations");
