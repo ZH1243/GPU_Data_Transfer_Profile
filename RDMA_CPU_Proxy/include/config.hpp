@@ -40,6 +40,13 @@ struct ProxyConfig {
     std::size_t token_dimension{0};
     std::size_t tokens_per_chunk{1};
     int num_qps_per_peer{1};
+    // Opt-in two-node RDMA-only QP selection before measured iterations.
+    bool rdma_qp_calibration_enabled{false};
+    double min_bandwidth_gbps_needed{340.0};
+    int rdma_qp_calibration_warmup_iterations{2};
+    int rdma_qp_calibration_sample_iterations{5};
+    int rdma_qp_calibration_max_attempts{10};
+    uint64_t rdma_qp_calibration_timeout_ms{300000};
 
     std::string rdma_device_name;
     uint8_t rdma_port{1};

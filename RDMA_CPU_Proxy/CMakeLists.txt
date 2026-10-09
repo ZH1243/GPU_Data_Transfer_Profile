@@ -109,6 +109,12 @@ if(RDMA_PROXY_BUILD_TESTS)
   target_link_libraries(test_measured_run PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_measured_run COMMAND test_measured_run)
 
+  add_executable(test_qp_calibration tests/test_qp_calibration.cpp)
+  target_link_libraries(test_qp_calibration PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_qp_calibration COMMAND test_qp_calibration)
+  add_test(NAME test_qp_calibration_transport COMMAND test_qp_calibration --transport-only)
+  set_tests_properties(test_qp_calibration test_qp_calibration_transport PROPERTIES TIMEOUT 30)
+
   add_executable(test_router_routing tests/test_router_routing.cpp)
   target_link_libraries(test_router_routing PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_router_routing COMMAND test_router_routing)

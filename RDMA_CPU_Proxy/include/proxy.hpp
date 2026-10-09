@@ -50,6 +50,7 @@ public:
 
 private:
     friend struct PreparedForwardingTestAccess;
+    friend struct QpCalibrationTestAccess;
     struct PeerState {
         int peer_rank{-1};
         int remote_gpu_index{-1};
@@ -141,6 +142,13 @@ private:
 
     PeerConnectionInfo make_local_peer_info(const PeerState& peer) const;
     void setup_peer(PeerGpuBuffers& buffers);
+    void calibrate_rdma_qps();
+    void recreate_peer_qps(PeerState& peer);
+    bool calibration_local_all(bool value, uint64_t signature);
+    uint64_t calibration_remaining_ms() const;
+    bool rdma_qp_calibration_complete_{false};
+    uint64_t calibration_barrier_sequence_{0};
+    std::chrono::steady_clock::time_point calibration_deadline_;
     RouterX3Metadata exchange_router_receive_metadata(
         const PeerAddress& peer_addr) const;
     void exchange_router_expert_metadata_all_to_all();

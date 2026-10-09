@@ -6,6 +6,7 @@
 #include <array>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -70,7 +71,11 @@ struct alignas(64) Proxy::LocalIterationSyncSlot {
         uint64_t iteration{0};
         uint64_t round{0};
     } prepared_arrivals[4]; // local, legacy remote, ping-pong2 A, ping-pong2 B
-    char padding[24]{};
+    // Separate reusable two-phase barrier for calibration; normal iteration
+    // markers remain untouched. These fields occupy the former padding.
+    uint64_t calibration_marker{0};
+    uint64_t calibration_value{0};
+    uint64_t calibration_signature{0};
 };
 
 struct alignas(64) Proxy::NvlinkForwardNotification {
@@ -501,6 +506,9 @@ void Proxy::prepare_iteration_step(uint64_t iteration) {
     if (config_.num_iterations != 0 && iteration >= config_.num_iterations) {
         throw std::runtime_error("proxy iteration index exceeds configured num_iterations");
     }
+    if (config_.rdma_qp_calibration_enabled && !rdma_qp_calibration_complete_) {
+        calibrate_rdma_qps();
+    }
     if (iteration_prepared_) {
         if (prepared_iteration_ == iteration) return;
         throw std::runtime_error(
@@ -578,6 +586,8 @@ void Proxy::shutdown() {
     release_local_iteration_sync();
     iteration_prepared_ = false;
     local_router_input_staged_ = false;
+    rdma_qp_calibration_complete_ = false;
+    calibration_barrier_sequence_ = 0;
     initialized_ = false;
     check_forwarding_error();
 }
@@ -651,6 +661,182 @@ void Proxy::setup_peer(PeerGpuBuffers& buffers) {
     synchronize_peer_ready(peer_addr, peer);
     RDMA_PROXY_LOG_INFO("peer ", buffers.peer_rank, " initialized with ", peer.qps.size(), " RC QPs");
     peers_.push_back(std::move(peer));
+}
+
+uint64_t Proxy::calibration_remaining_ms() const {
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        calibration_deadline_ - std::chrono::steady_clock::now()).count();
+    if (remaining <= 0) throw std::runtime_error("RDMA QP calibration timed out");
+    return std::min(config_.completion_timeout_ms, static_cast<uint64_t>(remaining));
+}
+
+bool Proxy::calibration_local_all(bool value, uint64_t signature) {
+    if (config_.num_gpus_per_node == 1) return value;
+    if (!local_iteration_sync_header_) throw std::runtime_error("missing calibration shared memory");
+    auto* local = local_iteration_sync_slot(config_.local_gpu_index);
+    atomic_store_u64(&local->calibration_value, value ? 1 : 0);
+    atomic_store_u64(&local->calibration_signature, signature);
+    const auto barrier = [&] {
+        const auto marker = ++calibration_barrier_sequence_;
+        atomic_store_u64(&local->calibration_marker, marker);
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(calibration_remaining_ms());
+        for (;;) {
+            bool ready = true;
+            for (int gpu = 0; gpu < config_.num_gpus_per_node; ++gpu) {
+                const auto* slot = local_iteration_sync_slot(gpu);
+                ready = ready && atomic_load_u64(&slot->calibration_marker) >= marker;
+            }
+            if (ready) break;
+            if (std::chrono::steady_clock::now() >= deadline)
+                throw std::runtime_error("timed out waiting for local RDMA QP calibration barrier");
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    };
+    barrier();
+    bool all = true;
+    for (int gpu = 0; gpu < config_.num_gpus_per_node; ++gpu) {
+        const auto* slot = local_iteration_sync_slot(gpu);
+        if (atomic_load_u64(&slot->calibration_signature) != signature)
+            throw std::runtime_error("RDMA QP calibration settings/phase differ between local GPUs");
+        all = all && atomic_load_u64(&slot->calibration_value) != 0;
+    }
+    // No participant may overwrite its value until every participant read it.
+    barrier();
+    return all;
+}
+
+void Proxy::recreate_peer_qps(PeerState& peer) {
+    // The caller has exchanged a drained decision with the remote endpoint.
+    for (auto& worker : peer.workers) worker->stop();
+    peer.workers.clear(); // Workers hold references into qps.
+    peer.qps.clear();
+    for (int q = 0; q < config_.num_qps_per_peer; ++q)
+        peer.qps.emplace_back(new RdmaQueuePair(rdma_context_, config_, peer.peer_rank, q));
+    const auto& address = config_.peers.front();
+    const auto remote = connection_manager_.exchange_peer_info(address, make_local_peer_info(peer), calibration_remaining_ms());
+    if (remote.qps.size() != peer.qps.size())
+        throw std::runtime_error("calibration remote QP count mismatch");
+    peer.remote_recv_mr = remote.recv_buffer;
+    for (std::size_t q = 0; q < peer.qps.size(); ++q) {
+        peer.qps[q]->connect(remote.qps[q]);
+        auto worker = std::make_unique<QPWorker>(*peer.qps[q], config_.completion_poll_batch_size,
+                                               config_.max_in_flight_chunks_per_qp);
+        worker->configure_expected_chunks(peer.receive_chunks.size());
+        worker->post_initial_receives(config_.recv_queue_depth);
+        worker->start();
+        peer.workers.push_back(std::move(worker));
+    }
+    const std::string ready = "qp_calibration_recreated_ready";
+    if (connection_manager_.exchange_control_message(address, ready, calibration_remaining_ms()) != ready)
+        throw std::runtime_error("calibration recreated QP readiness mismatch");
+}
+
+void Proxy::calibrate_rdma_qps() {
+    if (peers_.size() != 1 || config_.nvlink_forwarding_enabled)
+        throw std::runtime_error("QP calibration requires a two-node RDMA-only run");
+    calibration_deadline_ = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(config_.rdma_qp_calibration_timeout_ms);
+    auto& peer = peers_.front();
+    const auto& address = config_.peers.front();
+    const auto& buffers = cuda_buffers_.peer_buffers().front();
+    const auto chunks = make_chunks(peer.peer_rank);
+    std::size_t bytes = 0;
+    for (const auto& chunk : chunks) bytes += chunk.length_bytes;
+
+    std::ostringstream settings;
+    settings << std::setprecision(17) << "qp_calibration_v1 "
+             << config_.min_bandwidth_gbps_needed << ' '
+             << config_.rdma_qp_calibration_warmup_iterations << ' '
+             << config_.rdma_qp_calibration_sample_iterations << ' '
+             << config_.rdma_qp_calibration_max_attempts << ' '
+             << config_.rdma_qp_calibration_timeout_ms << ' '
+             << config_.num_qps_per_peer << ' ' << config_.num_gpus_per_node;
+    const auto exchange = [&](const std::string& message) {
+        return connection_manager_.exchange_control_message(address, message, calibration_remaining_ms());
+    };
+    if (exchange(settings.str()) != settings.str())
+        throw std::runtime_error("RDMA QP calibration settings differ between endpoints");
+    const auto signature = fnv1a64(settings.str());
+    calibration_local_all(true, signature);
+    if (bytes == 0 || peer.receive_chunks.empty())
+        throw std::runtime_error("RDMA QP calibration requires nonempty traffic in both directions");
+
+    int generations = 1;
+    bool confirming = false;
+    uint64_t round = 0;
+    for (;;) {
+        ++round;
+        std::vector<double> samples;
+        const int sample_count = config_.rdma_qp_calibration_warmup_iterations +
+                                 config_.rdma_qp_calibration_sample_iterations;
+        for (int sample = 0; sample < sample_count; ++sample) {
+            fill_iteration_send_buffers(0);
+            const auto baselines = capture_baselines(peer, peer.receive_chunks);
+            const std::string phase = "qp_calibration_sample " + std::to_string(round) + " " +
+                                      std::to_string(sample);
+            calibration_local_all(true, signature);
+            if (exchange(phase) != phase) throw std::runtime_error("calibration sample phase mismatch");
+            calibration_local_all(true, signature);
+            const auto start = std::chrono::steady_clock::now();
+            const auto distributor = enqueue_chunks(peer, buffers, chunks);
+            wait_for_iteration(peer, baselines, distributor);
+            const auto end = std::chrono::steady_clock::now();
+            calibration_remaining_ms();
+            if (verify_immediates(peer, peer.receive_chunks, baselines, distributor->assignment(), 0) != 0 ||
+                validate_received_data(0) != 0)
+                throw std::runtime_error("RDMA QP calibration sample validation failed");
+            const double seconds = std::chrono::duration<double>(end - start).count();
+            const double gbps = static_cast<double>(bytes) * 8.0 / seconds / 1e9;
+            if (sample >= config_.rdma_qp_calibration_warmup_iterations) samples.push_back(gbps);
+            // Both endpoints finish consuming the receive buffer before reuse.
+            if (exchange(phase + " done") != phase + " done")
+                throw std::runtime_error("calibration sample completion phase mismatch");
+        }
+        std::sort(samples.begin(), samples.end());
+        const auto middle = samples.size() / 2;
+        const double median = samples.size() % 2 ? samples[middle] :
+            (samples[middle - 1] + samples[middle]) / 2.0;
+        // Exchange both directions, not a sum of bidirectional bandwidth.
+        std::ostringstream result;
+        result << std::setprecision(17) << "qp_calibration_result " << round << ' ' << median;
+        std::istringstream remote(exchange(result.str()));
+        std::string tag;
+        uint64_t remote_round = 0;
+        double remote_median = 0;
+        if (!(remote >> tag >> remote_round >> remote_median) || tag != "qp_calibration_result" ||
+            remote_round != round || !std::isfinite(remote_median) || remote_median < 0)
+            throw std::runtime_error("invalid calibration result from peer");
+        const bool pass = median >= config_.min_bandwidth_gbps_needed &&
+                          remote_median >= config_.min_bandwidth_gbps_needed;
+        RDMA_PROXY_LOG_INFO("qp_calibration round=", round, " generation=", generations,
+                            " local_rank=", config_.node_rank, " local_gpu=", config_.local_gpu_index,
+                            " payload_bytes=", bytes, " local_min_gbps=", samples.front(),
+                            " local_max_gbps=", samples.back(),
+                            " local_median_gbps=", median, " remote_median_gbps=", remote_median,
+                            " threshold_gbps=", config_.min_bandwidth_gbps_needed,
+                            " pair_pass=", pass, " confirmation=", confirming);
+        const bool all_pass = calibration_local_all(pass, signature);
+        if (all_pass && confirming) {
+            const std::string accepted = "qp_calibration_accepted " + std::to_string(round);
+            if (exchange(accepted) != accepted) throw std::runtime_error("calibration acceptance mismatch");
+            calibration_local_all(true, signature);
+            rdma_qp_calibration_complete_ = true;
+            RDMA_PROXY_LOG_INFO("qp_calibration complete local_gpu=", config_.local_gpu_index,
+                                " generations=", generations, " rounds=", round);
+            return;
+        }
+        confirming = all_pass;
+        // All ranks fail together when any pair exhausts its QP generations.
+        if (!calibration_local_all(pass || generations < config_.rdma_qp_calibration_max_attempts, signature))
+            throw std::runtime_error("RDMA QP calibration exhausted max attempts; real iterations were not started");
+        if (!pass) {
+            const std::string retry = "qp_calibration_recreate " + std::to_string(round);
+            if (exchange(retry) != retry) throw std::runtime_error("calibration retry mismatch");
+            recreate_peer_qps(peer);
+            ++generations;
+        }
+    }
 }
 
 RouterX3Metadata Proxy::exchange_router_receive_metadata(
@@ -900,7 +1086,8 @@ Proxy::LocalIterationSyncSlot* Proxy::local_iteration_sync_slot(int gpu_index) c
 
 void Proxy::initialize_local_iteration_sync() {
     const bool sync_required =
-        config_.local_iteration_sync_enabled || config_.nvlink_forward_local_batch_sync_enabled;
+        config_.local_iteration_sync_enabled || config_.nvlink_forward_local_batch_sync_enabled ||
+        config_.rdma_qp_calibration_enabled;
     if (!sync_required || config_.num_gpus_per_node <= 1) return;
     if (local_iteration_sync_header_) return;
 
@@ -1004,6 +1191,9 @@ void Proxy::initialize_local_iteration_sync() {
     atomic_store_i32(&slot->gpu_index, config_.local_gpu_index);
     atomic_store_u64(&slot->iteration_start, 0);
     atomic_store_u64(&slot->iteration_done, 0);
+    atomic_store_u64(&slot->calibration_marker, 0);
+    atomic_store_u64(&slot->calibration_value, 0);
+    atomic_store_u64(&slot->calibration_signature, 0);
     atomic_store_u64(&slot->nvlink_forward_batch_iteration, 0);
     atomic_store_u64(&slot->nvlink_forward_batch_phase, 0);
     atomic_store_u64(&slot->nvlink_forward_batch_round, 0);
@@ -2599,7 +2789,8 @@ void Proxy::wait_for_iteration(
     const std::vector<QPCompletionBaseline>& baselines,
     const std::shared_ptr<DynamicChunkDistributor>& distributor) const {
     const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(config_.completion_timeout_ms);
+                          std::chrono::milliseconds(config_.rdma_qp_calibration_enabled && !rdma_qp_calibration_complete_ ?
+                              calibration_remaining_ms() : config_.completion_timeout_ms);
     while (true) {
         bool complete = true;
         for (std::size_t q = 0; q < peer.workers.size(); ++q) {

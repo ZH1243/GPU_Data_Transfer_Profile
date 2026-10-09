@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <limits>
@@ -261,6 +262,12 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "token_dimension") config.token_dimension = static_cast<std::size_t>(std::stoull(value));
     else if (key == "tokens_per_chunk") config.tokens_per_chunk = static_cast<std::size_t>(std::stoull(value));
     else if (key == "num_qps_per_peer") config.num_qps_per_peer = std::stoi(value);
+    else if (key == "rdma_qp_calibration_enabled") config.rdma_qp_calibration_enabled = (value == "1" || value == "true" || value == "yes");
+    else if (key == "min_bandwidth_gbps_needed") config.min_bandwidth_gbps_needed = std::stod(value);
+    else if (key == "rdma_qp_calibration_warmup_iterations") config.rdma_qp_calibration_warmup_iterations = std::stoi(value);
+    else if (key == "rdma_qp_calibration_sample_iterations") config.rdma_qp_calibration_sample_iterations = std::stoi(value);
+    else if (key == "rdma_qp_calibration_max_attempts") config.rdma_qp_calibration_max_attempts = std::stoi(value);
+    else if (key == "rdma_qp_calibration_timeout_ms") config.rdma_qp_calibration_timeout_ms = std::stoull(value);
     else if (key == "rdma_device_name") config.rdma_device_name = value;
     else if (key == "rdma_port") config.rdma_port = static_cast<uint8_t>(std::stoi(value));
     else if (key == "gid_index") config.gid_index = std::stoi(value);
@@ -581,6 +588,12 @@ static ProxyConfig parse_config_file(const std::string& path) {
     config.token_dimension = number_as<std::size_t>(object, "token_dimension", config.token_dimension);
     config.tokens_per_chunk = number_as<std::size_t>(object, "tokens_per_chunk", config.tokens_per_chunk);
     config.num_qps_per_peer = number_as<int>(object, "num_qps_per_peer", config.num_qps_per_peer);
+    config.rdma_qp_calibration_enabled = get_bool(object, "rdma_qp_calibration_enabled", config.rdma_qp_calibration_enabled);
+    config.min_bandwidth_gbps_needed = number_as<double>(object, "min_bandwidth_gbps_needed", config.min_bandwidth_gbps_needed);
+    config.rdma_qp_calibration_warmup_iterations = number_as<int>(object, "rdma_qp_calibration_warmup_iterations", config.rdma_qp_calibration_warmup_iterations);
+    config.rdma_qp_calibration_sample_iterations = number_as<int>(object, "rdma_qp_calibration_sample_iterations", config.rdma_qp_calibration_sample_iterations);
+    config.rdma_qp_calibration_max_attempts = number_as<int>(object, "rdma_qp_calibration_max_attempts", config.rdma_qp_calibration_max_attempts);
+    config.rdma_qp_calibration_timeout_ms = number_as<uint64_t>(object, "rdma_qp_calibration_timeout_ms", config.rdma_qp_calibration_timeout_ms);
     config.rdma_device_name = get_string(object, "rdma_device_name", config.rdma_device_name);
     config.rdma_port = number_as<uint8_t>(object, "rdma_port", config.rdma_port);
     config.gid_index = number_as<int>(object, "gid_index", config.gid_index);
@@ -803,6 +816,23 @@ ProxyConfig load_config(int argc, char** argv) {
 }
 
 void validate_config(const ProxyConfig& config) {
+    if (config.rdma_qp_calibration_enabled) {
+        if (config.num_nodes != 2 || config.nvlink_forwarding_enabled) {
+            throw std::runtime_error("rdma_qp_calibration_enabled requires two nodes and nvlink_forwarding_enabled=false");
+        }
+        if (!std::isfinite(config.min_bandwidth_gbps_needed) || config.min_bandwidth_gbps_needed <= 0 ||
+            config.rdma_qp_calibration_warmup_iterations < 0 ||
+            config.rdma_qp_calibration_warmup_iterations > 10000 ||
+            config.rdma_qp_calibration_sample_iterations < 1 ||
+            config.rdma_qp_calibration_sample_iterations > 10000 ||
+            config.rdma_qp_calibration_max_attempts < 1 ||
+            config.rdma_qp_calibration_max_attempts > 10000 ||
+            config.rdma_qp_calibration_timeout_ms < 1 ||
+            config.rdma_qp_calibration_timeout_ms > 86400000) {
+            throw std::runtime_error("invalid RDMA QP calibration settings: require finite positive bandwidth, warmups in [0,10000], samples/attempts in [1,10000], timeout in [1,86400000] ms");
+        }
+    }
+
     if (config.num_nodes < 1) throw std::runtime_error("num_nodes must be >= 1");
     if (config.node_rank < 0 || config.node_rank >= config.num_nodes) throw std::runtime_error("node_rank out of range");
     if (config.local_gpu_index < 0 || config.local_gpu_index >= config.num_gpus_per_node) {
@@ -1290,6 +1320,14 @@ std::string config_summary(const ProxyConfig& config) {
         << " rdma_bandwidth_summary_dir=" << config.rdma_bandwidth_summary_dir
         << " cpu_affinity=" << (config.cpu_affinity.empty() ? "none" : config.cpu_affinity)
         << " mock_mode=" << (config.mock_mode ? "true" : "false");
+    if (config.rdma_qp_calibration_enabled) {
+        out << " rdma_qp_calibration_enabled=true"
+            << " min_bandwidth_gbps_needed=" << config.min_bandwidth_gbps_needed
+            << " rdma_qp_calibration_warmup_iterations=" << config.rdma_qp_calibration_warmup_iterations
+            << " rdma_qp_calibration_sample_iterations=" << config.rdma_qp_calibration_sample_iterations
+            << " rdma_qp_calibration_max_attempts=" << config.rdma_qp_calibration_max_attempts
+            << " rdma_qp_calibration_timeout_ms=" << config.rdma_qp_calibration_timeout_ms;
+    }
     return out.str();
 }
 

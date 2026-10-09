@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <chrono>
+#include <cerrno>
+#include <fcntl.h>
+#include <poll.h>
 #include <cstring>
 #include <iomanip>
 #include <limits>
@@ -98,6 +101,133 @@ void recv_all(int fd, void* data, std::size_t bytes) {
         ptr += n;
         bytes -= static_cast<std::size_t>(n);
     }
+}
+
+// Calibration must also terminate when a peer connects but stops responding.
+// Keep the legacy transport unchanged when calibration is disabled.
+class CalibrationSocket {
+public:
+    explicit CalibrationSocket(int fd = -1) : fd_(fd) {}
+    ~CalibrationSocket() { if (fd_ >= 0) ::close(fd_); }
+    int get() const { return fd_; }
+    void reset(int fd = -1) { if (fd_ >= 0) ::close(fd_); fd_ = fd; }
+    CalibrationSocket(const CalibrationSocket&) = delete;
+    CalibrationSocket& operator=(const CalibrationSocket&) = delete;
+private:
+    int fd_;
+};
+
+std::string exchange_calibration_payload(
+    const PeerAddress& peer, uint16_t listen_port, bool client,
+    const std::string& payload, uint64_t timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    const auto check_deadline = [&] {
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (ms <= 0) throw std::runtime_error("calibration TCP exchange timed out");
+        return static_cast<int>(std::min<int64_t>(ms, std::numeric_limits<int>::max()));
+    };
+    const auto wait_fd = [&](int fd, short events) {
+        for (;;) {
+            pollfd descriptor{fd, events, 0};
+            const int rc = ::poll(&descriptor, 1, check_deadline());
+            if (rc > 0) return; // recv/send/SO_ERROR diagnoses HUP/ERR.
+            if (rc < 0 && errno == EINTR) continue;
+            throw std::runtime_error("calibration TCP socket wait failed or timed out");
+        }
+    };
+    const auto nonblocking = [](int fd) {
+        const int flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+            throw std::runtime_error("cannot make calibration socket nonblocking");
+#ifdef SO_NOSIGPIPE
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+    };
+    CalibrationSocket socket;
+    if (client) {
+        addrinfo hints{};
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_family = AF_UNSPEC;
+        addrinfo* result = nullptr;
+        if (getaddrinfo(peer.host.c_str(), std::to_string(peer.port).c_str(), &hints, &result) != 0)
+            throw std::runtime_error("calibration getaddrinfo failed for " + peer.host);
+        std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> addresses(result, freeaddrinfo);
+        bool connected = false;
+        while (!connected) {
+            check_deadline();
+            for (auto* rp = result; rp; rp = rp->ai_next) {
+                socket.reset(::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol));
+                if (socket.get() < 0) continue;
+                nonblocking(socket.get());
+                int rc = ::connect(socket.get(), rp->ai_addr, rp->ai_addrlen);
+                if (rc < 0 && errno == EINPROGRESS) {
+                    wait_fd(socket.get(), POLLOUT);
+                    int error = 0;
+                    socklen_t size = sizeof(error);
+                    if (getsockopt(socket.get(), SOL_SOCKET, SO_ERROR, &error, &size) == 0 && !error) rc = 0;
+                }
+                if (rc == 0) { connected = true; break; }
+            }
+            if (!connected) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    } else {
+        CalibrationSocket listener(::socket(AF_INET6, SOCK_STREAM, 0));
+        if (listener.get() < 0) throw std::runtime_error("calibration listener socket failed");
+        int one = 1;
+        setsockopt(listener.get(), SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        sockaddr_in6 addr{};
+        addr.sin6_family = AF_INET6;
+        addr.sin6_addr = in6addr_any;
+        addr.sin6_port = htons(listen_port);
+        if (::bind(listener.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+            ::listen(listener.get(), 1) != 0)
+            throw std::runtime_error("calibration listener bind/listen failed");
+        nonblocking(listener.get());
+        for (;;) {
+            wait_fd(listener.get(), POLLIN);
+            socket.reset(::accept(listener.get(), nullptr, nullptr));
+            if (socket.get() >= 0) break;
+            if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+                throw std::runtime_error("calibration accept failed");
+        }
+        nonblocking(socket.get());
+    }
+    const auto transfer = [&](void* data, std::size_t bytes, bool sending) {
+        auto* ptr = static_cast<char*>(data);
+        while (bytes) {
+            wait_fd(socket.get(), sending ? POLLOUT : POLLIN);
+            int flags = 0;
+#ifdef MSG_NOSIGNAL
+            if (sending) flags = MSG_NOSIGNAL;
+#endif
+            const auto n = sending ? ::send(socket.get(), ptr, bytes, flags) :
+                                     ::recv(socket.get(), ptr, bytes, 0);
+            if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+            if (n <= 0) throw std::runtime_error("calibration TCP peer disconnected or I/O failed");
+            ptr += n;
+            bytes -= static_cast<std::size_t>(n);
+        }
+    };
+    const auto send_payload = [&] {
+        auto length = host_to_be64(payload.size());
+        transfer(&length, sizeof(length), true);
+        transfer(const_cast<char*>(payload.data()), payload.size(), true);
+    };
+    const auto receive_payload = [&] {
+        uint64_t length = 0;
+        transfer(&length, sizeof(length), false);
+        length = be64_to_host(length);
+        if (length > 1024 * 1024) throw std::runtime_error("calibration control payload exceeds 1 MiB");
+        std::string received(static_cast<std::size_t>(length), '\0');
+        transfer(received.data(), received.size(), false);
+        return received;
+    };
+    if (client) { send_payload(); return receive_payload(); }
+    auto received = receive_payload();
+    send_payload();
+    return received;
 }
 
 std::string exchange_payload_client(const PeerAddress& peer, const std::string& payload, uint64_t timeout_ms) {
@@ -658,7 +788,8 @@ ConnectionManager::ConnectionManager(ProxyConfig config) : config_(std::move(con
 
 PeerConnectionInfo ConnectionManager::exchange_peer_info(
     const PeerAddress& peer,
-    const PeerConnectionInfo& local_info) const {
+    const PeerConnectionInfo& local_info,
+    uint64_t timeout_ms) const {
     const auto local_payload = serialize_peer_info(local_info);
     std::string remote_payload;
 
@@ -667,7 +798,11 @@ PeerConnectionInfo ConnectionManager::exchange_peer_info(
         return local_info;
     }
 
-    if (config_.node_rank < peer.node_rank) {
+    if (timeout_ms == 0) timeout_ms = config_.completion_timeout_ms;
+    if (config_.rdma_qp_calibration_enabled) {
+        remote_payload = exchange_calibration_payload(peer, config_.listen_port,
+            config_.node_rank < peer.node_rank, local_payload, timeout_ms);
+    } else if (config_.node_rank < peer.node_rank) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         remote_payload = exchange_payload_client(peer, local_payload, config_.completion_timeout_ms);
     } else {
@@ -688,6 +823,10 @@ std::string ConnectionManager::exchange_control_message(
         return local_payload;
     }
 
+    if (config_.rdma_qp_calibration_enabled) {
+        return exchange_calibration_payload(peer, config_.listen_port,
+            config_.node_rank < peer.node_rank, local_payload, timeout_ms);
+    }
     if (config_.node_rank < peer.node_rank) {
         return exchange_payload_client(peer, local_payload, timeout_ms);
     }

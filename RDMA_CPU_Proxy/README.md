@@ -25,6 +25,92 @@ Before the first measured send, peers also exchange a TCP ready barrier after QP
 
 When `nvlink_forwarding_enabled=true`, each proxy also starts NVLink forwarding threads for its local GPU. The QP CQ workers still own CQ polling and immediate decoding; the forwarding-ready thread monitors their per-chunk immediate counters, while the forwarding thread processes peer-node receive buffers in deterministic descending ring order and issues intra-node GPU-to-GPU copies after a forwarding batch has arrived.
 
+## Optional RDMA QP calibration
+
+For a **two-node, RDMA-only** run, enable `rdma_qp_calibration_enabled=true`
+on every proxy on both nodes to select a QP set before real iteration zero.
+It is disabled by default; leaving it disabled preserves the existing launch,
+transfer, and reporting path. This option currently rejects NVLink forwarding
+and deployments with more or fewer than two nodes. Router-selected RDMA payloads
+are supported, as are contiguous payloads with router routing disabled.
+
+After Python finishes initializing its GPU tensors, the first iteration
+preparation performs calibration using the existing buffers, memory
+registrations, chunk layout, SGE pattern, QP count, and in-flight limit. Each
+round runs all local GPU pairs concurrently, including previously passing
+pairs. Both endpoints exchange their median outgoing payload bandwidth over
+TCP. A pair passes only when **both directions** reach the threshold; the
+threshold is the aggregate across the pair's QPs, not per-QP bandwidth and not
+the sum of transmit and receive bandwidth. `340` means **340 Gb/s (42.5 GB/s)**.
+
+Only failing pairs quiesce their workers and recreate their complete QP/CQ and
+worker sets at both endpoints. Buffers, registered memory, and router metadata
+are retained. When every pair passes, another complete concurrent round must
+also pass before any real iteration starts. A previously passing pair that
+fails a later round is eligible for recreation. Sampling and confirmation do
+not count toward `num_iterations` or the normal bandwidth summary; normal
+iteration completion baselines exclude calibration traffic. The real run uses
+the accepted QPs without reconnecting them.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `rdma_qp_calibration_enabled` | `false` | Enable startup calibration on both nodes |
+| `min_bandwidth_gbps_needed` | `340` | Required median outgoing payload Gb/s at each endpoint |
+| `rdma_qp_calibration_warmup_iterations` | `2` | Unmeasured samples at the start of each round |
+| `rdma_qp_calibration_sample_iterations` | `5` | Measured samples per round |
+| `rdma_qp_calibration_max_attempts` | `10` | Maximum QP generations per pair, including the initial set |
+| `rdma_qp_calibration_timeout_ms` | `300000` | Calibration time budget, starting at first iteration preparation |
+
+These options work in JSON and as `--key=value` CLI overrides. Calibration
+settings must match across all workers. Local calibration synchronization is
+automatically enabled even if `local_iteration_sync_enabled=false`; use the
+same `local_iteration_sync_run_id` for all local workers and a fresh ID for
+separate launches. The existing `completion_timeout_ms` still bounds individual
+control exchanges, local barriers, and completion waits. Exhaustion or timeout
+fails the run; it does not silently start with a below-threshold QP set. Fatal
+peer failures are propagated through control-exchange/barrier timeouts.
+
+Rebuild `rdma_cpu_proxy_shared` on both remote nodes. Append the following to
+**each of your existing RDMA-only torchrun commands**:
+
+```bash
+--rdma_qp_calibration_enabled=true \
+--min_bandwidth_gbps_needed=340 \
+--rdma_qp_calibration_warmup_iterations=2 \
+--rdma_qp_calibration_sample_iterations=5 \
+--rdma_qp_calibration_max_attempts=10 \
+--rdma_qp_calibration_timeout_ms=300000
+```
+
+The checked-in torchrun scripts enable forwarding by default. For those scripts,
+also supply the RDMA-only overrides:
+
+```bash
+--nvlink_forwarding_enabled=false \
+--router_local_input_staging_enabled=false \
+--nvlink_forward_local_batch_sync_enabled=false \
+--nvlink_forward_completion_notifications_enabled=false \
+--nvlink_forward_preparation_enabled=false \
+--nvlink_forward_submit_epilogue_enabled=false \
+--nvlink_forward_prepared_atomic_ring_enabled=false \
+--local_forwarding_rdma_overlap_enabled=false
+```
+
+Logs beginning with `qp_calibration` report round, QP generation, local/remote
+median bandwidth, threshold, pair decision, and confirmation status. QP creation
+logs include the QPNs of each replacement set. The score uses outgoing payload
+bytes divided by the elapsed sample time through observation of both local-send
+and remote-receive end markers, including software scheduling and CQ polling
+latency. It is not Nsight's active-PCIe bandwidth metric. Initialization,
+barriers, payload filling, and optional payload validation are outside the
+sample's timed interval. Empty routed traffic cannot be calibrated.
+
+Recreating QPs may improve path distribution but cannot guarantee bandwidth if
+the limit is CPU scheduling, insufficient outstanding work, or shared-fabric
+congestion. Calibration traffic is visible in Nsight before real iteration zero.
+Mock-mode tests exercise the lifecycle and coordination only; their bandwidth
+values do not represent RDMA hardware performance.
+
 ## GPU Buffer Layout
 
 Each token buffer is contiguous row-major memory with shape:
