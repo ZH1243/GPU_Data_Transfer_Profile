@@ -16,6 +16,17 @@ import threading
 
 EXPECTED_ABI_VERSION = 1
 
+# Keep CLI parsing (including --dry-run) independent of CUDA/QuACK imports.
+ORDINARY_ACTIVATIONS = ("silu", "silu-tanh", "relu", "relu_sq", "gelu_tanh_approx", "tanh")
+GATED_ACTIVATIONS = (
+    "swiglu", "swiglu-tanh", "swiglu_oai", "swiglu_oai-tanh", "reglu", "geglu", "glu",
+)
+
+
+def projection_dimension(output_dimension: int, activation: str | None) -> int:
+    """The table schedules projection columns, before gated activation halves them."""
+    return output_dimension * (2 if activation in GATED_ACTIVATIONS else 1)
+
 DEVICE_BUFFER_RDMA_SEND = 1
 DEVICE_BUFFER_RDMA_RECEIVE = 2
 DEVICE_BUFFER_NVLINK_RECEIVE = 3
@@ -240,6 +251,7 @@ class GroupedGemmRunner:
         world_size: int,
         num_experts: int,
         output_dimension: int,
+        activation: str | None,
         tile_m: int,
         tile_n: int,
         tile_k: int | None,
@@ -274,6 +286,21 @@ class GroupedGemmRunner:
         except Exception as error:
             raise RuntimeError(f"failed to import QuACK from {quack_root}: {error}") from error
         self.quack_gemm = quack_gemm
+        self.activation = activation
+        self.gated = activation in GATED_ACTIVATIONS
+        self.gemm_dimension = projection_dimension(output_dimension, activation)
+        if activation is not None:
+            from quack.gemm_config import GemmConfig
+            from quack.gemm_interface import gemm_act
+
+            self.quack_gemm_act = gemm_act
+            self.activation_config = GemmConfig(
+                tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+                cluster_m=cluster_m, cluster_n=1, cluster_k=1,
+                pingpong=False, is_dynamic_persistent=False,
+                max_swizzle_size=max_swizzle_size,
+                device_capacity=9, use_tma_gather=False,
+            )
 
         a_idx_entries = [
             (key, tensor)
@@ -333,7 +360,7 @@ class GroupedGemmRunner:
         if work_table.shape[0] == 0:
             raise RuntimeError("QuACK gather table has zero rows")
 
-        clusters_n = math.ceil(output_dimension / tile_n)
+        clusters_n = math.ceil(self.gemm_dimension / tile_n)
         group_size = min(max_swizzle_size, clusters_n)
         if group_size == 0 or clusters_n % group_size != 0:
             raise RuntimeError(
@@ -342,11 +369,19 @@ class GroupedGemmRunner:
 
         local_experts = num_experts // world_size
         hidden_dimension = int(first_x.shape[1])
+        # Gated epilogues use QuACK's concat-B layout: contiguous [gate; up]
+        # rows in storage, exposed logically as [E, K, 2H].
+        weight_shape = (
+            (local_experts, self.gemm_dimension, hidden_dimension)
+            if self.gated else (local_experts, hidden_dimension, self.gemm_dimension)
+        )
         self.weights = torch_module.randn(
-            (local_experts, hidden_dimension, output_dimension),
+            weight_shape,
             dtype=first_x.dtype,
             device=first_x.device,
         )
+        if self.gated:
+            self.weights = self.weights.transpose(1, 2)
         self.weights.mul_(1.0 / math.sqrt(hidden_dimension))
         self.output = torch_module.empty(
             (len(x_buffers) * int(first_a_idx.numel()), output_dimension),
@@ -367,6 +402,7 @@ class GroupedGemmRunner:
         self.max_swizzle_size = max_swizzle_size
         print(
             "GroupedGEMM configured: "
+            f"activation={activation or 'none'} projection_N={self.gemm_dimension} "
             f"active_sources={source_pairs} X={tuple(first_x.shape)} "
             f"A_idx={tuple(first_a_idx.shape)} W={tuple(self.weights.shape)} "
             f"output={tuple(self.output.shape)} table={tuple(work_table.shape)}",
@@ -374,6 +410,23 @@ class GroupedGemmRunner:
         )
 
     def launch(self) -> None:
+        if self.activation is not None:
+            self.quack_gemm_act(
+                self.x_buffers,
+                self.weights,
+                activation=self.activation,
+                postact_out=self.output,
+                A_idx=self.a_idx,
+                gather_work_table=self.work_table,
+                gather_work_table_ready=self.ready_rows,
+                multi_buffer_gather=True,
+                store_preact=False,
+                dynamic_scheduler=False,
+                tuned=False,
+                config=self.activation_config,
+                concat_layout=("B",) if self.gated else None,
+            )
+            return
         self.quack_gemm(
             self.x_buffers,
             self.transposed_weights,
@@ -488,7 +541,7 @@ def build_proxy_argv(
                 "--router_local_input_staging_enabled=true",
                 f"--expert_gemm_m_tile={args.expert_gemm_m_tile}",
                 f"--expert_gemm_n_tile={args.expert_gemm_n_tile}",
-                f"--expert_gemm_dimension={args.expert_gemm_dimension}",
+                f"--expert_gemm_dimension={projection_dimension(args.expert_gemm_dimension, args.grouped_gemm_activation)}",
                 f"--expert_gemm_cluster_m={args.expert_gemm_cluster_m}",
                 f"--expert_gemm_max_swizzle_size={args.expert_gemm_max_swizzle_size}",
             ]
@@ -696,6 +749,7 @@ def run_proxy_with_concurrent_kernel(
     world_size: int,
     num_experts: int,
     expert_gemm_dimension: int,
+    activation: str | None,
     expert_gemm_m_tile: int,
     expert_gemm_n_tile: int,
     expert_gemm_k_tile: int | None,
@@ -753,6 +807,7 @@ def run_proxy_with_concurrent_kernel(
             world_size=world_size,
             num_experts=num_experts,
             output_dimension=expert_gemm_dimension,
+            activation=activation,
             tile_m=expert_gemm_m_tile,
             tile_n=expert_gemm_n_tile,
             tile_k=expert_gemm_k_tile,
@@ -775,7 +830,7 @@ def run_proxy_with_concurrent_kernel(
             2
             * int(computation_tokens.value)
             * hidden_dimension
-            * expert_gemm_dimension
+            * grouped_gemm.gemm_dimension
         )
         iteration_throughputs: list[tuple[int, float, float]] = []
         kernel_stream = torch.cuda.Stream(device=cuda_device_id)
@@ -873,7 +928,9 @@ def run_proxy_with_concurrent_kernel(
         print(
             "GroupedGEMM effective throughput by iteration "
             f"(useful_routes={computation_tokens.value}, K={hidden_dimension}, "
-            f"N={expert_gemm_dimension}):",
+            f"projection_N={grouped_gemm.gemm_dimension}, "
+            f"output_N={expert_gemm_dimension}, activation={activation or 'none'}; "
+            "GEMM FLOPs only, timing includes fused activation):",
             flush=True,
         )
         for iteration, elapsed_value, effective_tflops in iteration_throughputs:
@@ -914,6 +971,12 @@ def main() -> int:
         help="launch QuACK multi-buffer GroupedGEMM with every proxy iteration",
     )
     parser.add_argument("--num-experts", "--num_experts", type=int)
+    parser.add_argument(
+        "--grouped-gemm-activation",
+        choices=("none", *ORDINARY_ACTIVATIONS, *GATED_ACTIVATIONS),
+        default="none",
+        help="fused up-projection activation; requires --concurrent-kernel",
+    )
     parser.add_argument("--grouped-gemm-m-tile", dest="expert_gemm_m_tile", type=int, default=128)
     parser.add_argument("--grouped-gemm-n-tile", dest="expert_gemm_n_tile", type=int, default=256)
     parser.add_argument(
@@ -924,6 +987,7 @@ def main() -> int:
         dest="expert_gemm_dimension",
         type=int,
         default=8192,
+        help="post-activation width; gated activations use twice this GEMM width",
     )
     parser.add_argument(
         "--grouped-gemm-cluster-m", dest="expert_gemm_cluster_m", type=int, default=1
@@ -945,6 +1009,13 @@ def main() -> int:
         help="print the derived C++ argv without loading the shared library",
     )
     args, proxy_args = parser.parse_known_args()
+    if args.grouped_gemm_activation != "none" and not args.concurrent_kernel:
+        parser.error("--grouped-gemm-activation requires --concurrent-kernel")
+    if args.expert_gemm_dimension <= 0:
+        parser.error("--grouped-gemm-output-dimension must be positive")
+    args.grouped_gemm_activation = (
+        None if args.grouped_gemm_activation == "none" else args.grouped_gemm_activation
+    )
 
     proxy_argv, metadata = build_proxy_argv(args, proxy_args)
     print(
@@ -972,6 +1043,7 @@ def main() -> int:
             world_size=int(metadata["world_size"]),
             num_experts=args.num_experts,
             expert_gemm_dimension=args.expert_gemm_dimension,
+            activation=args.grouped_gemm_activation,
             expert_gemm_m_tile=args.expert_gemm_m_tile,
             expert_gemm_n_tile=args.expert_gemm_n_tile,
             expert_gemm_k_tile=args.expert_gemm_k_tile,

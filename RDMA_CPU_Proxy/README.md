@@ -613,6 +613,50 @@ default to the proxy scheduler values and can be overridden with the
 `--grouped-gemm-*` worker options; the worker forwards matching scheduler values
 to C++. The shell launchers forward additional arguments to the worker.
 
+### Fused up-projection activation
+
+Add `--grouped-gemm-activation=swiglu` (or an ordinary activation such as `relu`)
+alongside `--concurrent-kernel` on both nodes. For example, append these options
+to the existing forwarding configuration:
+
+```bash
+--concurrent-kernel --grouped-gemm-activation=swiglu \
+  --grouped-gemm-output-dimension=8192
+```
+
+The default activation is `none`, preserving the plain GEMM launch. Supported
+ordinary activations are `silu`, `silu-tanh`, `relu`, `relu_sq`,
+`gelu_tanh_approx`, and `tanh`. Gated activations are `swiglu`, `swiglu-tanh`,
+`swiglu_oai`, `swiglu_oai-tanh`, `reglu`, `geglu`, and `glu`.
+
+The output-dimension option always specifies the **post-activation width** H.
+Ordinary activations use weights shaped `[E, K, H]`. Gated activations use
+logical weights `[E, K, 2H]`, containing gate and up projections, and produce
+`[R, H]` output. The worker forwards the actual projection width (2H for gated
+activations) as `expert_gemm_dimension` to C++, so the published table covers
+both projections. Thus SwiGLU with H=8192 schedules a GEMM width of 16384.
+Python's explicit tile/cluster/swizzle options continue to override the JSON
+scheduler settings in concurrent mode.
+
+Activation uses QuACK's existing `gemm_act` fused epilogue with an explicit
+Hopper configuration, the same multi-buffer gather table and ready-row flag,
+and no saved pre-activation tensor. No separate activation kernel, down
+projection, or token-combine stage is launched. No QuACK or C++ implementation
+changes are needed. Timing includes the fused epilogue; effective TFLOP/s counts
+only GEMM arithmetic, including both projections for gated activations.
+
+Run the worker's CLI checks and numerical Hopper tests with:
+
+```bash
+python -m unittest discover -s RDMA_CPU_Proxy/tests -p test_worker_activation.py -v
+```
+
+Run from the parent of `RDMA_CPU_Proxy`. Set `QUACK_ROOT` for a non-sibling QuACK
+checkout. Numerical tests compare plain GEMM, ReLU, and SwiGLU against FP32
+references with multiple input buffers and ragged expert batches. They require
+Hopper and CUDA PyTorch and are skipped otherwise. The full two-node run is
+still required to validate RDMA/activation overlap.
+
 ## Example Launch
 
 Edit `config/example_config.json` for each node and GPU process. Every proxy should use the same `local_gpu_index` value as the GPU it owns, and peers should point to the same-index proxy on other nodes.
