@@ -366,6 +366,33 @@ extern "C" int rdma_proxy_get_computation_num_tokens(
     }
 }
 
+extern "C" int rdma_proxy_get_computation_expert_counts(
+    RdmaProxyHandle* handle, uint64_t* counts, uint64_t capacity,
+    uint64_t* num_experts) {
+    clear_error();
+    if (!handle || !num_experts || (!counts && capacity != 0)) {
+        last_error = "invalid expert-count query arguments";
+        return -1;
+    }
+    if (!handle->initialized || handle->shut_down) {
+        last_error = "querying expert counts requires an initialized proxy";
+        return -1;
+    }
+    try {
+        const auto state = handle->proxy.router_computation_scheduler_state();
+        if (!state.initialized) throw std::runtime_error("router scheduler is not initialized");
+        *num_experts = state.expert_total_tokens.size();
+        if (!counts) return 0;
+        if (capacity < *num_experts) throw std::runtime_error("expert-count capacity is too small");
+        for (std::size_t i = 0; i < state.expert_total_tokens.size(); ++i) {
+            counts[i] = state.expert_total_tokens[i];
+        }
+        return 0;
+    } catch (...) {
+        return record_current_exception();
+    }
+}
+
 extern "C" int rdma_proxy_finish(RdmaProxyHandle* handle) {
     clear_error();
     if (handle == nullptr) {

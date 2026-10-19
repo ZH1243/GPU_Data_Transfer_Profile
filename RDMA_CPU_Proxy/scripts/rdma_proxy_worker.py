@@ -452,6 +452,107 @@ class GroupedGemmRunner:
         )
 
 
+def add_down_arguments(parser):
+    parser.add_argument("--down-projection2", action="store_true")
+    for name, default in (("tile-m", 128), ("tile-n", 128), ("cluster-m", 1),
+                          ("max-swizzle-size", 1), ("scatter-output-buffers", 2)):
+        parser.add_argument(f"--down-{name}", type=int, default=default)
+    for name in ("pingpong", "scatter-table", "n-tile-major-output",
+                 "multi-buffer-scatter", "gather-table", "gather-table-expert-waves",
+                 "gather-table-wave-barrier"):
+        parser.add_argument(f"--down-{name}", action="store_true")
+    parser.add_argument("--down-epilogue-store",
+                        choices=("tma", "bulk_rows", "bulk_rows_reduce"), default="tma")
+
+
+def validate_down_arguments(args):
+    if not args.down_projection2:
+        return
+    if not args.concurrent_kernel or args.grouped_gemm_activation in (None, "none"):
+        raise ValueError("--down-projection2 requires --concurrent-kernel and a fused activation")
+    for name in ("tile_m", "tile_n", "cluster_m", "max_swizzle_size"):
+        if getattr(args, "down_" + name) <= 0:
+            raise ValueError(f"--down-{name.replace('_', '-')} must be positive")
+    if args.down_scatter_table and args.down_epilogue_store == "tma":
+        raise ValueError("down scatter requires a bulk-row epilogue")
+    if (args.down_multi_buffer_scatter or args.down_n_tile_major_output) and not args.down_scatter_table:
+        raise ValueError("down multi-buffer/tiled output requires --down-scatter-table")
+    if args.down_multi_buffer_scatter and args.down_scatter_output_buffers < 2:
+        raise ValueError("--down-scatter-output-buffers must be at least 2")
+    if args.down_gather_table_expert_waves and not args.down_gather_table:
+        raise ValueError("down expert waves require --down-gather-table")
+    if args.down_gather_table_wave_barrier and (
+        not args.down_gather_table_expert_waves or not args.down_pingpong
+        or args.down_epilogue_store == "tma"
+    ):
+        raise ValueError("down wave barrier requires expert waves, pingpong, and a bulk-row epilogue")
+
+
+class DownProjectionRunner:
+    """Compose QuACK's existing plain grouped-GEMM runner with the up output."""
+
+    def __init__(self, torch, up, counts, options):
+        # GroupedGemmRunner has already inserted the selected QuACK checkout.
+        from run import hopper_pregather_gemm as pregather
+
+        routes = sum(counts)
+        if len(counts) != up.weights.shape[0] or routes <= 0 or routes > up.output.shape[0]:
+            raise ValueError("expert counts do not describe the up-projection output")
+        # Reuse QuACK's defaults for internal options outside the exposed subset.
+        parser = argparse.ArgumentParser()
+        pregather.add_kernel_arguments(parser)
+        args = parser.parse_args([])
+        for name, value in vars(options).items():
+            if name.startswith("down_") and name != "down_projection2":
+                setattr(args, name[5:], value)
+        hidden = int(up.output.shape[1])
+        output_dim = int(up.x_buffers[0].shape[1])
+        vars(args).update(tokens=routes, routes=routes, experts=len(counts),
+                          hidden=hidden, output_dim=output_dim, activation=None,
+                          down_projection=False, iterations=1, timing_samples=1, warmup=0)
+        pregather.validate_args(args, prepacked=True)
+        self.weights = torch.randn(
+            (len(counts), hidden, output_dim), dtype=up.output.dtype, device=up.output.device
+        )
+        self.weights.mul_(1 / math.sqrt(hidden))
+        # A_idx arrays are padded, but only this expert-contiguous prefix is written.
+        self.inputs = pregather.prepare_grouped_inputs(
+            args, up.output[:routes], self.weights, counts
+        )
+        self.launch_gemm = pregather.make_launch(args, self.inputs)
+        self.flops = 2 * routes * hidden * output_dim
+        self.reset_start = torch.cuda.Event(enable_timing=True)
+        self.gemm_start = torch.cuda.Event(enable_timing=True)
+        self.end = torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize(up.cuda_device_id)
+        print(f"DownGEMM configured: routes={routes} H={hidden} K={output_dim} "
+              f"counts={counts} output_shapes="
+              f"{[tuple(x.shape) for x in self.inputs.output_buffers()]}", flush=True)
+
+    def launch(self):
+        self.reset_start.record()
+        self.inputs.zero_up_output()
+        self.gemm_start.record()
+        self.launch_gemm()
+        self.end.record()
+
+
+def get_expert_counts(library, handle):
+    try:
+        query = library.rdma_proxy_get_computation_expert_counts
+    except AttributeError as error:
+        raise RuntimeError("--down-projection2 requires rebuilding librdma_cpu_proxy") from error
+    query.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64),
+                      ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64)]
+    query.restype = ctypes.c_int
+    size = ctypes.c_uint64()
+    require_proxy_success(library, query(handle, None, 0, ctypes.byref(size)), "querying expert count")
+    counts = (ctypes.c_uint64 * size.value)()
+    require_proxy_success(library, query(handle, counts, size.value, ctypes.byref(size)),
+                          "querying per-expert routed rows")
+    return list(counts)
+
+
 def environment_integer(name: str) -> int:
     value = os.environ.get(name)
     if value is None:
@@ -756,6 +857,7 @@ def run_proxy_with_concurrent_kernel(
     expert_gemm_cluster_m: int,
     expert_gemm_max_swizzle_size: int,
     quack_root: Path,
+    down_options: argparse.Namespace,
 ) -> int:
     """Launch readiness-gated QuACK GroupedGEMM with each proxy iteration."""
 
@@ -826,6 +928,12 @@ def run_proxy_with_concurrent_kernel(
         if computation_tokens.value == 0:
             raise RuntimeError("GroupedGEMM has zero meaningful routed tokens")
         hidden_dimension = int(grouped_gemm.x_buffers[0].shape[1])
+        down = None
+        if down_options.down_projection2:
+            counts = get_expert_counts(library, handle)
+            if sum(counts) != computation_tokens.value:
+                raise RuntimeError("per-expert counts disagree with total routed rows")
+            down = DownProjectionRunner(torch, grouped_gemm, counts, down_options)
         useful_flops = (
             2
             * int(computation_tokens.value)
@@ -833,6 +941,7 @@ def run_proxy_with_concurrent_kernel(
             * grouped_gemm.gemm_dimension
         )
         iteration_throughputs: list[tuple[int, float, float]] = []
+        down_timings = []
         kernel_stream = torch.cuda.Stream(device=cuda_device_id)
         kernel_finished = torch.cuda.Event(enable_timing=False, blocking=False)
 
@@ -889,6 +998,8 @@ def run_proxy_with_concurrent_kernel(
                     f"recording GroupedGEMM end for iteration {iteration}",
                 )
                 with torch.cuda.stream(kernel_stream):
+                    if down is not None:
+                        down.launch()
                     kernel_finished.record(kernel_stream)
             except BaseException as error:
                 kernel_error = error
@@ -920,6 +1031,13 @@ def run_proxy_with_concurrent_kernel(
             iteration_throughputs.append(
                 (iteration, float(elapsed_ms.value), effective_tflops)
             )
+            if down is not None:
+                reset_ms = down.reset_start.elapsed_time(down.gemm_start)
+                down_ms = down.gemm_start.elapsed_time(down.end)
+                # Sum measured stages; excludes host launch gaps between stages.
+                tail_ms = down.reset_start.elapsed_time(down.end)
+                down_timings.append((iteration, reset_ms, down_ms,
+                                     elapsed_ms.value + tail_ms))
 
         commands.put(None)
         coordinator.join()
@@ -939,6 +1057,11 @@ def run_proxy_with_concurrent_kernel(
                 f"effective_throughput={effective_tflops:.2f} TFLOP/s",
                 flush=True,
             )
+        for iteration, reset_ms, down_ms, combined_ms in down_timings:
+            print(f"  down iteration {iteration}: reset_ms={reset_ms:.4f} "
+                  f"gemm_ms={down_ms:.4f} "
+                  f"effective_throughput={down.flops / (max(down_ms, 1e-9) * 1e9):.2f} TFLOP/s "
+                  f"up_plus_down_ms={combined_ms:.4f}", flush=True)
         return 0
     finally:
         if coordinator is not None:
@@ -1008,7 +1131,16 @@ def main() -> int:
         action="store_true",
         help="print the derived C++ argv without loading the shared library",
     )
+    add_down_arguments(parser)
     args, proxy_args = parser.parse_known_args()
+    if any(arg.startswith("--down-") for arg in proxy_args):
+        parser.error("unsupported --down-* option")
+    try:
+        validate_down_arguments(args)
+    except ValueError as error:
+        parser.error(str(error))
+    if not args.down_projection2 and any(arg.startswith("--down-") for arg in sys.argv[1:]):
+        parser.error("--down-* options require --down-projection2")
     if args.grouped_gemm_activation != "none" and not args.concurrent_kernel:
         parser.error("--grouped-gemm-activation requires --concurrent-kernel")
     if args.expert_gemm_dimension <= 0:
@@ -1050,6 +1182,7 @@ def main() -> int:
             expert_gemm_cluster_m=args.expert_gemm_cluster_m,
             expert_gemm_max_swizzle_size=args.expert_gemm_max_swizzle_size,
             quack_root=args.quack_root,
+            down_options=args,
         )
     return run_proxy(
         library,

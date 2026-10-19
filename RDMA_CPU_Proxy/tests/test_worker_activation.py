@@ -43,6 +43,23 @@ class ActivationCliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("requires --concurrent-kernel", result.stderr)
 
+    def test_down_options_and_rejections(self):
+        common = ("--concurrent-kernel", "--grouped-gemm-activation=swiglu")
+        valid = ("--down-projection2", "--down-gather-table",
+                 "--down-gather-table-expert-waves", "--down-gather-table-wave-barrier",
+                 "--down-pingpong", "--down-scatter-table", "--down-multi-buffer-scatter",
+                 "--down-n-tile-major-output", "--down-epilogue-store=bulk_rows_reduce")
+        result = self.run_cli(*common, *valid)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--down-", result.stdout)
+        for options in (("--down-projection2",),
+                        (*common, "--down-tile-m=128"),
+                        (*common, "--down-projection2", "--down-scatter-table"),
+                        (*common, "--down-projection2", "--down-gather-table-wave-barrier"),
+                        (*common, "--down-projection2", "--down-unknown")):
+            with self.subTest(options=options):
+                self.assertNotEqual(self.run_cli(*options).returncode, 0)
+
 
 class HopperActivationTests(unittest.TestCase):
     @classmethod
@@ -104,6 +121,42 @@ class HopperActivationTests(unittest.TestCase):
                         parts.append(value)
                 expected = torch.cat(parts).to(torch.bfloat16)
                 torch.testing.assert_close(runner.output[:10], expected, atol=6e-2, rtol=2e-3)
+
+                if activation == "swiglu":
+                    # Reuse the actual fused up output, including its unused padding.
+                    variants = (
+                        (),
+                        ("--down-gather-table",),
+                        ("--down-scatter-table", "--down-epilogue-store=bulk_rows_reduce"),
+                        ("--down-scatter-table", "--down-multi-buffer-scatter",
+                         "--down-scatter-output-buffers=2", "--down-n-tile-major-output",
+                         "--down-gather-table", "--down-gather-table-expert-waves",
+                         "--down-gather-table-wave-barrier", "--down-pingpong",
+                         "--down-epilogue-store=bulk_rows_reduce"),
+                    )
+                    import argparse
+                    parser = argparse.ArgumentParser()
+                    worker.add_down_arguments(parser)
+                    for flags in variants:
+                        with self.subTest(down=flags):
+                            options = parser.parse_args(["--down-projection2", *flags])
+                            down = worker.DownProjectionRunner(torch, runner, [6, 4], options)
+                            reference = torch.cat([
+                                runner.output[start:end].float() @ down.weights[e].float()
+                                for e, (start, end) in enumerate(((0, 6), (6, 10)))
+                            ])
+                            if down.inputs.scatter_table is not None:
+                                scattered = torch.zeros_like(reference)
+                                scattered.index_add_(0, down.inputs.scatter_table.long(), reference)
+                                reference = scattered
+                            for _ in range(2):
+                                # A second launch catches missing reduction destination resets.
+                                down.launch()
+                                torch.cuda.synchronize()
+                                torch.testing.assert_close(
+                                    down.inputs.collected_up_output(), reference.to(torch.bfloat16),
+                                    atol=6e-2, rtol=2e-3,
+                                )
 
 
 if __name__ == "__main__":

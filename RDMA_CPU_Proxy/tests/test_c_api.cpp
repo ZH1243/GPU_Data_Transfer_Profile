@@ -1,5 +1,6 @@
 #include "rdma_proxy_c_api.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -153,6 +154,56 @@ int main(int argc, char** argv) {
     // The proxy borrows callback allocations and must leave freeing them to
     // the embedding runtime.
     for (void* pointer : external_allocations.pointers) std::free(pointer);
+
+    // Two local mock proxies are needed for CUDA-IPC metadata/notification setup.
+    const auto nonce = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    const std::string exchange = "--nvlink_forward_exchange_dir=/tmp/test_c_api_" + nonce;
+    const std::string run_id = "--local_iteration_sync_run_id=test_c_api_" + nonce;
+    bool counts_ok[2] = {false, false};
+    std::thread query_threads[2];
+    for (int gpu = 0; gpu < 2; ++gpu) {
+        query_threads[gpu] = std::thread([&, gpu] {
+            std::vector<const char*> router_argv(proxy_argv, proxy_argv + proxy_argc);
+            const std::string gpu_arg = "--local_gpu_index=" + std::to_string(gpu);
+            const std::string device_arg = "--cuda_device_id=" + std::to_string(gpu);
+            for (const char* option : {
+                     "--num_gpus_per_node=2", "--router_routing_enabled=true",
+                     "--nvlink_forwarding_enabled=true", "--num_experts=64",
+                     "--nvlink_forward_synchronize_batches=true",
+                     "--nvlink_forward_completion_notifications_enabled=true",
+                     "--nvlink_forward_threshold_chunks=1", "--nvlink_forward_min_threshold_chunks=1",
+                     "--nvlink_forward_max_threshold_chunks=2",
+                     "--nvlink_forward_synchronize_iteration=false",
+                     exchange.c_str(), run_id.c_str(), gpu_arg.c_str(), device_arg.c_str()}) {
+                router_argv.push_back(option);
+            }
+            auto* router = rdma_proxy_create(static_cast<int>(router_argv.size()), router_argv.data());
+            uint64_t n = 0;
+            if (!router || rdma_proxy_get_computation_expert_counts(router, nullptr, 0, &n) == 0 ||
+                rdma_proxy_initialize(router) != 0) {
+                std::cerr << "router query setup failed: " << rdma_proxy_last_error() << '\n';
+                rdma_proxy_destroy(router);
+                return;
+            }
+            bool ok = rdma_proxy_get_computation_expert_counts(router, nullptr, 0, &n) == 0 && n == 8;
+            std::vector<uint64_t> counts(n);
+            uint64_t total = 0;
+            ok = ok && rdma_proxy_get_computation_expert_counts(router, counts.data(), n, &n) == 0 &&
+                rdma_proxy_get_computation_num_tokens(router, &total) == 0;
+            uint64_t sum = 0;
+            for (auto count : counts) sum += count;
+            counts_ok[gpu] = ok && sum == total && total > 0 &&
+                rdma_proxy_get_computation_expert_counts(router, counts.data(), 1, &n) != 0 &&
+                rdma_proxy_get_computation_expert_counts(router, nullptr, 1, &n) != 0;
+            rdma_proxy_shutdown(router);
+            rdma_proxy_destroy(router);
+        });
+    }
+    for (auto& thread : query_threads) thread.join();
+    if (!counts_ok[0] || !counts_ok[1]) {
+        std::cerr << "per-expert C ABI counts or capacity validation failed\n";
+        return 1;
+    }
 
     const char* invalid_argv[] = {"rdma_cpu_proxy"};
     if (rdma_proxy_create(1, invalid_argv) != nullptr) {

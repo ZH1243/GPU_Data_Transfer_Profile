@@ -119,6 +119,11 @@ RDMA_PROXY_C_API int rdma_proxy_get_computation_elapsed_ms(
 RDMA_PROXY_C_API int rdma_proxy_get_computation_num_tokens(
     RdmaProxyHandle* handle,
     uint64_t* num_tokens);
+/* Query length with counts=NULL, capacity=0; otherwise copy all local expert
+ * counts in scheduler expert order. Counts exclude A_idx capacity padding. */
+RDMA_PROXY_C_API int rdma_proxy_get_computation_expert_counts(
+    RdmaProxyHandle* handle, uint64_t* counts, uint64_t capacity,
+    uint64_t* num_experts);
 RDMA_PROXY_C_API int rdma_proxy_finish(RdmaProxyHandle* handle);
 
 RDMA_PROXY_C_API int rdma_proxy_shutdown(RdmaProxyHandle* handle);

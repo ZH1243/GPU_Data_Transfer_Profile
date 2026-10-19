@@ -657,6 +657,63 @@ references with multiple input buffers and ragged expert batches. They require
 Hopper and CUDA PyTorch and are skipped otherwise. The full two-node run is
 still required to validate RDMA/activation overlap.
 
+### Configurable down projection
+
+Add `--down-projection2` to concurrent mode with a fused activation to run a
+plain grouped down GEMM after the up GEMM on the same CUDA stream. The down
+input is only the meaningful expert-contiguous prefix of the activated output;
+padding in the up allocation is excluded. Down weights have logical shape
+`[local_experts, activated_width, token_dimension]` and are initialized once.
+The up and down GEMMs execute sequentially; down wave barriers do not provide
+up/down overlap.
+
+Rebuild `librdma_cpu_proxy` on both Hopper nodes: this feature adds the
+`rdma_proxy_get_computation_expert_counts` C ABI query. No QuACK changes are
+required, but the selected checkout must contain `run/hopper_pregather_gemm.py`:
+the worker reuses its table/scatter preparation and kernel launch helpers.
+
+Append the following options to both existing node commands:
+
+```bash
+--concurrent-kernel --grouped-gemm-activation=swiglu \
+--grouped-gemm-output-dimension=8192 --down-projection2 \
+--down-tile-m=128 --down-tile-n=128 --down-pingpong \
+--down-scatter-table --down-n-tile-major-output \
+--down-multi-buffer-scatter --down-scatter-output-buffers=4 \
+--down-gather-table --down-gather-table-expert-waves \
+--down-max-swizzle-size=1 --down-gather-table-wave-barrier \
+--down-epilogue-store=bulk_rows_reduce
+```
+
+Down defaults are tile M/N=128/128, cluster M=1, swizzle=1, pingpong disabled,
+and `tma` stores. `--down-cluster-m` also permits explicit cluster sizing.
+Without the down gather table, the kernel uses per-expert sequence lengths.
+With it, a separate static table and identity indices describe the materialized
+activated input. Expert waves require that table; the wave barrier additionally
+requires pingpong and a bulk-row epilogue. QuACK validates device-dependent wave
+capacity and tile/layout constraints. No down options are forwarded to C++.
+
+Scatter matches the standalone benchmark: a random permutation distributes
+routed rows across separately allocated local outputs. It does not map results
+back to original tokens, apply routing weights, or return results over RDMA.
+Although `bulk_rows_reduce` uses additive stores, permutation destinations do
+not collide. Destination buffers are zeroed before every down invocation to
+prevent accumulation across iterations. N-tile-major buffers have shape
+`[ceil(token_dimension / down_tile_n), rows_in_buffer * down_tile_n]`; they are
+not row-major tensors and require layout conversion for ordinary consumers.
+
+Existing up-GEMM timings remain up-only. Additional reports show down output
+reset time, down GEMM time/TFLOP/s, and `up_plus_down_ms`, the sum of measured
+stages (including reset, excluding gaps between stages). Down FLOPs are
+`2 * meaningful_routes * activated_width * token_dimension`. Cold compilation
+can inflate initial event timings; use later iterations for performance analysis.
+
+The Python test command above now also checks down CLI validation and, on Hopper,
+compares down outputs against FP32 references for sequence-length scheduling,
+table scheduling, scatter/reduction, and multi-buffer N-tile-major expert waves
+with a wave barrier. Repeated launches check output reset. These single-GPU
+checks do not replace the two-node integration run.
+
 ## Example Launch
 
 Edit `config/example_config.json` for each node and GPU process. Every proxy should use the same `local_gpu_index` value as the GPU it owns, and peers should point to the same-index proxy on other nodes.
