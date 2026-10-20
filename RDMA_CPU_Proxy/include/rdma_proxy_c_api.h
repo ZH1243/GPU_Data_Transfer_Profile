@@ -126,6 +126,19 @@ RDMA_PROXY_C_API int rdma_proxy_get_computation_expert_counts(
     uint64_t* num_experts);
 RDMA_PROXY_C_API int rdma_proxy_finish(RdmaProxyHandle* handle);
 
+/* Configure once after initialization, before the first prepare_iteration.
+ * The proxy owns the mapped flag. Finish GPU writes before shutdown/destroy.
+ * prepare_iteration resets/arms it; the notification receiver polls it.
+ * Times are CPU detection microseconds since iteration preparation, including
+ * up computation and host launch/compilation delays, not GPU timestamps.
+ * read waits for the final prefix; capacity must hold up to final_groups entries.
+ */
+RDMA_PROXY_C_API int rdma_proxy_configure_down_ready_trace(
+    RdmaProxyHandle* handle, int32_t final_groups, uintptr_t* device_address);
+RDMA_PROXY_C_API int rdma_proxy_read_down_ready_trace(
+    RdmaProxyHandle* handle, uint64_t iteration, int32_t* groups,
+    double* times_us, uint64_t capacity, uint64_t* count);
+
 RDMA_PROXY_C_API int rdma_proxy_shutdown(RdmaProxyHandle* handle);
 RDMA_PROXY_C_API void rdma_proxy_destroy(RdmaProxyHandle* handle);
 

@@ -455,6 +455,8 @@ class GroupedGemmRunner:
 
 def add_down_arguments(parser):
     parser.add_argument("--down-projection2", action="store_true")
+    parser.add_argument("--trace-down-ready", action="store_true",
+                        help="poll down-output readiness in the C++ notification receiver")
     parser.add_argument("--local-gpu-combine", action="store_true",
                         help="sum down outputs into separate per-source token buffers, without routing weights")
     for name, default in (("tile-m", 128), ("tile-n", 128), ("cluster-m", 1),
@@ -474,6 +476,11 @@ def add_down_arguments(parser):
 
 
 def validate_down_arguments(args):
+    if args.trace_down_ready and (
+        not args.down_projection2 or not args.down_gather_table_publish_ready
+    ):
+        raise ValueError("--trace-down-ready requires --down-projection2 and "
+                         "--down-gather-table-publish-ready")
     if args.local_gpu_combine and not args.down_projection2:
         raise ValueError("--local-gpu-combine requires --down-projection2")
     if not args.down_projection2:
@@ -556,7 +563,7 @@ def compact_combine_mapping(torch, mapping, num_sources, capacity):
 class DownProjectionRunner:
     """Compose QuACK's existing plain grouped-GEMM runner with the up output."""
 
-    def __init__(self, torch, up, counts, options):
+    def __init__(self, torch, up, counts, options, trace_configure=None):
         # GroupedGemmRunner has already inserted the selected QuACK checkout.
         from run import hopper_pregather_gemm as pregather
 
@@ -624,6 +631,13 @@ class DownProjectionRunner:
         self.inputs = pregather.prepare_grouped_inputs(
             args, up.output[:routes], self.weights, counts, **external
         )
+        if options.trace_down_ready:
+            if trace_configure is None:
+                raise ValueError("--trace-down-ready requires the proxy trace allocator")
+            self.trace_groups = int(self.inputs.wave_ready_prefix[-1].item())
+            address = trace_configure(self.trace_groups)
+            self.inputs.wave_ready_host_address = torch.tensor(
+                [address], dtype=torch.int64, device=up.output.device)
         self.launch_gemm = pregather.make_launch(args, self.inputs)
         self.combine_tile_n = args.tile_n if self.combine and args.n_tile_major_output else None
         self.flops = 2 * routes * hidden * output_dim
@@ -998,6 +1012,42 @@ def run_proxy(
         library.rdma_proxy_destroy(handle)
 
 
+class DownReadyTrace:
+    """The C++ proxy owns the mapped flag and polls it on its receiver thread."""
+
+    def __init__(self, library, handle):
+        self.library, self.handle = library, handle
+        try:
+            self.configure_fn = library.rdma_proxy_configure_down_ready_trace
+            self.read_fn = library.rdma_proxy_read_down_ready_trace
+        except AttributeError as error:
+            raise RuntimeError("--trace-down-ready requires rebuilding librdma_cpu_proxy") from error
+        self.configure_fn.argtypes = [ctypes.c_void_p, ctypes.c_int32,
+                                      ctypes.POINTER(ctypes.c_size_t)]
+        self.configure_fn.restype = ctypes.c_int
+        self.read_fn.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_int32),
+            ctypes.POINTER(ctypes.c_double), ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64),
+        ]
+        self.read_fn.restype = ctypes.c_int
+
+    def configure(self, groups):
+        self.groups = groups
+        address = ctypes.c_size_t()
+        require_proxy_success(self.library, self.configure_fn(
+            self.handle, groups, ctypes.byref(address)), "configuring down-ready trace")
+        return address.value
+
+    def read(self, iteration):
+        groups = (ctypes.c_int32 * self.groups)()
+        times = (ctypes.c_double * self.groups)()
+        count = ctypes.c_uint64()
+        require_proxy_success(self.library, self.read_fn(
+            self.handle, iteration, groups, times, self.groups, ctypes.byref(count)),
+            "reading down-ready trace")
+        return [(groups[i], times[i]) for i in range(count.value)]
+
+
 def run_proxy_with_concurrent_kernel(
     library: ctypes.CDLL,
     proxy_argv: list[str],
@@ -1030,6 +1080,8 @@ def run_proxy_with_concurrent_kernel(
     commands: queue.Queue = queue.Queue()
     results: queue.Queue = queue.Queue()
     device_buffers: TorchDeviceBuffers | None = None
+    trace = None
+    kernel_stream = None
     try:
         device_buffers = install_python_device_buffers(
             library,
@@ -1091,7 +1143,11 @@ def run_proxy_with_concurrent_kernel(
             counts = get_expert_counts(library, handle)
             if sum(counts) != computation_tokens.value:
                 raise RuntimeError("per-expert counts disagree with total routed rows")
-            down = DownProjectionRunner(torch, grouped_gemm, counts, down_options)
+            if down_options.trace_down_ready:
+                trace = DownReadyTrace(library, handle)
+            down = DownProjectionRunner(
+                torch, grouped_gemm, counts, down_options,
+                trace_configure=trace.configure if trace is not None else None)
         useful_flops = (
             2
             * int(computation_tokens.value)
@@ -1100,6 +1156,7 @@ def run_proxy_with_concurrent_kernel(
         )
         iteration_throughputs: list[tuple[int, float, float]] = []
         down_timings = []
+        down_traces = []
         kernel_stream = torch.cuda.Stream(device=cuda_device_id)
         kernel_finished = torch.cuda.Event(enable_timing=False, blocking=False)
 
@@ -1172,6 +1229,8 @@ def run_proxy_with_concurrent_kernel(
                     f"proxy iteration {iteration} failed: {proxy_error}"
                 )
             kernel_finished.synchronize()
+            if trace is not None:
+                down_traces.append((iteration, trace.read(iteration)))
             elapsed_ms = ctypes.c_float()
             require_proxy_success(
                 library,
@@ -1222,8 +1281,29 @@ def run_proxy_with_concurrent_kernel(
                   f"gemm_ms={down_ms:.4f} "
                   f"effective_throughput={down.flops / (max(down_ms, 1e-9) * 1e9):.2f} TFLOP/s "
                   f"up_plus_down_ms={combined_ms:.4f}", flush=True)
+        if trace is not None:
+            print("CPU down-ready trace: detection times since iteration preparation "
+                  "(includes up GEMM and host delays; not GPU timestamps). "
+                  "Ranges are completed group prefixes; jumps share one observation.",
+                  flush=True)
+            width = min(down_options.down_max_swizzle_size,
+                        math.ceil(hidden_dimension / down_options.down_tile_n)) * down_options.down_tile_n
+            for iteration, observations in down_traces:
+                previous = 0
+                for ready, elapsed_us in observations:
+                    print(f"  down-ready iteration {iteration}: groups=[{previous},{ready}) "
+                          f"columns=[{previous * width},{min(ready * width, hidden_dimension)}) "
+                          f"detected_us={elapsed_us:.3f}", flush=True)
+                    previous = ready
         return 0
     finally:
+        # Keep both the mapped host flag and its GPU address tensor alive until
+        # the last possible kernel write, including exceptional launch paths.
+        if trace is not None and kernel_stream is not None:
+            try:
+                kernel_stream.synchronize()
+            except Exception as error:
+                print(f"down-ready stream cleanup failed: {error}", file=sys.stderr, flush=True)
         if coordinator is not None:
             commands.put(None)
             coordinator.join()

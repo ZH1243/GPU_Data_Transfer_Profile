@@ -702,10 +702,53 @@ projection command above. The worker passes it to QuACK's existing preparation
 and launch helpers, which reset the readiness flag on every down invocation.
 A GPU consumer must acquire-load the flag before reading the completed column
 prefix; each group spans `effective_swizzle_size * down_tile_n` columns.
-This publishes output readiness only: it does not enable `--trace-down-ready`
-or result-return communication. Up and down GEMMs still run sequentially.
+This publishes output readiness only; host tracing is separately enabled below.
+Up and down GEMMs still run sequentially.
 Use a QuACK checkout containing `--gather-table-publish-ready`; this worker
 change does not require a C++ library rebuild.
+
+To observe down-output readiness on the CPU, also append `--trace-down-ready`.
+Rebuild `rdma_cpu_proxy_shared` on both Hopper nodes for this option. It requires
+`--down-projection2`, `--down-gather-table-publish-ready`, and the existing
+notification-driven concurrent mode. The proxy allocates a mapped pinned host
+counter and passes its device address to QuACK's `wave_ready_host_address`.
+QuACK publishes the completed prefix with system-scope release stores; the
+existing NVLink notification receiver polls it with acquire loads. No additional
+polling thread is created. Counter checks are interleaved with notification
+processing, and continue after gather-table publication finishes.
+
+Each iteration resets and arms the counter before GPU launches. After GPU
+completion, Python waits for the receiver's final observation before preparing
+the next iteration. Logs report completed group/column ranges and CPU detection
+microseconds since the counter was armed during iteration preparation. These
+times include up computation and host launch/compilation delays; they are not
+GPU completion timestamps. A jump is recorded as one observation, and the first
+iteration includes cold compilation. Polling uses `completion_timeout_ms`,
+including the time spent in compilation and up computation; increase it if
+needed for cold runs. Shutdown cancels polling. This feature only observes
+readiness; it does not return token results or perform additional communication.
+
+From `RDMA_CPU_Proxy`, rebuild on each remote node:
+
+```bash
+cmake --build build-hopper --target rdma_cpu_proxy_shared -j4
+```
+
+Append the following to both existing node commands to enable a SwiGLU up
+projection, local down-output combine, and CPU readiness tracing:
+
+```bash
+--concurrent-kernel --grouped-gemm-activation=swiglu \
+--down-projection2 --local-gpu-combine \
+--down-n-tile-major-output --down-tile-m=128 --down-tile-n=128 \
+--down-pingpong --down-gather-table --down-gather-table-expert-waves \
+--down-max-swizzle-size=1 --down-gather-table-wave-barrier \
+--down-gather-table-publish-ready --trace-down-ready
+```
+
+`--local-gpu-combine` selects the additive bulk-row epilogue required by this
+configuration. It combines into local per-source buffers without routing
+weights; it does not perform the standalone QuACK benchmark's return exchange.
 
 Scatter matches the standalone benchmark: a random permutation distributes
 routed rows across separately allocated local outputs. It does not map results

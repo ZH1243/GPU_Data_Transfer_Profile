@@ -195,6 +195,23 @@ int main(int argc, char** argv) {
             counts_ok[gpu] = ok && sum == total && total > 0 &&
                 rdma_proxy_get_computation_expert_counts(router, counts.data(), 1, &n) != 0 &&
                 rdma_proxy_get_computation_expert_counts(router, nullptr, 1, &n) != 0;
+            uintptr_t address = 0;
+            int32_t groups[3]{};
+            double times[3]{};
+            uint64_t observed = 0;
+            bool trace_ok = rdma_proxy_configure_down_ready_trace(router, 3, &address) == 0 &&
+                address != 0 && rdma_proxy_prepare_iteration(router, 0) == 0;
+            if (trace_ok) {
+                // Mock mapped storage; the real notification receiver observes
+                // this publication, exercising the ABI and receiver integration.
+                __atomic_store_n(reinterpret_cast<int32_t*>(address), 3, __ATOMIC_RELEASE);
+                trace_ok = rdma_proxy_read_down_ready_trace(
+                    router, 0, groups, times, 3, &observed) == 0 &&
+                    observed == 1 && groups[0] == 3 && times[0] >= 0 &&
+                    rdma_proxy_read_down_ready_trace(router, 0, groups, times, 0, &observed) != 0 &&
+                    rdma_proxy_read_down_ready_trace(router, 1, groups, times, 3, &observed) != 0;
+            }
+            counts_ok[gpu] = counts_ok[gpu] && trace_ok;
             rdma_proxy_shutdown(router);
             rdma_proxy_destroy(router);
         });

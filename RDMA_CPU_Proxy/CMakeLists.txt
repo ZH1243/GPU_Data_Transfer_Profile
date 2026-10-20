@@ -38,6 +38,7 @@ set(RDMA_PROXY_SOURCES
   src/protocol.cpp
   src/proxy.cpp
   src/qp_worker.cpp
+  src/down_ready_trace.cpp
   src/rdma_connection.cpp
   src/rdma_context.cpp
   src/router_routing.cpp
@@ -124,6 +125,9 @@ if(RDMA_PROXY_BUILD_TESTS)
   add_test(NAME test_global_metadata_exchange COMMAND test_global_metadata_exchange)
 
   add_executable(test_c_api tests/test_c_api.cpp)
+  add_executable(test_down_ready_trace tests/test_down_ready_trace.cpp)
+  target_link_libraries(test_down_ready_trace PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_down_ready_trace COMMAND test_down_ready_trace)
   target_link_libraries(test_c_api PRIVATE rdma_cpu_proxy_shared)
   add_test(NAME test_c_api COMMAND test_c_api ${CMAKE_CURRENT_SOURCE_DIR}/config/example_config.json)
 

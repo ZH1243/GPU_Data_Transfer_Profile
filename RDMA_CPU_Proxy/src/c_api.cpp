@@ -191,6 +191,36 @@ extern "C" int rdma_proxy_initialize(RdmaProxyHandle* handle) {
     }
 }
 
+extern "C" int rdma_proxy_configure_down_ready_trace(
+    RdmaProxyHandle* handle, int32_t final_groups, uintptr_t* device_address) {
+    clear_error();
+    try {
+        if (!handle || !device_address || !handle->initialized || handle->shut_down ||
+            handle->next_iteration != 0 || handle->finished)
+            throw std::runtime_error("invalid down-ready trace configuration request");
+        *device_address = handle->proxy.configure_down_ready_trace(final_groups);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
+extern "C" int rdma_proxy_read_down_ready_trace(
+    RdmaProxyHandle* handle, uint64_t iteration, int32_t* groups,
+    double* times_us, uint64_t capacity, uint64_t* count) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down || !groups || !times_us || !count)
+            throw std::runtime_error("invalid down-ready trace read request");
+        const auto observations = handle->proxy.read_down_ready_trace(iteration);
+        if (capacity < observations.size()) throw std::runtime_error("down-ready trace capacity too small");
+        for (std::size_t i = 0; i < observations.size(); ++i) {
+            groups[i] = observations[i].first;
+            times_us[i] = observations[i].second;
+        }
+        *count = observations.size();
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
 extern "C" int rdma_proxy_run(RdmaProxyHandle* handle) {
     clear_error();
     if (handle == nullptr) {

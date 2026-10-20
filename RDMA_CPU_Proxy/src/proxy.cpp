@@ -532,6 +532,7 @@ void Proxy::prepare_iteration_step(uint64_t iteration) {
             " tokens=", local_x3.size());
     }
     prepared_iteration_ = iteration;
+    down_ready_trace_.reset(iteration);
     iteration_prepared_ = true;
 }
 
@@ -566,6 +567,29 @@ std::size_t Proxy::router_computation_num_tokens() const {
     return cuda_buffers_.router_computation_num_tokens();
 }
 
+uintptr_t Proxy::configure_down_ready_trace(int groups) {
+    if (!initialized_ || iteration_prepared_ || !config_.router_routing_enabled ||
+        !config_.nvlink_forward_completion_notifications_enabled ||
+        !nvlink_forward_notification_thread_.joinable() || config_.num_iterations == 0) {
+        throw std::runtime_error("down-ready trace requires an initialized finite-run notification receiver");
+    }
+    return down_ready_trace_.configure(
+        config_.cuda_device_id, groups, config_.completion_timeout_ms, config_.mock_mode);
+}
+
+std::vector<std::pair<int32_t, double>> Proxy::read_down_ready_trace(uint64_t iteration) {
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(config_.completion_timeout_ms);
+    std::vector<std::pair<int32_t, double>> result;
+    while (true) {
+        check_forwarding_error();
+        if (down_ready_trace_.read(iteration, result)) return result;
+        if (std::chrono::steady_clock::now() >= deadline)
+            throw std::runtime_error("timed out waiting for down-ready trace");
+        std::this_thread::yield();
+    }
+}
+
 void Proxy::finish_run() {
     if (!initialized_) throw std::runtime_error("proxy is not initialized");
     if (config_.num_iterations != 0) {
@@ -574,6 +598,7 @@ void Proxy::finish_run() {
 }
 
 void Proxy::shutdown() {
+    down_ready_trace_.cancel();
     stop_forwarding_thread();
     for (auto& peer : peers_) {
         for (auto& worker : peer.workers) {
@@ -2019,6 +2044,7 @@ void Proxy::drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQue
                 notification.num_tokens);
         }
         atomic_store_u64(&queue->tail, tail + 1);
+        down_ready_trace_.poll();
         const auto dequeue_timestamp_ns = unix_epoch_nanoseconds_now();
         nvlink_forward_notifications_received_.fetch_add(1);
         enqueue_nvlink_forward_notification_log(notification, dequeue_timestamp_ns);
@@ -2059,6 +2085,9 @@ void Proxy::nvlink_forward_notification_loop() {
                 drain_nvlink_forward_notification_queue(queue);
                 progressed = progressed || atomic_load_u64(&queue->tail) != before;
             }
+            // Interleave observations with publication; after input draining this
+            // same receiver continues polling without waiting for a CPU handoff.
+            down_ready_trace_.poll();
             if (!progressed) {
                 // std::this_thread::sleep_for(std::chrono::microseconds(10));
                 cpu_relax();

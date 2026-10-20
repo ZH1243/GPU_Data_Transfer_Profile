@@ -310,14 +310,30 @@ int main(int argc, char** argv) {
                 if (mode == 6) return; // shutdown while both pipeline threads wait
                 if (mode == 7) { PreparedForwardingTestAccess::fail(proxy); return; }
                 if (mode == 8) PreparedForwardingTestAccess::invalidate_destination(proxy);
+                int32_t* trace_flag = nullptr;
+                if (notifications && mode < 6)
+                    trace_flag = reinterpret_cast<int32_t*>(proxy.configure_down_ready_trace(3));
                 for (uint64_t i = 0; i < config.num_iterations; ++i) {
                     PreparedForwardingTestAccess::fill_source(proxy, i);
-                    if (unified) {
+                    if (unified || trace_flag) {
                         proxy.prepare_iteration_step(i);
+                    }
+                    if (unified) {
                         PreparedForwardingTestAccess::fill_local_source(proxy, i);
+                    }
+                    if (trace_flag) {
+                        if (__atomic_load_n(trace_flag, __ATOMIC_ACQUIRE) != 0)
+                            throw std::runtime_error("stale down-ready flag across iterations");
+                        __atomic_store_n(trace_flag, 1, __ATOMIC_RELEASE);
                     }
                     proxy.run_iteration_step(i);
                     PreparedForwardingTestAccess::verify(proxy, *proxies[1 - gpu], i);
+                    if (trace_flag) {
+                        __atomic_store_n(trace_flag, 3, __ATOMIC_RELEASE);
+                        const auto trace = proxy.read_down_ready_trace(i);
+                        if (trace.empty() || trace.back().first != 3)
+                            throw std::runtime_error("receiver missed final down-ready prefix");
+                    }
                     checked.fetch_add(1);
                     while (checked.load() < (i + 1) * 2 && !failed.load()) std::this_thread::yield();
                     if (failed.load()) return;

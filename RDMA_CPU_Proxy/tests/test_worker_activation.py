@@ -81,6 +81,20 @@ class ActivationCliTests(unittest.TestCase):
                 result = self.run_cli(*(option for option in options if option != required))
                 self.assertNotEqual(result.returncode, 0)
 
+    def test_trace_down_ready_prerequisites(self):
+        options = ("--concurrent-kernel", "--grouped-gemm-activation=swiglu",
+                   "--down-projection2", "--down-gather-table",
+                   "--down-gather-table-expert-waves", "--down-gather-table-wave-barrier",
+                   "--down-pingpong", "--down-epilogue-store=bulk_rows_reduce",
+                   "--down-gather-table-publish-ready", "--trace-down-ready")
+        result = self.run_cli(*options)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--trace-down-ready", result.stdout)
+        for required in ("--down-projection2", "--down-gather-table-publish-ready"):
+            result = self.run_cli(*(option for option in options if option != required))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("--trace-down-ready requires", result.stderr)
+
 
 class CombineCompactionTests(unittest.TestCase):
     def test_compaction_preserves_input_order_and_reduces_duplicates(self):
@@ -226,6 +240,10 @@ class HopperActivationTests(unittest.TestCase):
                          "--down-gather-table-wave-barrier", "--down-pingpong",
                          "--down-epilogue-store=bulk_rows",
                          "--down-gather-table-publish-ready"),
+                        ("--local-gpu-combine", "--down-n-tile-major-output",
+                         "--down-gather-table", "--down-gather-table-expert-waves",
+                         "--down-gather-table-wave-barrier", "--down-pingpong",
+                         "--down-gather-table-publish-ready", "--trace-down-ready"),
                     )
                     import argparse
                     parser = argparse.ArgumentParser()
@@ -233,7 +251,28 @@ class HopperActivationTests(unittest.TestCase):
                     for flags in variants:
                         with self.subTest(down=flags):
                             options = parser.parse_args(["--down-projection2", *flags])
-                            down = worker.DownProjectionRunner(torch, runner, [6, 4], options)
+                            host_flag = None
+
+                            def configure_trace(groups):
+                                # Supply mapped host storage without a two-node proxy.
+                                # Production allocates it through the proxy C ABI.
+                                import ctypes
+                                nonlocal host_flag
+                                self.assertEqual(groups, 2)
+                                host_flag = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+                                driver = ctypes.CDLL("libcuda.so.1")
+                                get_pointer = driver.cuMemHostGetDevicePointer_v2
+                                get_pointer.argtypes = [
+                                    ctypes.POINTER(ctypes.c_uint64), ctypes.c_void_p, ctypes.c_uint,
+                                ]
+                                get_pointer.restype = ctypes.c_int
+                                address = ctypes.c_uint64()
+                                self.assertEqual(get_pointer(
+                                    ctypes.byref(address), host_flag.data_ptr(), 0), 0)
+                                return address.value
+
+                            down = worker.DownProjectionRunner(
+                                torch, runner, [6, 4], options, trace_configure=configure_trace)
                             reference = torch.cat([
                                 runner.output[start:end].float() @ down.weights[e].float()
                                 for e, (start, end) in enumerate(((0, 6), (6, 10)))
@@ -253,8 +292,12 @@ class HopperActivationTests(unittest.TestCase):
                                 reference = scattered
                             for _ in range(2):
                                 # A second launch catches missing reduction destination resets.
+                                if host_flag is not None:
+                                    host_flag.zero_()
                                 down.launch()
                                 torch.cuda.synchronize()
+                                if host_flag is not None:
+                                    self.assertEqual(host_flag.item(), 2)
                                 if options.down_gather_table_publish_ready:
                                     # N=256, tile N=128, swizzle=1: both output groups
                                     # must be published on each invocation.

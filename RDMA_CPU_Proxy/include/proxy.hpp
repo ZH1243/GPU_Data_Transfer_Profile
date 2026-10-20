@@ -2,6 +2,7 @@
 
 #include "config.hpp"
 #include "cuda_buffers.hpp"
+#include "down_ready_trace.hpp"
 #include "protocol.hpp"
 #include "qp_worker.hpp"
 #include "rdma_connection.hpp"
@@ -37,6 +38,8 @@ public:
     float router_computation_elapsed_ms(uint64_t iteration);
     std::size_t router_computation_num_tokens() const;
     void finish_run();
+    uintptr_t configure_down_ready_trace(int groups);
+    std::vector<std::pair<int32_t, double>> read_down_ready_trace(uint64_t iteration);
     void shutdown();
     const RouterExpertMetadata& router_expert_metadata_for_source(
         int source_node_rank,
@@ -49,6 +52,7 @@ public:
     router_notification_publication_buffers() const;
 
 private:
+    DownReadyTrace down_ready_trace_;
     friend struct PreparedForwardingTestAccess;
     friend struct QpCalibrationTestAccess;
     struct PeerState {
