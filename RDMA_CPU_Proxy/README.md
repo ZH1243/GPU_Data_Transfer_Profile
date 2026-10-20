@@ -732,18 +732,31 @@ Outputs are row-major by default; `--down-n-tile-major-output` uses the existing
 QuACK tiled layout. `DownProjectionRunner.inputs.output_buffers()` exposes the
 buffers; `down.up.source_pairs` identifies their sources.
 
-For each source and input-buffer row, the result is the unweighted sum of all
-down-projection outputs from experts on this computing GPU that consumed that
-row. All destinations are zeroed each iteration, including unused rows.
-Positions refer to the actual input buffer: compact forwarded-row positions for
-compact inputs and destination-node RDMA receive positions for direct inputs.
-They are not necessarily original source-token indices. This step performs no
-cross-GPU reduction, return RDMA transfer, or routing-weight multiplication.
+Each output stores only a compact prefix of logically valid results. Distinct
+input rows used by any local expert are sorted in ascending input-row order;
+output row k sums all local expert contributions for the k-th such input row.
+For example, used input rows [2, 5, 9] produce output rows [0, 1, 2], regardless
+of expert or arrival order. Multiple experts using row 5 still share output row 1.
+Already compact NVLink inputs retain their row positions. Local-staging and
+direct-RDMA inputs lose any gaps between locally used rows.
+
+Allocation capacity remains equal to input capacity. All destinations are zeroed
+each iteration, including the unused tail. The GPU int64 tensor
+`down.combine_valid_rows[source]` gives the valid prefix length; the GPU int64
+tensor `down.combine_output_to_input[source, k]` gives its input-buffer row
+(-1 beyond the valid prefix). These tensors update on the down stream each
+iteration; consumers must wait for that stream before reading them. For tiled
+outputs, compaction concerns logical rows: N-tile strides still use allocation
+capacity, so the valid rows are a prefix within each N tile, not one contiguous
+row-major byte prefix. Input-row indices are not necessarily original source-token
+indices. No cross-GPU reduction, return transfer, or routing weights are applied.
 
 The up scheduler's packed row order can change with notification arrival order.
 After up completes on its CUDA stream, the worker reconstructs each output row's
 source and token from that iteration's gather table and `A_idx` arrays. Repeated
 N groups are removed; source segments are ordered by their packed output offsets.
+Only those meaningful routes determine compaction; padded A_idx entries are
+excluded. A per-source used-row mask and prefix sum assign compact destinations.
 The resulting scatter addresses are rebuilt on the GPU every iteration before
 down launches on the same stream. Address lookup for all valid destination rows
 is validated once during initialization. No host readback of the live table is

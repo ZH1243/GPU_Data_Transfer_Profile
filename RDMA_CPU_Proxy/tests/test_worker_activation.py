@@ -68,6 +68,43 @@ class ActivationCliTests(unittest.TestCase):
         self.assertNotEqual(self.run_cli("--local-gpu-combine").returncode, 0)
 
 
+class CombineCompactionTests(unittest.TestCase):
+    def test_compaction_preserves_input_order_and_reduces_duplicates(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("PyTorch is not installed")
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        for device in devices:
+            with self.subTest(device=device):
+                # Source 1 is empty; source 2 is already compact. Source 0 has
+                # gaps and repeated expert contributions in arbitrary order.
+                mapping = torch.tensor([[0, 6], [2, 1], [0, 2], [0, 6], [2, 0]],
+                                       device=device)
+                compact, counts, inverse = worker.compact_combine_mapping(
+                    torch, mapping, 3, 8)
+                torch.testing.assert_close(compact, torch.tensor(
+                    [[0, 1], [2, 1], [0, 0], [0, 1], [2, 0]], device=device))
+                torch.testing.assert_close(counts, torch.tensor([2, 0, 2], device=device))
+                torch.testing.assert_close(inverse, torch.tensor(
+                    [[2, 6, -1, -1, -1, -1, -1, -1], [-1] * 8,
+                     [0, 1, -1, -1, -1, -1, -1, -1]], device=device))
+                contributions = torch.tensor([1., 2., 3., 4., 5.], device=device)
+                output = torch.zeros(24, device=device)
+                output.index_add_(0, compact[:, 0] * 8 + compact[:, 1], contributions)
+                expected = torch.zeros((3, 8), device=device)
+                expected[0, :2] = torch.tensor([3., 5.], device=device)
+                expected[2, :2] = torch.tensor([5., 2.], device=device)
+                torch.testing.assert_close(output.view(3, 8), expected)
+                # Recompute with changed membership: no stale valid rows or inverse map.
+                _, counts, inverse = worker.compact_combine_mapping(
+                    torch, torch.tensor([[0, 7]], device=device), 3, 8)
+                torch.testing.assert_close(counts, torch.tensor([1, 0, 0], device=device))
+                expected_inverse = torch.full((3, 8), -1, device=device)
+                expected_inverse[0, 0] = 7
+                torch.testing.assert_close(inverse, expected_inverse)
+
+
 class HopperActivationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -181,8 +218,9 @@ class HopperActivationTests(unittest.TestCase):
                             if options.local_gpu_combine:
                                 # Independent known expert/source packing; two experts
                                 # collide at token 4 in each separate source output.
+                                # Used input rows [1, 3, 4, 6] map to [0, 1, 2, 3].
                                 destinations = torch.tensor(
-                                    [4, 1, 6, 12, 9, 14, 4, 3, 12, 11], device="cuda")
+                                    [2, 0, 3, 10, 8, 11, 2, 1, 10, 9], device="cuda")
                                 scattered = torch.zeros((16, 64), device="cuda")
                                 scattered.index_add_(0, destinations, reference)
                                 reference = scattered
@@ -194,6 +232,12 @@ class HopperActivationTests(unittest.TestCase):
                                 # A second launch catches missing reduction destination resets.
                                 down.launch()
                                 torch.cuda.synchronize()
+                                if options.local_gpu_combine:
+                                    torch.testing.assert_close(down.combine_valid_rows,
+                                        torch.tensor([4, 4], device="cuda"))
+                                    torch.testing.assert_close(down.combine_output_to_input,
+                                        torch.tensor([[1, 3, 4, 6, -1, -1, -1, -1]] * 2,
+                                                     device="cuda"))
                                 torch.testing.assert_close(
                                     down.inputs.collected_up_output(), reference.to(torch.bfloat16),
                                     atol=6e-2, rtol=2e-3,

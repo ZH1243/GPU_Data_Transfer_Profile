@@ -523,6 +523,26 @@ def local_combine_mapping(torch, work_table, a_idx, routes, n_groups):
     return torch.stack((source, indices[source, index].long()), dim=1)
 
 
+def compact_combine_mapping(torch, mapping, num_sources, capacity):
+    """Compact distinct used rows per source in ascending input-row order.
+
+    Returns route destinations, device-side valid counts, and a capacity-sized
+    output-to-input map (-1 beyond each valid prefix). Duplicate expert routes
+    share a destination. Only meaningful routes participate, never A_idx padding.
+    All operations stay on the calling CUDA stream, with fixed-size allocations.
+    """
+    flat = mapping[:, 0] * capacity + mapping[:, 1]
+    hits = torch.zeros(num_sources * capacity, dtype=torch.int64, device=mapping.device)
+    hits.scatter_add_(0, flat, torch.ones_like(flat))
+    used = hits.reshape(num_sources, capacity) > 0
+    ranks = used.long().cumsum(dim=1) - 1
+    compact = torch.stack((mapping[:, 0], ranks.flatten()[flat]), dim=1)
+    rows = torch.arange(capacity, device=mapping.device, dtype=torch.int64)
+    output_to_input = torch.where(used, rows, capacity).sort(dim=1).values
+    output_to_input = torch.where(output_to_input < capacity, output_to_input, -1)
+    return compact, used.sum(dim=1), output_to_input
+
+
 class DownProjectionRunner:
     """Compose QuACK's existing plain grouped-GEMM runner with the up output."""
 
@@ -583,6 +603,10 @@ class DownProjectionRunner:
                 tile_n=args.tile_n if args.n_tile_major_output else None,
             )
             self.combine_rows = rows
+            self.combine_valid_rows = torch.zeros(
+                len(outputs), dtype=torch.int64, device=up.output.device)
+            self.combine_output_to_input = torch.full(
+                (len(outputs), rows), -1, dtype=torch.int64, device=up.output.device)
             clusters_n = math.ceil(up.gemm_dimension / up.tile_n)
             self.combine_n_groups = clusters_n // min(up.max_swizzle_size, clusters_n)
             external = dict(output_buffers=outputs, scatter_mapping=torch.zeros(
@@ -603,7 +627,7 @@ class DownProjectionRunner:
         if self.combine:
             print(f"Local GPU combine: sources={up.source_pairs} "
                   f"rows_per_source={self.combine_rows} epilogue=bulk_rows_reduce "
-                  "positions=input-buffer rows; no routing weights or return communication",
+                  "positions=compact prefixes in input-row order; no routing weights or return communication",
                   flush=True)
 
     def launch(self):
@@ -615,6 +639,11 @@ class DownProjectionRunner:
                 self.up.torch, self.up.work_table, self.up.a_idx,
                 self.routes, self.combine_n_groups,
             )
+            mapping, valid_rows, output_to_input = compact_combine_mapping(
+                self.up.torch, mapping, len(self.up.x_buffers), self.combine_rows,
+            )
+            self.combine_valid_rows.copy_(valid_rows)
+            self.combine_output_to_input.copy_(output_to_input)
             flat = mapping[:, 0] * self.combine_rows + mapping[:, 1]
             self.inputs.scatter_mapping.copy_(mapping)
             self.inputs.scatter_table.copy_(flat)
