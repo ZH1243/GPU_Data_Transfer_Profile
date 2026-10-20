@@ -391,6 +391,7 @@ class GroupedGemmRunner:
         torch_module.cuda.synchronize(cuda_device_id)
 
         self.x_buffers = tuple(x_buffers)
+        self.source_pairs = tuple(source_pairs)
         self.a_idx = tuple(a_idx)
         self.work_table = work_table
         self.ready_rows = ready_rows
@@ -454,6 +455,8 @@ class GroupedGemmRunner:
 
 def add_down_arguments(parser):
     parser.add_argument("--down-projection2", action="store_true")
+    parser.add_argument("--local-gpu-combine", action="store_true",
+                        help="sum down outputs into separate per-source token buffers, without routing weights")
     for name, default in (("tile-m", 128), ("tile-n", 128), ("cluster-m", 1),
                           ("max-swizzle-size", 1), ("scatter-output-buffers", 2)):
         parser.add_argument(f"--down-{name}", type=int, default=default)
@@ -466,8 +469,15 @@ def add_down_arguments(parser):
 
 
 def validate_down_arguments(args):
+    if args.local_gpu_combine and not args.down_projection2:
+        raise ValueError("--local-gpu-combine requires --down-projection2")
     if not args.down_projection2:
         return
+    if args.local_gpu_combine:
+        # Combine owns the destination count and requires additive scatter.
+        args.down_scatter_table = True
+        args.down_multi_buffer_scatter = True
+        args.down_epilogue_store = "bulk_rows_reduce"
     if not args.concurrent_kernel or args.grouped_gemm_activation in (None, "none"):
         raise ValueError("--down-projection2 requires --concurrent-kernel and a fused activation")
     for name in ("tile_m", "tile_n", "cluster_m", "max_swizzle_size"):
@@ -477,7 +487,8 @@ def validate_down_arguments(args):
         raise ValueError("down scatter requires a bulk-row epilogue")
     if (args.down_multi_buffer_scatter or args.down_n_tile_major_output) and not args.down_scatter_table:
         raise ValueError("down multi-buffer/tiled output requires --down-scatter-table")
-    if args.down_multi_buffer_scatter and args.down_scatter_output_buffers < 2:
+    if (not args.local_gpu_combine and args.down_multi_buffer_scatter
+            and args.down_scatter_output_buffers < 2):
         raise ValueError("--down-scatter-output-buffers must be at least 2")
     if args.down_gather_table_expert_waves and not args.down_gather_table:
         raise ValueError("down expert waves require --down-gather-table")
@@ -486,6 +497,30 @@ def validate_down_arguments(args):
         or args.down_epilogue_store == "tma"
     ):
         raise ValueError("down wave barrier requires expert waves, pingpong, and a bulk-row epilogue")
+
+
+def local_combine_mapping(torch, work_table, a_idx, routes, n_groups):
+    """Recover each packed up-output row's (source, input row) on device.
+
+    Multi-buffer QuACK places a table row at sum(start_j), concatenating its
+    source ranges. N groups repeat those ranges. Publication order is arbitrary;
+    neither expert order nor source order alone describes the packed output.
+    Called on the up/down stream after up has consumed the complete table.
+    """
+    ranges = work_table[::n_groups, 2:].long().reshape(-1, len(a_idx), 2)
+    starts, ends = ranges[:, :, 0], ranges[:, :, 1]
+    lengths = ends - starts
+    output_ends = starts.sum(dim=1, keepdim=True) + lengths.cumsum(dim=1)
+    # Empty source segments must never win a search, even at batch boundaries.
+    keys = torch.where(lengths > 0, output_ends, routes + 1).flatten()
+    order = keys.argsort()
+    rows = torch.arange(routes, device=work_table.device, dtype=torch.int64)
+    segments = order[torch.searchsorted(keys[order], rows, right=True)]
+    source = segments % len(a_idx)
+    output_starts = (output_ends - lengths).flatten()
+    index = starts.flatten()[segments] + rows - output_starts[segments]
+    indices = torch.stack(a_idx)
+    return torch.stack((source, indices[source, index].long()), dim=1)
 
 
 class DownProjectionRunner:
@@ -510,28 +545,80 @@ class DownProjectionRunner:
         vars(args).update(tokens=routes, routes=routes, experts=len(counts),
                           hidden=hidden, output_dim=output_dim, activation=None,
                           down_projection=False, iterations=1, timing_samples=1, warmup=0)
-        pregather.validate_args(args, prepacked=True)
+        self.combine = options.local_gpu_combine
+        self.up = up
+        self.routes = routes
+        if self.combine:
+            args.scatter_table = True
+            args.multi_buffer_scatter = True
+            args.epilogue_store = "bulk_rows_reduce"
+            args.scatter_output_buffers = len(up.x_buffers)
+        validation_args = argparse.Namespace(**vars(args))
+        if self.combine:
+            # The benchmark partitions `routes` among outputs. Our externally
+            # allocated source buffers can be mostly empty and have independent
+            # capacities; build_scatter_row_addresses validates those below.
+            validation_args.multi_buffer_scatter = False
+        pregather.validate_args(validation_args, prepacked=True)
         self.weights = torch.randn(
             (len(counts), hidden, output_dim), dtype=up.output.dtype, device=up.output.device
         )
         self.weights.mul_(1 / math.sqrt(hidden))
         # A_idx arrays are padded, but only this expert-contiguous prefix is written.
+        external = {}
+        if self.combine:
+            from quack.gemm import build_scatter_row_addresses
+
+            rows = int(up.x_buffers[0].shape[0])
+            outputs = tuple(torch.empty(
+                (math.ceil(output_dim / args.tile_n), rows * args.tile_n)
+                if args.n_tile_major_output else (rows, output_dim),
+                dtype=up.output.dtype, device=up.output.device,
+            ) for _ in up.x_buffers)
+            # Validate every possible destination once, outside iteration timing.
+            flat = torch.arange(len(outputs) * rows, device=up.output.device)
+            all_mapping = torch.stack((flat // rows, flat % rows), dim=1)
+            self.combine_addresses = build_scatter_row_addresses(
+                outputs, all_mapping, reduce=True,
+                tile_n=args.tile_n if args.n_tile_major_output else None,
+            )
+            self.combine_rows = rows
+            clusters_n = math.ceil(up.gemm_dimension / up.tile_n)
+            self.combine_n_groups = clusters_n // min(up.max_swizzle_size, clusters_n)
+            external = dict(output_buffers=outputs, scatter_mapping=torch.zeros(
+                (routes, 2), dtype=torch.int64, device=up.output.device))
         self.inputs = pregather.prepare_grouped_inputs(
-            args, up.output[:routes], self.weights, counts
+            args, up.output[:routes], self.weights, counts, **external
         )
         self.launch_gemm = pregather.make_launch(args, self.inputs)
         self.flops = 2 * routes * hidden * output_dim
         self.reset_start = torch.cuda.Event(enable_timing=True)
+        self.mapping_start = torch.cuda.Event(enable_timing=True)
         self.gemm_start = torch.cuda.Event(enable_timing=True)
         self.end = torch.cuda.Event(enable_timing=True)
         torch.cuda.synchronize(up.cuda_device_id)
         print(f"DownGEMM configured: routes={routes} H={hidden} K={output_dim} "
               f"counts={counts} output_shapes="
               f"{[tuple(x.shape) for x in self.inputs.output_buffers()]}", flush=True)
+        if self.combine:
+            print(f"Local GPU combine: sources={up.source_pairs} "
+                  f"rows_per_source={self.combine_rows} epilogue=bulk_rows_reduce "
+                  "positions=input-buffer rows; no routing weights or return communication",
+                  flush=True)
 
     def launch(self):
         self.reset_start.record()
         self.inputs.zero_up_output()
+        self.mapping_start.record()
+        if self.combine:
+            mapping = local_combine_mapping(
+                self.up.torch, self.up.work_table, self.up.a_idx,
+                self.routes, self.combine_n_groups,
+            )
+            flat = mapping[:, 0] * self.combine_rows + mapping[:, 1]
+            self.inputs.scatter_mapping.copy_(mapping)
+            self.inputs.scatter_table.copy_(flat)
+            self.inputs.scatter_row_addresses.copy_(self.combine_addresses[flat])
         self.gemm_start.record()
         self.launch_gemm()
         self.end.record()
@@ -1032,11 +1119,12 @@ def run_proxy_with_concurrent_kernel(
                 (iteration, float(elapsed_ms.value), effective_tflops)
             )
             if down is not None:
-                reset_ms = down.reset_start.elapsed_time(down.gemm_start)
+                reset_ms = down.reset_start.elapsed_time(down.mapping_start)
+                mapping_ms = down.mapping_start.elapsed_time(down.gemm_start)
                 down_ms = down.gemm_start.elapsed_time(down.end)
                 # Sum measured stages; excludes host launch gaps between stages.
                 tail_ms = down.reset_start.elapsed_time(down.end)
-                down_timings.append((iteration, reset_ms, down_ms,
+                down_timings.append((iteration, reset_ms, mapping_ms, down_ms,
                                      elapsed_ms.value + tail_ms))
 
         commands.put(None)
@@ -1057,8 +1145,9 @@ def run_proxy_with_concurrent_kernel(
                 f"effective_throughput={effective_tflops:.2f} TFLOP/s",
                 flush=True,
             )
-        for iteration, reset_ms, down_ms, combined_ms in down_timings:
+        for iteration, reset_ms, mapping_ms, down_ms, combined_ms in down_timings:
             print(f"  down iteration {iteration}: reset_ms={reset_ms:.4f} "
+                  f"mapping_ms={mapping_ms:.4f} "
                   f"gemm_ms={down_ms:.4f} "
                   f"effective_throughput={down.flops / (max(down_ms, 1e-9) * 1e9):.2f} TFLOP/s "
                   f"up_plus_down_ms={combined_ms:.4f}", flush=True)

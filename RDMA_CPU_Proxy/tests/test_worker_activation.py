@@ -60,6 +60,13 @@ class ActivationCliTests(unittest.TestCase):
             with self.subTest(options=options):
                 self.assertNotEqual(self.run_cli(*options).returncode, 0)
 
+    def test_local_combine_cli(self):
+        result = self.run_cli("--local-gpu-combine", "--down-projection2",
+                              "--concurrent-kernel", "--grouped-gemm-activation=swiglu")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--local-gpu-combine", result.stdout)
+        self.assertNotEqual(self.run_cli("--local-gpu-combine").returncode, 0)
+
 
 class HopperActivationTests(unittest.TestCase):
     @classmethod
@@ -71,6 +78,28 @@ class HopperActivationTests(unittest.TestCase):
         if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
             raise unittest.SkipTest("requires a Hopper CUDA device")
         cls.torch = torch
+
+    def test_combine_dynamic_mapping(self):
+        torch = self.torch
+        # Expert 1 arrives first. Expert 0's first batch consumes only source 1;
+        # its second batch consumes source 0. N groups duplicate each descriptor.
+        rows = [[1, 0, 2, 3, 2, 3], [0, 0, 0, 0, 0, 2],
+                [0, 0, 0, 2, 2, 2]]
+        table = torch.tensor([r[:1] + [n] + r[2:] for r in rows for n in (0, 2)],
+                             dtype=torch.int32, device="cuda")
+        indices = tuple(torch.tensor(x, dtype=torch.int32, device="cuda")
+                        for x in ([4, 1, 4, 0], [2, 3, 2, 0]))
+        expected = torch.tensor([[1, 2], [1, 3], [0, 4], [0, 1], [0, 4], [1, 2]],
+                                device="cuda")
+        torch.testing.assert_close(worker.local_combine_mapping(
+            torch, table, indices, 6, 2), expected)
+        # A new iteration with a different source arrival order changes the map.
+        rows = [[0, 0, 0, 2, 0, 0], [1, 0, 2, 3, 2, 3], [0, 0, 2, 2, 0, 2]]
+        table.copy_(torch.tensor([r[:1] + [n] + r[2:] for r in rows for n in (0, 2)],
+                                 dtype=torch.int32, device="cuda"))
+        expected = expected[[2, 3, 0, 1, 4, 5]]
+        torch.testing.assert_close(worker.local_combine_mapping(
+            torch, table, indices, 6, 2), expected)
 
     def test_runner_numerical_outputs(self):
         torch = self.torch
@@ -86,7 +115,7 @@ class HopperActivationTests(unittest.TestCase):
                 xs, indices = [], []
                 for source in range(2):
                     x = torch.randn(8, 64, device="cuda", dtype=torch.bfloat16)
-                    idx = torch.tensor([4, 1, 6, 0, 3, 0, 0], device="cuda", dtype=torch.int32)
+                    idx = torch.tensor([4, 1, 6, 4, 3, 0, 0], device="cuda", dtype=torch.int32)
                     buffers.tensors[(worker.DEVICE_BUFFER_NVLINK_RECEIVE, -1, 0, source)] = x
                     buffers.tensors[(worker.DEVICE_BUFFER_ROUTER_A_IDX, -1, 0, source)] = idx
                     xs.append(x)
@@ -126,6 +155,10 @@ class HopperActivationTests(unittest.TestCase):
                     # Reuse the actual fused up output, including its unused padding.
                     variants = (
                         (),
+                        ("--local-gpu-combine",),
+                        ("--local-gpu-combine", "--down-n-tile-major-output",
+                         "--down-gather-table", "--down-gather-table-expert-waves",
+                         "--down-gather-table-wave-barrier", "--down-pingpong"),
                         ("--down-gather-table",),
                         ("--down-scatter-table", "--down-epilogue-store=bulk_rows_reduce"),
                         ("--down-scatter-table", "--down-multi-buffer-scatter",
@@ -145,7 +178,15 @@ class HopperActivationTests(unittest.TestCase):
                                 runner.output[start:end].float() @ down.weights[e].float()
                                 for e, (start, end) in enumerate(((0, 6), (6, 10)))
                             ])
-                            if down.inputs.scatter_table is not None:
+                            if options.local_gpu_combine:
+                                # Independent known expert/source packing; two experts
+                                # collide at token 4 in each separate source output.
+                                destinations = torch.tensor(
+                                    [4, 1, 6, 12, 9, 14, 4, 3, 12, 11], device="cuda")
+                                scattered = torch.zeros((16, 64), device="cuda")
+                                scattered.index_add_(0, destinations, reference)
+                                reference = scattered
+                            elif down.inputs.scatter_table is not None:
                                 scattered = torch.zeros_like(reference)
                                 scattered.index_add_(0, down.inputs.scatter_table.long(), reference)
                                 reference = scattered

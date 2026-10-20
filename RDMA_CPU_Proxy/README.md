@@ -708,6 +708,55 @@ stages (including reset, excluding gaps between stages). Down FLOPs are
 `2 * meaningful_routes * activated_width * token_dimension`. Cold compilation
 can inflate initial event timings; use later iterations for performance analysis.
 
+### Local GPU combine without routing weights
+
+Append `--local-gpu-combine` together with `--down-projection2` and a fused
+up activation to the existing concurrent commands on both nodes, for example:
+
+```bash
+--concurrent-kernel --grouped-gemm-activation=swiglu \
+--down-projection2 --local-gpu-combine
+```
+
+This option selects multi-buffer scatter and `bulk_rows_reduce`, replacing the
+benchmark permutation. It owns those settings, including the destination-buffer
+count: `--down-scatter-output-buffers` does not control combine outputs. The
+existing down tile, pingpong, gather-table, expert-wave, wave-barrier, and
+N-tile-major options remain available with their usual constraints.
+
+Each computing GPU allocates one separate output buffer per active source
+`(node, GPU)` in the up runner's source order: 16 buffers for the two-node,
+eight-GPU configuration. Each has the same logical token-row capacity and
+feature width as its corresponding input. Inputs are never overwritten.
+Outputs are row-major by default; `--down-n-tile-major-output` uses the existing
+QuACK tiled layout. `DownProjectionRunner.inputs.output_buffers()` exposes the
+buffers; `down.up.source_pairs` identifies their sources.
+
+For each source and input-buffer row, the result is the unweighted sum of all
+down-projection outputs from experts on this computing GPU that consumed that
+row. All destinations are zeroed each iteration, including unused rows.
+Positions refer to the actual input buffer: compact forwarded-row positions for
+compact inputs and destination-node RDMA receive positions for direct inputs.
+They are not necessarily original source-token indices. This step performs no
+cross-GPU reduction, return RDMA transfer, or routing-weight multiplication.
+
+The up scheduler's packed row order can change with notification arrival order.
+After up completes on its CUDA stream, the worker reconstructs each output row's
+source and token from that iteration's gather table and `A_idx` arrays. Repeated
+N groups are removed; source segments are ordered by their packed output offsets.
+The resulting scatter addresses are rebuilt on the GPU every iteration before
+down launches on the same stream. Address lookup for all valid destination rows
+is validated once during initialization. No host readback of the live table is
+needed. This adds GPU mapping work between up and down, reported separately as
+`mapping_ms`; `up_plus_down_ms` includes reset, mapping, and down time in addition
+to the existing up timing.
+
+No C++ ABI or QuACK changes are needed beyond the existing down-projection
+requirements. Run `test_worker_activation.py` on Hopper for numerical coverage
+of colliding expert contributions, distinct sources, both output layouts,
+iteration reset, and changing gather-table publication order. CPU CLI tests
+alone do not validate CUDA reduction correctness.
+
 The Python test command above now also checks down CLI validation and, on Hopper,
 compares down outputs against FP32 references for sequence-length scheduling,
 table scheduling, scatter/reduction, and multi-buffer N-tile-major expert waves
