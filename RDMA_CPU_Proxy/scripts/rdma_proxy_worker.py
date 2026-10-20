@@ -466,6 +466,11 @@ def add_down_arguments(parser):
         parser.add_argument(f"--down-{name}", action="store_true")
     parser.add_argument("--down-epilogue-store",
                         choices=("tma", "bulk_rows", "bulk_rows_reduce"), default="tma")
+    parser.add_argument(
+        "--down-gather-table-publish-ready", action="store_true",
+        help="publish completed down-output column groups to a GPU flag; "
+             "requires down expert waves and the wave barrier",
+    )
 
 
 def validate_down_arguments(args):
@@ -492,6 +497,11 @@ def validate_down_arguments(args):
         raise ValueError("--down-scatter-output-buffers must be at least 2")
     if args.down_gather_table_expert_waves and not args.down_gather_table:
         raise ValueError("down expert waves require --down-gather-table")
+    if args.down_gather_table_publish_ready and (
+        not args.down_gather_table_expert_waves or not args.down_gather_table_wave_barrier
+    ):
+        raise ValueError("--down-gather-table-publish-ready requires "
+                         "--down-gather-table-expert-waves and --down-gather-table-wave-barrier")
     if args.down_gather_table_wave_barrier and (
         not args.down_gather_table_expert_waves or not args.down_pingpong
         or args.down_epilogue_store == "tma"

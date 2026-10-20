@@ -693,6 +693,20 @@ activated input. Expert waves require that table; the wave barrier additionally
 requires pingpong and a bulk-row epilogue. QuACK validates device-dependent wave
 capacity and tile/layout constraints. No down options are forwarded to C++.
 
+Add `--down-gather-table-publish-ready` to publish completed down-output column
+groups to `DownProjectionRunner.inputs.ready_groups`, a GPU `int32[1]` flag.
+It requires `--down-gather-table-expert-waves` and
+`--down-gather-table-wave-barrier`, including their gather-table, pingpong, and
+bulk-row epilogue prerequisites. For example, append the flag to the down
+projection command above. The worker passes it to QuACK's existing preparation
+and launch helpers, which reset the readiness flag on every down invocation.
+A GPU consumer must acquire-load the flag before reading the completed column
+prefix; each group spans `effective_swizzle_size * down_tile_n` columns.
+This publishes output readiness only: it does not enable `--trace-down-ready`
+or result-return communication. Up and down GEMMs still run sequentially.
+Use a QuACK checkout containing `--gather-table-publish-ready`; this worker
+change does not require a C++ library rebuild.
+
 Scatter matches the standalone benchmark: a random permutation distributes
 routed rows across separately allocated local outputs. It does not map results
 back to original tokens, apply routing weights, or return results over RDMA.

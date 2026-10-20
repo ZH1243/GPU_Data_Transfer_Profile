@@ -67,6 +67,20 @@ class ActivationCliTests(unittest.TestCase):
         self.assertNotIn("--local-gpu-combine", result.stdout)
         self.assertNotEqual(self.run_cli("--local-gpu-combine").returncode, 0)
 
+    def test_down_publish_ready_prerequisites(self):
+        options = ("--concurrent-kernel", "--grouped-gemm-activation=swiglu",
+                   "--down-projection2", "--down-gather-table",
+                   "--down-gather-table-expert-waves", "--down-gather-table-wave-barrier",
+                   "--down-pingpong", "--down-epilogue-store=bulk_rows_reduce",
+                   "--down-gather-table-publish-ready")
+        result = self.run_cli(*options)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--down-", result.stdout)
+        for required in options[:-1]:
+            with self.subTest(missing=required):
+                result = self.run_cli(*(option for option in options if option != required))
+                self.assertNotEqual(result.returncode, 0)
+
 
 class CombineCompactionTests(unittest.TestCase):
     def test_compaction_preserves_input_order_and_reduces_duplicates(self):
@@ -197,6 +211,10 @@ class HopperActivationTests(unittest.TestCase):
                         ("--local-gpu-combine", "--down-n-tile-major-output",
                          "--down-gather-table", "--down-gather-table-expert-waves",
                          "--down-gather-table-wave-barrier", "--down-pingpong"),
+                        ("--local-gpu-combine", "--down-n-tile-major-output",
+                         "--down-gather-table", "--down-gather-table-expert-waves",
+                         "--down-gather-table-wave-barrier", "--down-pingpong",
+                         "--down-gather-table-publish-ready"),
                         ("--down-gather-table",),
                         ("--down-scatter-table", "--down-epilogue-store=bulk_rows_reduce"),
                         ("--down-scatter-table", "--down-multi-buffer-scatter",
@@ -204,6 +222,10 @@ class HopperActivationTests(unittest.TestCase):
                          "--down-gather-table", "--down-gather-table-expert-waves",
                          "--down-gather-table-wave-barrier", "--down-pingpong",
                          "--down-epilogue-store=bulk_rows_reduce"),
+                        ("--down-gather-table", "--down-gather-table-expert-waves",
+                         "--down-gather-table-wave-barrier", "--down-pingpong",
+                         "--down-epilogue-store=bulk_rows",
+                         "--down-gather-table-publish-ready"),
                     )
                     import argparse
                     parser = argparse.ArgumentParser()
@@ -233,6 +255,10 @@ class HopperActivationTests(unittest.TestCase):
                                 # A second launch catches missing reduction destination resets.
                                 down.launch()
                                 torch.cuda.synchronize()
+                                if options.down_gather_table_publish_ready:
+                                    # N=256, tile N=128, swizzle=1: both output groups
+                                    # must be published on each invocation.
+                                    self.assertEqual(down.inputs.ready_groups.item(), 2)
                                 if options.local_gpu_combine:
                                     torch.testing.assert_close(down.combine_valid_rows,
                                         torch.tensor([4, 4], device="cuda"))
