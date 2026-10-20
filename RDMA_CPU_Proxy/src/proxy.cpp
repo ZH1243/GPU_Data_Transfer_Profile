@@ -590,6 +590,20 @@ std::vector<std::pair<int32_t, double>> Proxy::read_down_ready_trace(uint64_t it
     }
 }
 
+void Proxy::configure_return_copies(
+    const RdmaProxyReturnCopy* copies, std::size_t count, const int64_t* rows,
+    std::size_t row_count, std::size_t width, std::size_t tile,
+    std::size_t group_tiles, std::size_t element_bytes, bool per_group, uintptr_t down_done) {
+    if (!initialized_ || iteration_prepared_)
+        throw std::runtime_error("return copies require initialized, idle proxy");
+    down_ready_trace_.configure_returns(copies, count, rows, row_count, width,
+                                       tile, group_tiles, element_bytes, per_group, down_done);
+}
+
+void Proxy::arm_return_copies(uint64_t iteration) {
+    down_ready_trace_.arm_returns(iteration);
+}
+
 void Proxy::finish_run() {
     if (!initialized_) throw std::runtime_error("proxy is not initialized");
     if (config_.num_iterations != 0) {
@@ -600,6 +614,7 @@ void Proxy::finish_run() {
 void Proxy::shutdown() {
     down_ready_trace_.cancel();
     stop_forwarding_thread();
+    down_ready_trace_.drain_returns();
     for (auto& peer : peers_) {
         for (auto& worker : peer.workers) {
             if (worker) worker->stop();

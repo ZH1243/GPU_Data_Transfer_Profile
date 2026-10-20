@@ -18,6 +18,25 @@ spec.loader.exec_module(worker)
 
 
 class ActivationCliTests(unittest.TestCase):
+    def test_return_results_cli(self):
+        common = ("--concurrent-kernel", "--grouped-gemm-activation=swiglu",
+                  "--down-projection2", "--local-gpu-combine", "--down-pingpong",
+                  "--down-gather-table", "--down-gather-table-expert-waves",
+                  "--down-gather-table-wave-barrier", "--down-gather-table-publish-ready")
+        for extra in (("--return-token-results",),
+                      ("--return-token-results", "--return-token-results-per-group",
+                       "--down-n-tile-major-output", "--check-return-token-results")):
+            result = self.run_cli(*common, *extra)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("--return-token", result.stdout)
+        for extra in (("--return-token-results-per-group",),
+                      ("--return-token-results", "--return-token-results-per-group"),
+                      ("--check-return-token-results",),
+                      ("--return-token-results", "--return-token-timeout=0"),
+                      ("--return-token-results", "--return-token-timeout=nan")):
+            self.assertNotEqual(self.run_cli(*common, *extra).returncode, 0)
+        self.assertNotEqual(self.run_cli("--return-token-results").returncode, 0)
+
     def run_cli(self, *options):
         return subprocess.run(
             [sys.executable, str(WORKER), "--library=/unused.so",

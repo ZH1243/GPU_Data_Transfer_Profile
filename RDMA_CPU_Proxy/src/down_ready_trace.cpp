@@ -60,6 +60,7 @@ void DownReadyTrace::reset(uint64_t iteration) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!host_) return;
     if (active_.load()) throw std::runtime_error("previous down-ready trace is still active");
+    if (returns_) returns_->reset();
     __atomic_store_n(host_, 0, __ATOMIC_RELEASE);
     observations_.clear();
     iteration_ = iteration;
@@ -83,12 +84,36 @@ void DownReadyTrace::poll() {
             ready, std::chrono::duration<double, std::micro>(now - start_).count());
         previous_ = ready;
     }
-    if (ready == groups_) {
+    const bool returned = !returns_ || returns_->poll(ready);
+    if (ready == groups_ && returned) {
         complete_ = true;
         active_.store(false);
     } else if (now - start_ > std::chrono::milliseconds(timeout_ms_)) {
-        throw std::runtime_error("timed out polling down-GEMM readiness");
+        throw std::runtime_error("timed out polling down-GEMM readiness or return completion");
     }
+}
+
+void DownReadyTrace::configure_returns(
+    const RdmaProxyReturnCopy* copies, std::size_t count, const int64_t* rows,
+    std::size_t row_count, std::size_t width, std::size_t tile,
+    std::size_t group_tiles, std::size_t element_bytes, bool per_group, uintptr_t down_done) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!host_ || armed_ || returns_) throw std::runtime_error("invalid return configuration state");
+    returns_ = std::make_unique<ReturnCopies>(
+        device_, mock_, groups_, copies, count, rows, row_count, width,
+        tile, group_tiles, element_bytes, per_group, down_done);
+}
+
+void DownReadyTrace::arm_returns(uint64_t iteration) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!returns_ || !armed_ || cancelled_ || iteration != iteration_ || !active_.load())
+        throw std::runtime_error("invalid return arm state/iteration");
+    returns_->arm();
+}
+
+void DownReadyTrace::drain_returns() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (returns_) returns_->drain();
 }
 
 void DownReadyTrace::cancel() {

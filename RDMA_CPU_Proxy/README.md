@@ -748,7 +748,8 @@ projection, local down-output combine, and CPU readiness tracing:
 
 `--local-gpu-combine` selects the additive bulk-row epilogue required by this
 configuration. It combines into local per-source buffers without routing
-weights; it does not perform the standalone QuACK benchmark's return exchange.
+weights. Add `--return-token-results` below to return these outputs to their
+same-node NVLink senders.
 
 Scatter matches the standalone benchmark: a random permutation distributes
 routed rows across separately allocated local outputs. It does not map results
@@ -814,7 +815,8 @@ capacity-based shape. An empty source has a zero-length prefix and no stores.
 row-major valid tensor per source for inspection. Do not use QuACK's generic
 `inputs.collected_up_output()` for combine: it assumes capacity-based strides.
 Input-row indices are not necessarily original source-token indices. No
-cross-GPU reduction, return transfer, or routing weights are applied.
+cross-GPU reduction or routing weights are applied. Return transfer is opt-in
+with `--return-token-results`.
 
 The up scheduler's packed row order can change with notification arrival order.
 After up completes on its CUDA stream, the worker reconstructs each output row's
@@ -828,6 +830,103 @@ is validated once during initialization. No host readback of the live table is
 needed. This adds GPU mapping work between up and down, reported separately as
 `mapping_ms`; `up_plus_down_ms` includes reset, mapping, and down time in addition
 to the existing up timing.
+
+### Return local-combine results to NVLink senders
+
+Rebuild the shared library on both Hopper nodes:
+
+```bash
+cmake --build build-hopper --target rdma_cpu_proxy_shared -j4
+```
+
+Append the following to both existing node commands, retaining your prepared
+forwarding options:
+
+```bash
+--concurrent-kernel --grouped-gemm-activation=swiglu \
+--down-projection2 --local-gpu-combine \
+--down-n-tile-major-output --down-tile-m=128 --down-tile-n=128 \
+--down-pingpong --down-gather-table --down-gather-table-expert-waves \
+--down-max-swizzle-size=1 --down-gather-table-wave-barrier \
+--down-gather-table-publish-ready \
+--return-token-results --return-token-results-per-group
+```
+
+Omit `--return-token-results-per-group` for whole-buffer returns after down
+completion. Whole-buffer mode permits row-major output too. Both modes require
+local combine and down ready-prefix publication (including its existing
+prerequisites). `--trace-down-ready` is optional: return mode enables the mapped
+host counter and receiver polling automatically, without requiring trace logs.
+The QuACK checkout must include `run/token_exchange.py` and the CUDA IPC export
+helper in `run/hopper_stream_gather_table_gemm.py`; no QuACK source changes or
+QuACK CPU-proxy rebuild are needed.
+
+On node A GPU i, each source `(source_node, GPU j)` with `j != i` is returned to
+node A GPU j. In the two-node/eight-GPU case this means 14 outputs, grouped into
+seven `cudaMemcpyBatchAsync` calls, each containing two independent segments.
+The local-staging and direct-RDMA outputs remain on GPU i. Each destination
+allocates 14 separate persistent receive buffers keyed by
+`(computing_peer_gpu, original_source_node)`. The allocation capacity matches
+the combine outputs; only valid prefixes are copied. At 10,240 rows, width
+4,096 and BF16 this adds about 1.09 GiB of receive storage per GPU.
+
+Source and destination use identical physical layouts. For tiled output,
+each valid prefix is `[ceil(width / tile_n), valid_rows, tile_n]`, independent
+of the capacity-based allocation shape. Each group's byte offset and size
+use that source's valid-row count; the two segments in a peer batch may differ
+in length. Empty segments and all-empty batches are skipped. Receive tails
+are unspecified and must not be consumed.
+
+The existing notification receiver submits returns on a dedicated nonblocking
+CUDA stream. Per-group mode submits every newly ready group exactly once, even
+when a poll observes a prefix jump, and does not synchronize between groups.
+Whole-buffer mode additionally queries an event recorded after down GEMM;
+the iteration is armed only after that event is recorded, preventing reuse of
+the previous iteration's event state. Compact valid counts are copied to pinned
+host storage on the compute stream after mapping and before down GEMM. A
+positive system-release ready prefix therefore also establishes count readiness.
+
+After observing all groups, the receiver continues polling until the return
+stream completes. Python waits for this completion and a same-node rank barrier
+before starting the next iteration. The barrier also exchanges valid counts.
+`down.return_exchange.received[(peer, source_node)]` exposes the receive tensor;
+`received_valid_rows[(peer, source_node)]` gives its current valid count after
+the barrier. Exported allocations and imported mappings remain alive until all
+workers stop and all imports close. Non-identity CUDA device maps are supported;
+all workers must use consistent CUDA visibility and distinct devices.
+
+Return transfers and the rank barrier are excluded from the existing GEMM event
+timings, although overlapping transfers can affect down-GEMM performance. The
+small count readback is included in mapping time. This feature performs only the
+reverse intra-node NVLink hop: remote-origin results still need a later reverse
+RDMA transfer, and final token reduction/routing weights are not implemented.
+
+For remote validation, add `--check-return-token-results` on both nodes. Every
+iteration compares each received valid physical prefix byte-for-byte with the
+producing GPU's combine output, then waits for every rank to finish checking
+before reuse. Run both whole-buffer and per-group modes; these checks validate
+transport, while the existing Hopper numerical tests validate combine arithmetic.
+Validation allocates a temporary comparison buffer and is outside GEMM timing.
+
+`--return-token-timeout=120` controls same-node IPC setup/completion barriers in
+seconds. The native ready/copy poll retains `completion_timeout_ms`; use a larger
+value such as `--completion_timeout_ms=120000` if first-iteration compilation
+exceeds the current limit. The control plane uses node-local `/dev/shm`, scoped
+by torchrun identity and node rank. It is removed on successful shutdown;
+after an aborted run use a fresh torchrun rendezvous identity/port (or remove
+the stale `quack-rdma-return-node*` file after all workers have exited).
+
+Local CPU checks:
+
+```bash
+ctest --test-dir build -R 'test_return_copies|test_down_ready_trace' --output-on-failure
+python -m unittest discover -s tests -p test_worker_activation.py -v
+```
+
+Mock tests cover compact byte ranges, two segments per peer, empty/unequal
+sources, partial final groups, prefix jumps, arm ordering, capacity rejection,
+and repeated iterations. CUDA IPC, GPU publication visibility, and actual
+copy/GEMM overlap require validation on Hopper.
 
 No C++ ABI or QuACK changes are needed beyond the existing down-projection
 requirements. Run `test_worker_activation.py` on Hopper for numerical coverage

@@ -40,6 +40,11 @@ public:
     void finish_run();
     uintptr_t configure_down_ready_trace(int groups);
     std::vector<std::pair<int32_t, double>> read_down_ready_trace(uint64_t iteration);
+    void configure_return_copies(const RdmaProxyReturnCopy* copies, std::size_t count,
+                                const int64_t* rows, std::size_t row_count, std::size_t width,
+                                std::size_t tile, std::size_t group_tiles,
+                                std::size_t element_bytes, bool per_group, uintptr_t down_done);
+    void arm_return_copies(uint64_t iteration);
     void shutdown();
     const RouterExpertMetadata& router_expert_metadata_for_source(
         int source_node_rank,

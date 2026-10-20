@@ -6,6 +6,8 @@
 #include <mutex>
 #include <utility>
 #include <vector>
+#include <memory>
+#include "return_copies.hpp"
 
 namespace rdma_proxy {
 
@@ -19,6 +21,12 @@ public:
     void poll();
     void cancel();
     bool read(uint64_t iteration, std::vector<std::pair<int32_t, double>>& observations);
+    void configure_returns(const RdmaProxyReturnCopy* copies, std::size_t count,
+                           const int64_t* rows, std::size_t row_count, std::size_t width,
+                           std::size_t tile, std::size_t group_tiles, std::size_t element_bytes,
+                           bool per_group, uintptr_t down_done);
+    void arm_returns(uint64_t iteration);
+    void drain_returns();
 
 private:
     std::mutex mutex_;
@@ -30,5 +38,6 @@ private:
     bool armed_{false}, complete_{false}, cancelled_{false};
     std::chrono::steady_clock::time_point start_;
     std::vector<std::pair<int32_t, double>> observations_;
+    std::unique_ptr<ReturnCopies> returns_;
 };
 }  // namespace rdma_proxy

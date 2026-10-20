@@ -39,6 +39,7 @@ set(RDMA_PROXY_SOURCES
   src/proxy.cpp
   src/qp_worker.cpp
   src/down_ready_trace.cpp
+  src/return_copies.cpp
   src/rdma_connection.cpp
   src/rdma_context.cpp
   src/router_routing.cpp
@@ -126,6 +127,9 @@ if(RDMA_PROXY_BUILD_TESTS)
 
   add_executable(test_c_api tests/test_c_api.cpp)
   add_executable(test_down_ready_trace tests/test_down_ready_trace.cpp)
+  add_executable(test_return_copies tests/test_return_copies.cpp)
+  target_link_libraries(test_return_copies PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_return_copies COMMAND test_return_copies)
   target_link_libraries(test_down_ready_trace PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_down_ready_trace COMMAND test_down_ready_trace)
   target_link_libraries(test_c_api PRIVATE rdma_cpu_proxy_shared)

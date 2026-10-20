@@ -454,6 +454,14 @@ class GroupedGemmRunner:
 
 
 def add_down_arguments(parser):
+    parser.add_argument("--return-token-results", action="store_true",
+                        help="return local-combine outputs to their same-node NVLink senders")
+    parser.add_argument("--return-token-results-per-group", action="store_true",
+                        help="return each ready column group while down GEMM continues")
+    parser.add_argument("--check-return-token-results", action="store_true",
+                        help="compare received valid bytes with producing GPU outputs each iteration")
+    parser.add_argument("--return-token-timeout", type=float, default=120.0,
+                        help="same-node return setup/completion barrier timeout in seconds")
     parser.add_argument("--down-projection2", action="store_true")
     parser.add_argument("--trace-down-ready", action="store_true",
                         help="poll down-output readiness in the C++ notification receiver")
@@ -476,6 +484,19 @@ def add_down_arguments(parser):
 
 
 def validate_down_arguments(args):
+    if args.return_token_results_per_group and (
+        not args.return_token_results or not args.down_n_tile_major_output
+    ):
+        raise ValueError("--return-token-results-per-group requires --return-token-results "
+                         "and --down-n-tile-major-output")
+    if args.check_return_token_results and not args.return_token_results:
+        raise ValueError("--check-return-token-results requires --return-token-results")
+    if args.return_token_results:
+        if not args.local_gpu_combine or not args.down_gather_table_publish_ready:
+            raise ValueError("--return-token-results requires --local-gpu-combine "
+                             "and --down-gather-table-publish-ready")
+        if not math.isfinite(args.return_token_timeout) or args.return_token_timeout <= 0:
+            raise ValueError("--return-token-timeout must be finite and positive")
     if args.trace_down_ready and (
         not args.down_projection2 or not args.down_gather_table_publish_ready
     ):
@@ -631,15 +652,16 @@ class DownProjectionRunner:
         self.inputs = pregather.prepare_grouped_inputs(
             args, up.output[:routes], self.weights, counts, **external
         )
-        if options.trace_down_ready:
+        if options.trace_down_ready or options.return_token_results:
             if trace_configure is None:
-                raise ValueError("--trace-down-ready requires the proxy trace allocator")
+                raise ValueError("down readiness requires the proxy trace allocator")
             self.trace_groups = int(self.inputs.wave_ready_prefix[-1].item())
             address = trace_configure(self.trace_groups)
             self.inputs.wave_ready_host_address = torch.tensor(
                 [address], dtype=torch.int64, device=up.output.device)
         self.launch_gemm = pregather.make_launch(args, self.inputs)
         self.combine_tile_n = args.tile_n if self.combine and args.n_tile_major_output else None
+        self.return_exchange = None
         self.flops = 2 * routes * hidden * output_dim
         self.reset_start = torch.cuda.Event(enable_timing=True)
         self.mapping_start = torch.cuda.Event(enable_timing=True)
@@ -652,7 +674,7 @@ class DownProjectionRunner:
         if self.combine:
             print(f"Local GPU combine: sources={up.source_pairs} "
                   f"rows_per_source={self.combine_rows} epilogue=bulk_rows_reduce "
-                  "positions=compact prefixes in input-row order; no routing weights or return communication",
+                  "positions=compact prefixes in input-row order; no routing weights",
                   flush=True)
 
     def launch(self):
@@ -679,6 +701,8 @@ class DownProjectionRunner:
                 addresses[:, 1] = (valid_rows[mapping[:, 0]] * self.combine_tile_n
                                    * self.up.output.element_size())
             self.inputs.scatter_row_addresses.copy_(addresses)
+        if self.return_exchange is not None:
+            self.return_exchange.publish_counts()
         self.gemm_start.record()
         self.launch_gemm()
         self.end.record()
@@ -1081,6 +1105,8 @@ def run_proxy_with_concurrent_kernel(
     results: queue.Queue = queue.Queue()
     device_buffers: TorchDeviceBuffers | None = None
     trace = None
+    return_exchange = None
+    success = False
     kernel_stream = None
     try:
         device_buffers = install_python_device_buffers(
@@ -1143,11 +1169,16 @@ def run_proxy_with_concurrent_kernel(
             counts = get_expert_counts(library, handle)
             if sum(counts) != computation_tokens.value:
                 raise RuntimeError("per-expert counts disagree with total routed rows")
-            if down_options.trace_down_ready:
+            if down_options.trace_down_ready or down_options.return_token_results:
                 trace = DownReadyTrace(library, handle)
             down = DownProjectionRunner(
                 torch, grouped_gemm, counts, down_options,
                 trace_configure=trace.configure if trace is not None else None)
+            if down_options.return_token_results:
+                from rdma_return_exchange import ReturnExchange
+                return_exchange = ReturnExchange(
+                    torch, library, handle, down, down_options,
+                    node_rank, local_gpu_index, cuda_device_id, num_iterations.value)
         useful_flops = (
             2
             * int(computation_tokens.value)
@@ -1215,6 +1246,8 @@ def run_proxy_with_concurrent_kernel(
                 with torch.cuda.stream(kernel_stream):
                     if down is not None:
                         down.launch()
+                    if return_exchange is not None:
+                        return_exchange.arm(iteration)
                     kernel_finished.record(kernel_stream)
             except BaseException as error:
                 kernel_error = error
@@ -1231,6 +1264,8 @@ def run_proxy_with_concurrent_kernel(
             kernel_finished.synchronize()
             if trace is not None:
                 down_traces.append((iteration, trace.read(iteration)))
+            if return_exchange is not None:
+                return_exchange.finish_iteration(iteration)
             elapsed_ms = ctypes.c_float()
             require_proxy_success(
                 library,
@@ -1281,7 +1316,7 @@ def run_proxy_with_concurrent_kernel(
                   f"gemm_ms={down_ms:.4f} "
                   f"effective_throughput={down.flops / (max(down_ms, 1e-9) * 1e9):.2f} TFLOP/s "
                   f"up_plus_down_ms={combined_ms:.4f}", flush=True)
-        if trace is not None:
+        if down_options.trace_down_ready:
             print("CPU down-ready trace: detection times since iteration preparation "
                   "(includes up GEMM and host delays; not GPU timestamps). "
                   "Ranges are completed group prefixes; jumps share one observation.",
@@ -1295,6 +1330,7 @@ def run_proxy_with_concurrent_kernel(
                           f"columns=[{previous * width},{min(ready * width, hidden_dimension)}) "
                           f"detected_us={elapsed_us:.3f}", flush=True)
                     previous = ready
+        success = True
         return 0
     finally:
         # Keep both the mapped host flag and its GPU address tensor alive until
@@ -1316,6 +1352,8 @@ def run_proxy_with_concurrent_kernel(
                     flush=True,
                 )
         library.rdma_proxy_destroy(handle)
+        if return_exchange is not None:
+            return_exchange.close(success and shutdown_status == 0)
 
 
 def main() -> int:

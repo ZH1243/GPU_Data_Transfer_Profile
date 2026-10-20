@@ -221,6 +221,31 @@ extern "C" int rdma_proxy_read_down_ready_trace(
     } catch (...) { return record_current_exception(); }
 }
 
+extern "C" int rdma_proxy_configure_return_copies(
+    RdmaProxyHandle* handle, const RdmaProxyReturnCopy* copies, uint64_t count,
+    const int64_t* rows, uint64_t row_count, uint64_t width, uint64_t tile,
+    uint64_t group_tiles, uint64_t element_bytes, int32_t per_group, uintptr_t down_done) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down ||
+            handle->next_iteration != 0 || handle->finished || (per_group != 0 && per_group != 1))
+            throw std::runtime_error("invalid return-copy configuration request");
+        handle->proxy.configure_return_copies(copies, count, rows, row_count, width,
+                                             tile, group_tiles, element_bytes, per_group != 0, down_done);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
+extern "C" int rdma_proxy_arm_return_copies(RdmaProxyHandle* handle, uint64_t iteration) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down)
+            throw std::runtime_error("invalid return-copy arm request");
+        handle->proxy.arm_return_copies(iteration);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
 extern "C" int rdma_proxy_run(RdmaProxyHandle* handle) {
     clear_error();
     if (handle == nullptr) {

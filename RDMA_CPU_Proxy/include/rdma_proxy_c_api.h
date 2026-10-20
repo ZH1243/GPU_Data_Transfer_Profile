@@ -139,6 +139,29 @@ RDMA_PROXY_C_API int rdma_proxy_read_down_ready_trace(
     RdmaProxyHandle* handle, uint64_t iteration, int32_t* groups,
     double* times_us, uint64_t capacity, uint64_t* count);
 
+typedef struct RdmaProxyReturnCopy {
+    uintptr_t source;
+    uintptr_t destination;
+    uint64_t capacity_bytes; /* Minimum of source and destination capacities. */
+    uint64_t row_index;      /* Index into host_valid_rows. */
+    int32_t peer;            /* Same-node destination GPU index; batches group by peer. */
+} RdmaProxyReturnCopy;
+
+/* Configure after down-ready trace, before the first iteration. Pointers/events
+ * are borrowed until shutdown. host_valid_rows must be pinned host int64 storage,
+ * updated on the compute stream BEFORE down GEMM. tile_n=0 means row-major.
+ * All destination buffers use the same packed layout/count as their sources.
+ * read_down_ready_trace additionally waits for outgoing returns when configured;
+ * the embedder must also coordinate incoming completion across local ranks.
+ */
+RDMA_PROXY_C_API int rdma_proxy_configure_return_copies(
+    RdmaProxyHandle* handle, const RdmaProxyReturnCopy* copies, uint64_t count,
+    const int64_t* host_valid_rows, uint64_t row_count, uint64_t width,
+    uint64_t tile_n, uint64_t group_tiles, uint64_t element_bytes,
+    int32_t per_group, uintptr_t down_done_event);
+/* Call after recording this iteration's down_done_event, never before. */
+RDMA_PROXY_C_API int rdma_proxy_arm_return_copies(RdmaProxyHandle* handle, uint64_t iteration);
+
 RDMA_PROXY_C_API int rdma_proxy_shutdown(RdmaProxyHandle* handle);
 RDMA_PROXY_C_API void rdma_proxy_destroy(RdmaProxyHandle* handle);
 
