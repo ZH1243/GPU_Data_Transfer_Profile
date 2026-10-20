@@ -151,7 +151,8 @@ class HopperActivationTests(unittest.TestCase):
                 )
                 xs, indices = [], []
                 for source in range(2):
-                    x = torch.randn(8, 64, device="cuda", dtype=torch.bfloat16)
+                    # Down width spans two N=128 tiles to test packed strides.
+                    x = torch.randn(8, 256, device="cuda", dtype=torch.bfloat16)
                     idx = torch.tensor([4, 1, 6, 4, 3, 0, 0], device="cuda", dtype=torch.int32)
                     buffers.tensors[(worker.DEVICE_BUFFER_NVLINK_RECEIVE, -1, 0, source)] = x
                     buffers.tensors[(worker.DEVICE_BUFFER_ROUTER_A_IDX, -1, 0, source)] = idx
@@ -221,7 +222,7 @@ class HopperActivationTests(unittest.TestCase):
                                 # Used input rows [1, 3, 4, 6] map to [0, 1, 2, 3].
                                 destinations = torch.tensor(
                                     [2, 0, 3, 10, 8, 11, 2, 1, 10, 9], device="cuda")
-                                scattered = torch.zeros((16, 64), device="cuda")
+                                scattered = torch.zeros((16, 256), device="cuda")
                                 scattered.index_add_(0, destinations, reference)
                                 reference = scattered
                             elif down.inputs.scatter_table is not None:
@@ -238,10 +239,19 @@ class HopperActivationTests(unittest.TestCase):
                                     torch.testing.assert_close(down.combine_output_to_input,
                                         torch.tensor([[1, 3, 4, 6, -1, -1, -1, -1]] * 2,
                                                      device="cuda"))
-                                torch.testing.assert_close(
-                                    down.inputs.collected_up_output(), reference.to(torch.bfloat16),
-                                    atol=6e-2, rtol=2e-3,
-                                )
+                                    for source, output in enumerate(down.collected_combine_outputs()):
+                                        expected = reference[source * 8:source * 8 + 4]
+                                        torch.testing.assert_close(output, expected.to(torch.bfloat16),
+                                                                   atol=6e-2, rtol=2e-3)
+                                        raw = down.inputs.output_buffers()[source].view(-1)
+                                        # Both layouts occupy exactly one 4-token prefix.
+                                        torch.testing.assert_close(raw[4 * 256:],
+                                                                   torch.zeros_like(raw[4 * 256:]))
+                                else:
+                                    torch.testing.assert_close(
+                                        down.inputs.collected_up_output(), reference.to(torch.bfloat16),
+                                        atol=6e-2, rtol=2e-3,
+                                    )
 
 
 if __name__ == "__main__":

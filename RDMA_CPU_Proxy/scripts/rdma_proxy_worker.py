@@ -615,6 +615,7 @@ class DownProjectionRunner:
             args, up.output[:routes], self.weights, counts, **external
         )
         self.launch_gemm = pregather.make_launch(args, self.inputs)
+        self.combine_tile_n = args.tile_n if self.combine and args.n_tile_major_output else None
         self.flops = 2 * routes * hidden * output_dim
         self.reset_start = torch.cuda.Event(enable_timing=True)
         self.mapping_start = torch.cuda.Event(enable_timing=True)
@@ -647,10 +648,41 @@ class DownProjectionRunner:
             flat = mapping[:, 0] * self.combine_rows + mapping[:, 1]
             self.inputs.scatter_mapping.copy_(mapping)
             self.inputs.scatter_table.copy_(flat)
-            self.inputs.scatter_row_addresses.copy_(self.combine_addresses[flat])
+            addresses = self.combine_addresses[flat]
+            if self.combine_tile_n is not None:
+                # Tile zero's addresses are unchanged. Pack subsequent N tiles
+                # using the distinct valid-token count, not allocation capacity.
+                addresses[:, 1] = (valid_rows[mapping[:, 0]] * self.combine_tile_n
+                                   * self.up.output.element_size())
+            self.inputs.scatter_row_addresses.copy_(addresses)
         self.gemm_start.record()
         self.launch_gemm()
         self.end.record()
+
+    def collected_combine_outputs(self):
+        """Return one row-major valid tensor per source for inspection/testing.
+
+        Synchronizes this runner's last launch. The timed path uses device-side
+        counts and packed buffers directly, without this host count readback.
+        QuACK's generic collected_up_output assumes capacity-based tile strides
+        and must not be used for these dynamically packed combine outputs.
+        """
+        if not self.combine:
+            raise ValueError("combine outputs require --local-gpu-combine")
+        self.end.synchronize()
+        counts = self.combine_valid_rows.tolist()
+        width = int(self.up.x_buffers[0].shape[1])
+        result = []
+        for buffer, count in zip(self.inputs.output_buffers(), counts):
+            if self.combine_tile_n is None:
+                result.append(buffer[:count])
+            else:
+                tile = self.combine_tile_n
+                n_tiles = math.ceil(width / tile)
+                result.append(buffer.view(-1)[:n_tiles * count * tile]
+                              .view(n_tiles, count, tile).permute(1, 0, 2)
+                              .reshape(count, n_tiles * tile)[:, :width])
+        return tuple(result)
 
 
 def get_expert_counts(library, handle):

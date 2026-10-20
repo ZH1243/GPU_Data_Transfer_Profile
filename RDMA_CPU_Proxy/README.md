@@ -745,11 +745,19 @@ each iteration, including the unused tail. The GPU int64 tensor
 `down.combine_valid_rows[source]` gives the valid prefix length; the GPU int64
 tensor `down.combine_output_to_input[source, k]` gives its input-buffer row
 (-1 beyond the valid prefix). These tensors update on the down stream each
-iteration; consumers must wait for that stream before reading them. For tiled
-outputs, compaction concerns logical rows: N-tile strides still use allocation
-capacity, so the valid rows are a prefix within each N tile, not one contiguous
-row-major byte prefix. Input-row indices are not necessarily original source-token
-indices. No cross-GPU reduction, return transfer, or routing weights are applied.
+iteration; consumers must wait for that stream before reading them. N-tile-major
+stores use `valid_rows[source] * tile_n * element_size` as the N-tile byte stride.
+Thus all valid results occupy one contiguous allocation prefix in both layouts:
+`n * feature_width` elements for row-major and
+`ceil(feature_width / tile_n) * n * tile_n` for tiled output. Tiled output remains
+N-tile-major, with feature padding if the width is not divisible by tile_n;
+view its prefix as `[num_n_tiles, n, tile_n]`, not using the allocation's original
+capacity-based shape. An empty source has a zero-length prefix and no stores.
+`down.collected_combine_outputs()` synchronizes the last launch and returns one
+row-major valid tensor per source for inspection. Do not use QuACK's generic
+`inputs.collected_up_output()` for combine: it assumes capacity-based strides.
+Input-row indices are not necessarily original source-token indices. No
+cross-GPU reduction, return transfer, or routing weights are applied.
 
 The up scheduler's packed row order can change with notification arrival order.
 After up completes on its CUDA stream, the worker reconstructs each output row's
