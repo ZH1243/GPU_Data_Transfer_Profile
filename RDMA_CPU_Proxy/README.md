@@ -879,15 +879,20 @@ are unspecified and must not be consumed.
 
 The existing notification receiver submits returns on a dedicated nonblocking
 CUDA stream. Per-group mode submits every newly ready group exactly once, even
-when a poll observes a prefix jump, and does not synchronize between groups.
+when a poll observes a prefix jump. After submitting a group's batches to all
+destination GPUs, it calls `cudaStreamSynchronize` on the return stream before
+submitting the next ready group. This blocks the notification receiver until
+that group's copies complete; down GEMM can continue on its separate compute
+stream.
 Whole-buffer mode additionally queries an event recorded after down GEMM;
 the iteration is armed only after that event is recorded, preventing reuse of
 the previous iteration's event state. Compact valid counts are copied to pinned
 host storage on the compute stream after mapping and before down GEMM. A
 positive system-release ready prefix therefore also establishes count readiness.
 
-After observing all groups, the receiver continues polling until the return
-stream completes. Python waits for this completion and a same-node rank barrier
+In whole-buffer mode, the receiver continues polling until the return stream
+completes; per-group mode waits synchronously for each group, including the last.
+Python waits for return completion and a same-node rank barrier
 before starting the next iteration. The barrier also exchanges valid counts.
 `down.return_exchange.received[(peer, source_node)]` exposes the receive tensor;
 `received_valid_rows[(peer, source_node)]` gives its current valid count after

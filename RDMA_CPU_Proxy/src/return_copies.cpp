@@ -97,6 +97,9 @@ bool ReturnCopies::poll(int ready) {
     if (per_group_) {
         while (submitted_ < ready) {
             submit(submitted_);
+            // Wait for this group's batches to all destination GPUs before
+            // submitting another group, even if its ready prefix is visible.
+            synchronize_cuda_stream(stream_, mock_);
             ++submitted_;
         }
     } else if (ready == groups_ && submitted_ == 0) {
