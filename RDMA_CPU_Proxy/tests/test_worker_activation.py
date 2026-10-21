@@ -292,6 +292,20 @@ class HopperActivationTests(unittest.TestCase):
 
                             down = worker.DownProjectionRunner(
                                 torch, runner, [6, 4], options, trace_configure=configure_trace)
+                            # Warmup must not consume/overwrite the live gather
+                            # table, and real launches must replace its dummy map.
+                            saved_up = runner.output.clone()
+                            saved_table = runner.work_table.clone()
+                            with torch.inference_mode(False):
+                                down.warmup()
+                            torch.testing.assert_close(runner.work_table, saved_table)
+                            for output in down.inputs.output_buffers():
+                                torch.testing.assert_close(output, torch.zeros_like(output))
+                            if options.local_gpu_combine:
+                                torch.testing.assert_close(
+                                    down.combine_valid_rows,
+                                    torch.tensor([7, 3], dtype=torch.int64, device="cuda"))
+                            runner.output.copy_(saved_up)
                             reference = torch.cat([
                                 runner.output[start:end].float() @ down.weights[e].float()
                                 for e, (start, end) in enumerate(((0, 6), (6, 10)))

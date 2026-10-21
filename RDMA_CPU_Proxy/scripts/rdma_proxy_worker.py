@@ -537,7 +537,7 @@ def validate_down_arguments(args):
         raise ValueError("down wave barrier requires expert waves, pingpong, and a bulk-row epilogue")
 
 
-def local_combine_mapping(torch, work_table, a_idx, routes, n_groups):
+def local_combine_mapping(torch, work_table, a_idx, routes, n_groups, trace=None):
     """Recover each packed up-output row's (source, input row) on device.
 
     Multi-buffer QuACK places a table row at sum(start_j), concatenating its
@@ -545,20 +545,48 @@ def local_combine_mapping(torch, work_table, a_idx, routes, n_groups):
     neither expert order nor source order alone describes the packed output.
     Called on the up/down stream after up has consumed the complete table.
     """
+    def mark(message):
+        if trace is not None:
+            trace("mapping: " + message)
+
+    mark("table conversion begin")
     ranges = work_table[::n_groups, 2:].long().reshape(-1, len(a_idx), 2)
     starts, ends = ranges[:, :, 0], ranges[:, :, 1]
+    mark("table conversion submitted; lengths begin")
     lengths = ends - starts
-    output_ends = starts.sum(dim=1, keepdim=True) + lengths.cumsum(dim=1)
+    mark("lengths submitted; sum begin")
+    start_sums = starts.sum(dim=1, keepdim=True)
+    mark("sum submitted; cumsum begin")
+    cumulative_lengths = lengths.cumsum(dim=1)
+    mark("cumsum submitted; output ends begin")
+    output_ends = start_sums + cumulative_lengths
+    del start_sums, cumulative_lengths
     # Empty source segments must never win a search, even at batch boundaries.
+    mark("output ends submitted; keys begin")
     keys = torch.where(lengths > 0, output_ends, routes + 1).flatten()
+    mark("keys submitted; argsort begin")
     order = keys.argsort()
+    mark("argsort submitted; arange begin")
     rows = torch.arange(routes, device=work_table.device, dtype=torch.int64)
-    segments = order[torch.searchsorted(keys[order], rows, right=True)]
+    mark("arange submitted; sorted keys gather begin")
+    sorted_keys = keys[order]
+    mark("sorted keys submitted; searchsorted begin")
+    positions = torch.searchsorted(sorted_keys, rows, right=True)
+    mark("searchsorted submitted; segment gather begin")
+    segments = order[positions]
+    del sorted_keys, positions
+    mark("segment gather submitted; source and index arithmetic begin")
     source = segments % len(a_idx)
     output_starts = (output_ends - lengths).flatten()
     index = starts.flatten()[segments] + rows - output_starts[segments]
+    mark("index arithmetic submitted; A_idx stack begin")
     indices = torch.stack(a_idx)
-    return torch.stack((source, indices[source, index].long()), dim=1)
+    mark("A_idx stack submitted; token index gather begin")
+    token_indices = indices[source, index].long()
+    mark("token index gather submitted; result stack begin")
+    result = torch.stack((source, token_indices), dim=1)
+    mark("result stack submitted")
+    return result
 
 
 def compact_combine_mapping(torch, mapping, num_sources, capacity):
@@ -662,6 +690,7 @@ class DownProjectionRunner:
         self.launch_gemm = pregather.make_launch(args, self.inputs)
         self.combine_tile_n = args.tile_n if self.combine and args.n_tile_major_output else None
         self.return_exchange = None
+        self._trace_first_combine_launch = self.combine
         self.flops = 2 * routes * hidden * output_dim
         self.reset_start = torch.cuda.Event(enable_timing=True)
         self.mapping_start = torch.cuda.Event(enable_timing=True)
@@ -680,50 +709,85 @@ class DownProjectionRunner:
     def warmup(self):
         """Initialize the down CUDA path before any readiness-gated up launch."""
         torch = self.up.torch
-        print("DownGEMM warming up before concurrent iterations", flush=True)
+        print(f"[gpu={self.up.cuda_device_id}] DownGEMM warming up before concurrent iterations", flush=True)
         with torch.inference_mode():
             self.up.output.zero_()
             self.inputs.zero_up_output()
-            # Use the static, valid preparation-time metadata. The live combine
-            # mapping depends on the streamed up table and is not available yet.
+            if self.combine:
+                # Exercise the full mapping path without reading the unpublished
+                # live table. One synthetic batch covers all routes; remaining
+                # rows are empty. Preserve production shapes, strides and dtypes.
+                table = torch.empty_like(self.up.work_table)
+                table.zero_()
+                indices = []
+                remaining = self.routes
+                for source, real_idx in enumerate(self.up.a_idx):
+                    count = min(remaining, real_idx.numel())
+                    remaining -= count
+                    table[:, 2 + 2 * source:4 + 2 * source] = count
+                    table[:self.combine_n_groups, 2 + 2 * source] = 0
+                    idx = torch.arange(real_idx.numel(), device=real_idx.device,
+                                       dtype=real_idx.dtype) % self.combine_rows
+                    indices.append(idx)
+                if remaining:
+                    raise RuntimeError("combine warmup routes exceed A_idx capacity")
+                self._prepare_combine(table, tuple(indices))
+                print(f"[gpu={self.up.cuda_device_id}] Combine mapping warmup submitted",
+                      flush=True)
+            # Warm the selected down kernel using the prepared scatter addresses.
             self.launch_gemm()
             for event in (self.reset_start, self.mapping_start, self.gemm_start, self.end):
                 event.record()
         torch.cuda.synchronize(self.up.cuda_device_id)
-        print("DownGEMM warmup complete", flush=True)
+        print(f"[gpu={self.up.cuda_device_id}] DownGEMM warmup complete", flush=True)
+
+    def _log_combine_startup(self, message):
+        if self._trace_first_combine_launch:
+            print(f"[gpu={self.up.cuda_device_id}] combine startup: {message}", flush=True)
+
+    def _prepare_combine(self, work_table, a_idx):
+        mapping = local_combine_mapping(
+            self.up.torch, work_table, a_idx,
+            self.routes, self.combine_n_groups,
+            trace=self._log_combine_startup if self._trace_first_combine_launch else None,
+        )
+        self._log_combine_startup("route mapping submitted; compaction begin")
+        mapping, valid_rows, output_to_input = compact_combine_mapping(
+            self.up.torch, mapping, len(self.up.x_buffers), self.combine_rows,
+        )
+        self._log_combine_startup("compaction submitted; scatter address updates begin")
+        self.combine_valid_rows.copy_(valid_rows)
+        self.combine_output_to_input.copy_(output_to_input)
+        flat = mapping[:, 0] * self.combine_rows + mapping[:, 1]
+        self.inputs.scatter_mapping.copy_(mapping)
+        self.inputs.scatter_table.copy_(flat)
+        addresses = self.combine_addresses[flat]
+        if self.combine_tile_n is not None:
+            # Tile zero's addresses are unchanged. Pack subsequent N tiles
+            # using the distinct valid-token count, not allocation capacity.
+            addresses[:, 1] = (valid_rows[mapping[:, 0]] * self.combine_tile_n
+                               * self.up.output.element_size())
+        self.inputs.scatter_row_addresses.copy_(addresses)
 
     def launch(self):
         # QuACK prepares output and metadata tensors under inference_mode.
         # Keep their resets and in-place updates in the same mode.
         with self.up.torch.inference_mode():
+            self._log_combine_startup("reset begin")
             self.reset_start.record()
             self.inputs.zero_up_output()
             self.mapping_start.record()
             if self.combine:
-                mapping = local_combine_mapping(
-                    self.up.torch, self.up.work_table, self.up.a_idx,
-                    self.routes, self.combine_n_groups,
-                )
-                mapping, valid_rows, output_to_input = compact_combine_mapping(
-                    self.up.torch, mapping, len(self.up.x_buffers), self.combine_rows,
-                )
-                self.combine_valid_rows.copy_(valid_rows)
-                self.combine_output_to_input.copy_(output_to_input)
-                flat = mapping[:, 0] * self.combine_rows + mapping[:, 1]
-                self.inputs.scatter_mapping.copy_(mapping)
-                self.inputs.scatter_table.copy_(flat)
-                addresses = self.combine_addresses[flat]
-                if self.combine_tile_n is not None:
-                    # Tile zero's addresses are unchanged. Pack subsequent N tiles
-                    # using the distinct valid-token count, not allocation capacity.
-                    addresses[:, 1] = (valid_rows[mapping[:, 0]] * self.combine_tile_n
-                                       * self.up.output.element_size())
-                self.inputs.scatter_row_addresses.copy_(addresses)
+                self._log_combine_startup("route mapping begin")
+                self._prepare_combine(self.up.work_table, self.up.a_idx)
             if self.return_exchange is not None:
                 self.return_exchange.publish_counts()
             self.gemm_start.record()
+            self._log_combine_startup("scatter updates submitted; down GEMM launch begin")
             self.launch_gemm()
+            self._log_combine_startup("down GEMM launch returned")
             self.end.record()
+            self._trace_first_combine_launch = False
 
     def collected_combine_outputs(self):
         """Return one row-major valid tensor per source for inspection/testing.
@@ -1182,6 +1246,7 @@ def run_proxy_with_concurrent_kernel(
         if computation_tokens.value == 0:
             raise RuntimeError("GroupedGEMM has zero meaningful routed tokens")
         hidden_dimension = int(grouped_gemm.x_buffers[0].shape[1])
+        kernel_stream = torch.cuda.Stream(device=cuda_device_id)
         down = None
         if down_options.down_projection2:
             counts = get_expert_counts(library, handle)
@@ -1192,7 +1257,8 @@ def run_proxy_with_concurrent_kernel(
             down = DownProjectionRunner(
                 torch, grouped_gemm, counts, down_options,
                 trace_configure=trace.configure if trace is not None else None)
-            down.warmup()
+            with torch.cuda.stream(kernel_stream):
+                down.warmup()
             if down_options.return_token_results:
                 from rdma_return_exchange import ReturnExchange
                 return_exchange = ReturnExchange(
@@ -1207,7 +1273,6 @@ def run_proxy_with_concurrent_kernel(
         iteration_throughputs: list[tuple[int, float, float]] = []
         down_timings = []
         down_traces = []
-        kernel_stream = torch.cuda.Stream(device=cuda_device_id)
         kernel_finished = torch.cuda.Event(enable_timing=False, blocking=False)
 
         def proxy_iteration_coordinator() -> None:
@@ -1240,6 +1305,11 @@ def run_proxy_with_concurrent_kernel(
         )
 
         for iteration in range(num_iterations.value):
+            def log_startup(message):
+                if iteration == 0 and down is not None and down.combine:
+                    print(f"[gpu={cuda_device_id}] iteration=0: {message}", flush=True)
+
+            log_startup("proxy preparation begin")
             require_proxy_success(
                 library,
                 library.rdma_proxy_prepare_iteration(handle, iteration),
@@ -1248,11 +1318,13 @@ def run_proxy_with_concurrent_kernel(
             start_barrier = threading.Barrier(2)
             commands.put((iteration, start_barrier))
             start_barrier.wait()
+            log_startup("proxy released; up GEMM launch begin")
 
             kernel_error: BaseException | None = None
             try:
                 with torch.cuda.stream(kernel_stream):
                     grouped_gemm.launch()
+                log_startup("up GEMM launch returned")
                 require_proxy_success(
                     library,
                     library.rdma_proxy_record_computation_end(
@@ -1274,7 +1346,9 @@ def run_proxy_with_concurrent_kernel(
                 print(f"concurrent CUDA launch failed at iteration {iteration}: {error}",
                       file=sys.stderr, flush=True)
 
+            log_startup("waiting for proxy result")
             proxy_status, proxy_error = results.get()
+            log_startup("proxy result received")
             if kernel_error is not None:
                 raise RuntimeError(
                     f"concurrent CUDA kernel failed at iteration {iteration}: {kernel_error}"
@@ -1284,6 +1358,7 @@ def run_proxy_with_concurrent_kernel(
                     f"proxy iteration {iteration} failed: {proxy_error}"
                 )
             kernel_finished.synchronize()
+            log_startup("GPU iteration complete")
             if trace is not None:
                 down_traces.append((iteration, trace.read(iteration)))
             if return_exchange is not None:
