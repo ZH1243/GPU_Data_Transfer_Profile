@@ -191,6 +191,15 @@ class ReturnExchange:
             for exported in self.exports:
                 exported.release()
             self.control.close()
+            # Counter release alone does not destroy the exported storages.
+            # Break down -> exchange -> down so they are reclaimed before
+            # PyTorch's CUDA IPC globals are destroyed at interpreter shutdown.
+            self.down.return_exchange = None
+            self.down = None
+            self.exports.clear()
+            self.outputs = ()
+            self.received.clear()
+            self.received_valid_rows.clear()
         except BaseException:
             _failed_exchanges.append(self)
             raise
