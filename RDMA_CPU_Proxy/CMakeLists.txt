@@ -40,6 +40,7 @@ set(RDMA_PROXY_SOURCES
   src/qp_worker.cpp
   src/down_ready_trace.cpp
   src/return_copies.cpp
+  src/return_ready_publication.cpp
   src/rdma_connection.cpp
   src/rdma_context.cpp
   src/router_routing.cpp
@@ -129,6 +130,12 @@ if(RDMA_PROXY_BUILD_TESTS)
   add_executable(test_down_ready_trace tests/test_down_ready_trace.cpp)
   add_executable(test_return_copies tests/test_return_copies.cpp)
   add_executable(test_return_notifications tests/test_return_notifications.cpp)
+  add_executable(test_return_ready_publication tests/test_return_ready_publication.cpp)
+  target_link_libraries(test_return_ready_publication PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_return_ready_publication COMMAND test_return_ready_publication)
+  add_test(NAME test_return_ready_publication_cuda COMMAND test_return_ready_publication --cuda)
+  set_tests_properties(test_return_ready_publication test_return_ready_publication_cuda
+    PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
   target_link_libraries(test_return_notifications PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_return_notifications COMMAND test_return_notifications)
   set_tests_properties(test_return_notifications PROPERTIES TIMEOUT 30)

@@ -49,7 +49,7 @@ namespace rdma_proxy {
 // Exercise the actual receiver -> dispatcher -> shared-memory peer queue ->
 // forwarding submitter path, with CUDA copies mocked on CPU memory. No NIC/GPU.
 struct ReturnNotificationsTestAccess {
-    static void exercise(bool atomic_ring, bool enabled) {
+    static void exercise(bool atomic_ring, bool enabled, bool publish_gpu = false) {
         constexpr int world = 3, groups = 3, width = 6;
         using Buffer = std::array<unsigned char, width>;
         std::array<std::array<Buffer, world>, world> src{}, dst{};
@@ -64,6 +64,7 @@ struct ReturnNotificationsTestAccess {
         config.router_routing_enabled = true;
         config.nvlink_forward_completion_notifications_enabled = true;
         config.nvlink_return_completion_notifications_enabled = enabled;
+        config.nvlink_return_ready_gpu_publication_enabled = publish_gpu;
         config.nvlink_forward_preparation_enabled = true;
         config.nvlink_forward_submit_epilogue_enabled = true;
         config.nvlink_forward_prepared_atomic_ring_enabled = atomic_ring;
@@ -110,6 +111,7 @@ struct ReturnNotificationsTestAccess {
                 auto& proxy = *proxies[gpu];
                 if (enabled) rejects([&] { proxy.configure_down_ready_trace(groups + 1); });
                 flags[gpu] = reinterpret_cast<int32_t*>(proxy.configure_down_ready_trace(groups));
+                if (!publish_gpu) rejects([&] { proxy.return_ready_publication_addresses(); });
                 std::vector<RdmaProxyReturnCopy> copies;
                 for (int peer = 0; peer < world; ++peer) {
                     if (peer == gpu) continue;
@@ -145,6 +147,13 @@ struct ReturnNotificationsTestAccess {
                     if (enabled) proxy.return_group_progress_.reset(iteration);
                     proxy.down_ready_trace_.reset(iteration);
                     proxy.arm_return_copies(iteration);
+                    if (publish_gpu && iteration == 0) {
+                        const auto addresses = proxy.return_ready_publication_addresses();
+                        require(addresses.first != addresses.second, "host and device flags alias");
+                        require(__atomic_load_n(reinterpret_cast<int32_t*>(addresses.first), __ATOMIC_ACQUIRE) == 0 &&
+                                __atomic_load_n(reinterpret_cast<int32_t*>(addresses.second), __ATOMIC_ACQUIRE) == 0,
+                                "return-ready flags were not initialized to zero");
+                    }
                     if (enabled && iteration == 1 && gpu == 0) {
                         // A whole future iteration can arrive before peers
                         // reset. Their forwarding threads must leave it queued.
@@ -163,6 +172,11 @@ struct ReturnNotificationsTestAccess {
                             "aggregate ignored empty producer's notifications");
                     __atomic_store_n(flags[2], 1, __ATOMIC_RELEASE);
                     wait([&] { return proxies[0]->return_ready_prefix(iteration) == 1; });
+                    if (publish_gpu) {
+                        const auto addresses = proxies[0]->return_ready_publication_addresses();
+                        require(__atomic_load_n(reinterpret_cast<int32_t*>(addresses.second), __ATOMIC_ACQUIRE) == 1,
+                                "partial aggregate prefix was not published to mock GPU");
+                    }
                     require(proxies[1]->return_ready_prefix(iteration) <= 1, "prefix advanced too far");
                 }
                 __atomic_store_n(flags[2], groups, __ATOMIC_RELEASE);
@@ -180,6 +194,12 @@ struct ReturnNotificationsTestAccess {
                         rejects([&] { proxies[gpu]->return_ready_prefix(iteration); });
                         require(proxies[gpu]->return_notifications_sent_.load() == 0,
                                 "disabled feature sent notifications");
+                    }
+                    if (publish_gpu) {
+                        const auto addresses = proxies[gpu]->return_ready_publication_addresses();
+                        require(__atomic_load_n(reinterpret_cast<int32_t*>(addresses.first), __ATOMIC_ACQUIRE) == groups &&
+                                __atomic_load_n(reinterpret_cast<int32_t*>(addresses.second), __ATOMIC_ACQUIRE) == groups,
+                                "final returned prefix missing from host or mock GPU flag");
                     }
                 }
             }
@@ -199,6 +219,8 @@ int main() {
         rdma_proxy::ReturnNotificationsTestAccess::exercise(true, true);
         rdma_proxy::ReturnNotificationsTestAccess::exercise(false, true);
         rdma_proxy::ReturnNotificationsTestAccess::exercise(true, false);
+        rdma_proxy::ReturnNotificationsTestAccess::exercise(true, true, true);
+        rdma_proxy::ReturnNotificationsTestAccess::exercise(false, true, true);
         std::cout << "return notification checks passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

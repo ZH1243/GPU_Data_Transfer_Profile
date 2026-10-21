@@ -953,6 +953,52 @@ The Python worker already calls this before its existing same-node barrier,
 so normal iteration reuse and shutdown occur after notifications drain.
 Exceptional shutdown cancels unfinished work rather than claiming completion.
 
+To additionally publish the aggregate return-ready prefix into this GPU's HBM,
+enable the following alongside return notifications:
+
+```bash
+--nvlink_return_completion_notifications_enabled=true \
+--nvlink_return_ready_gpu_publication_enabled=true
+```
+
+GPU publication defaults to `false`. When disabled, the CPU-only return path
+retains its existing behavior and allocates no publication flags or stream.
+When enabled, the proxy allocates a pinned host `int32` and a separate HBM
+`int32`. Each increase in the all-peer prefix updates the pinned host value
+and enqueues `cuStreamWriteValue32(..., CU_STREAM_WRITE_VALUE_DEFAULT)` on a
+dedicated nonblocking stream. This uses the same default memory-barrier mode
+as the up-GEMM ready-row publication. There is no per-update stream
+synchronization and no memcpy fallback. The value is passed directly to the
+driver, so subsequent host-flag changes cannot overwrite an in-flight memcpy
+source. Both the CPU and GPU values retain the `[0,N)` prefix meaning.
+
+Iteration preparation publishes zero and synchronizes the publication stream
+before allowing new notifications to advance the flag. Reset and publication
+are serialized under the progress lock, including when next-iteration messages
+arrive early. Iteration completion also waits for the final flag publication.
+Shutdown stops the producers, drains the publication stream, and frees both
+allocations. The stream has no dependency on the compute or return-copy streams.
+
+After `configure_down_ready_trace`, embedders can obtain the stable addresses
+with `Proxy::return_ready_publication_addresses()` (host, device), or the C ABI:
+
+```cpp
+uintptr_t host_flag = 0, device_flag = 0;
+int status = rdma_proxy_get_return_ready_publication(handle, &host_flag, &device_flag);
+```
+
+The addresses are borrowed until shutdown and must not be written by consumers.
+Use acquire/atomic host reads or the existing CPU prefix accessor. The host
+snapshot describes an enqueued publication; the HBM update can lag it. GPU
+consumers need a suitable acquire polling protocol, and must finish before
+the next iteration preparation or shutdown. This option only publishes the
+flag; it does not launch a GPU consumer, reduction, or reverse RDMA operation.
+
+The local mock tests cover publication, reset, and notification integration.
+To check actual pinned allocation and HBM writes on Hopper, build the
+`test_return_ready_publication` target and run
+`ctest --test-dir build-hopper -R '^test_return_ready_publication_cuda$' --output-on-failure`.
+
 For remote validation, add `--check-return-token-results` on both nodes. Every
 iteration compares each received valid physical prefix byte-for-byte with the
 producing GPU's combine output, then waits for every rank to finish checking

@@ -390,6 +390,10 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
         config.nvlink_forward_completion_notifications_enabled =
             (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "nvlink_return_ready_gpu_publication_enabled") {
+        config.nvlink_return_ready_gpu_publication_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "nvlink_return_completion_notifications_enabled") {
         config.nvlink_return_completion_notifications_enabled =
             (value == "1" || value == "true" || value == "yes");
@@ -677,6 +681,9 @@ static ProxyConfig parse_config_file(const std::string& path) {
         object, "nvlink_forward_stream_nonblocking", config.nvlink_forward_stream_nonblocking);
     config.nvlink_forward_synchronize_batches = get_bool(
         object, "nvlink_forward_synchronize_batches", config.nvlink_forward_synchronize_batches);
+    config.nvlink_return_ready_gpu_publication_enabled = get_bool(
+        object, "nvlink_return_ready_gpu_publication_enabled",
+        config.nvlink_return_ready_gpu_publication_enabled);
     config.nvlink_return_completion_notifications_enabled = get_bool(
         object, "nvlink_return_completion_notifications_enabled",
         config.nvlink_return_completion_notifications_enabled);
@@ -936,6 +943,10 @@ void validate_config(const ProxyConfig& config) {
         !config.nvlink_forward_submit_epilogue_enabled) {
         throw std::runtime_error("stream_query completion requires nvlink_forward_submit_epilogue_enabled=true");
     }
+    if (config.nvlink_return_ready_gpu_publication_enabled &&
+        !config.nvlink_return_completion_notifications_enabled)
+        throw std::runtime_error("nvlink_return_ready_gpu_publication_enabled requires "
+                                 "nvlink_return_completion_notifications_enabled=true");
     if (config.nvlink_return_completion_notifications_enabled &&
         (!config.nvlink_forward_submit_epilogue_enabled ||
          !config.nvlink_forward_completion_notifications_enabled ||
@@ -1291,6 +1302,8 @@ std::string config_summary(const ProxyConfig& config) {
         << " nvlink_forward_use_batch_api=" << (config.nvlink_forward_use_batch_api ? "true" : "false")
         << " nvlink_forward_synchronize_batches="
         << (config.nvlink_forward_synchronize_batches ? "true" : "false")
+        << " nvlink_return_ready_gpu_publication_enabled="
+        << (config.nvlink_return_ready_gpu_publication_enabled ? "true" : "false")
         << " nvlink_return_completion_notifications_enabled="
         << (config.nvlink_return_completion_notifications_enabled ? "true" : "false")
         << " nvlink_forward_completion_notifications_enabled="

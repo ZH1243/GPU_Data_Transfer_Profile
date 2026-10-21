@@ -49,6 +49,7 @@ int main(int argc, char** argv) {
     assert(!config.nvlink_forward_synchronize_batches);
     assert(!config.nvlink_forward_completion_notifications_enabled);
     assert(!config.nvlink_return_completion_notifications_enabled);
+    assert(!config.nvlink_return_ready_gpu_publication_enabled);
     assert(!config.nvlink_forward_notification_flush_only_enabled);
     assert(!config.nvlink_forward_notification_flush_per_entry_enabled);
     assert(!config.router_local_input_staging_enabled);
@@ -365,6 +366,14 @@ int main(int argc, char** argv) {
     return_notifications.nvlink_forward_completion_notifications_enabled = true;
     return_notifications.nvlink_return_completion_notifications_enabled = true;
     rdma_proxy::validate_config(return_notifications);
+    auto gpu_return_notifications = return_notifications;
+    gpu_return_notifications.nvlink_return_ready_gpu_publication_enabled = true;
+    rdma_proxy::validate_config(gpu_return_notifications);
+    gpu_return_notifications.nvlink_return_completion_notifications_enabled = false;
+    bool rejected_gpu_without_notifications = false;
+    try { rdma_proxy::validate_config(gpu_return_notifications); }
+    catch (const std::runtime_error&) { rejected_gpu_without_notifications = true; }
+    assert(rejected_gpu_without_notifications);
     for (int conflict = 0; conflict < 4; ++conflict) {
         auto bad = return_notifications;
         if (conflict == 0) bad.nvlink_forward_submit_epilogue_enabled = false;
@@ -472,6 +481,16 @@ int main(int argc, char** argv) {
     const auto parsed_returns = rdma_proxy::load_config(
         static_cast<int>(return_args.size()), const_cast<char**>(return_args.data()));
     assert(parsed_returns.nvlink_return_completion_notifications_enabled);
+    auto gpu_return_args = return_args;
+    gpu_return_args.push_back("--nvlink_return_ready_gpu_publication_enabled=true");
+    const auto parsed_gpu_returns = rdma_proxy::load_config(
+        static_cast<int>(gpu_return_args.size()), const_cast<char**>(gpu_return_args.data()));
+    assert(parsed_gpu_returns.nvlink_return_ready_gpu_publication_enabled);
+    assert(rdma_proxy::config_summary(parsed_gpu_returns).find(
+        "nvlink_return_ready_gpu_publication_enabled=true") != std::string::npos);
+    gpu_return_args.push_back("--nvlink_return_ready_gpu_publication_enabled=false");
+    assert(!rdma_proxy::load_config(static_cast<int>(gpu_return_args.size()),
+        const_cast<char**>(gpu_return_args.data())).nvlink_return_ready_gpu_publication_enabled);
     assert(rdma_proxy::config_summary(parsed_returns).find(
         "nvlink_return_completion_notifications_enabled=true") != std::string::npos);
     return_args.push_back("--nvlink_return_completion_notifications_enabled=false");
@@ -563,10 +582,13 @@ int main(int argc, char** argv) {
                        "nvlink_forward_preparation_enabled":true,
                        "nvlink_forward_prepared_batch_chunks":19,
                        "nvlink_forward_submit_epilogue_enabled":true,
-                       "nvlink_return_completion_notifications_enabled":true})json";
+                       "nvlink_return_completion_notifications_enabled":true,
+                       "nvlink_return_ready_gpu_publication_enabled":true})json";
     }
     assert(rdma_proxy::load_config_file("return_notifications_config.json")
         .nvlink_return_completion_notifications_enabled);
+    assert(rdma_proxy::load_config_file("return_notifications_config.json")
+        .nvlink_return_ready_gpu_publication_enabled);
     for (int conflict = 0; conflict < 2; ++conflict) {
         auto bad = json_split;
         if (conflict == 0) bad.nvlink_forward_submit_epilogue_enabled = false;

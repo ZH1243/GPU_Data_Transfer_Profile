@@ -42,6 +42,7 @@ public:
     uintptr_t configure_down_ready_trace(int groups);
     std::vector<std::pair<int32_t, double>> read_down_ready_trace(uint64_t iteration);
     int return_ready_prefix(uint64_t iteration) const;
+    std::pair<uintptr_t, uintptr_t> return_ready_publication_addresses() const;
     void configure_return_copies(const RdmaProxyReturnCopy* copies, std::size_t count,
                                 const int64_t* rows, std::size_t row_count, std::size_t width,
                                 std::size_t tile, std::size_t group_tiles,

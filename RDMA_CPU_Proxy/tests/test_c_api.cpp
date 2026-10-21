@@ -83,6 +83,15 @@ int main(int argc, char** argv) {
         return 1;
     }
     int32_t return_prefix = -1;
+    uintptr_t return_host = 0, return_device = 0;
+    if (rdma_proxy_get_return_ready_publication(handle, &return_host, &return_device) == 0 ||
+        rdma_proxy_get_return_ready_publication(nullptr, &return_host, &return_device) == 0 ||
+        rdma_proxy_get_return_ready_publication(handle, nullptr, &return_device) == 0 ||
+        rdma_proxy_get_return_ready_publication(handle, &return_host, nullptr) == 0) {
+        std::cerr << "return publication accepted disabled feature or invalid arguments\n";
+        rdma_proxy_destroy(handle);
+        return 1;
+    }
     if (rdma_proxy_get_return_ready_prefix(handle, 0, &return_prefix) == 0 ||
         rdma_proxy_get_return_ready_prefix(nullptr, 0, &return_prefix) == 0 ||
         rdma_proxy_get_return_ready_prefix(handle, 0, nullptr) == 0) {

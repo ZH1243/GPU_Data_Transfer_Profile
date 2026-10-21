@@ -587,7 +587,8 @@ uintptr_t Proxy::configure_down_ready_trace(int groups) {
     const auto address = down_ready_trace_.configure(
         config_.cuda_device_id, groups, config_.completion_timeout_ms, config_.mock_mode);
     if (config_.nvlink_return_completion_notifications_enabled) {
-        return_group_progress_.configure(config_.num_gpus_per_node, config_.local_gpu_index, groups);
+        return_group_progress_.configure(config_.num_gpus_per_node, config_.local_gpu_index, groups,
+            config_.nvlink_return_ready_gpu_publication_enabled, config_.cuda_device_id, config_.mock_mode);
         return_notification_groups_ = groups;
     }
     return address;
@@ -614,6 +615,10 @@ int Proxy::return_ready_prefix(uint64_t iteration) const {
     return return_group_progress_.prefix(iteration);
 }
 
+std::pair<uintptr_t, uintptr_t> Proxy::return_ready_publication_addresses() const {
+    return return_group_progress_.publication_addresses();
+}
+
 bool Proxy::return_notifications_complete(uint64_t iteration) const {
     if (return_ready_prefix(iteration) != return_notification_groups_) return false;
     const auto expected = (iteration + 1) * static_cast<uint64_t>(return_notification_groups_);
@@ -634,7 +639,7 @@ bool Proxy::return_notifications_complete(uint64_t iteration) const {
             destination.header, config_.local_gpu_index, true);
         if (atomic_load_u64(&queue->tail) < expected) return false;
     }
-    return true;
+    return return_group_progress_.publication_complete();
 }
 
 void Proxy::configure_return_copies(
@@ -681,6 +686,7 @@ void Proxy::finish_run() {
 void Proxy::shutdown() {
     down_ready_trace_.cancel();
     stop_forwarding_thread();
+    return_group_progress_.shutdown_publication();
     down_ready_trace_.drain_returns();
     for (auto& peer : peers_) {
         for (auto& worker : peer.workers) {

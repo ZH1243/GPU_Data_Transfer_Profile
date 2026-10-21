@@ -257,6 +257,19 @@ extern "C" int rdma_proxy_get_return_ready_prefix(
     } catch (...) { return record_current_exception(); }
 }
 
+extern "C" int rdma_proxy_get_return_ready_publication(
+    RdmaProxyHandle* handle, uintptr_t* host_address, uintptr_t* device_address) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down || !host_address || !device_address)
+            throw std::runtime_error("invalid return-ready publication request");
+        const auto addresses = handle->proxy.return_ready_publication_addresses();
+        *host_address = addresses.first;
+        *device_address = addresses.second;
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
 extern "C" int rdma_proxy_run(RdmaProxyHandle* handle) {
     clear_error();
     if (handle == nullptr) {

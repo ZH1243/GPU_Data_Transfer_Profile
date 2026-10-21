@@ -172,6 +172,20 @@ RDMA_PROXY_C_API int rdma_proxy_arm_return_copies(RdmaProxyHandle* handle, uint6
 RDMA_PROXY_C_API int rdma_proxy_get_return_ready_prefix(
     RdmaProxyHandle* handle, uint64_t iteration, int32_t* prefix);
 
+/* Available after configure_down_ready_trace with
+ * nvlink_return_ready_gpu_publication_enabled=true. Borrowed int32 flags:
+ * host_address is pinned CPU memory, device_address is separate GPU HBM.
+ * Host reads must be atomic/acquire; GPU consumers must use a suitable
+ * acquire polling protocol. Neither address may be modified by the embedder.
+ * The host value denotes enqueued publication; the device update is async.
+ * prepare_iteration resets both flags to zero and completes the GPU reset
+ * before returning; read_down_ready_trace waits for final GPU publication.
+ * Finish all GPU consumers before the next preparation or shutdown. Both
+ * addresses remain stable until shutdown, when their allocations are freed.
+ */
+RDMA_PROXY_C_API int rdma_proxy_get_return_ready_publication(
+    RdmaProxyHandle* handle, uintptr_t* host_address, uintptr_t* device_address);
+
 RDMA_PROXY_C_API int rdma_proxy_shutdown(RdmaProxyHandle* handle);
 RDMA_PROXY_C_API void rdma_proxy_destroy(RdmaProxyHandle* handle);
 

@@ -4,8 +4,11 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <memory>
 #include <stdexcept>
 #include <vector>
+#include <utility>
+#include "return_ready_publication.hpp"
 
 namespace rdma_proxy {
 
@@ -13,10 +16,12 @@ namespace rdma_proxy {
 // The mutex also serializes iteration reset and iteration-qualified snapshots.
 class ReturnGroupProgress {
 public:
-    void configure(int peers, int self, int groups) {
+    void configure(int peers, int self, int groups, bool publish_gpu = false,
+                   int device = 0, bool mock = false) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (groups_ || peers < 2 || self < 0 || self >= peers || groups <= 0)
             throw std::runtime_error("invalid return-group progress configuration");
+        if (publish_gpu) publication_ = std::make_unique<ReturnReadyPublication>(device, mock);
         groups_ = groups;
         self_ = self;
         peers_.resize(peers);
@@ -26,6 +31,9 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (!groups_ || (active_ && (prefix_.load() != groups_ || iteration != iteration_ + 1)))
             throw std::runtime_error("previous return notifications have not drained or iteration is invalid");
+        // Hold the progress lock through the GPU reset: an early peer message
+        // cannot publish a new prefix ahead of zero or have it erased by zero.
+        if (publication_) publication_->reset();
         iteration_ = iteration;
         std::fill(peers_.begin(), peers_.end(), 0);
         peers_[self_] = groups_; // Locally retained outputs are not returned.
@@ -44,7 +52,9 @@ public:
         if (iteration != iteration_ || group != peers_[peer])
             throw std::runtime_error("stale, duplicate or out-of-order return-group notification");
         ++peers_[peer];
-        prefix_.store(*std::min_element(peers_.begin(), peers_.end()), std::memory_order_release);
+        const auto ready = *std::min_element(peers_.begin(), peers_.end());
+        if (publication_ && ready > prefix_.load()) publication_->publish(ready);
+        prefix_.store(ready, std::memory_order_release);
         return true;
     }
 
@@ -52,7 +62,24 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (!active_ || iteration != iteration_)
             throw std::runtime_error("return-group progress iteration mismatch");
-        return prefix_.load(std::memory_order_acquire);
+        return publication_ ? publication_->host_value() : prefix_.load(std::memory_order_acquire);
+    }
+
+    std::pair<uintptr_t, uintptr_t> publication_addresses() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!publication_) throw std::runtime_error("return-ready GPU publication is disabled or unconfigured");
+        return {publication_->host_address(), publication_->device_address()};
+    }
+
+    bool publication_complete() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return !publication_ || publication_->complete();
+    }
+
+    void shutdown_publication() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (publication_) publication_->drain();
+        publication_.reset();
     }
 
 private:
@@ -61,7 +88,9 @@ private:
     int groups_{0}, self_{-1};
     uint64_t iteration_{0};
     bool active_{false};
-    // CPU DRAM only; not a GPU-readable flag.
+    std::unique_ptr<ReturnReadyPublication> publication_;
+    // CPU fallback/progress bookkeeping. With GPU publication enabled, the
+    // exposed host snapshot lives in publication_'s pinned allocation.
     std::atomic<int32_t> prefix_{0};
 };
 } // namespace rdma_proxy

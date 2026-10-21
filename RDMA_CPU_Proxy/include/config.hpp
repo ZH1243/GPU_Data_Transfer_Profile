@@ -105,6 +105,7 @@ struct ProxyConfig {
     bool nvlink_forward_synchronize_batches{false};
     bool nvlink_forward_completion_notifications_enabled{false};
     bool nvlink_return_completion_notifications_enabled{false};
+    bool nvlink_return_ready_gpu_publication_enabled{false};
     bool nvlink_forward_notification_flush_only_enabled{false};
     bool nvlink_forward_notification_flush_per_entry_enabled{false};
     // Limit QuACK's gather inputs to remote-node buffers. Cross-local-GPU
