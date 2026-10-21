@@ -162,6 +162,16 @@ RDMA_PROXY_C_API int rdma_proxy_configure_return_copies(
 /* Call after recording this iteration's down_done_event, never before. */
 RDMA_PROXY_C_API int rdma_proxy_arm_return_copies(RdmaProxyHandle* handle, uint64_t iteration);
 
+/* CPU DRAM readiness snapshot, enabled by nvlink_return_completion_notifications_enabled.
+ * prefix=N means groups [0,N) arrived from every other local GPU. No final
+ * reduction or reverse RDMA is implied. Requires the matching prepared iteration.
+ * With the feature enabled, read_down_ready_trace also waits for incoming
+ * notifications to be consumed and outgoing notifications to be dispatched
+ * and consumed by their destinations.
+ */
+RDMA_PROXY_C_API int rdma_proxy_get_return_ready_prefix(
+    RdmaProxyHandle* handle, uint64_t iteration, int32_t* prefix);
+
 RDMA_PROXY_C_API int rdma_proxy_shutdown(RdmaProxyHandle* handle);
 RDMA_PROXY_C_API void rdma_proxy_destroy(RdmaProxyHandle* handle);
 

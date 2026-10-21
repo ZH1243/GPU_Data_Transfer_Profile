@@ -24,7 +24,8 @@ public:
     void configure_returns(const RdmaProxyReturnCopy* copies, std::size_t count,
                            const int64_t* rows, std::size_t row_count, std::size_t width,
                            std::size_t tile, std::size_t group_tiles, std::size_t element_bytes,
-                           bool per_group, uintptr_t down_done);
+                           bool per_group, uintptr_t down_done,
+                           std::function<void(uint64_t, int)> group_completed = {});
     void arm_returns(uint64_t iteration);
     void drain_returns();
 

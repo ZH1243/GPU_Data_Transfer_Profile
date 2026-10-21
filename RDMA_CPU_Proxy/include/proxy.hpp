@@ -3,6 +3,7 @@
 #include "config.hpp"
 #include "cuda_buffers.hpp"
 #include "down_ready_trace.hpp"
+#include "return_group_progress.hpp"
 #include "protocol.hpp"
 #include "qp_worker.hpp"
 #include "rdma_connection.hpp"
@@ -40,6 +41,7 @@ public:
     void finish_run();
     uintptr_t configure_down_ready_trace(int groups);
     std::vector<std::pair<int32_t, double>> read_down_ready_trace(uint64_t iteration);
+    int return_ready_prefix(uint64_t iteration) const;
     void configure_return_copies(const RdmaProxyReturnCopy* copies, std::size_t count,
                                 const int64_t* rows, std::size_t row_count, std::size_t width,
                                 std::size_t tile, std::size_t group_tiles,
@@ -59,6 +61,7 @@ public:
 private:
     DownReadyTrace down_ready_trace_;
     friend struct PreparedForwardingTestAccess;
+    friend struct ReturnNotificationsTestAccess;
     friend struct QpCalibrationTestAccess;
     struct PeerState {
         int peer_rank{-1};
@@ -171,11 +174,11 @@ private:
     std::string nvlink_forward_notification_shm_name(int gpu_index) const;
     NvlinkForwardNotificationQueue* nvlink_forward_notification_queue_for_source(
         NvlinkForwardNotificationHeader* header,
-        int source_gpu) const;
+        int source_gpu, bool returning = false) const;
     NvlinkForwardNotification* nvlink_forward_notification_entry(
         NvlinkForwardNotificationHeader* header,
         NvlinkForwardNotificationQueue* queue,
-        uint64_t position) const;
+        uint64_t position, bool returning = false) const;
     void prepare_forwarding_notification_destinations();
     void initialize_nvlink_forward_notification_dispatch();
     void enqueue_forward_completion_notifications(
@@ -187,6 +190,10 @@ private:
     void mark_forward_notification_senders_done();
     bool nvlink_forward_notification_queues_complete() const;
     void nvlink_forward_notification_dispatch_loop();
+    void enqueue_return_group_notification(uint64_t iteration, int group);
+    void dispatch_return_group_notification(uint64_t iteration, int group);
+    void drain_return_notifications();
+    bool return_notifications_complete(uint64_t iteration) const;
     void nvlink_forward_notification_loop();
     void drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQueue* queue);
     std::string format_nvlink_forward_notification_log(
@@ -360,6 +367,10 @@ private:
     std::atomic<uint64_t> nvlink_forward_notifications_sent_{0};
     std::atomic<uint64_t> nvlink_forward_notifications_received_{0};
     std::atomic<uint64_t> nvlink_forward_notifications_dropped_{0};
+    ReturnGroupProgress return_group_progress_;
+    int return_notification_groups_{0};
+    bool return_copies_configured_{false};
+    std::atomic<uint64_t> return_notifications_sent_{0}; // Completed group envelopes.
     std::mutex nvlink_forward_notification_log_mutex_;
     std::deque<std::string> nvlink_forward_notification_log_queue_;
     std::vector<double> rdma_iteration_bandwidth_gbps_;

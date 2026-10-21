@@ -82,6 +82,14 @@ int main(int argc, char** argv) {
         rdma_proxy_destroy(handle);
         return 1;
     }
+    int32_t return_prefix = -1;
+    if (rdma_proxy_get_return_ready_prefix(handle, 0, &return_prefix) == 0 ||
+        rdma_proxy_get_return_ready_prefix(nullptr, 0, &return_prefix) == 0 ||
+        rdma_proxy_get_return_ready_prefix(handle, 0, nullptr) == 0) {
+        std::cerr << "return prefix accepted disabled feature or invalid arguments\n";
+        rdma_proxy_destroy(handle);
+        return 1;
+    }
     std::size_t send_request_count = 0;
     std::size_t receive_request_count = 0;
     bool invalid_request = false;

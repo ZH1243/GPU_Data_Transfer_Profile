@@ -19,10 +19,12 @@ ReturnCopies::ReturnCopies(
     int device, bool mock, int groups, const RdmaProxyReturnCopy* copies,
     std::size_t count, const int64_t* rows, std::size_t row_count,
     std::size_t width, std::size_t tile, std::size_t group_tiles,
-    std::size_t element_bytes, bool per_group, uintptr_t down_done)
+    std::size_t element_bytes, bool per_group, uintptr_t down_done,
+    std::function<void(int)> group_completed)
     : device_(device), groups_(groups), mock_(mock), per_group_(per_group),
       rows_(rows), width_(width), tile_(tile),
-      group_tiles_(group_tiles), element_bytes_(element_bytes), down_done_(down_done) {
+      group_tiles_(group_tiles), element_bytes_(element_bytes), down_done_(down_done),
+      group_completed_(std::move(group_completed)) {
     if (!copies || !count || !rows || !row_count || !width || !element_bytes ||
         groups <= 0 || (!mock && !down_done) || (per_group && (!tile || !group_tiles)))
         throw std::runtime_error("invalid return-copy configuration");
@@ -100,6 +102,7 @@ bool ReturnCopies::poll(int ready) {
             // Wait for this group's batches to all destination GPUs before
             // submitting another group, even if its ready prefix is visible.
             synchronize_cuda_stream(stream_, mock_);
+            if (group_completed_) group_completed_(submitted_);
             ++submitted_;
         }
     } else if (ready == groups_ && submitted_ == 0) {

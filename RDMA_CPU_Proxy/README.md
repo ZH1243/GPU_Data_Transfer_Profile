@@ -906,6 +906,53 @@ small count readback is included in mapping time. This feature performs only the
 reverse intra-node NVLink hop: remote-origin results still need a later reverse
 RDMA transfer, and final token reduction/routing weights are not implemented.
 
+To notify each destination GPU's forwarding thread after every returned column
+group, append this option on every local rank (on both nodes for a two-node run):
+
+```bash
+--nvlink_return_completion_notifications_enabled=true
+```
+
+This option defaults to `false`; when disabled, no return notification queues,
+messages, or incoming-prefix waits are added. It requires
+`--return-token-results --return-token-results-per-group` and the existing
+prepared submit/epilogue mode (`nvlink_forward_submit_epilogue_enabled=true`,
+with preparation enabled and both ping-pong modes disabled). Both the atomic
+ring and mutex prepared queue are supported. All local ranks must use the same
+setting and column-group layout. `nvlink_forward_notification_queue_depth`
+(default 1024) must hold at least one full iteration's column groups. This
+keeps reverse notifications from blocking the dispatcher behind a full queue
+while it still has forward notifications to send.
+
+After the receiver successfully synchronizes a group's return stream, it hands
+one group-completion envelope to the existing dispatcher. The dispatcher sends
+`(iteration, column_group)` to every other local GPU, including peers whose
+valid-row counts are zero. Each destination owns a separate shared-memory
+return queue for each producing GPU (the self queue is unused). These queues
+are separate from the up-projection notification queues. Source identity is
+implicit in the queue; one notification covers that group's copies for all
+original-source-node buffers returned to this destination.
+
+The forwarding submitter drains the return queues, including while waiting
+for new forward work. It advances a per-peer contiguous prefix and publishes
+their minimum to an atomic CPU-DRAM flag. A prefix of `N` means groups `[0,N)`
+have arrived from every other local GPU. It does not include this GPU's own
+retained output, final reduction, or reverse RDMA. No further GPU work is
+launched by the consumer. Empty contributions still advance the prefix.
+
+The prefix resets to zero during iteration preparation. Stale, duplicate, and
+out-of-order messages are rejected; an early next-iteration message remains
+queued until local preparation. C++ embedders can read
+`Proxy::return_ready_prefix(iteration)`; the C ABI exposes
+`rdma_proxy_get_return_ready_prefix(handle, iteration, &prefix)`. These are
+nonblocking, iteration-qualified snapshots of CPU state, not GPU-readable
+flags. When enabled, `read_down_ready_trace` also waits for all incoming
+notifications to be consumed and all outgoing notifications to be dispatched
+and consumed by their destinations.
+The Python worker already calls this before its existing same-node barrier,
+so normal iteration reuse and shutdown occur after notifications drain.
+Exceptional shutdown cancels unfinished work rather than claiming completion.
+
 For remote validation, add `--check-return-token-results` on both nodes. Every
 iteration compares each received valid physical prefix byte-for-byte with the
 producing GPU's combine output, then waits for every rank to finish checking

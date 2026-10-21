@@ -246,6 +246,17 @@ extern "C" int rdma_proxy_arm_return_copies(RdmaProxyHandle* handle, uint64_t it
     } catch (...) { return record_current_exception(); }
 }
 
+extern "C" int rdma_proxy_get_return_ready_prefix(
+    RdmaProxyHandle* handle, uint64_t iteration, int32_t* prefix) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down || !prefix)
+            throw std::runtime_error("invalid return-ready prefix request");
+        *prefix = handle->proxy.return_ready_prefix(iteration);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
 extern "C" int rdma_proxy_run(RdmaProxyHandle* handle) {
     clear_error();
     if (handle == nullptr) {

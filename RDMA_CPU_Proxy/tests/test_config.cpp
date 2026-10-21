@@ -48,6 +48,7 @@ int main(int argc, char** argv) {
     assert(config.nvlink_forward_stream_nonblocking);
     assert(!config.nvlink_forward_synchronize_batches);
     assert(!config.nvlink_forward_completion_notifications_enabled);
+    assert(!config.nvlink_return_completion_notifications_enabled);
     assert(!config.nvlink_forward_notification_flush_only_enabled);
     assert(!config.nvlink_forward_notification_flush_per_entry_enabled);
     assert(!config.router_local_input_staging_enabled);
@@ -360,6 +361,21 @@ int main(int argc, char** argv) {
     auto submit_epilogue = prepared_config;
     submit_epilogue.nvlink_forward_submit_epilogue_enabled = true;
     rdma_proxy::validate_config(submit_epilogue);
+    auto return_notifications = submit_epilogue;
+    return_notifications.nvlink_forward_completion_notifications_enabled = true;
+    return_notifications.nvlink_return_completion_notifications_enabled = true;
+    rdma_proxy::validate_config(return_notifications);
+    for (int conflict = 0; conflict < 4; ++conflict) {
+        auto bad = return_notifications;
+        if (conflict == 0) bad.nvlink_forward_submit_epilogue_enabled = false;
+        if (conflict == 1) bad.nvlink_forward_completion_notifications_enabled = false;
+        if (conflict == 2) bad.router_routing_enabled = false;
+        if (conflict == 3) bad.num_iterations = 0;
+        bool rejected = false;
+        try { rdma_proxy::validate_config(bad); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+    }
     for (int conflict = 0; conflict < 3; ++conflict) {
         auto bad = submit_epilogue;
         if (conflict == 0) bad.nvlink_forward_preparation_enabled = false;
@@ -450,6 +466,17 @@ int main(int argc, char** argv) {
     const auto parsed_split = rdma_proxy::load_config(
         static_cast<int>(split_args.size()), const_cast<char**>(split_args.data()));
     assert(parsed_split.nvlink_forward_submit_epilogue_enabled);
+    auto return_args = split_args;
+    return_args.push_back("--nvlink_forward_completion_notifications_enabled=true");
+    return_args.push_back("--nvlink_return_completion_notifications_enabled=true");
+    const auto parsed_returns = rdma_proxy::load_config(
+        static_cast<int>(return_args.size()), const_cast<char**>(return_args.data()));
+    assert(parsed_returns.nvlink_return_completion_notifications_enabled);
+    assert(rdma_proxy::config_summary(parsed_returns).find(
+        "nvlink_return_completion_notifications_enabled=true") != std::string::npos);
+    return_args.push_back("--nvlink_return_completion_notifications_enabled=false");
+    assert(!rdma_proxy::load_config(static_cast<int>(return_args.size()),
+        const_cast<char**>(return_args.data())).nvlink_return_completion_notifications_enabled);
     rdma_proxy::validate_config(parsed_split);
     assert(rdma_proxy::config_summary(parsed_split).find(
         "nvlink_forward_submit_epilogue_enabled=true") != std::string::npos);
@@ -526,6 +553,20 @@ int main(int argc, char** argv) {
     rdma_proxy::validate_config(json_split);
 
     assert(json_split.nvlink_forward_local_staging_prepared_enabled);
+    {
+        std::ofstream json("return_notifications_config.json");
+        json << R"json({"num_tokens":65, "token_dimension":8, "tokens_per_chunk":4,
+                       "num_gpus_per_node":2, "router_routing_enabled":true,
+                       "num_experts":2, "top_k":1, "nvlink_forwarding_enabled":true,
+                       "nvlink_forward_synchronize_batches":true,
+                       "nvlink_forward_completion_notifications_enabled":true,
+                       "nvlink_forward_preparation_enabled":true,
+                       "nvlink_forward_prepared_batch_chunks":19,
+                       "nvlink_forward_submit_epilogue_enabled":true,
+                       "nvlink_return_completion_notifications_enabled":true})json";
+    }
+    assert(rdma_proxy::load_config_file("return_notifications_config.json")
+        .nvlink_return_completion_notifications_enabled);
     for (int conflict = 0; conflict < 2; ++conflict) {
         auto bad = json_split;
         if (conflict == 0) bad.nvlink_forward_submit_epilogue_enabled = false;

@@ -3,6 +3,7 @@
 #include "cuda_buffers.hpp"
 #include "rdma_proxy_c_api.h"
 #include <map>
+#include <functional>
 #include <vector>
 
 namespace rdma_proxy {
@@ -15,7 +16,8 @@ public:
                  const RdmaProxyReturnCopy* copies, std::size_t count,
                  const int64_t* rows, std::size_t row_count,
                  std::size_t width, std::size_t tile, std::size_t group_tiles,
-                 std::size_t element_bytes, bool per_group, uintptr_t down_done);
+                 std::size_t element_bytes, bool per_group, uintptr_t down_done,
+                 std::function<void(int)> group_completed = {});
     ~ReturnCopies();
     void reset();
     void arm();
@@ -32,5 +34,6 @@ private:
     void* stream_{nullptr};
     std::map<int, std::vector<RdmaProxyReturnCopy>> peers_;
     std::map<int, CudaPreparedForwardBatch> batches_;
+    std::function<void(int)> group_completed_;
 };
 }  // namespace rdma_proxy
