@@ -313,7 +313,9 @@ class HopperActivationTests(unittest.TestCase):
                                 # A second launch catches missing reduction destination resets.
                                 if host_flag is not None:
                                     host_flag.zero_()
-                                down.launch()
+                                # Match the worker caller: it does not enter inference mode.
+                                with torch.inference_mode(False):
+                                    down.launch()
                                 torch.cuda.synchronize()
                                 if host_flag is not None:
                                     self.assertEqual(host_flag.item(), 2)
