@@ -463,6 +463,11 @@ def add_down_arguments(parser):
     parser.add_argument("--return-token-timeout", type=float, default=120.0,
                         help="same-node return setup/completion barrier timeout in seconds")
     parser.add_argument("--down-projection2", action="store_true")
+    parser.add_argument(
+        "--down-sm-count", type=int, default=None,
+        help="cap down GEMM persistent CTAs; positive multiple of --down-cluster-m. "
+             "Defaults to hardware capacity; does not reserve physical SMs",
+    )
     parser.add_argument("--trace-down-ready", action="store_true",
                         help="poll down-output readiness in the C++ notification receiver")
     parser.add_argument("--local-gpu-combine", action="store_true",
@@ -516,6 +521,10 @@ def validate_down_arguments(args):
     for name in ("tile_m", "tile_n", "cluster_m", "max_swizzle_size"):
         if getattr(args, "down_" + name) <= 0:
             raise ValueError(f"--down-{name.replace('_', '-')} must be positive")
+    if args.down_sm_count is not None and (
+        args.down_sm_count <= 0 or args.down_sm_count % args.down_cluster_m
+    ):
+        raise ValueError("--down-sm-count must be positive and divisible by --down-cluster-m")
     if args.down_scatter_table and args.down_epilogue_store == "tma":
         raise ValueError("down scatter requires a bulk-row epilogue")
     if (args.down_multi_buffer_scatter or args.down_n_tile_major_output) and not args.down_scatter_table:

@@ -79,6 +79,25 @@ class ActivationCliTests(unittest.TestCase):
             with self.subTest(options=options):
                 self.assertNotEqual(self.run_cli(*options).returncode, 0)
 
+    def test_down_sm_count_cli(self):
+        common = ("--concurrent-kernel", "--grouped-gemm-activation=swiglu",
+                  "--down-projection2")
+        for extra in (("--down-sm-count", "40"),
+                      ("--down-sm-count=40", "--down-cluster-m=2")):
+            with self.subTest(extra=extra):
+                result = self.run_cli(*common, *extra)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("--down-", result.stdout)
+        for count in (0, -1, 3):
+            with self.subTest(count=count):
+                result = self.run_cli(*common, f"--down-sm-count={count}",
+                                      "--down-cluster-m=2")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("must be positive and divisible by --down-cluster-m", result.stderr)
+        result = self.run_cli(*common[:-1], "--down-sm-count=40")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--down-* options require --down-projection2", result.stderr)
+
     def test_local_combine_cli(self):
         result = self.run_cli("--local-gpu-combine", "--down-projection2",
                               "--concurrent-kernel", "--grouped-gemm-activation=swiglu")
@@ -240,6 +259,12 @@ class HopperActivationTests(unittest.TestCase):
                     # Reuse the actual fused up output, including its unused padding.
                     variants = (
                         (),
+                        ("--down-sm-count=2",),
+                        ("--down-sm-count=2", "--down-gather-table",
+                         "--down-gather-table-expert-waves",
+                         "--down-gather-table-wave-barrier", "--down-pingpong",
+                         "--down-epilogue-store=bulk_rows",
+                         "--down-gather-table-publish-ready"),
                         ("--local-gpu-combine",),
                         ("--local-gpu-combine", "--down-n-tile-major-output",
                          "--down-gather-table", "--down-gather-table-expert-waves",
