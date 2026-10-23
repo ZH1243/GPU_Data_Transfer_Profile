@@ -37,6 +37,21 @@ class ActivationCliTests(unittest.TestCase):
             self.assertNotEqual(self.run_cli(*common, *extra).returncode, 0)
         self.assertNotEqual(self.run_cli("--return-token-results").returncode, 0)
 
+    def test_intra_node_combine_cli(self):
+        common = ("--concurrent-kernel", "--grouped-gemm-activation=swiglu",
+                  "--down-projection2", "--local-gpu-combine", "--down-pingpong",
+                  "--down-gather-table", "--down-gather-table-expert-waves",
+                  "--down-gather-table-wave-barrier", "--down-gather-table-publish-ready",
+                  "--return-token-results", "--return-token-results-per-group",
+                  "--down-n-tile-major-output", "--intra-node-combine")
+        result = self.run_cli(*common, "--check-intra-node-combine")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--nvlink_return_completion_notifications_enabled=true", result.stdout)
+        self.assertIn("--nvlink_return_ready_gpu_publication_enabled=true", result.stdout)
+        for options in (("--intra-node-combine",), ("--check-intra-node-combine",),
+                        (*common, "--intra-node-combine-ctas=0")):
+            self.assertNotEqual(self.run_cli(*options).returncode, 0)
+
     def run_cli(self, *options):
         return subprocess.run(
             [sys.executable, str(WORKER), "--library=/unused.so",

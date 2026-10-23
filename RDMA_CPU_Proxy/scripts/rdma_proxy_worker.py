@@ -454,6 +454,17 @@ class GroupedGemmRunner:
 
 
 def add_down_arguments(parser):
+    parser.add_argument("--intra-node-combine", action="store_true",
+                        help="combine returned and retained down outputs while down GEMM runs")
+    parser.add_argument("--check-intra-node-combine", action="store_true",
+                        help="compare intra-node output with an FP32 reference each iteration")
+    parser.add_argument("--intra-node-combine-ctas", type=int, default=4)
+    parser.add_argument("--intra-node-combine-elements-per-thread", type=int,
+                        choices=(8, 16, 32, 64, 128), default=32)
+    parser.add_argument("--intra-node-combine-threads-per-cta", type=int,
+                        choices=(256, 512), default=512)
+    parser.add_argument("--intra-node-combine-prefetch-peers", type=int,
+                        choices=(1, 2, 4), default=4)
     parser.add_argument("--return-token-results", action="store_true",
                         help="return local-combine outputs to their same-node NVLink senders")
     parser.add_argument("--return-token-results-per-group", action="store_true",
@@ -489,6 +500,17 @@ def add_down_arguments(parser):
 
 
 def validate_down_arguments(args):
+    if args.check_intra_node_combine and not args.intra_node_combine:
+        raise ValueError("--check-intra-node-combine requires --intra-node-combine")
+    if args.intra_node_combine:
+        if not (args.local_gpu_combine and args.return_token_results_per_group):
+            raise ValueError("--intra-node-combine requires --local-gpu-combine and "
+                             "--return-token-results-per-group with their prerequisites")
+        if args.intra_node_combine_ctas <= 0:
+            raise ValueError("--intra-node-combine-ctas must be positive")
+        if args.down_sm_count is None:
+            args.down_sm_count = 40
+
     if args.return_token_results_per_group and (
         not args.return_token_results or not args.down_n_tile_major_output
     ):
@@ -699,6 +721,7 @@ class DownProjectionRunner:
         self.launch_gemm = pregather.make_launch(args, self.inputs)
         self.combine_tile_n = args.tile_n if self.combine and args.n_tile_major_output else None
         self.return_exchange = None
+        self.intra_node_combine = None
         self._trace_first_combine_launch = self.combine
         self.flops = 2 * routes * hidden * output_dim
         self.reset_start = torch.cuda.Event(enable_timing=True)
@@ -793,7 +816,11 @@ class DownProjectionRunner:
                 self.return_exchange.publish_counts()
             self.gemm_start.record()
             self._log_combine_startup("scatter updates submitted; down GEMM launch begin")
+            if self.intra_node_combine is not None:
+                self.intra_node_combine.mapping_ready.record()
             self.launch_gemm()
+            if self.intra_node_combine is not None:
+                self.intra_node_combine.launch()
             self._log_combine_startup("down GEMM launch returned")
             self.end.record()
             self._trace_first_combine_launch = False
@@ -934,6 +961,11 @@ def build_proxy_argv(
                 f"--expert_gemm_max_swizzle_size={args.expert_gemm_max_swizzle_size}",
             ]
         )
+    if args.intra_node_combine:
+        generated_args.extend([
+            "--nvlink_return_completion_notifications_enabled=true",
+            "--nvlink_return_ready_gpu_publication_enabled=true",
+        ])
     metadata: dict[str, int | str] = {
         "rank": rank,
         "node_rank": node_rank,
@@ -1199,6 +1231,7 @@ def run_proxy_with_concurrent_kernel(
     return_exchange = None
     success = False
     kernel_stream = None
+    down = None
     try:
         device_buffers = install_python_device_buffers(
             library,
@@ -1273,6 +1306,9 @@ def run_proxy_with_concurrent_kernel(
                 return_exchange = ReturnExchange(
                     torch, library, handle, down, down_options,
                     node_rank, local_gpu_index, cuda_device_id, num_iterations.value)
+                if down_options.intra_node_combine:
+                    from intra_node_combine import IntraNodeCombine
+                    down.intra_node_combine = IntraNodeCombine(return_exchange, down_options)
         useful_flops = (
             2
             * int(computation_tokens.value)
@@ -1372,6 +1408,10 @@ def run_proxy_with_concurrent_kernel(
                 down_traces.append((iteration, trace.read(iteration)))
             if return_exchange is not None:
                 return_exchange.finish_iteration(iteration)
+                if down.intra_node_combine is not None:
+                    down.intra_node_combine.finish()
+                    # No rank may overwrite returned buffers while a peer still combines.
+                    return_exchange.control.gather(f"intra-node-done-{iteration}")
             elapsed_ms = ctypes.c_float()
             require_proxy_success(
                 library,
@@ -1439,6 +1479,8 @@ def run_proxy_with_concurrent_kernel(
         success = True
         return 0
     finally:
+        if down is not None and down.intra_node_combine is not None:
+            down.intra_node_combine.abort()
         # Keep both the mapped host flag and its GPU address tensor alive until
         # the last possible kernel write, including exceptional launch paths.
         if trace is not None and kernel_stream is not None:

@@ -48,6 +48,7 @@ public:
                                 std::size_t tile, std::size_t group_tiles,
                                 std::size_t element_bytes, bool per_group, uintptr_t down_done);
     void arm_return_copies(uint64_t iteration);
+    std::vector<uint8_t> intra_node_source_masks(int source_node) const;
     void shutdown();
     const RouterExpertMetadata& router_expert_metadata_for_source(
         int source_node_rank,

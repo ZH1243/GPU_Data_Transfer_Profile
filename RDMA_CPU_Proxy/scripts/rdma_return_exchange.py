@@ -50,6 +50,7 @@ class ReturnExchange:
                          int(down.up.x_buffers[0].shape[1]), options.down_n_tile_major_output,
                          options.down_tile_n, options.down_max_swizzle_size,
                          options.return_token_results_per_group, self.check_enabled, iterations,
+                         options.intra_node_combine, options.check_intra_node_combine,
                          os.environ.get("CUDA_VISIBLE_DEVICES")]
             settings = self.control.gather("configuration", {
                 "signature": signature, "device": device, "sources": sources,
@@ -194,6 +195,7 @@ class ReturnExchange:
             # Counter release alone does not destroy the exported storages.
             # Break down -> exchange -> down so they are reclaimed before
             # PyTorch's CUDA IPC globals are destroyed at interpreter shutdown.
+            self.down.intra_node_combine = None
             self.down.return_exchange = None
             self.down = None
             self.exports.clear()

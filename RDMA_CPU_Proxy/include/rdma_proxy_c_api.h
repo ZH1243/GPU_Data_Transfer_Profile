@@ -124,6 +124,13 @@ RDMA_PROXY_C_API int rdma_proxy_get_computation_num_tokens(
 RDMA_PROXY_C_API int rdma_proxy_get_computation_expert_counts(
     RdmaProxyHandle* handle, uint64_t* counts, uint64_t capacity,
     uint64_t* num_experts);
+/* Static routing masks in this GPU's full staging (local source_node) or RDMA
+ * receive (remote source_node) row order. Bit g means computing GPU g uses row.
+ * Query length with masks=NULL, capacity=0; populated rows exclude capacity tails.
+ * Valid after initialization; benchmark routing remains fixed across iterations. */
+RDMA_PROXY_C_API int rdma_proxy_get_intra_node_source_masks(
+    RdmaProxyHandle* handle, int32_t source_node, uint8_t* masks,
+    uint64_t capacity, uint64_t* count);
 RDMA_PROXY_C_API int rdma_proxy_finish(RdmaProxyHandle* handle);
 
 /* Configure once after initialization, before the first prepare_iteration.

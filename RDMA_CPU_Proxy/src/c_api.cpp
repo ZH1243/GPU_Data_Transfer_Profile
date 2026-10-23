@@ -5,6 +5,7 @@
 #include "logging.hpp"
 #include "proxy.hpp"
 
+#include <algorithm>
 #include <exception>
 #include <limits>
 #include <stdexcept>
@@ -470,6 +471,22 @@ extern "C" int rdma_proxy_get_computation_expert_counts(
     } catch (...) {
         return record_current_exception();
     }
+}
+
+extern "C" int rdma_proxy_get_intra_node_source_masks(
+    RdmaProxyHandle* handle, int32_t source_node, uint8_t* masks,
+    uint64_t capacity, uint64_t* count) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down || !count ||
+            (!masks && capacity)) throw std::runtime_error("invalid source-mask query");
+        const auto values = handle->proxy.intra_node_source_masks(source_node);
+        *count = values.size();
+        if (!masks) return 0;
+        if (capacity < values.size()) throw std::runtime_error("source-mask capacity too small");
+        std::copy(values.begin(), values.end(), masks);
+        return 0;
+    } catch (...) { return record_current_exception(); }
 }
 
 extern "C" int rdma_proxy_finish(RdmaProxyHandle* handle) {

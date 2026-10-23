@@ -839,6 +839,79 @@ needed. This adds GPU mapping work between up and down, reported separately as
 `mapping_ms`; `up_plus_down_ms` includes reset, mapping, and down time in addition
 to the existing up timing.
 
+### Intra-node combine concurrent with down GEMM
+
+Append `--intra-node-combine` to the prepared, per-group return configuration
+on every rank. It uses a register-prefetch CuTe kernel adapted from QuACK's
+`run/final_combine.py`, with striped 128-bit loads and FP32 accumulation in
+computing-GPU order. QuACK itself does not need source changes or reinstalling.
+Rebuild `rdma_cpu_proxy_shared` on both Hopper nodes for the new routing-mask
+query, and deploy the updated Python scripts together.
+
+For the two-node scripts, retain the prepared-forwarding options and append:
+
+```bash
+--concurrent-kernel --down-projection2 --local-gpu-combine \
+--down-n-tile-major-output --down-tile-m=128 --down-tile-n=128 \
+--down-pingpong --down-gather-table --down-gather-table-expert-waves \
+--down-max-swizzle-size=1 --down-gather-table-wave-barrier \
+--down-gather-table-publish-ready \
+--return-token-results --return-token-results-per-group \
+--intra-node-combine --down-sm-count=40 \
+--check-intra-node-combine
+```
+
+The new flag enables both native return-completion notifications and HBM ready
+publication. Their prepared submit/epilogue prerequisites still apply.
+`--check-intra-node-combine` is optional and compares every iteration with an
+independent FP32 PyTorch reference after all returns finish; omit it for timing.
+The single-node script already enables the required return path, so append
+`--intra-node-combine` (and optionally the check).
+
+Defaults are four persistent CTAs, 512 threads/CTA, 32 elements/thread, and four
+prefetched peers. Tune with `--intra-node-combine-ctas`,
+`--intra-node-combine-threads-per-cta`,
+`--intra-node-combine-elements-per-thread`, and
+`--intra-node-combine-prefetch-peers`. The kernel requires BF16/FP16 tiled inputs
+with feature width divisible by down tile N and tile N divisible by elements/thread.
+Column groups may contain multiple N tiles; readiness uses the down swizzle group
+width. `--down-sm-count` defaults to 40 when intra-node combine is enabled. The
+worker checks that the down CTA budget leaves room for the combine CTAs (one
+whole cluster reserved per combine CTA). These are launch budgets, not SM affinity.
+
+The combine stream waits for an event recorded after down-output reset and
+mapping, before down GEMM. It then polls the native HBM ready prefix with
+system-acquire loads while down GEMM runs on its own stream. A group is consumed
+only after all peer returns and the two retained outputs are ready. The existing
+seven peer copy batches remain unchanged. Iteration completion waits for combine
+and a same-node barrier before any rank can reuse incoming buffers. A separate
+cancellation flag releases polling during exceptional teardown.
+
+The C ABI query `rdma_proxy_get_intra_node_source_masks` exports immutable routing
+masks in full staging/RDMA input-row order, with bit g identifying computing GPU g.
+It uses actual received remote routing metadata, not an assumption of equal seeds.
+For each computing GPU, ascending selected rows map to its compact contribution
+rows, including the compact retained self output. Mapping and compilation happen
+once during setup; this benchmark's routing and source order are fixed across
+iterations. There is no runtime exchange of row maps or per-group transpose.
+
+`down.intra_node_combine.outputs[source_node]` exposes a row-major tensor of shape
+`[populated_staging_or_RDMA_rows, token_dimension]`. For two nodes, one tensor is
+the intra-node sum for local staging and one is the intra-node sum for the local
+RDMA input. They are views into one output allocation and are valid after combine
+completion. The kernel reduces 14 received plus two retained contributions in
+one launch; single-node mode reduces seven received plus one retained contribution.
+This adds no routing weights, reverse RDMA, or final cross-node reduction.
+Existing GEMM event timings exclude combine completion and its additional barrier,
+although concurrent execution can affect down-GEMM performance.
+
+Run the standalone numerical/readiness test on Hopper from this repository:
+
+```bash
+RDMA_PROXY_TEST_CUDA=1 QUACK_ROOT=/path/to/quack_for_communication_overlap \
+python -m unittest discover -s RDMA_CPU_Proxy/tests -p test_intra_node_combine.py -v
+```
+
 ### Return local-combine results to NVLink senders
 
 Rebuild the shared library on both Hopper nodes:

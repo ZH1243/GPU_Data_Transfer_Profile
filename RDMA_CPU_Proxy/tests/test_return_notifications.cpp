@@ -56,6 +56,44 @@ namespace rdma_proxy {
 // Exercise the actual receiver -> dispatcher -> shared-memory peer queue ->
 // forwarding submitter path, with CUDA copies mocked on CPU memory. No NIC/GPU.
 struct ReturnNotificationsTestAccess {
+    static void test_source_masks() {
+        ProxyConfig config;
+        config.mock_mode = true;
+        config.num_nodes = 2;
+        config.num_gpus_per_node = 8;
+        config.local_gpu_index = 3;
+        config.router_routing_enabled = true;
+        config.router_local_input_staging_enabled = true;
+        config.router_num_experts = 128;
+        config.router_top_k = 8;
+        config.num_tokens = 64;
+        Proxy proxy(config);
+        proxy.router_routing_.initialize();
+        proxy.initialized_ = true;
+        Proxy::PeerState peer;
+        peer.peer_rank = 1;
+        // Independent remote routing, including self-only and wraparound bits.
+        peer.router_x4 = {1, 2, 4, 8, 16, 32, 64, 128, 255};
+        proxy.peers_.push_back(std::move(peer));
+        const auto remote = proxy.intra_node_source_masks(1);
+        const auto local = proxy.intra_node_source_masks(0);
+        proxy.initialized_ = false;
+        require(remote == std::vector<uint8_t>({8, 4, 2, 1, 128, 64, 32, 16, 255}),
+                "remote mask source-GPU rotation is incorrect");
+        for (int gpu = 0; gpu < 8; ++gpu) {
+            const auto& metadata = proxy.router_routing_.expert_metadata_for_gpu(0, gpu);
+            std::vector<int32_t> used = metadata.expert_token_indices;
+            std::sort(used.begin(), used.end());
+            used.erase(std::unique(used.begin(), used.end()), used.end());
+            std::vector<int32_t> expected;
+            for (std::size_t row = 0; row < local.size(); ++row)
+                if (local[row] & (1U << gpu)) expected.push_back(static_cast<int32_t>(row));
+            if (gpu != config.local_gpu_index)
+                for (std::size_t i = 0; i < expected.size(); ++i) expected[i] = static_cast<int32_t>(i);
+            require(used == expected, "mask-derived rows disagree with local expert metadata");
+        }
+    }
+
     static void exercise(bool atomic_ring, bool enabled, bool publish_gpu = false) {
         constexpr int world = 3, groups = 3, width = 6;
         using Buffer = std::array<unsigned char, width>;
@@ -233,6 +271,7 @@ struct ReturnNotificationsTestAccess {
 int main() {
     try {
         test_progress();
+        rdma_proxy::ReturnNotificationsTestAccess::test_source_masks();
         rdma_proxy::ReturnNotificationsTestAccess::exercise(true, true);
         rdma_proxy::ReturnNotificationsTestAccess::exercise(false, true);
         rdma_proxy::ReturnNotificationsTestAccess::exercise(true, false);

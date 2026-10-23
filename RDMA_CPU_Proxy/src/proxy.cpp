@@ -609,6 +609,31 @@ std::vector<std::pair<int32_t, double>> Proxy::read_down_ready_trace(uint64_t it
     }
 }
 
+std::vector<uint8_t> Proxy::intra_node_source_masks(int source_node) const {
+    if (!initialized_ || !config_.router_routing_enabled ||
+        !config_.router_local_input_staging_enabled ||
+        source_node < 0 || source_node >= config_.num_nodes)
+        throw std::runtime_error("invalid intra-node source-mask query");
+    const std::vector<uint8_t>* masks = nullptr;
+    if (source_node == config_.node_rank) {
+        masks = &router_routing_.token_masks_for_node(source_node);
+    } else {
+        for (const auto& peer : peers_)
+            if (peer.peer_rank == source_node) masks = &peer.router_x4;
+    }
+    if (!masks) throw std::runtime_error("intra-node source peer not found");
+    // x4 bit b denotes GPU (source_gpu - b) modulo local world size.
+    // Export natural GPU bit positions, in the full staging/RDMA row order.
+    std::vector<uint8_t> result(masks->size(), 0);
+    for (std::size_t row = 0; row < masks->size(); ++row)
+        for (int gpu = 0; gpu < config_.num_gpus_per_node; ++gpu) {
+            const int bit = (config_.local_gpu_index - gpu + config_.num_gpus_per_node) %
+                config_.num_gpus_per_node;
+            if ((*masks)[row] & (1U << bit)) result[row] |= 1U << gpu;
+        }
+    return result;
+}
+
 int Proxy::return_ready_prefix(uint64_t iteration) const {
     if (!config_.nvlink_return_completion_notifications_enabled)
         throw std::runtime_error("return completion notifications are disabled");

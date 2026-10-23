@@ -185,6 +185,7 @@ int main(int argc, char** argv) {
             const std::string device_arg = "--cuda_device_id=" + std::to_string(gpu);
             for (const char* option : {
                      "--num_gpus_per_node=2", "--router_routing_enabled=true",
+                     "--router_local_input_staging_enabled=true",
                      "--nvlink_forwarding_enabled=true", "--num_experts=64",
                      "--nvlink_forward_synchronize_batches=true",
                      "--nvlink_forward_completion_notifications_enabled=true",
@@ -212,6 +213,18 @@ int main(int argc, char** argv) {
             counts_ok[gpu] = ok && sum == total && total > 0 &&
                 rdma_proxy_get_computation_expert_counts(router, counts.data(), 1, &n) != 0 &&
                 rdma_proxy_get_computation_expert_counts(router, nullptr, 1, &n) != 0;
+            uint64_t mask_count = 0;
+            bool masks_ok = rdma_proxy_get_intra_node_source_masks(
+                router, 0, nullptr, 0, &mask_count) == 0 && mask_count > 0 && mask_count <= 32;
+            std::vector<uint8_t> masks(mask_count);
+            masks_ok = masks_ok && rdma_proxy_get_intra_node_source_masks(
+                router, 0, masks.data(), masks.size(), &mask_count) == 0;
+            for (auto mask : masks) masks_ok = masks_ok && mask > 0 && mask < 4;
+            masks_ok = masks_ok && rdma_proxy_get_intra_node_source_masks(
+                router, -1, nullptr, 0, &mask_count) != 0 &&
+                rdma_proxy_get_intra_node_source_masks(router, 0, nullptr, 1, &mask_count) != 0 &&
+                rdma_proxy_get_intra_node_source_masks(router, 0, masks.data(), 0, &mask_count) != 0;
+            counts_ok[gpu] = counts_ok[gpu] && masks_ok;
             uintptr_t address = 0;
             int32_t groups[3]{};
             double times[3]{};
