@@ -914,9 +914,9 @@ q tiles occupies byte offset `t * R * down_tile_n * element_bytes` and byte coun
 multi-tile group is contiguous independently for each RDMA peer. Empty sources
 have zero-length spans. Row order within each tile remains the full input order.
 
-This option changes storage only: it does not publish per-group combine-output
-completion or initiate reverse RDMA. The input HBM ready prefix must not be used
-as an output-completion signal; currently consumers wait for combine completion.
+The layout option changes storage only. Add
+`--intra-node-combine-publish-ready` to publish output completion as described
+below. The input HBM ready prefix must not be used as an output-completion signal.
 The kernel reduces 14 received plus two retained contributions in one launch;
 single-node mode reduces seven received plus one retained contribution.
 This adds no routing weights, reverse RDMA, or final cross-node reduction.
@@ -929,6 +929,47 @@ Run the standalone numerical/readiness test on Hopper from this repository:
 RDMA_PROXY_TEST_CUDA=1 QUACK_ROOT=/path/to/quack_for_communication_overlap \
 python -m unittest discover -s RDMA_CPU_Proxy/tests -p test_intra_node_combine.py -v
 ```
+
+### Intra-node combine output-ready prefix
+
+Add `--intra-node-combine-publish-ready` alongside `--intra-node-combine` on every
+rank. It supports both output layouts; use
+`--intra-node-combine-n-tile-major-output` for contiguous per-source column-group
+spans suitable for a later RDMA return.
+
+`down.intra_node_combine.ready_groups` is a stable, one-element CUDA `int32`
+tensor in local GPU HBM (`None` when disabled). Its `.data_ptr()` exposes the
+address for a future consumer. Value N means output column groups `[0,N)` are
+complete for **all source outputs**, including staging and every RDMA peer.
+Group width is `min(down_max_swizzle_size, num_N_tiles) * down_tile_n`; a final
+group may be shorter. This flag is separate from the native input-ready prefix.
+No reverse RDMA transfers or CPU notifications are added by this option.
+
+With publication enabled, the combine kernel assigns work separately for each
+column group. All CTAs, including CTAs with no work in that group, execute a
+block barrier and release-store their completion slot in HBM. CTA 0 acquire-loads
+all slots and system-release-stores the completed prefix. CTA 0 is the only
+publisher and processes groups in order, so the prefix cannot regress or skip
+unfinished groups. Other CTAs can proceed to later groups without waiting for
+CTA 0. Ordinary output stores precede publication; consumers must use an acquire
+load/polling protocol (system scope for cross-device use), not an ordinary cached
+load. Empty outputs have no payload and complete vacuously. Cancellation releases
+polling without marking unfinished groups complete.
+
+The worker resets the prefix and all CTA slots to zero before proxy iteration
+preparation, and synchronizes this reset before allowing new work. The addresses
+remain stable across iterations. Embedders must finish all output consumers
+before the next iteration/reset or teardown. The worker already waits for combine
+completion and its same-node barrier; integrating reverse RDMA must also join
+those transfers before buffer reuse. Disabled mode allocates no output-ready flag
+or slots and keeps its original work distribution.
+
+`--check-intra-node-combine` also checks that the final prefix equals
+`down.intra_node_combine.num_groups`. The opt-in Hopper test consumes each group
+as soon as its prefix appears, before releasing the next input group, and compares
+it to an FP32 reference. It covers row-major/tiled outputs, iteration reuse,
+partial final groups, idle CTAs, and cancellation. Only Python/CuTe files change
+for this feature; no additional C++ rebuild is needed.
 
 ### Return local-combine results to NVLink senders
 

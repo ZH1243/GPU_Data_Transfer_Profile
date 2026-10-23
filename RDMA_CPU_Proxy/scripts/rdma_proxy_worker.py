@@ -458,6 +458,8 @@ def add_down_arguments(parser):
                         help="combine returned and retained down outputs while down GEMM runs")
     parser.add_argument("--intra-node-combine-n-tile-major-output", action="store_true",
                         help="store each source output as [N tiles, input rows, tile N]")
+    parser.add_argument("--intra-node-combine-publish-ready", action="store_true",
+                        help="publish completed intra-node output column-group prefix in HBM")
     parser.add_argument("--check-intra-node-combine", action="store_true",
                         help="compare intra-node output with an FP32 reference each iteration")
     parser.add_argument("--intra-node-combine-ctas", type=int, default=4)
@@ -502,6 +504,8 @@ def add_down_arguments(parser):
 
 
 def validate_down_arguments(args):
+    if args.intra_node_combine_publish_ready and not args.intra_node_combine:
+        raise ValueError("--intra-node-combine-publish-ready requires --intra-node-combine")
     if args.intra_node_combine_n_tile_major_output and not args.intra_node_combine:
         raise ValueError("--intra-node-combine-n-tile-major-output requires --intra-node-combine")
     if args.check_intra_node_combine and not args.intra_node_combine:
@@ -1358,6 +1362,8 @@ def run_proxy_with_concurrent_kernel(
                 if iteration == 0 and down is not None and down.combine:
                     print(f"[gpu={cuda_device_id}] iteration=0: {message}", flush=True)
 
+            if down is not None and down.intra_node_combine is not None:
+                down.intra_node_combine.prepare_iteration()
             log_startup("proxy preparation begin")
             require_proxy_success(
                 library,

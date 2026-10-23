@@ -52,7 +52,16 @@ class IntraNodeCombine:
         publication.restype = ctypes.c_int
         host, device = ctypes.c_size_t(), ctypes.c_size_t()
         exchange.require(publication(exchange.handle, ctypes.byref(host), ctypes.byref(device)))
-        self.addresses = torch.tensor([device.value, self.cancel.data_ptr()],
+        self.group_tiles = min(options.down_max_swizzle_size, width // tile)
+        self.num_groups = (width // tile + self.group_tiles - 1) // self.group_tiles
+        self.ready_groups = (torch.zeros(1, dtype=torch.int32, device=self.device)
+                             if options.intra_node_combine_publish_ready else None)
+        self.completion_slots = (torch.zeros(self.num_groups * ctas, dtype=torch.int32,
+                                            device=self.device)
+                                 if self.ready_groups is not None else None)
+        self.addresses = torch.tensor([device.value, self.cancel.data_ptr(),
+                                      self.completion_slots.data_ptr() if self.completion_slots is not None else 0,
+                                      self.ready_groups.data_ptr() if self.ready_groups is not None else 0],
                                      dtype=torch.int64, device=self.device)
         self.nodes = sorted({node for node, _ in exchange.down.up.source_pairs})
         self.domains = []
@@ -78,7 +87,7 @@ class IntraNodeCombine:
         if total_rows * width > 2**31 - 1:
             raise ValueError("intra-node combine exceeds the kernel's int32 element-index range")
         active = [entry for entry in self.entries if entry[3].numel()]
-        inverse = torch.full((max(1, len(active)), total_rows), -1,
+        inverse = torch.full((max(1, len(active)), max(1, total_rows)), -1,
                              dtype=torch.int32, device=self.device)
         for p, (_, _, offset, index, _) in enumerate(active):
             inverse[p, index + offset] = torch.arange(index.numel(), dtype=torch.int32, device=self.device)
@@ -99,18 +108,21 @@ class IntraNodeCombine:
                              for _, _, _, index, buffer in active)
         self.compiled = None
         self.width, self.tile = width, tile
-        if total_rows:
+        self.kernel_output = self.output if total_rows else torch.empty(1, dtype=dtype, device=self.device)
+        if total_rows or self.ready_groups is not None:
             self.arguments = (
                 tuple(from_dlpack(buffer, assumed_align=16) for buffer in self.buffers)
                 if self.buffers else None,
-                from_dlpack(self.rows), from_dlpack(self.output, assumed_align=16),
+                from_dlpack(self.rows), from_dlpack(self.kernel_output, assumed_align=16),
                 from_dlpack(self.addresses),
             )
             kernel = RegisterIntraNodeKernel(
                 tuple(entry[3].numel() for entry in active), width, tile, ctas, vec,
                 threads, True, self.output_tile_n)
             kernel.output_domains = tuple((offset, count) for _, offset, count in self.domains)
-            kernel.group_tiles = min(options.down_max_swizzle_size, width // tile)
+            kernel.group_tiles = self.group_tiles
+            kernel.publish_ready = self.ready_groups is not None
+            kernel.source_tokens = total_rows
             kernel.prefetch_peers = options.intra_node_combine_prefetch_peers
             lanes = 32
             while (tile // vec) % lanes:
@@ -124,6 +136,20 @@ class IntraNodeCombine:
               f"{[(n, c) for n, _, c in self.domains]} CTAs={ctas}, "
               f"outputs={'N-tile-major' if self.output_tile_n else 'row-major'} "
               "in staging/RDMA input-row order", flush=True)
+
+    def prepare_iteration(self):
+        """Reset publication before allowing any work for the next iteration.
+
+        Caller has joined combine and all consumers from the previous iteration.
+        Returning guarantees zero is visible, including to other CUDA streams.
+        """
+        if self.launched:
+            raise RuntimeError("cannot reset intra-node readiness while combine is active")
+        if self.ready_groups is not None:
+            with self.torch.cuda.stream(self.control_stream):
+                self.ready_groups.zero_()
+                self.completion_slots.zero_()
+            self.control_stream.synchronize()
 
     def launch(self):
         # Called on the down stream after mapping/reset and down launch. This
@@ -139,6 +165,8 @@ class IntraNodeCombine:
             self.finished.synchronize()
             self.launched = False
         if self.check_enabled:
+            if self.ready_groups is not None and self.ready_groups.item() != self.num_groups:
+                raise RuntimeError("intra-node output-ready prefix did not reach the final group")
             self.check()
 
     def check(self):

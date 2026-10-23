@@ -52,6 +52,7 @@ class ReturnExchange:
                          options.return_token_results_per_group, self.check_enabled, iterations,
                          options.intra_node_combine, options.check_intra_node_combine,
                          options.intra_node_combine_n_tile_major_output,
+                         options.intra_node_combine_publish_ready,
                          os.environ.get("CUDA_VISIBLE_DEVICES")]
             settings = self.control.gather("configuration", {
                 "signature": signature, "device": device, "sources": sources,
