@@ -44,11 +44,16 @@ class ActivationCliTests(unittest.TestCase):
                   "--down-gather-table-wave-barrier", "--down-gather-table-publish-ready",
                   "--return-token-results", "--return-token-results-per-group",
                   "--down-n-tile-major-output", "--intra-node-combine")
+        tiled = self.run_cli(*common, "--check-intra-node-combine",
+                             "--intra-node-combine-n-tile-major-output")
+        self.assertEqual(tiled.returncode, 0, tiled.stderr)
+        self.assertNotIn("--intra-node-combine-n-tile-major-output", tiled.stdout)
         result = self.run_cli(*common, "--check-intra-node-combine")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--nvlink_return_completion_notifications_enabled=true", result.stdout)
         self.assertIn("--nvlink_return_ready_gpu_publication_enabled=true", result.stdout)
         for options in (("--intra-node-combine",), ("--check-intra-node-combine",),
+                        ("--intra-node-combine-n-tile-major-output",),
                         (*common, "--intra-node-combine-ctas=0")):
             self.assertNotEqual(self.run_cli(*options).returncode, 0)
 

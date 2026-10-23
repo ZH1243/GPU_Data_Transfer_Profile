@@ -896,11 +896,29 @@ once during setup; this benchmark's routing and source order are fixed across
 iterations. There is no runtime exchange of row maps or per-group transpose.
 
 `down.intra_node_combine.outputs[source_node]` exposes a row-major tensor of shape
-`[populated_staging_or_RDMA_rows, token_dimension]`. For two nodes, one tensor is
-the intra-node sum for local staging and one is the intra-node sum for the local
-RDMA input. They are views into one output allocation and are valid after combine
-completion. The kernel reduces 14 received plus two retained contributions in
-one launch; single-node mode reduces seven received plus one retained contribution.
+`[populated_staging_or_RDMA_rows, token_dimension]` by default. Append
+`--intra-node-combine-n-tile-major-output` (requires `--intra-node-combine`) to
+write each source directly as a contiguous tensor of shape
+`[token_dimension / down_tile_n, populated_input_rows, down_tile_n]`.
+The output tile width equals `--down-tile-n`. No transpose kernel is launched.
+`--check-intra-node-combine` supports either layout.
+
+For two nodes, one tensor is the intra-node sum for local staging and one is the
+intra-node sum for the local RDMA input. They are views into one output allocation,
+with each source packed in its own contiguous span, and are valid after combine
+completion. In tiled mode `down.intra_node_combine.output` is the flat backing
+allocation; use the per-source views rather than a global N-tile-major reshape.
+For a source with R populated rows, a group starting at N tile t and containing
+q tiles occupies byte offset `t * R * down_tile_n * element_bytes` and byte count
+`q * R * down_tile_n * element_bytes` relative to that source view. Thus even a
+multi-tile group is contiguous independently for each RDMA peer. Empty sources
+have zero-length spans. Row order within each tile remains the full input order.
+
+This option changes storage only: it does not publish per-group combine-output
+completion or initiate reverse RDMA. The input HBM ready prefix must not be used
+as an output-completion signal; currently consumers wait for combine completion.
+The kernel reduces 14 received plus two retained contributions in one launch;
+single-node mode reduces seven received plus one retained contribution.
 This adds no routing weights, reverse RDMA, or final cross-node reduction.
 Existing GEMM event timings exclude combine completion and its additional barrier,
 although concurrent execution can affect down-GEMM performance.

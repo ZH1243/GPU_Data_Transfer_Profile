@@ -51,74 +51,93 @@ class KernelTests(unittest.TestCase):
         width, tile, tokens = 512, 128, 56
         for group_tiles in (1, 2):
             for dtype in (torch.bfloat16, torch.float16):
-                with self.subTest(group_tiles=group_tiles, dtype=dtype):
-                    # Two original-source domains, each reduced over eight GPUs.
-                    masks = [[1 + ((row * 37) % 127) for row in range(37)],
-                             [128 if row % 2 else 3 for row in range(19)]]
-                    selected = []
-                    offset = 0
-                    for domain in masks:
-                        selected += [[r + offset for r in rows]
-                                     for rows in contribution_indices(domain, 8) if rows]
-                        offset += len(domain)
-                    rows = torch.full((len(selected), tokens), -1, dtype=torch.int32, device="cuda")
-                    indices = [torch.tensor(x, dtype=torch.int64, device="cuda") for x in selected]
-                    counts = tuple(len(x) for x in selected)
-                    buffers = [torch.empty(width * n, dtype=dtype, device="cuda") for n in counts]
-                    for p, idx in enumerate(indices):
-                        rows[p, idx] = torch.arange(idx.numel(), dtype=torch.int32, device="cuda")
-                    output = torch.empty((tokens, width), dtype=dtype, device="cuda")
-                    ready = torch.zeros(1, dtype=torch.int32, device="cuda")
-                    cancel = torch.zeros_like(ready)
-                    addresses = torch.tensor([ready.data_ptr(), cancel.data_ptr()], dtype=torch.int64, device="cuda")
-                    args = (tuple(from_dlpack(b, assumed_align=16) for b in buffers),
-                            from_dlpack(rows), from_dlpack(output, assumed_align=16), from_dlpack(addresses))
-                    stream = torch.cuda.Stream()
-                    kernel = RegisterIntraNodeKernel(counts, width, tile, 4, 32, 512, True, 0)
-                    kernel.group_tiles, kernel.prefetch_peers, kernel.lanes_per_group = group_tiles, 4, 4
-                    compiled = cute.compile(kernel, *args, cuda.CUstream(stream.cuda_stream))
-                    for iteration in range(2):
+                for tiled in (False, True):
+                    with self.subTest(group_tiles=group_tiles, dtype=dtype, tiled=tiled):
+                        # Two original-source domains, each reduced over eight GPUs.
+                        masks = [[1 + ((row * 37) % 127) for row in range(37)],
+                                 [128 if row % 2 else 3 for row in range(19)]]
+                        selected = []
+                        offset = 0
+                        for domain in masks:
+                            selected += [[r + offset for r in rows]
+                                         for rows in contribution_indices(domain, 8) if rows]
+                            offset += len(domain)
+                        rows = torch.full((len(selected), tokens), -1, dtype=torch.int32, device="cuda")
+                        indices = [torch.tensor(x, dtype=torch.int64, device="cuda") for x in selected]
+                        counts = tuple(len(x) for x in selected)
+                        buffers = [torch.empty(width * n, dtype=dtype, device="cuda") for n in counts]
+                        for p, idx in enumerate(indices):
+                            rows[p, idx] = torch.arange(idx.numel(), dtype=torch.int32, device="cuda")
+                        output = torch.empty((tokens * width,) if tiled else (tokens, width),
+                                             dtype=dtype, device="cuda")
+                        ready = torch.zeros(1, dtype=torch.int32, device="cuda")
+                        cancel = torch.zeros_like(ready)
+                        addresses = torch.tensor([ready.data_ptr(), cancel.data_ptr()], dtype=torch.int64, device="cuda")
+                        args = (tuple(from_dlpack(b, assumed_align=16) for b in buffers),
+                                from_dlpack(rows), from_dlpack(output, assumed_align=16), from_dlpack(addresses))
+                        stream = torch.cuda.Stream()
+                        kernel = RegisterIntraNodeKernel(counts, width, tile, 4, 32, 512, True, tile if tiled else 0)
+                        kernel.output_domains = ((0, 37), (37, 0), (37, 19))
+                        kernel.group_tiles, kernel.prefetch_peers, kernel.lanes_per_group = group_tiles, 4, 4
+                        compiled = cute.compile(kernel, *args, cuda.CUstream(stream.cuda_stream))
+                        for iteration in range(2):
+                            ready.zero_()
+                            output.fill_(-100)
+                            for b in buffers:
+                                b.fill_(float('nan'))
+                            values = [torch.randn((n, width), device="cuda", dtype=dtype) for n in counts]
+                            expected = torch.zeros((tokens, width), device="cuda", dtype=torch.float32)
+                            for idx, val in zip(indices, values):
+                                expected[idx] += val.float()
+                            torch.cuda.synchronize()
+                            compiled(*args, cuda.CUstream(stream.cuda_stream))
+                            try:
+                                time.sleep(0.05)
+                                torch.testing.assert_close(output, torch.full_like(output, -100),
+                                                           rtol=0, atol=0)
+                                # Publish real data group by group while combine polls.
+                                for group in range(width // (tile * group_tiles)):
+                                    lo, hi = group * group_tiles, (group + 1) * group_tiles
+                                    for b, val, n in zip(buffers, values, counts):
+                                        b.view(width // tile, n, tile)[lo:hi].copy_(
+                                            val.view(n, width // tile, tile).permute(1, 0, 2)[lo:hi])
+                                    ready.fill_(group + 1)
+                                done = torch.cuda.Event()
+                                done.record(stream)
+                                # Bounded host wait; failure cancels kernel polling.
+                                deadline = time.monotonic() + 20
+                                while not done.query() and time.monotonic() < deadline:
+                                    time.sleep(0.01)
+                                self.assertTrue(done.query(), "combine timed out")
+                                if tiled:
+                                    # Inspect each physical column-group span directly;
+                                    # unequal domains catch a mistaken global tile stride.
+                                    for start, count in kernel.output_domains:
+                                        packed = output.view(-1)[start * width:(start + count) * width]
+                                        for group in range(width // (tile * group_tiles)):
+                                            first = group * group_tiles
+                                            span = packed[first * count * tile:
+                                                          (first + group_tiles) * count * tile]
+                                            reference = (expected[start:start + count,
+                                                                  first * tile:(first + group_tiles) * tile]
+                                                         .reshape(count, group_tiles, tile)
+                                                         .permute(1, 0, 2).contiguous().view(-1))
+                                            torch.testing.assert_close(span, reference.to(dtype), rtol=0, atol=0)
+                                else:
+                                    torch.testing.assert_close(output, expected.to(dtype), rtol=0, atol=0)
+                            finally:
+                                cancel.fill_(1)
+                                torch.cuda.current_stream().synchronize()
+                                stream.synchronize()
+                                cancel.zero_()
+                        # Cancellation also releases a launch with no ready groups.
                         ready.zero_()
-                        output.fill_(-100)
-                        for b in buffers:
-                            b.fill_(float('nan'))
-                        values = [torch.randn((n, width), device="cuda", dtype=dtype) for n in counts]
-                        expected = torch.zeros((tokens, width), device="cuda", dtype=torch.float32)
-                        for idx, val in zip(indices, values):
-                            expected[idx] += val.float()
                         torch.cuda.synchronize()
                         compiled(*args, cuda.CUstream(stream.cuda_stream))
-                        try:
-                            time.sleep(0.05)
-                            torch.testing.assert_close(output, torch.full_like(output, -100),
-                                                       rtol=0, atol=0)
-                            # Publish real data group by group while combine polls.
-                            for group in range(width // (tile * group_tiles)):
-                                lo, hi = group * group_tiles, (group + 1) * group_tiles
-                                for b, val, n in zip(buffers, values, counts):
-                                    b.view(width // tile, n, tile)[lo:hi].copy_(
-                                        val.view(n, width // tile, tile).permute(1, 0, 2)[lo:hi])
-                                ready.fill_(group + 1)
-                            done = torch.cuda.Event()
-                            done.record(stream)
-                            # Bounded host wait; failure cancels kernel polling.
-                            deadline = time.monotonic() + 20
-                            while not done.query() and time.monotonic() < deadline:
-                                time.sleep(0.01)
-                            self.assertTrue(done.query(), "combine timed out")
-                            torch.testing.assert_close(output, expected.to(dtype), rtol=0, atol=0)
-                        finally:
-                            cancel.fill_(1)
-                            torch.cuda.current_stream().synchronize()
-                            stream.synchronize()
-                            cancel.zero_()
-                    # Cancellation also releases a launch with no ready groups.
-                    ready.zero_()
-                    torch.cuda.synchronize()
-                    compiled(*args, cuda.CUstream(stream.cuda_stream))
-                    cancel.fill_(1)
-                    torch.cuda.current_stream().synchronize()
-                    stream.synchronize()
+                        cancel.fill_(1)
+                        torch.cuda.current_stream().synchronize()
+                        stream.synchronize()
+
 
 
 if __name__ == "__main__":

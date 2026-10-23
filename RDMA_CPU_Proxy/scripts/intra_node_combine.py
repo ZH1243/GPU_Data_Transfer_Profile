@@ -83,9 +83,18 @@ class IntraNodeCombine:
         for p, (_, _, offset, index, _) in enumerate(active):
             inverse[p, index + offset] = torch.arange(index.numel(), dtype=torch.int32, device=self.device)
         self.rows = inverse
-        self.output = torch.empty((total_rows, width), dtype=dtype, device=self.device)
-        self.outputs = {node: self.output[offset:offset + count]
-                        for node, offset, count in self.domains}
+        self.output_tile_n = tile if options.intra_node_combine_n_tile_major_output else 0
+        self.total_rows = total_rows
+        # Pack each domain independently so consecutive N tiles for a source
+        # form one contiguous transfer span, including multi-tile groups.
+        self.output = torch.empty((total_rows * width,) if self.output_tile_n else (total_rows, width),
+                                  dtype=dtype, device=self.device)
+        self.outputs = {
+            node: (self.output.view(-1)[offset * width:(offset + count) * width]
+                   .view(width // tile, count, tile)
+                   if self.output_tile_n else self.output[offset:offset + count])
+            for node, offset, count in self.domains
+        }
         self.buffers = tuple(buffer.view(-1)[:index.numel() * width]
                              for _, _, _, index, buffer in active)
         self.compiled = None
@@ -99,7 +108,8 @@ class IntraNodeCombine:
             )
             kernel = RegisterIntraNodeKernel(
                 tuple(entry[3].numel() for entry in active), width, tile, ctas, vec,
-                threads, True, 0)
+                threads, True, self.output_tile_n)
+            kernel.output_domains = tuple((offset, count) for _, offset, count in self.domains)
             kernel.group_tiles = min(options.down_max_swizzle_size, width // tile)
             kernel.prefetch_peers = options.intra_node_combine_prefetch_peers
             lanes = 32
@@ -112,7 +122,8 @@ class IntraNodeCombine:
         torch.cuda.synchronize(self.device)
         print(f"Intra-node combine: register-prefetch, rows_by_source="
               f"{[(n, c) for n, _, c in self.domains]} CTAs={ctas}, "
-              "outputs=row-major in staging/RDMA input-row order", flush=True)
+              f"outputs={'N-tile-major' if self.output_tile_n else 'row-major'} "
+              "in staging/RDMA input-row order", flush=True)
 
     def launch(self):
         # Called on the down stream after mapping/reset and down launch. This
@@ -133,7 +144,7 @@ class IntraNodeCombine:
     def check(self):
         """Independent FP32 gather/add reference after all returns are complete."""
         torch = self.torch
-        expected = torch.zeros(self.output.shape, dtype=torch.float32, device=self.device)
+        expected = torch.zeros((self.total_rows, self.width), dtype=torch.float32, device=self.device)
         for node, peer, offset, index, buffer in self.entries:
             count = index.numel()
             if peer == self.exchange.rank:
@@ -150,7 +161,12 @@ class IntraNodeCombine:
                           .view(self.width // self.tile, count, self.tile)
                           .permute(1, 0, 2).reshape(count, self.width))
                 expected[index + offset] += values.float()
-        torch.testing.assert_close(self.output, expected.to(self.output.dtype), rtol=0, atol=0)
+        for node, offset, count in self.domains:
+            actual = self.outputs[node]
+            if self.output_tile_n:
+                actual = actual.permute(1, 0, 2).reshape(count, self.width)
+            torch.testing.assert_close(actual, expected[offset:offset + count].to(self.output.dtype),
+                                       rtol=0, atol=0)
         print("Intra-node combine reference check: PASSED", flush=True)
 
     def abort(self):

@@ -90,11 +90,21 @@ class RegisterIntraNodeKernel(_CombineKernel):
                                             + staged[None, None, slot].load().to(cutlass.Float32))
                     values.store(total.load().to(output.element_type))
                     if cutlass.const_expr(self.output_tile_n > 0):
-                        # Row traversal may stripe a thread's values across several
-                        # output groups. Address each 128-bit stripe independently.
+                        # Each original-source domain has its own packed tiled
+                        # span. A global tile stride would interleave domains.
+                        output_base = cutlass.Int32(0)
+                        output_row = token
+                        output_rows = cutlass.Int32(rows.shape[1])
+                        for domain in cutlass.range_constexpr(len(self.output_domains)):
+                            start, count = self.output_domains[domain]
+                            if token >= start and token < start + count:
+                                output_base = cutlass.Int32(start * self.hidden)
+                                output_row = token - start
+                                output_rows = cutlass.Int32(count)
                         for stripe in cutlass.range_constexpr(vec // 8):
                             col = column + stripe * lanes * 8
-                            output_offset = ((col // self.output_tile_n * rows.shape[1] + token)
+                            output_offset = (output_base
+                                             + (col // self.output_tile_n * output_rows + output_row)
                                              * self.output_tile_n + col % self.output_tile_n)
                             destination = cute.make_tensor(
                                 output.iterator + cute.assume(output_offset, divby=8),
