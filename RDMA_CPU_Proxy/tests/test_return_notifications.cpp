@@ -27,10 +27,15 @@ void test_progress() {
     progress.consume(0, 0, 1);
     require(progress.prefix(0) == 0, "fast peer advanced aggregate prefix");
     progress.consume(2, 0, 0);
+    require(progress.prefix(0) == 0, "missing self was ignored");
+    progress.consume(1, 0, 0);
     require(progress.prefix(0) == 1, "aggregate prefix did not advance");
     rejects([&] { progress.consume(2, 0, 0); }); // Duplicate.
     rejects([&] { progress.consume(2, 0, 2); }); // Gap.
-    rejects([&] { progress.consume(1, 0, 0); }); // Self.
+    rejects([&] { progress.consume(1, 0, 0); }); // Duplicate self.
+    rejects([&] { progress.consume(1, 0, 2); }); // Self gap.
+    progress.consume(1, 0, 1);
+    progress.consume(1, 0, 2);
     rejects([&] { progress.reset(1); });
     progress.consume(2, 0, 1);
     progress.consume(2, 0, 2);
@@ -38,9 +43,11 @@ void test_progress() {
     progress.consume(0, 0, 2);
     require(progress.prefix(0) == 3, "last group did not complete");
     require(!progress.consume(0, 1, 0), "future iteration was consumed");
+    require(!progress.consume(1, 1, 0), "future self iteration was consumed");
     progress.reset(1);
     require(progress.prefix(1) == 0, "iteration prefix not reset");
     rejects([&] { progress.consume(0, 0, 0); });
+    rejects([&] { progress.consume(1, 0, 0); });
     rejects([&] { progress.prefix(0); });
 }
 } // namespace
@@ -167,7 +174,17 @@ struct ReturnNotificationsTestAccess {
                 __atomic_store_n(flags[1], groups, __ATOMIC_RELEASE);
                 if (enabled) {
                     // GPU 2 receives both peers' groups but has not sent its own.
-                    wait([&] { return proxies[2]->return_ready_prefix(iteration) == groups; });
+                    wait([&] {
+                        return proxies[0]->return_notifications_sent_.load() == (iteration + 1) * groups &&
+                               proxies[1]->return_notifications_sent_.load() == (iteration + 1) * groups;
+                    });
+                    require(proxies[2]->return_ready_prefix(iteration) == 0,
+                            "incoming peers bypassed unfinished retained outputs");
+                    if (publish_gpu) {
+                        const auto addresses = proxies[2]->return_ready_publication_addresses();
+                        require(__atomic_load_n(reinterpret_cast<int32_t*>(addresses.second), __ATOMIC_ACQUIRE) == 0,
+                                "GPU flag bypassed unfinished retained outputs");
+                    }
                     require(proxies[0]->return_ready_prefix(iteration) == 0,
                             "aggregate ignored empty producer's notifications");
                     __atomic_store_n(flags[2], 1, __ATOMIC_RELEASE);

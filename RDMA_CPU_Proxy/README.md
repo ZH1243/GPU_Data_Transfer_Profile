@@ -687,6 +687,14 @@ Append the following options to both existing node commands:
 
 Down defaults are tile M/N=128/128, cluster M=1, swizzle=1, pingpong disabled,
 and `tma` stores. `--down-cluster-m` also permits explicit cluster sizing.
+Add `--down-sm-count=40` to cap the down GEMM's persistent CTA count. The value
+must be positive and divisible by `--down-cluster-m`; omitting it keeps QuACK's
+default hardware capacity. This limits launch parallelism without reserving
+specific physical SMs and does not affect the up GEMM. The same cap is used
+when preparing down expert-wave metadata. It requires a QuACK checkout whose
+`run/hopper_pregather_gemm.py` supports `--sm-count`. Only the Python worker
+needs updating for this option; no C++ library rebuild is required.
+
 Without the down gather table, the kernel uses per-expert sequence lengths.
 With it, a separate static table and identity indices describe the materialized
 activated input. Expert waves require that table; the wave barrier additionally
@@ -926,9 +934,12 @@ while it still has forward notifications to send.
 
 After the receiver successfully synchronizes a group's return stream, it hands
 one group-completion envelope to the existing dispatcher. The dispatcher sends
-`(iteration, column_group)` to every other local GPU, including peers whose
-valid-row counts are zero. Each destination owns a separate shared-memory
-return queue for each producing GPU (the self queue is unused). These queues
+`(iteration, column_group)` to every local GPU, including itself and peers whose
+valid-row counts are zero. The self notification covers the retained outputs;
+it issues no copy. The down-GEMM ready prefix was observed before submitting
+that group's returns, so retained outputs are already ready at this point.
+Each destination owns a separate shared-memory return queue for each producing
+GPU, including self. These queues
 are separate from the up-projection notification queues. Source identity is
 implicit in the queue; one notification covers that group's copies for all
 original-source-node buffers returned to this destination.
@@ -936,9 +947,16 @@ original-source-node buffers returned to this destination.
 The forwarding submitter drains the return queues, including while waiting
 for new forward work. It advances a per-peer contiguous prefix and publishes
 their minimum to an atomic CPU-DRAM flag. A prefix of `N` means groups `[0,N)`
-have arrived from every other local GPU. It does not include this GPU's own
-retained output, final reduction, or reverse RDMA. No further GPU work is
+have arrived from every other local GPU and this GPU's retained outputs are
+ready for those groups. In the two-node/eight-GPU case this covers 14 received
+buffers plus two retained outputs, with the same seven peer copy batches.
+It does not imply final reduction or reverse RDMA. No further GPU work is
 launched by the consumer. Empty contributions still advance the prefix.
+
+Rebuild the shared library and upgrade all local workers together: notification
+protocol version 4 includes self readiness and rejects older workers. Self uses
+the same ordered queue and retirement checks as peers. Its notification waits
+for outgoing return copies to complete, conservatively delaying self readiness.
 
 The prefix resets to zero during iteration preparation. Stale, duplicate, and
 out-of-order messages are rejected; an early next-iteration message remains

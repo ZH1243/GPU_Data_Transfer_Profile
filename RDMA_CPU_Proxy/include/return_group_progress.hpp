@@ -23,7 +23,6 @@ public:
             throw std::runtime_error("invalid return-group progress configuration");
         if (publish_gpu) publication_ = std::make_unique<ReturnReadyPublication>(device, mock);
         groups_ = groups;
-        self_ = self;
         peers_.resize(peers);
     }
 
@@ -36,7 +35,7 @@ public:
         if (publication_) publication_->reset();
         iteration_ = iteration;
         std::fill(peers_.begin(), peers_.end(), 0);
-        peers_[self_] = groups_; // Locally retained outputs are not returned.
+        // Self advances through the same notifications as returned peer outputs.
         prefix_.store(0, std::memory_order_release);
         active_ = true;
     }
@@ -45,7 +44,7 @@ public:
     // that message queued until reset; never consume it into the old prefix.
     bool consume(int peer, uint64_t iteration, int group) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (peer < 0 || peer >= static_cast<int>(peers_.size()) || peer == self_ ||
+        if (peer < 0 || peer >= static_cast<int>(peers_.size()) ||
             group < 0 || group >= groups_)
             throw std::runtime_error("invalid return-group notification");
         if (!active_ || iteration > iteration_) return false;
@@ -85,7 +84,7 @@ public:
 private:
     mutable std::mutex mutex_;
     std::vector<int> peers_;
-    int groups_{0}, self_{-1};
+    int groups_{0};
     uint64_t iteration_{0};
     bool active_{false};
     std::unique_ptr<ReturnReadyPublication> publication_;

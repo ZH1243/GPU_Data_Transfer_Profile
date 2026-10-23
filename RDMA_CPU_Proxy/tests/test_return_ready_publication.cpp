@@ -59,7 +59,12 @@ void exercise(bool mock) {
         require(__atomic_load_n(host, __ATOMIC_ACQUIRE) == 0 && read_device() == 0,
                 "one peer prematurely advanced publication");
         progress.consume(2, iteration, 0);
+        require(progress.prefix(iteration) == 0 && read_device() == 0,
+                "peers bypassed unfinished self output");
+        progress.consume(1, iteration, 0);
         require(progress.prefix(iteration) == 1 && read_device() == 1, "partial prefix missing");
+        progress.consume(1, iteration, 1);
+        progress.consume(1, iteration, 2);
         progress.consume(2, iteration, 1);
         progress.consume(2, iteration, 2);
         require(progress.prefix(iteration) == 3 && read_device() == 3, "final prefix missing");

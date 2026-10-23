@@ -252,7 +252,7 @@ public:
 constexpr uint64_t kLocalIterationSyncMagic = 0x52444d415053594eULL;  // "RDMAPSyn"
 constexpr uint32_t kLocalIterationSyncVersion = 7;
 constexpr uint64_t kNvlinkForwardNotificationMagic = 0x52444d414e464e51ULL;  // "RDMANFNQ"
-constexpr uint32_t kNvlinkForwardNotificationVersion = 3;
+constexpr uint32_t kNvlinkForwardNotificationVersion = 4;
 constexpr uint32_t kNvlinkForwardRoundRobinFlag = 1U;
 constexpr uint32_t kDirectRdmaInputFlag = 1U << 1;
 
@@ -626,7 +626,6 @@ bool Proxy::return_notifications_complete(uint64_t iteration) const {
     // The prefix is published during consumption, before the queue tail. Wait
     // for slot retirement too before permitting another full iteration.
     for (int peer = 0; peer < config_.num_gpus_per_node; ++peer) {
-        if (peer == config_.local_gpu_index) continue;
         auto* queue = nvlink_forward_notification_queue_for_source(
             nvlink_forward_notification_header_, peer, true);
         if (atomic_load_u64(&queue->tail) < expected) return false;
@@ -634,7 +633,6 @@ bool Proxy::return_notifications_complete(uint64_t iteration) const {
     // Also retire our outgoing slots before reuse, even for a C++ embedder
     // without Python's subsequent all-rank barrier.
     for (const auto& destination : forwarding_notification_destinations_) {
-        if (destination.gpu_index == config_.local_gpu_index) continue;
         auto* queue = nvlink_forward_notification_queue_for_source(
             destination.header, config_.local_gpu_index, true);
         if (atomic_load_u64(&queue->tail) < expected) return false;
@@ -1961,7 +1959,8 @@ bool Proxy::nvlink_forward_notification_queues_complete() const {
 
 void Proxy::enqueue_return_group_notification(uint64_t iteration, int group) {
     // Called only after the receiver synchronized all destinations for this
-    // group. Include peers with zero rows: they still satisfy the same barrier.
+    // group, whose down-ready prefix was already observed. Include self for
+    // retained outputs and peers with zero rows: all satisfy the same barrier.
     auto& dispatch = *nvlink_forward_notification_dispatch_;
     {
         std::lock_guard<std::mutex> lock(dispatch.mutex);
@@ -1974,7 +1973,6 @@ void Proxy::enqueue_return_group_notification(uint64_t iteration, int group) {
 
 void Proxy::dispatch_return_group_notification(uint64_t iteration, int group) {
     for (const auto& destination : forwarding_notification_destinations_) {
-        if (destination.gpu_index == config_.local_gpu_index) continue;
         auto* queue = nvlink_forward_notification_queue_for_source(
             destination.header, config_.local_gpu_index, true);
         const auto head = atomic_load_u64(&queue->head);
@@ -1998,7 +1996,6 @@ void Proxy::drain_return_notifications() {
     // identity comes from the queue and its owner, not the message payload.
     if (!nvlink_forward_notification_header_) return;
     for (int peer = 0; peer < config_.num_gpus_per_node; ++peer) {
-        if (peer == config_.local_gpu_index) continue;
         auto* queue = nvlink_forward_notification_queue_for_source(
             nvlink_forward_notification_header_, peer, true);
         while (true) {
