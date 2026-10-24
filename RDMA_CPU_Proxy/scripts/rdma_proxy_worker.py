@@ -455,7 +455,7 @@ class GroupedGemmRunner:
 
 def add_down_arguments(parser):
     parser.add_argument("--inter-node-combine", action="store_true",
-                        help="combine node sums after RDMA returns into original token order")
+                        help="combine node sums into original token order after local combine and any RDMA returns")
     parser.add_argument("--check-inter-node-combine", action="store_true",
                         help="check final token-order output against an FP32 reference")
     parser.add_argument("--rdma-return-token-results", action="store_true",
@@ -515,8 +515,10 @@ def add_down_arguments(parser):
 def validate_down_arguments(args):
     if args.check_inter_node_combine and not args.inter_node_combine:
         raise ValueError("--check-inter-node-combine requires --inter-node-combine")
-    if args.inter_node_combine and not args.rdma_return_token_results:
-        raise ValueError("--inter-node-combine requires --rdma-return-token-results")
+    if args.inter_node_combine and not (args.intra_node_combine
+                                        and args.intra_node_combine_n_tile_major_output):
+        raise ValueError("--inter-node-combine requires --intra-node-combine "
+                         "and --intra-node-combine-n-tile-major-output")
     if args.check_rdma_return_token_results and not args.rdma_return_token_results:
         raise ValueError("--check-rdma-return-token-results requires --rdma-return-token-results")
     if args.rdma_return_token_results:
@@ -991,6 +993,8 @@ def build_proxy_argv(
                 f"--expert_gemm_max_swizzle_size={args.expert_gemm_max_swizzle_size}",
             ]
         )
+    if args.inter_node_combine and num_nodes > 1 and not args.rdma_return_token_results:
+        raise ValueError("--inter-node-combine requires --rdma-return-token-results with multiple nodes")
     if args.rdma_return_token_results and num_nodes < 2:
         raise ValueError("--rdma-return-token-results requires at least two nodes")
     if args.intra_node_combine:

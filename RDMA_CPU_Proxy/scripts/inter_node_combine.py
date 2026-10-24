@@ -144,4 +144,4 @@ class InterNodeCombine(TokenOrderCombine):
                           else combine.rdma_return.received[node])
         super().__init__(inputs, token_lists, num_tokens, options.check_inter_node_combine)
         print(f"Inter-node combine: output={tuple(self.output.shape)} row-major, "
-              "original token order; runs after RDMA returns", flush=True)
+              "original token order; runs after local combine and any RDMA returns", flush=True)

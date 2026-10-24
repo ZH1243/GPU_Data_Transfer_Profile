@@ -76,13 +76,35 @@ class ActivationCliTests(unittest.TestCase):
                         (*common, "--intra-node-combine-ctas=0")):
             self.assertNotEqual(self.run_cli(*options).returncode, 0)
 
-    def run_cli(self, *options):
+    def test_single_node_inter_node_combine(self):
+        common = ("--concurrent-kernel", "--grouped-gemm-activation=swiglu",
+                  "--down-projection2", "--local-gpu-combine", "--down-pingpong",
+                  "--down-gather-table", "--down-gather-table-expert-waves",
+                  "--down-gather-table-wave-barrier", "--down-gather-table-publish-ready",
+                  "--return-token-results", "--return-token-results-per-group",
+                  "--down-n-tile-major-output", "--intra-node-combine",
+                  "--intra-node-combine-n-tile-major-output", "--inter-node-combine")
+        result = self.run_cli(*common, "--check-inter-node-combine", nodes=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--num_nodes=1", result.stdout)
+        self.assertNotIn("--inter-node-combine", result.stdout)
+        # Multiple nodes still require reverse RDMA; one node rejects it.
+        multi = self.run_cli(*common)
+        self.assertNotEqual(multi.returncode, 0)
+        self.assertIn("requires --rdma-return-token-results", multi.stderr)
+        self.assertNotEqual(self.run_cli(*common, "--rdma-return-token-results",
+                                        "--intra-node-combine-publish-ready", nodes=1).returncode, 0)
+        for missing in ("--intra-node-combine", "--intra-node-combine-n-tile-major-output"):
+            self.assertNotEqual(self.run_cli(*(x for x in common if x != missing),
+                                            nodes=1).returncode, 0)
+
+    def run_cli(self, *options, nodes=2):
         return subprocess.run(
             [sys.executable, str(WORKER), "--library=/unused.so",
              "--cuda-device-map=0,1", "--rdma-device-map=nic0,nic1",
              "--dry-run", *options],
             env={**os.environ, "LOCAL_RANK": "0", "LOCAL_WORLD_SIZE": "2",
-                 "RANK": "0", "WORLD_SIZE": "4", "GROUP_RANK": "0"},
+                 "RANK": "0", "WORLD_SIZE": str(nodes * 2), "GROUP_RANK": "0"},
             text=True, capture_output=True,
         )
 

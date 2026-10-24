@@ -1773,8 +1773,9 @@ both existing prepared-forwarding / down-GEMM commands:
 --inter-node-combine
 ```
 
-`--inter-node-combine` is opt-in and requires `--rdma-return-token-results` and
-all its existing prerequisites. It runs after native reverse-RDMA completion
+`--inter-node-combine` is opt-in and requires `--intra-node-combine` and
+`--intra-node-combine-n-tile-major-output`. With multiple nodes it additionally
+requires `--rdma-return-token-results` and all its existing prerequisites. It runs after native reverse-RDMA completion
 (including receive visibility) and local intra-node combine completion. A single
 CuTe kernel gathers the local staging node sum and each remote returned node sum,
 accumulates in FP32 in ascending node order, and writes a contiguous
@@ -1782,6 +1783,19 @@ accumulates in FP32 in ascending node order, and writes a contiguous
 no separate scatter kernel, no atomics, and no group-readiness polling. Tokens
 without contributions are written zero. Routing weights are not applied; input
 node sums have already been rounded to their BF16/FP16 storage precision.
+
+For a single-node run, retain the existing down-GEMM, NVLink-return, and
+intra-node-combine prerequisites, and append only:
+
+```bash
+--intra-node-combine-n-tile-major-output \
+--inter-node-combine
+```
+
+Do not enable RDMA returns in this case. The kernel reads only the local staging
+node sum after intra-node combine finishes, converting its tiled layout and x3
+row order directly to original token order. Output-ready publication is optional
+for this single-node path because the worker joins the producer stream first.
 
 Read the result through
 `down.intra_node_combine.inter_node_combine.output`. It has the same dtype as the

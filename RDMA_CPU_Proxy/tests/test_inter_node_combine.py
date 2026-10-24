@@ -44,7 +44,8 @@ class KernelTests(unittest.TestCase):
             Path(__file__).resolve().parents[3] / 'quack_for_communication_overlap')))
         from inter_node_combine import TokenOrderCombine
         for dtype in (torch.bfloat16, torch.float16):
-            for domains, tokens in (([[5, 0, 2], [2, 4]], 7),
+            for domains, tokens in (([[5, 0, 2]], 7), ([[]], 7), ([[]], 0),
+                                    ([[5, 0, 2], [2, 4]], 7),
                                     ([[5, 0, 2], [], [4, 2], [0, 5, 3]], 7),
                                     ([[], []], 7), ([[], []], 0)):
                 for tile in (8, 128):
