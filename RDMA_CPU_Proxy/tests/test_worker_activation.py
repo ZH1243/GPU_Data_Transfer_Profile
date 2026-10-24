@@ -88,6 +88,14 @@ class ActivationCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--num_nodes=1", result.stdout)
         self.assertNotIn("--inter-node-combine", result.stdout)
+        for count in (1, 4, 40):
+            tuned = self.run_cli(*common, f"--inter-node-combine-ctas={count}", nodes=1)
+            self.assertEqual(tuned.returncode, 0, tuned.stderr)
+            self.assertNotIn("--inter-node-combine-ctas", tuned.stdout)
+        for count in (0, -1):
+            self.assertNotEqual(self.run_cli(*common, f"--inter-node-combine-ctas={count}",
+                                            nodes=1).returncode, 0)
+        self.assertNotEqual(self.run_cli("--inter-node-combine-ctas=4", nodes=1).returncode, 0)
         # Multiple nodes still require reverse RDMA; one node rejects it.
         multi = self.run_cli(*common)
         self.assertNotEqual(multi.returncode, 0)

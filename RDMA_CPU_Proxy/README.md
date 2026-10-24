@@ -1804,6 +1804,11 @@ its CUDA-event time is available as `.elapsed_ms` and is excluded from existing
 up/down GEMM timing. Disabled mode allocates no final output or inverse map.
 For 204800 tokens and width 4096, the additional BF16 output occupies 1.56 GiB.
 
+Use `--inter-node-combine-ctas=40` to select a positive CTA count independently
+of intra-node combine. Omitting it uses one CTA per GPU SM. Each CTA has 256
+threads and processes a strided share of the output; this is a launch-grid
+size, not SM affinity. It works for both single-node and multi-node runs.
+
 The new C ABI `rdma_proxy_get_outgoing_token_indices` exposes this source GPU's
 per-destination x3 lists, including the local domain, and full input token count.
 The inverse row maps are constructed once during setup because benchmark routing

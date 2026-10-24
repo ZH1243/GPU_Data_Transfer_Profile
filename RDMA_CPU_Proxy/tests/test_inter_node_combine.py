@@ -53,7 +53,8 @@ class KernelTests(unittest.TestCase):
                         width = tile * 3
                         inputs = [torch.empty((3, len(ids), tile), dtype=dtype, device='cuda')
                                   for ids in domains]
-                        combine = TokenOrderCombine(inputs, domains, tokens, check=True)
+                        combine = TokenOrderCombine(inputs, domains, tokens, check=True,
+                                                    ctas=1 if tile == 8 else 4)
                         for iteration in range(2):
                             expected = torch.zeros((tokens, width), dtype=torch.float32, device='cuda')
                             for tensor, ids in zip(inputs, domains):

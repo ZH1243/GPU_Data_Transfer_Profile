@@ -24,7 +24,7 @@ class TokenOrderCombine:
     compiled tuple, but tokens without any contribution are still written zero.
     """
 
-    def __init__(self, inputs, token_lists, num_tokens, check=False):
+    def __init__(self, inputs, token_lists, num_tokens, check=False, ctas=None):
         import torch
         import cuda.bindings.driver as cuda
         import cutlass.cute as cute
@@ -33,6 +33,8 @@ class TokenOrderCombine:
 
         if not inputs or len(inputs) != len(token_lists):
             raise ValueError("inter-node combine requires one x3 list per input")
+        if ctas is not None and ctas <= 0:
+            raise ValueError("inter-node combine CTA count must be positive")
         first = inputs[0]
         if first.ndim != 3 or first.dtype not in (torch.bfloat16, torch.float16):
             raise ValueError("inter-node combine requires tiled BF16/FP16 inputs")
@@ -55,6 +57,8 @@ class TokenOrderCombine:
         self.start = torch.cuda.Event(enable_timing=True)
         self.end = torch.cuda.Event(enable_timing=True)
         self.compiled = None
+        self.num_ctas = (ctas if ctas is not None else
+                         torch.cuda.get_device_properties(first.device).multi_processor_count)
         active = [i for i, tokens in enumerate(token_lists) if tokens]
         self.rows = torch.tensor([inverse[i] for i in active], dtype=torch.int32,
                                  device=first.device) if active and num_tokens else torch.full(
@@ -74,7 +78,7 @@ class TokenOrderCombine:
                 lanes //= 2
             kernel = RegisterInterNodeKernel(
                 tuple(len(token_lists[i]) for i in active), width, tile,
-                torch.cuda.get_device_properties(first.device).multi_processor_count,
+                self.num_ctas,
                 vec, 256, False, 0)
             kernel.source_tokens = num_tokens
             kernel.lanes_per_group = lanes
@@ -142,6 +146,7 @@ class InterNodeCombine(TokenOrderCombine):
             token_lists.append(list(indices))
             inputs.append(combine.outputs[node] if node == exchange.node
                           else combine.rdma_return.received[node])
-        super().__init__(inputs, token_lists, num_tokens, options.check_inter_node_combine)
-        print(f"Inter-node combine: output={tuple(self.output.shape)} row-major, "
+        super().__init__(inputs, token_lists, num_tokens, options.check_inter_node_combine,
+                         ctas=options.inter_node_combine_ctas)
+        print(f"Inter-node combine: CTAs={self.num_ctas}, output={tuple(self.output.shape)} row-major, "
               "original token order; runs after local combine and any RDMA returns", flush=True)

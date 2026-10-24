@@ -456,6 +456,8 @@ class GroupedGemmRunner:
 def add_down_arguments(parser):
     parser.add_argument("--inter-node-combine", action="store_true",
                         help="combine node sums into original token order after local combine and any RDMA returns")
+    parser.add_argument("--inter-node-combine-ctas", type=int, default=None,
+                        help="positive CTA count for inter-node combine; defaults to GPU SM count")
     parser.add_argument("--check-inter-node-combine", action="store_true",
                         help="check final token-order output against an FP32 reference")
     parser.add_argument("--rdma-return-token-results", action="store_true",
@@ -513,6 +515,9 @@ def add_down_arguments(parser):
 
 
 def validate_down_arguments(args):
+    if args.inter_node_combine_ctas is not None:
+        if not args.inter_node_combine or args.inter_node_combine_ctas <= 0:
+            raise ValueError("--inter-node-combine-ctas requires --inter-node-combine and a positive count")
     if args.check_inter_node_combine and not args.inter_node_combine:
         raise ValueError("--check-inter-node-combine requires --inter-node-combine")
     if args.inter_node_combine and not (args.intra_node_combine
