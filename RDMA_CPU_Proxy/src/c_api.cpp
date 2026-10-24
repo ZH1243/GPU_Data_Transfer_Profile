@@ -489,6 +489,24 @@ extern "C" int rdma_proxy_get_intra_node_source_masks(
     } catch (...) { return record_current_exception(); }
 }
 
+extern "C" int rdma_proxy_get_outgoing_token_indices(
+    RdmaProxyHandle* handle, int32_t destination_node, uint64_t* indices,
+    uint64_t capacity, uint64_t* count, uint64_t* num_tokens) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down || !count ||
+            !num_tokens || (!indices && capacity))
+            throw std::runtime_error("invalid outgoing token-index query");
+        const auto& values = handle->proxy.outgoing_token_indices(destination_node);
+        *count = values.size();
+        *num_tokens = handle->config.num_tokens;
+        if (!indices) return 0;
+        if (capacity < values.size()) throw std::runtime_error("token-index capacity too small");
+        std::copy(values.begin(), values.end(), indices);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
 extern "C" int rdma_proxy_get_rdma_return_receive_rows(
     RdmaProxyHandle* handle, int32_t peer, uint64_t* rows) {
     clear_error();

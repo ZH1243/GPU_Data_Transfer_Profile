@@ -133,6 +133,14 @@ RDMA_PROXY_C_API int rdma_proxy_get_intra_node_source_masks(
     uint64_t capacity, uint64_t* count);
 RDMA_PROXY_C_API int rdma_proxy_finish(RdmaProxyHandle* handle);
 
+/* This source GPU's original token IDs in outgoing x3 order for a destination
+ * node, including the local staging domain. Query with indices=NULL, capacity=0.
+ * num_tokens is the full original input size, including tokens absent from x3.
+ * Routing is immutable after initialization in this benchmark. */
+RDMA_PROXY_C_API int rdma_proxy_get_outgoing_token_indices(
+    RdmaProxyHandle* handle, int32_t destination_node, uint64_t* indices,
+    uint64_t capacity, uint64_t* count, uint64_t* num_tokens);
+
 /* Reverse RDMA: caller owns the stable tiled source/destination GPU storage.
  * Empty buffers still supply a non-null one-element allocation for registration.
  * Setup is collective among same-index GPUs across nodes, before iterations.

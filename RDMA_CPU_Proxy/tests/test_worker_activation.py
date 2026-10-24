@@ -54,6 +54,13 @@ class ActivationCliTests(unittest.TestCase):
                                "--check-rdma-return-token-results", "--rdma-return-chunk-bytes=37")
         self.assertEqual(network.returncode, 0, network.stderr)
         self.assertNotIn("--rdma-return-token-results", network.stdout)
+        final = self.run_cli(*common, "--intra-node-combine-n-tile-major-output",
+                            "--intra-node-combine-publish-ready", "--rdma-return-token-results",
+                            "--inter-node-combine", "--check-inter-node-combine")
+        self.assertEqual(final.returncode, 0, final.stderr)
+        self.assertNotIn("--inter-node-combine", final.stdout)
+        for extra in (("--inter-node-combine",), ("--check-inter-node-combine",)):
+            self.assertNotEqual(self.run_cli(*common, *extra).returncode, 0)
         for extra in (("--rdma-return-token-results",), ("--check-rdma-return-token-results",),
                       ("--rdma-return-token-results", "--intra-node-combine-n-tile-major-output",
                        "--intra-node-combine-publish-ready", "--rdma-return-chunk-bytes=0")):

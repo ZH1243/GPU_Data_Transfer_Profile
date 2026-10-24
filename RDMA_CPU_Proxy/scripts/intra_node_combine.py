@@ -26,6 +26,7 @@ class IntraNodeCombine:
         self.mapping_ready = torch.cuda.Event()
         self.finished = torch.cuda.Event()
         self.launched = False
+        self.inter_node_combine = None
         self.check_enabled = options.check_intra_node_combine
         self.cancel = torch.zeros(1, dtype=torch.int32, device=self.device)
         width = int(exchange.down.up.x_buffers[0].shape[1])

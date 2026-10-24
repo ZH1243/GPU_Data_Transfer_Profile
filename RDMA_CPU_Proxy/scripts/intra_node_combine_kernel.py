@@ -17,6 +17,7 @@ class RegisterIntraNodeKernel(_CombineKernel):
     Prefetch depth is a compiler scheduling opportunity, not an async-copy fence.
     """
 
+    wait_for_inputs = True
     publish_ready = False
     publish_rdma_ready = False
     source_tokens = None
@@ -68,20 +69,22 @@ class RegisterIntraNodeKernel(_CombineKernel):
                         column = (tile * self.tile_n
                                   + within_tile % groups_per_tile_row * (lanes * vec))
                     column += vector % lanes * 8
-                    ready_ptr = cute.make_ptr(cutlass.Int32, ready_groups[0],
-                                              cute.AddressSpace.gmem, assumed_align=4)
-                    cancel_ptr = cute.make_ptr(cutlass.Int32, ready_groups[1],
-                                               cute.AddressSpace.gmem, assumed_align=4)
-                    required = column // (self.tile_n * self.group_tiles) + 1
-                    ready = cute.arch.load(ready_ptr.llvm_ptr, cutlass.Int32,
-                                           sem="acquire", scope="sys")
-                    cancelled = cute.arch.load(cancel_ptr.llvm_ptr, cutlass.Int32,
-                                               sem="acquire", scope="sys")
-                    while ready < required and cancelled == 0:
+                    cancelled = cutlass.Int32(0)
+                    if cutlass.const_expr(self.wait_for_inputs):
+                        ready_ptr = cute.make_ptr(cutlass.Int32, ready_groups[0],
+                                                  cute.AddressSpace.gmem, assumed_align=4)
+                        cancel_ptr = cute.make_ptr(cutlass.Int32, ready_groups[1],
+                                                   cute.AddressSpace.gmem, assumed_align=4)
+                        required = column // (self.tile_n * self.group_tiles) + 1
                         ready = cute.arch.load(ready_ptr.llvm_ptr, cutlass.Int32,
                                                sem="acquire", scope="sys")
                         cancelled = cute.arch.load(cancel_ptr.llvm_ptr, cutlass.Int32,
                                                    sem="acquire", scope="sys")
+                        while ready < required and cancelled == 0:
+                            ready = cute.arch.load(ready_ptr.llvm_ptr, cutlass.Int32,
+                                                   sem="acquire", scope="sys")
+                            cancelled = cute.arch.load(cancel_ptr.llvm_ptr, cutlass.Int32,
+                                                       sem="acquire", scope="sys")
                     if cancelled == 0:
                         for peer in cutlass.range_constexpr(peer_count):
                             peer_rows[peer] = rows[peer, token]
@@ -172,3 +175,9 @@ class RegisterIntraNodeKernel(_CombineKernel):
                                                 sem="release", scope="sys")
                 # Keep CTA 0's next group behind publication of this one.
                 cute.arch.sync_threads()
+
+
+class RegisterInterNodeKernel(RegisterIntraNodeKernel):
+    """Post-RDMA reduction: no polling or publication; rows index original tokens."""
+
+    wait_for_inputs = False

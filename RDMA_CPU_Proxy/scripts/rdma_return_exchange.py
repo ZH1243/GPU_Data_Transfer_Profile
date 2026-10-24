@@ -56,6 +56,7 @@ class ReturnExchange:
                          options.intra_node_combine_publish_ready,
                          options.rdma_return_token_results, options.check_rdma_return_token_results,
                          options.rdma_return_chunk_bytes,
+                         options.inter_node_combine, options.check_inter_node_combine,
                          os.environ.get("CUDA_VISIBLE_DEVICES")]
             settings = self.control.gather("configuration", {
                 "signature": signature, "device": device, "sources": sources,

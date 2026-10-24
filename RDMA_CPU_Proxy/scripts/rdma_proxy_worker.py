@@ -454,6 +454,10 @@ class GroupedGemmRunner:
 
 
 def add_down_arguments(parser):
+    parser.add_argument("--inter-node-combine", action="store_true",
+                        help="combine node sums after RDMA returns into original token order")
+    parser.add_argument("--check-inter-node-combine", action="store_true",
+                        help="check final token-order output against an FP32 reference")
     parser.add_argument("--rdma-return-token-results", action="store_true",
                         help="return completed intra-node combine column groups over existing RDMA QPs")
     parser.add_argument("--check-rdma-return-token-results", action="store_true",
@@ -509,6 +513,10 @@ def add_down_arguments(parser):
 
 
 def validate_down_arguments(args):
+    if args.check_inter_node_combine and not args.inter_node_combine:
+        raise ValueError("--check-inter-node-combine requires --inter-node-combine")
+    if args.inter_node_combine and not args.rdma_return_token_results:
+        raise ValueError("--inter-node-combine requires --rdma-return-token-results")
     if args.check_rdma_return_token_results and not args.rdma_return_token_results:
         raise ValueError("--check-rdma-return-token-results requires --rdma-return-token-results")
     if args.rdma_return_token_results:
@@ -1333,6 +1341,10 @@ def run_proxy_with_concurrent_kernel(
                 if down_options.intra_node_combine:
                     from intra_node_combine import IntraNodeCombine
                     down.intra_node_combine = IntraNodeCombine(return_exchange, down_options)
+                    if down_options.inter_node_combine:
+                        from inter_node_combine import InterNodeCombine
+                        down.intra_node_combine.inter_node_combine = InterNodeCombine(
+                            down.intra_node_combine, down_options)
         useful_flops = (
             2
             * int(computation_tokens.value)
@@ -1436,6 +1448,8 @@ def run_proxy_with_concurrent_kernel(
                 return_exchange.finish_iteration(iteration)
                 if down.intra_node_combine is not None:
                     down.intra_node_combine.finish()
+                    if down.intra_node_combine.inter_node_combine is not None:
+                        down.intra_node_combine.inter_node_combine.run()
                     # No rank may overwrite returned buffers while a peer still combines.
                     return_exchange.control.gather(f"intra-node-done-{iteration}")
             elapsed_ms = ctypes.c_float()

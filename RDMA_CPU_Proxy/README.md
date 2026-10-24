@@ -1761,3 +1761,52 @@ ctest --test-dir RDMA_CPU_Proxy/build -R test_unified_local --output-on-failure
 ```
 
 Real CUDA/RDMA performance must be measured on the target GPU nodes.
+
+### Inter-node combine in original token order
+
+After rebuilding `rdma_cpu_proxy_shared` on both Hopper nodes, append these to
+both existing prepared-forwarding / down-GEMM commands:
+
+```bash
+--intra-node-combine-n-tile-major-output \
+--rdma-return-token-results \
+--inter-node-combine
+```
+
+`--inter-node-combine` is opt-in and requires `--rdma-return-token-results` and
+all its existing prerequisites. It runs after native reverse-RDMA completion
+(including receive visibility) and local intra-node combine completion. A single
+CuTe kernel gathers the local staging node sum and each remote returned node sum,
+accumulates in FP32 in ascending node order, and writes a contiguous
+`[num_tokens, token_dimension]` tensor in original source-token order. There is
+no separate scatter kernel, no atomics, and no group-readiness polling. Tokens
+without contributions are written zero. Routing weights are not applied; input
+node sums have already been rounded to their BF16/FP16 storage precision.
+
+Read the result through
+`down.intra_node_combine.inter_node_combine.output`. It has the same dtype as the
+node sums. The worker joins the kernel before any next-iteration buffer reuse;
+its CUDA-event time is available as `.elapsed_ms` and is excluded from existing
+up/down GEMM timing. Disabled mode allocates no final output or inverse map.
+For 204800 tokens and width 4096, the additional BF16 output occupies 1.56 GiB.
+
+The new C ABI `rdma_proxy_get_outgoing_token_indices` exposes this source GPU's
+per-destination x3 lists, including the local domain, and full input token count.
+The inverse row maps are constructed once during setup because benchmark routing
+is fixed. Each node's input has its own row count and order; equal row indices
+across node buffers are not assumed to identify the same token.
+
+Add `--check-inter-node-combine` for an independent FP32 scatter/add reference
+check each iteration. It uses bounded output-row blocks and casts to the output
+dtype before comparison. Combine with the existing intra-node and RDMA-return
+checks to validate the earlier stages as well. Checks add overhead.
+
+Run the standalone kernel tests on Hopper:
+
+```bash
+RDMA_PROXY_TEST_CUDA=1 QUACK_ROOT=/path/to/quack_for_communication_overlap \
+python -m unittest discover -s RDMA_CPU_Proxy/tests -p test_inter_node_combine.py -v
+```
+
+The tests cover unequal and shuffled x3 domains, missing contributions, empty
+inputs, BF16/FP16, multiple tile widths, and changed payloads across iterations.

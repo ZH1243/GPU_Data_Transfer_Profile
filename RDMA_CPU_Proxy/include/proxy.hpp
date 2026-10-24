@@ -49,6 +49,7 @@ public:
                                 std::size_t element_bytes, bool per_group, uintptr_t down_done);
     void arm_return_copies(uint64_t iteration);
     std::vector<uint8_t> intra_node_source_masks(int source_node) const;
+    const std::vector<std::size_t>& outgoing_token_indices(int destination_node) const;
     std::size_t rdma_return_receive_rows(int peer) const;
     uintptr_t configure_rdma_returns(const RdmaProxyNetworkReturnBuffer* buffers, std::size_t count,
         std::size_t width, std::size_t tile, std::size_t group_tiles, std::size_t element_bytes,

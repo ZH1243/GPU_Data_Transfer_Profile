@@ -38,6 +38,13 @@ std::vector<std::vector<ChunkDescriptor>> return_chunks(
 }
 }
 
+const std::vector<std::size_t>& Proxy::outgoing_token_indices(int destination_node) const {
+    if (!initialized_ || !config_.router_routing_enabled || destination_node < 0 ||
+        destination_node >= config_.num_nodes)
+        throw std::runtime_error("invalid outgoing token-index query");
+    return router_routing_.token_indices_for_node(destination_node);
+}
+
 std::size_t Proxy::rdma_return_receive_rows(int peer) const {
     if (!initialized_ || peer == config_.node_rank || peer < 0 || peer >= config_.num_nodes ||
         !config_.router_routing_enabled)

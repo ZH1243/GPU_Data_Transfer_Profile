@@ -225,6 +225,27 @@ int main(int argc, char** argv) {
                 rdma_proxy_get_intra_node_source_masks(router, 0, nullptr, 1, &mask_count) != 0 &&
                 rdma_proxy_get_intra_node_source_masks(router, 0, masks.data(), 0, &mask_count) != 0;
             counts_ok[gpu] = counts_ok[gpu] && masks_ok;
+            uint64_t token_count = 0, original_tokens = 0;
+            bool tokens_ok = true;
+            for (int node = 0; node < 4; ++node) {
+                tokens_ok = tokens_ok && rdma_proxy_get_outgoing_token_indices(
+                    router, node, nullptr, 0, &token_count, &original_tokens) == 0 && original_tokens == 32;
+                std::vector<uint64_t> ids(token_count);
+                tokens_ok = tokens_ok && rdma_proxy_get_outgoing_token_indices(
+                    router, node, ids.data(), ids.size(), &token_count, &original_tokens) == 0;
+                bool seen[32]{};
+                for (auto id : ids) {
+                    if (id >= 32 || seen[id]) { tokens_ok = false; break; }
+                    seen[id] = true;
+                }
+                if (!ids.empty()) tokens_ok = tokens_ok && rdma_proxy_get_outgoing_token_indices(
+                    router, node, ids.data(), ids.size() - 1, &token_count, &original_tokens) != 0;
+            }
+            tokens_ok = tokens_ok && rdma_proxy_get_outgoing_token_indices(
+                router, -1, nullptr, 0, &token_count, &original_tokens) != 0 &&
+                rdma_proxy_get_outgoing_token_indices(router, 0, nullptr, 1, &token_count, &original_tokens) != 0 &&
+                rdma_proxy_get_outgoing_token_indices(router, 0, nullptr, 0, &token_count, nullptr) != 0;
+            counts_ok[gpu] = counts_ok[gpu] && tokens_ok;
             uintptr_t address = 0;
             int32_t groups[3]{};
             double times[3]{};
