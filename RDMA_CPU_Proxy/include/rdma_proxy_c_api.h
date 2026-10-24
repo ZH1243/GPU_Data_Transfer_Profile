@@ -133,6 +133,35 @@ RDMA_PROXY_C_API int rdma_proxy_get_intra_node_source_masks(
     uint64_t capacity, uint64_t* count);
 RDMA_PROXY_C_API int rdma_proxy_finish(RdmaProxyHandle* handle);
 
+/* Reverse RDMA: caller owns the stable tiled source/destination GPU storage.
+ * Empty buffers still supply a non-null one-element allocation for registration.
+ * Setup is collective among same-index GPUs across nodes, before iterations.
+ * Source rows are incoming remote x3 rows; destination rows are outgoing x3 rows.
+ * Layout is [width/tile_n, rows, tile_n], packed independently per peer.
+ * The returned device address aliases a native-owned mapped pinned int32 flag.
+ * After all CTA stores for groups [0,N), GPU must system-release store N there.
+ * prepare_iteration resets it; run_iteration waits for all outgoing and incoming
+ * return group markers, including GPUDirect receive visibility, before returning.
+ * Keep GPU storage alive until shutdown. Join all GPU writers before shutdown.
+ * Existing QP workers send returns after their current forward task finishes.
+ */
+typedef struct RdmaProxyNetworkReturnBuffer {
+    int32_t peer;
+    uintptr_t source;
+    uintptr_t destination;
+    uint64_t source_rows;
+    uint64_t destination_rows;
+} RdmaProxyNetworkReturnBuffer;
+RDMA_PROXY_C_API int rdma_proxy_get_rdma_return_receive_rows(
+    RdmaProxyHandle* handle, int32_t peer, uint64_t* rows);
+RDMA_PROXY_C_API int rdma_proxy_configure_rdma_returns(
+    RdmaProxyHandle* handle, const RdmaProxyNetworkReturnBuffer* buffers, uint64_t count,
+    uint64_t width, uint64_t tile_n, uint64_t group_tiles, uint64_t element_bytes,
+    uint64_t chunk_bytes, uint64_t timeout_ms, uintptr_t* mapped_device_prefix);
+/* Optional post-iteration SHA256 transport check; same-index peers call in rank order. */
+RDMA_PROXY_C_API int rdma_proxy_check_rdma_return(
+    RdmaProxyHandle* handle, int32_t peer, const char* sent_sha256, const char* received_sha256);
+
 /* Configure once after initialization, before the first prepare_iteration.
  * The proxy owns the mapped flag. Finish GPU writes before shutdown/destroy.
  * prepare_iteration resets/arms it; the notification receiver polls it.

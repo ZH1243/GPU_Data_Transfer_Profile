@@ -40,6 +40,7 @@ set(RDMA_PROXY_SOURCES
   src/qp_worker.cpp
   src/down_ready_trace.cpp
   src/return_copies.cpp
+  src/rdma_return.cpp
   src/return_ready_publication.cpp
   src/rdma_connection.cpp
   src/rdma_context.cpp
@@ -128,6 +129,10 @@ if(RDMA_PROXY_BUILD_TESTS)
 
   add_executable(test_c_api tests/test_c_api.cpp)
   add_executable(test_down_ready_trace tests/test_down_ready_trace.cpp)
+  add_executable(test_rdma_returns tests/test_rdma_returns.cpp)
+  target_link_libraries(test_rdma_returns PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_rdma_returns COMMAND test_rdma_returns)
+  set_tests_properties(test_rdma_returns PROPERTIES TIMEOUT 20)
   add_executable(test_return_copies tests/test_return_copies.cpp)
   add_executable(test_return_notifications tests/test_return_notifications.cpp)
   add_executable(test_return_ready_publication tests/test_return_ready_publication.cpp)

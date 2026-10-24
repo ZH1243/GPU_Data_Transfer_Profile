@@ -11,7 +11,7 @@
 namespace rdma_proxy {
 
 uint32_t encode_immediate(std::size_t chunk_index) {
-    if (chunk_index >= 0xffffffffULL) {
+    if (chunk_index >= kReturnImmediateBit) {
         throw std::runtime_error("chunk index exceeds immediate data capacity");
     }
     return static_cast<uint32_t>(chunk_index);

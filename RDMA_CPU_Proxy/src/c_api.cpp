@@ -489,6 +489,42 @@ extern "C" int rdma_proxy_get_intra_node_source_masks(
     } catch (...) { return record_current_exception(); }
 }
 
+extern "C" int rdma_proxy_get_rdma_return_receive_rows(
+    RdmaProxyHandle* handle, int32_t peer, uint64_t* rows) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down || !rows)
+            throw std::runtime_error("invalid RDMA return row query");
+        *rows = handle->proxy.rdma_return_receive_rows(peer);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
+extern "C" int rdma_proxy_configure_rdma_returns(
+    RdmaProxyHandle* handle, const RdmaProxyNetworkReturnBuffer* buffers, uint64_t count,
+    uint64_t width, uint64_t tile_n, uint64_t group_tiles, uint64_t element_bytes,
+    uint64_t chunk_bytes, uint64_t timeout_ms, uintptr_t* mapped_device_prefix) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down || !mapped_device_prefix)
+            throw std::runtime_error("invalid RDMA return setup");
+        *mapped_device_prefix = handle->proxy.configure_rdma_returns(
+            buffers, count, width, tile_n, group_tiles, element_bytes, chunk_bytes, timeout_ms);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
+extern "C" int rdma_proxy_check_rdma_return(
+    RdmaProxyHandle* handle, int32_t peer, const char* sent_sha256, const char* received_sha256) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down || !sent_sha256 || !received_sha256)
+            throw std::runtime_error("invalid RDMA return check");
+        handle->proxy.check_rdma_return(peer, sent_sha256, received_sha256);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
 extern "C" int rdma_proxy_finish(RdmaProxyHandle* handle) {
     clear_error();
     if (handle == nullptr) {

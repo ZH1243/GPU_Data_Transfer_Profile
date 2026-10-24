@@ -74,6 +74,14 @@ struct RouterExpertMetadata {
     std::vector<int32_t> expert_offsets;
 };
 
+// Return traffic has its own immediate namespace; forward marker remains UINT32_MAX.
+constexpr uint32_t kReturnImmediateBit = 1U << 31;
+constexpr uint32_t kReturnMarkerBit = 1U << 30;
+constexpr uint32_t kReturnSequenceLimit = (1U << 30) - 1;
+constexpr uint64_t kReturnWrIdBit = 1ULL << 62;
+inline bool is_return_immediate(uint32_t value) {
+    return value != 0xffffffffU && (value & kReturnImmediateBit);
+}
 uint32_t encode_immediate(std::size_t chunk_index);
 std::size_t decode_immediate(uint32_t imm_data);
 uint32_t encode_marker_immediate();

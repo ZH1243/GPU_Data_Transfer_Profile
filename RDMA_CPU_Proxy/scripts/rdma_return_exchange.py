@@ -25,6 +25,7 @@ class ReturnExchange:
 
         self.torch, self.library, self.handle, self.down = torch, library, handle, down
         self.rank, self.device = rank, device
+        self.node = node
         self.world = int(os.environ["LOCAL_WORLD_SIZE"])
         self.control = SharedExchange(rank, self.world, options.return_token_timeout,
                                       namespace=f"rdma-return-node{node}")
@@ -53,6 +54,8 @@ class ReturnExchange:
                          options.intra_node_combine, options.check_intra_node_combine,
                          options.intra_node_combine_n_tile_major_output,
                          options.intra_node_combine_publish_ready,
+                         options.rdma_return_token_results, options.check_rdma_return_token_results,
+                         options.rdma_return_chunk_bytes,
                          os.environ.get("CUDA_VISIBLE_DEVICES")]
             settings = self.control.gather("configuration", {
                 "signature": signature, "device": device, "sources": sources,
@@ -197,6 +200,7 @@ class ReturnExchange:
             # Counter release alone does not destroy the exported storages.
             # Break down -> exchange -> down so they are reclaimed before
             # PyTorch's CUDA IPC globals are destroyed at interpreter shutdown.
+            self.network_return = None
             self.down.intra_node_combine = None
             self.down.return_exchange = None
             self.down = None

@@ -18,6 +18,7 @@ class RegisterIntraNodeKernel(_CombineKernel):
     """
 
     publish_ready = False
+    publish_rdma_ready = False
     source_tokens = None
 
     @cute.kernel
@@ -164,5 +165,10 @@ class RegisterIntraNodeKernel(_CombineKernel):
                         if cancelled == 0:
                             cute.arch.store(done.llvm_ptr, completed_group + 1,
                                             sem="release", scope="sys")
+                            if cutlass.const_expr(self.publish_rdma_ready):
+                                host_done = cute.make_ptr(cutlass.Int32, ready_groups[4],
+                                                          cute.AddressSpace.gmem, assumed_align=4)
+                                cute.arch.store(host_done.llvm_ptr, completed_group + 1,
+                                                sem="release", scope="sys")
                 # Keep CTA 0's next group behind publication of this one.
                 cute.arch.sync_threads()

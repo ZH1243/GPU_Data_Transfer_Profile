@@ -454,6 +454,11 @@ class GroupedGemmRunner:
 
 
 def add_down_arguments(parser):
+    parser.add_argument("--rdma-return-token-results", action="store_true",
+                        help="return completed intra-node combine column groups over existing RDMA QPs")
+    parser.add_argument("--check-rdma-return-token-results", action="store_true",
+                        help="compare returned payload SHA256 with the remote source after each iteration")
+    parser.add_argument("--rdma-return-chunk-bytes", type=int, default=1048576)
     parser.add_argument("--intra-node-combine", action="store_true",
                         help="combine returned and retained down outputs while down GEMM runs")
     parser.add_argument("--intra-node-combine-n-tile-major-output", action="store_true",
@@ -504,6 +509,15 @@ def add_down_arguments(parser):
 
 
 def validate_down_arguments(args):
+    if args.check_rdma_return_token_results and not args.rdma_return_token_results:
+        raise ValueError("--check-rdma-return-token-results requires --rdma-return-token-results")
+    if args.rdma_return_token_results:
+        if not (args.intra_node_combine and args.intra_node_combine_n_tile_major_output
+                and args.intra_node_combine_publish_ready):
+            raise ValueError("--rdma-return-token-results requires --intra-node-combine, "
+                             "--intra-node-combine-n-tile-major-output and --intra-node-combine-publish-ready")
+        if not 0 < args.rdma_return_chunk_bytes <= 2**32 - 1:
+            raise ValueError("--rdma-return-chunk-bytes must be in [1, 2**32-1]")
     if args.intra_node_combine_publish_ready and not args.intra_node_combine:
         raise ValueError("--intra-node-combine-publish-ready requires --intra-node-combine")
     if args.intra_node_combine_n_tile_major_output and not args.intra_node_combine:
@@ -969,6 +983,8 @@ def build_proxy_argv(
                 f"--expert_gemm_max_swizzle_size={args.expert_gemm_max_swizzle_size}",
             ]
         )
+    if args.rdma_return_token_results and num_nodes < 2:
+        raise ValueError("--rdma-return-token-results requires at least two nodes")
     if args.intra_node_combine:
         generated_args.extend([
             "--nvlink_return_completion_notifications_enabled=true",

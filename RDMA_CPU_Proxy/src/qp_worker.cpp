@@ -57,13 +57,15 @@ DynamicChunkDistributor::DynamicChunkDistributor(
     uintptr_t local_base,
     uint32_t local_lkey,
     uintptr_t remote_base,
-    uint32_t remote_rkey)
+    uint32_t remote_rkey, int64_t return_sequence)
     : chunks_(std::move(chunks)),
       peer_rank_(peer_rank),
       local_base_(local_base),
       local_lkey_(local_lkey),
       remote_base_(remote_base),
-      remote_rkey_(remote_rkey) {
+      remote_rkey_(remote_rkey), return_sequence_(return_sequence) {
+    if (return_sequence >= kReturnSequenceLimit)
+        throw std::runtime_error("RDMA return sequence overflow");
     assignment_.qp_by_chunk.assign(chunks_.size(), -1);
     assignment_.chunks_by_qp.assign(qp_count, 0);
     assignment_.bytes_by_qp.assign(qp_count, 0);
@@ -102,6 +104,7 @@ bool DynamicChunkDistributor::next(int qp_index, SendTask& task) {
     task.remote_base = remote_base_;
     task.remote_rkey = remote_rkey_;
     task.signaled = true;
+    task.return_sequence = return_sequence_;
     return true;
 }
 
@@ -117,6 +120,7 @@ void DynamicChunkDistributor::make_marker(int qp_index, SendTask& task) const {
     task.remote_base = remote_base_;
     task.remote_rkey = remote_rkey_;
     task.signaled = true;
+    task.return_sequence = return_sequence_;
 }
 
 IterationAssignment DynamicChunkDistributor::assignment() const {
@@ -153,6 +157,12 @@ void QPWorker::stop() {
 
 void QPWorker::enqueue(SendTask task) {
     send_queue_.push(task);
+}
+
+void QPWorker::configure_return_protocol(uint64_t total_groups) {
+    if (!total_groups || total_groups >= kReturnSequenceLimit || return_total_groups_)
+        throw std::runtime_error("invalid RDMA return protocol configuration");
+    return_total_groups_ = total_groups;
 }
 
 void QPWorker::post_initial_receives(int recv_queue_depth) {
@@ -234,31 +244,34 @@ void QPWorker::send_loop() {
 void QPWorker::post_task(const SendTask& task) {
     if (task.marker) {
         qp_.post_send_with_immediate(
-            task.wr_id | kMarkerWrIdBit,
-            encode_marker_immediate());
+            task.wr_id | kMarkerWrIdBit | (task.return_sequence >= 0 ? kReturnWrIdBit : 0),
+            task.return_sequence >= 0 ? kReturnImmediateBit | kReturnMarkerBit |
+                static_cast<uint32_t>(task.return_sequence) : encode_marker_immediate());
     } else {
         qp_.post_write_with_immediate(
-            task.wr_id,
+            task.wr_id | (task.return_sequence >= 0 ? kReturnWrIdBit : 0),
             task.chunk.source_token_indices.empty() ?
                 task.local_base + task.chunk.src_offset_bytes : task.local_base,
             task.local_lkey,
             task.remote_base + task.chunk.dst_offset_bytes,
             task.remote_rkey,
             task.chunk.length_bytes,
-            task.chunk.imm_data,
+            task.return_sequence >= 0 ? kReturnImmediateBit | static_cast<uint32_t>(task.return_sequence) : task.chunk.imm_data,
             task.signaled,
-            task.chunk.source_token_indices);
+            task.chunk.source_token_indices, task.return_sequence >= 0);
     }
 }
 
 void QPWorker::run_dynamic_iteration(const std::shared_ptr<DynamicChunkDistributor>& distributor) {
     const auto max_in_flight = static_cast<std::size_t>(max_in_flight_chunks_);
     std::size_t in_flight = 0;
-    uint64_t observed_send_completions = send_completions_.load();
+    const bool returning = distributor->is_return();
+    auto completed_count = [&] { return returning ? return_sends_.load() : send_completions_.load(); };
+    uint64_t observed_send_completions = completed_count();
     bool distributor_drained = false;
 
     auto retire_completed = [&] {
-        const auto completed = send_completions_.load();
+        const auto completed = completed_count();
         if (completed <= observed_send_completions) return;
 
         const auto delta = static_cast<std::size_t>(completed - observed_send_completions);
@@ -280,23 +293,33 @@ void QPWorker::run_dynamic_iteration(const std::shared_ptr<DynamicChunkDistribut
         }
 
         if (distributor_drained && in_flight == 0) break;
-        if (!wait_for_send_completion(observed_send_completions)) return;
+        if (!wait_for_send_completion(observed_send_completions, returning)) return;
     }
 
     SendTask marker;
     distributor->make_marker(qp_.qp_index(), marker);
+    const auto marker_baseline = return_send_markers_.load();
     post_task(marker);
+    if (returning) {
+        // Bound SQ occupancy even for a long run of empty return groups.
+        std::unique_lock<std::mutex> lock(completion_mutex_);
+        completion_cv_.wait(lock, [&] {
+            return stop_.load() || return_send_markers_.load() > marker_baseline ||
+                   post_errors_.load() || cq_errors_.load();
+        });
+    }
 }
 
-bool QPWorker::wait_for_send_completion(uint64_t baseline) {
+bool QPWorker::wait_for_send_completion(uint64_t baseline, bool returning) {
+    auto completed = [&] { return returning ? return_sends_.load() : send_completions_.load(); };
     std::unique_lock<std::mutex> lock(completion_mutex_);
     completion_cv_.wait(lock, [&] {
         return stop_.load() ||
-               send_completions_.load() > baseline ||
+               completed() > baseline ||
                post_errors_.load() != 0 ||
                cq_errors_.load() != 0;
     });
-    return !stop_.load() && send_completions_.load() > baseline;
+    return !stop_.load() && completed() > baseline;
 }
 
 void QPWorker::cq_loop() {
@@ -313,7 +336,13 @@ void QPWorker::cq_loop() {
             }
             for (const auto& c : completions) {
                 if (c.kind == CompletionKind::kSend) {
-                    if (is_marker_wr_id(c.wr_id)) {
+                    if (c.wr_id & kReturnWrIdBit) {
+                        if (!return_total_groups_) throw std::runtime_error("unconfigured RDMA return send completion");
+                        std::lock_guard<std::mutex> lock(completion_mutex_);
+                        if (is_marker_wr_id(c.wr_id)) return_send_markers_.fetch_add(1);
+                        else return_sends_.fetch_add(1);
+                        completion_cv_.notify_all();
+                    } else if (is_marker_wr_id(c.wr_id)) {
                         send_marker_completions_.fetch_add(1);
                         {
                             std::lock_guard<std::mutex> lock(stats_mutex_);
@@ -329,7 +358,13 @@ void QPWorker::cq_loop() {
                         completion_cv_.notify_all();
                     }
                 } else {
-                    if (is_marker_immediate(c.imm_data)) {
+                    if (is_return_immediate(c.imm_data)) {
+                        const auto sequence = c.imm_data & (kReturnSequenceLimit);
+                        if (!return_total_groups_ || sequence >= return_total_groups_ ||
+                            sequence != return_recv_markers_.load())
+                            throw std::runtime_error("stale/out-of-order/unconfigured RDMA return immediate");
+                        if (c.imm_data & kReturnMarkerBit) return_recv_markers_.fetch_add(1);
+                    } else if (is_marker_immediate(c.imm_data)) {
                         recv_marker_completions_.fetch_add(1);
                         {
                             std::lock_guard<std::mutex> lock(stats_mutex_);

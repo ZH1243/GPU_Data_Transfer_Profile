@@ -656,9 +656,10 @@ void RdmaQueuePair::post_write_with_immediate(
     std::size_t length,
     uint32_t imm_data,
     bool signaled,
-    const std::vector<std::size_t>& source_token_indices) {
+    const std::vector<std::size_t>& source_token_indices, bool contiguous) {
+    const bool per_token = !contiguous && effective_rdma_chunk_per_token_sge_enabled(config_);
     if (config_.mock_mode) {
-        if (effective_rdma_chunk_per_token_sge_enabled(config_)) {
+        if (per_token) {
             (void)per_token_sge_count(config_, length);
         }
         if (!source_token_indices.empty()) {
@@ -688,7 +689,7 @@ void RdmaQueuePair::post_write_with_immediate(
 #if RDMA_PROXY_HAVE_VERBS
     ibv_sge sge{};
     std::vector<ibv_sge> sges;
-    if (length > 0 && effective_rdma_chunk_per_token_sge_enabled(config_)) {
+    if (length > 0 && per_token) {
         const auto token_bytes = rdma_token_bytes(config_);
         if (token_bytes > std::numeric_limits<uint32_t>::max()) {
             throw std::runtime_error("single token byte size exceeds verbs SGE length range");
@@ -717,10 +718,10 @@ void RdmaQueuePair::post_write_with_immediate(
 
     ibv_send_wr wr{};
     wr.wr_id = wr_id;
-    wr.sg_list = effective_rdma_chunk_per_token_sge_enabled(config_)
+    wr.sg_list = per_token
         ? (sges.empty() ? nullptr : sges.data())
         : (length > 0 ? &sge : nullptr);
-    wr.num_sge = effective_rdma_chunk_per_token_sge_enabled(config_)
+    wr.num_sge = per_token
         ? static_cast<int>(sges.size())
         : (length > 0 ? 1 : 0);
     wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;

@@ -49,6 +49,16 @@ class ActivationCliTests(unittest.TestCase):
                              "--intra-node-combine-publish-ready")
         self.assertEqual(tiled.returncode, 0, tiled.stderr)
         self.assertNotIn("--intra-node-combine-n-tile-major-output", tiled.stdout)
+        network = self.run_cli(*common, "--intra-node-combine-n-tile-major-output",
+                               "--intra-node-combine-publish-ready", "--rdma-return-token-results",
+                               "--check-rdma-return-token-results", "--rdma-return-chunk-bytes=37")
+        self.assertEqual(network.returncode, 0, network.stderr)
+        self.assertNotIn("--rdma-return-token-results", network.stdout)
+        for extra in (("--rdma-return-token-results",), ("--check-rdma-return-token-results",),
+                      ("--rdma-return-token-results", "--intra-node-combine-n-tile-major-output",
+                       "--intra-node-combine-publish-ready", "--rdma-return-chunk-bytes=0")):
+            self.assertNotEqual(self.run_cli(*common, *extra).returncode, 0)
+
         result = self.run_cli(*common, "--check-intra-node-combine")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--nvlink_return_completion_notifications_enabled=true", result.stdout)

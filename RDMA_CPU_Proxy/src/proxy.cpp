@@ -540,6 +540,7 @@ void Proxy::prepare_iteration_step(uint64_t iteration) {
             throw std::runtime_error("previous return notifications have not drained");
         return_group_progress_.reset(iteration);
     }
+    prepare_rdma_returns(iteration);
     down_ready_trace_.reset(iteration);
     iteration_prepared_ = true;
 }
@@ -554,6 +555,7 @@ void Proxy::run_iteration_step(uint64_t iteration) {
         throw std::runtime_error("prepared proxy iteration index does not match run request");
     }
     run_iteration(iteration);
+    finish_rdma_returns();
     synchronize_iteration(iteration);
     iteration_prepared_ = false;
 }
@@ -718,6 +720,7 @@ void Proxy::shutdown() {
         rdma_context_.deregister_memory(peer.local_send_mr);
         rdma_context_.deregister_memory(peer.local_recv_mr);
     }
+    release_rdma_returns();
     peers_.clear();
     release_local_iteration_sync();
     iteration_prepared_ = false;
@@ -3032,6 +3035,7 @@ void Proxy::wait_for_iteration(
                           std::chrono::milliseconds(config_.rdma_qp_calibration_enabled && !rdma_qp_calibration_complete_ ?
                               calibration_remaining_ms() : config_.completion_timeout_ms);
     while (true) {
+        service_rdma_returns();
         bool complete = true;
         for (std::size_t q = 0; q < peer.workers.size(); ++q) {
             const auto& worker = peer.workers[q];
@@ -3085,6 +3089,7 @@ void Proxy::wait_for_outgoing_transfer(
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(config_.completion_timeout_ms);
     while (true) {
+        service_rdma_returns();
         bool complete = true;
         for (std::size_t q = 0; q < peer.workers.size(); ++q) {
             const auto& worker = peer.workers[q];
@@ -5791,6 +5796,7 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(config_.completion_timeout_ms);
     while (true) {
+        service_rdma_returns();
         check_forwarding_error();
         bool complete = true;
         {

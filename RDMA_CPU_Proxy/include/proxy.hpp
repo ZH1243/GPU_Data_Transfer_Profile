@@ -49,6 +49,11 @@ public:
                                 std::size_t element_bytes, bool per_group, uintptr_t down_done);
     void arm_return_copies(uint64_t iteration);
     std::vector<uint8_t> intra_node_source_masks(int source_node) const;
+    std::size_t rdma_return_receive_rows(int peer) const;
+    uintptr_t configure_rdma_returns(const RdmaProxyNetworkReturnBuffer* buffers, std::size_t count,
+        std::size_t width, std::size_t tile, std::size_t group_tiles, std::size_t element_bytes,
+        std::size_t chunk_bytes, uint64_t timeout_ms);
+    void check_rdma_return(int peer, const std::string& sent, const std::string& received) const;
     void shutdown();
     const RouterExpertMetadata& router_expert_metadata_for_source(
         int source_node_rank,
@@ -61,10 +66,30 @@ public:
     router_notification_publication_buffers() const;
 
 private:
+    struct RdmaReturnPeer {
+        std::size_t peer_index{0};
+        MemoryRegionInfo source, destination, remote;
+        std::vector<std::vector<ChunkDescriptor>> chunks;
+        std::size_t next_group{0};
+    };
+    struct RdmaReturnState {
+        int32_t* host_prefix{nullptr};
+        uintptr_t device_prefix{0};
+        uint64_t iteration{0}, timeout_ms{0};
+        std::size_t groups{0};
+        bool active{false}, complete{true};
+        std::vector<RdmaReturnPeer> peers;
+    };
+    std::unique_ptr<RdmaReturnState> rdma_returns_;
+    void prepare_rdma_returns(uint64_t iteration);
+    void service_rdma_returns() const;
+    void finish_rdma_returns() const;
+    void release_rdma_returns();
     DownReadyTrace down_ready_trace_;
     friend struct PreparedForwardingTestAccess;
     friend struct ReturnNotificationsTestAccess;
     friend struct QpCalibrationTestAccess;
+    friend struct RdmaReturnsTestAccess;
     struct PeerState {
         int peer_rank{-1};
         int remote_gpu_index{-1};

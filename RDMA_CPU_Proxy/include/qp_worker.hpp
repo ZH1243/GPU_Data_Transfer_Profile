@@ -37,6 +37,7 @@ struct SendTask {
     uint32_t remote_rkey{0};
     bool signaled{true};
     bool marker{false};
+    int64_t return_sequence{-1};
     std::shared_ptr<DynamicChunkDistributor> distributor;
 };
 
@@ -62,8 +63,9 @@ public:
         uintptr_t local_base,
         uint32_t local_lkey,
         uintptr_t remote_base,
-        uint32_t remote_rkey);
+        uint32_t remote_rkey, int64_t return_sequence = -1);
 
+    bool is_return() const { return return_sequence_ >= 0; }
     bool next(int qp_index, SendTask& task);
     void make_marker(int qp_index, SendTask& task) const;
     IterationAssignment assignment() const;
@@ -77,6 +79,7 @@ private:
     uint32_t local_lkey_{0};
     uintptr_t remote_base_{0};
     uint32_t remote_rkey_{0};
+    int64_t return_sequence_{-1};
     std::size_t next_chunk_{0};
     IterationAssignment assignment_;
 };
@@ -92,6 +95,10 @@ public:
     void start();
     void stop();
     void enqueue(SendTask task);
+    void configure_return_protocol(uint64_t total_groups);
+    uint64_t return_sends() const { return return_sends_.load(); }
+    uint64_t return_send_markers() const { return return_send_markers_.load(); }
+    uint64_t return_recv_markers() const { return return_recv_markers_.load(); }
     void post_initial_receives(int recv_queue_depth);
     void configure_expected_chunks(std::size_t num_chunks);
     void set_receive_immediate_callback(std::function<void(std::size_t)> callback);
@@ -116,7 +123,7 @@ private:
     void cq_loop();
     void post_task(const SendTask& task);
     void run_dynamic_iteration(const std::shared_ptr<DynamicChunkDistributor>& distributor);
-    bool wait_for_send_completion(uint64_t baseline);
+    bool wait_for_send_completion(uint64_t baseline, bool returning = false);
 
     RdmaQueuePair& qp_;
     int poll_batch_size_{16};
@@ -126,6 +133,8 @@ private:
     std::thread send_thread_;
     std::thread cq_thread_;
     std::atomic<uint64_t> next_recv_wr_id_{1};
+    std::atomic<uint64_t> return_total_groups_{0};
+    std::atomic<uint64_t> return_sends_{0}, return_send_markers_{0}, return_recv_markers_{0};
     std::atomic<uint64_t> send_completions_{0};
     std::atomic<uint64_t> recv_completions_{0};
     std::atomic<uint64_t> send_marker_completions_{0};

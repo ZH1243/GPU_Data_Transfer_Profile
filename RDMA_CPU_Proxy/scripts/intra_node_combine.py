@@ -109,6 +109,12 @@ class IntraNodeCombine:
         self.compiled = None
         self.width, self.tile = width, tile
         self.kernel_output = self.output if total_rows else torch.empty(1, dtype=dtype, device=self.device)
+        self.rdma_return = None
+        if options.rdma_return_token_results:
+            from rdma_network_return import NetworkReturn
+            self.rdma_return = NetworkReturn(self, options)
+            self.addresses = torch.cat((self.addresses, torch.tensor(
+                [self.rdma_return.device_prefix], dtype=torch.int64, device=self.device)))
         if total_rows or self.ready_groups is not None:
             self.arguments = (
                 tuple(from_dlpack(buffer, assumed_align=16) for buffer in self.buffers)
@@ -122,6 +128,7 @@ class IntraNodeCombine:
             kernel.output_domains = tuple((offset, count) for _, offset, count in self.domains)
             kernel.group_tiles = self.group_tiles
             kernel.publish_ready = self.ready_groups is not None
+            kernel.publish_rdma_ready = self.rdma_return is not None
             kernel.source_tokens = total_rows
             kernel.prefetch_peers = options.intra_node_combine_prefetch_peers
             lanes = 32
@@ -164,6 +171,8 @@ class IntraNodeCombine:
         if self.launched:
             self.finished.synchronize()
             self.launched = False
+        if self.rdma_return is not None:
+            self.rdma_return.check()
         if self.check_enabled:
             if self.ready_groups is not None and self.ready_groups.item() != self.num_groups:
                 raise RuntimeError("intra-node output-ready prefix did not reach the final group")

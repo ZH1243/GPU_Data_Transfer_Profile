@@ -76,19 +76,24 @@ class KernelTests(unittest.TestCase):
                             groups = (width // tile + group_tiles - 1) // group_tiles
                             published = torch.zeros_like(ready)
                             slots = torch.zeros(groups * 4, dtype=torch.int32, device="cuda")
+                            host_published = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+                            status, host_device_ptr = cuda.cuMemHostGetDevicePointer(host_published.data_ptr(), 0)
+                            self.assertEqual(status, cuda.CUresult.CUDA_SUCCESS)
                             addresses = torch.tensor([ready.data_ptr(), cancel.data_ptr(), slots.data_ptr(),
-                                                      published.data_ptr()], dtype=torch.int64, device="cuda")
+                                                      published.data_ptr(), int(host_device_ptr)], dtype=torch.int64, device="cuda")
                             args = (tuple(from_dlpack(b, assumed_align=16) for b in buffers),
                                     from_dlpack(rows), from_dlpack(output, assumed_align=16), from_dlpack(addresses))
                             stream = torch.cuda.Stream()
                             kernel = RegisterIntraNodeKernel(counts, width, tile, 4, 32, 512, True, tile if tiled else 0)
                             kernel.publish_ready = publish
+                            kernel.publish_rdma_ready = publish
                             kernel.output_domains = ((0, 37), (37, 0), (37, 19))
                             kernel.group_tiles, kernel.prefetch_peers, kernel.lanes_per_group = group_tiles, 4, 4
                             compiled = cute.compile(kernel, *args, cuda.CUstream(stream.cuda_stream))
                             for iteration in range(2):
                                 ready.zero_()
                                 published.zero_()
+                                host_published.zero_()
                                 slots.zero_()
                                 output.fill_(-100)
                                 for b in buffers:
@@ -113,8 +118,9 @@ class KernelTests(unittest.TestCase):
                                         ready.fill_(group + 1)
                                         if publish:
                                             deadline = time.monotonic() + 20
-                                            while published.item() < group + 1 and time.monotonic() < deadline:
+                                            while host_published.item() < group + 1 and time.monotonic() < deadline:
                                                 time.sleep(0.001)
+                                            self.assertEqual(host_published.item(), group + 1)
                                             self.assertEqual(published.item(), group + 1)
                                             # Consume the finished group before releasing the next:
                                             # a prefix must imply completed stores for every source.
@@ -158,6 +164,7 @@ class KernelTests(unittest.TestCase):
                                     stream.synchronize()
                                     cancel.zero_()
                             # Cancellation also releases a launch with no ready groups.
+                            host_published.zero_()
                             ready.zero_()
                             published.zero_()
                             slots.zero_()
@@ -168,6 +175,7 @@ class KernelTests(unittest.TestCase):
                             stream.synchronize()
 
                             self.assertEqual(published.item(), 0)
+                            self.assertEqual(host_published.item(), 0)
 
     def test_empty_outputs_publish_without_payload(self):
         import torch

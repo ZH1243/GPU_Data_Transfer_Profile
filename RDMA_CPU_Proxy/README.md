@@ -971,6 +971,59 @@ it to an FP32 reference. It covers row-major/tiled outputs, iteration reuse,
 partial final groups, idle CTAs, and cancellation. Only Python/CuTe files change
 for this feature; no additional C++ rebuild is needed.
 
+### Return intra-node combine results over RDMA
+
+Rebuild the shared library on both Hopper nodes. Add these options to the existing
+multi-node down-GEMM / NVLink-return command on **every rank**:
+
+```bash
+--intra-node-combine \
+--intra-node-combine-n-tile-major-output \
+--intra-node-combine-publish-ready \
+--rdma-return-token-results
+```
+
+`--rdma-return-token-results` is opt-in and requires at least two nodes and the
+three combine options above (with their existing down-GEMM/NVLink prerequisites).
+It keeps the HBM output-ready prefix and additionally system-release-publishes
+that prefix to native-owned, CUDA-mapped pinned CPU memory. The coordinator
+acquire-polls this host flag during forward waits and while draining returns.
+Each newly completed group releases a precomputed chunk distributor to the
+existing RDMA send workers. No extra send or CQ threads are created. A worker
+finishes its current forward distributor before processing queued returns, so
+returns can overlap down-GEMM but do not preempt that QP's forward transfer.
+
+At setup, each remote-source combine output is registered directly as an RDMA
+source; no packing/copy kernel is added. A separate GPU receive buffer is
+allocated and registered for each remote node, and peers exchange its address,
+rkey, and layout. Each group is contiguous in that source's N-tile-major span.
+`--rdma-return-chunk-bytes` (default 1048576) splits that span into work for the
+existing QPs; it does not change the column-group size. Empty domains still
+exchange completion markers. Return immediates/counters are separate from
+forward arrivals and never trigger forward NVLink copies.
+
+After the proxy iteration completes, received tensors are accessible through
+`down.intra_node_combine.rdma_return.received[peer_node]`, with shape
+`[token_dimension / down_tile_n, outgoing_x3_rows_for_peer, down_tile_n]`.
+Their rows follow this GPU's original outgoing x3 order to that node. In the
+2-node case there is one such receive tensor per GPU; the locally retained
+staging combine output remains in `down.intra_node_combine.outputs[local_node]`.
+This step transports node sums back; it does **not** perform the final reduction
+across nodes or scatter them into original source-token order.
+
+Every QP sends a generation-tagged group-end marker. Before returning from an
+iteration the coordinator waits for every outgoing and incoming return marker
+and performs the required GPUDirect receive-visibility flush. The next iteration
+resets the host prefix only after prior transfers and GPU work have joined.
+Registered storage remains alive until native shutdown.
+
+Add `--check-rdma-return-token-results` on every rank for a post-iteration SHA256
+comparison of each received tensor against the peer's registered source. It
+copies bytes to CPU and exchanges hashes over the control channel; use it for
+correctness runs, not performance measurements. Combine it with
+`--check-intra-node-combine` to validate both numerical reduction and transport.
+The standalone opt-in Hopper combine test also exercises mapped-host publication.
+
 ### Return local-combine results to NVLink senders
 
 Rebuild the shared library on both Hopper nodes:
