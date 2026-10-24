@@ -61,12 +61,26 @@ master_port="${MASTER_PORT:-29500}"
     --log_qp_reports=false \
     --mock_mode=false \
     --router_local_input_staging_enabled=true \
+    --concurrent-kernel \
     --grouped-gemm-m-tile=128 \
     --grouped-gemm-n-tile=128 \
     --grouped-gemm-output-dimension=2048 \
     --grouped-gemm-cluster-m=2 \
     --grouped-gemm-max-swizzle-size=8 \
     --grouped-gemm-activation=swiglu \
+    --down-projection2 --down-sm-count=40 --local-gpu-combine \
+    --down-n-tile-major-output --down-tile-m=128 --down-tile-n=128 \
+    --down-pingpong --down-gather-table --down-gather-table-expert-waves \
+    --down-max-swizzle-size=1 --down-gather-table-wave-barrier \
+    --down-epilogue-store bulk_rows_reduce \
+    --down-gather-table-publish-ready \
+    --return-token-results --return-token-results-per-group \
+    --check-return-token-results \
+    --nvlink_return_completion_notifications_enabled=true \
+    --nvlink_return_ready_gpu_publication_enabled=true \
+    --intra-node-combine \
+    --check-intra-node-combine \
+    --intra-node-combine-publish-ready \
     "$@"
 
 

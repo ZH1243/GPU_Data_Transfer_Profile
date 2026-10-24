@@ -5,20 +5,20 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 project_dir="$(cd -- "${script_dir}/.." && pwd)"
 build_dir="${RDMA_PROXY_BUILD_DIR:-${project_dir}/build-hopper}"
 torchrun_bin="${TORCHRUN_BIN:-torchrun}"
-master_addr="${MASTER_ADDR:-28.49.38.169}"
+master_addr="${MASTER_ADDR:-28.59.80.49}"
 master_port="${MASTER_PORT:-29500}"
 
 "${torchrun_bin}" \
     --nnodes=2 \
-    --nproc_per_node=7 \
+    --nproc_per_node=8 \
     --node_rank=1 \
     --master_addr="${master_addr}" \
     --master_port="${master_port}" \
     --max_restarts=0 \
     "${script_dir}/rdma_proxy_worker.py" \
     --library="${build_dir}/librdma_cpu_proxy.so" \
-    --cuda-device-map=0,1,2,3,5,6,7 \
-    --rdma-device-map=mlx5_bond_1,mlx5_bond_4,mlx5_bond_3,mlx5_bond_2,mlx5_bond_6,mlx5_bond_8,mlx5_bond_5 \
+    --cuda-device-map=0,1,2,3,4,5,6,7 \
+    --rdma-device-map=mlx5_bond_1,mlx5_bond_4,mlx5_bond_3,mlx5_bond_2,mlx5_bond_7,mlx5_bond_6,mlx5_bond_8,mlx5_bond_5 \
     --listen-port-base=18515 \
     --config "${project_dir}/config/node1_config.json" \
     --node_rank=1 \
@@ -27,18 +27,18 @@ master_port="${MASTER_PORT:-29500}"
     --num_iterations=5 \
     --tokens_per_chunk=32 \
     --num_qps_per_peer=8 \
-    --num_tokens=10240 \
+    --num_tokens=204800 \
     --cpu_affinity=auto \
     --fill_test_data=false \
     --validate_data=false \
     --completion_poll_batch_size=64 \
-    --max_in_flight_chunks_per_qp=4 \
+    --max_in_flight_chunks_per_qp=8 \
     --rdma_chunk_per_token_sge_enabled=false \
     --rdma_discontinuous_token_payload_enabled=false \
     --router_routing_enabled=true \
     --router_computation_kernel_enabled=true \
-    --num_experts=112 \
-    --top_k=16 \
+    --num_experts=128 \
+    --top_k=8 \
     --router_seed=1234 \
     --nvlink_forward_notification_flush_per_entry_enabled=false \
     --sequential_peer_transfers=true \
@@ -54,4 +54,25 @@ master_port="${MASTER_PORT:-29500}"
     --local_iteration_sync_enabled=true \
     --log_qp_reports=false \
     --mock_mode=false \
+    --router_local_input_staging_enabled=true \
+    --concurrent-kernel \
+    --grouped-gemm-m-tile=128 \
+    --grouped-gemm-n-tile=128 \
+    --grouped-gemm-output-dimension=2048 \
+    --grouped-gemm-cluster-m=2 \
+    --grouped-gemm-max-swizzle-size=8 \
+    --grouped-gemm-activation=swiglu \
+    --down-projection2 --down-sm-count=40 --local-gpu-combine \
+    --down-n-tile-major-output --down-tile-m=128 --down-tile-n=128 \
+    --down-pingpong --down-gather-table --down-gather-table-expert-waves \
+    --down-max-swizzle-size=1 --down-gather-table-wave-barrier \
+    --down-epilogue-store bulk_rows_reduce \
+    --down-gather-table-publish-ready \
+    --return-token-results --return-token-results-per-group \
+    --check-return-token-results \
+    --nvlink_return_completion_notifications_enabled=true \
+    --nvlink_return_ready_gpu_publication_enabled=true \
+    --intra-node-combine \
+    --check-intra-node-combine \
+    --intra-node-combine-publish-ready \
     "$@"
