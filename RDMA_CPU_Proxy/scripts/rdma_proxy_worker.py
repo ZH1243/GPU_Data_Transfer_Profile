@@ -852,13 +852,16 @@ class DownProjectionRunner:
             if self.return_exchange is not None:
                 self.return_exchange.publish_counts()
             self.gemm_start.record()
-            self._log_combine_startup("scatter updates submitted; down GEMM launch begin")
+            self._log_combine_startup("scatter updates submitted")
             if self.intra_node_combine is not None:
+                self._log_combine_startup("intra-node mapping-ready event record begin")
                 self.intra_node_combine.mapping_ready.record()
+                self._log_combine_startup("intra-node mapping-ready event record returned")
+            self._log_combine_startup("down GEMM launch begin")
             self.launch_gemm()
+            self._log_combine_startup("down GEMM launch returned")
             if self.intra_node_combine is not None:
                 self.intra_node_combine.launch()
-            self._log_combine_startup("down GEMM launch returned")
             self.end.record()
             self._trace_first_combine_launch = False
 

@@ -140,10 +140,37 @@ class IntraNodeCombine:
                                          cuda.CUstream(self.stream.cuda_stream))
         # Compilation/metadata uploads finish before any readiness-gated launch.
         torch.cuda.synchronize(self.device)
+        self._warmup()
         print(f"Intra-node combine: register-prefetch, rows_by_source="
               f"{[(n, c) for n, _, c in self.domains]} CTAs={ctas}, "
               f"outputs={'N-tile-major' if self.output_tile_n else 'row-major'} "
               "in staging/RDMA input-row order", flush=True)
+
+    def _warmup(self):
+        """Exercise the compiled callable before readiness-gated GPU work starts.
+
+        Compilation alone does not exercise first-invocation runtime setup.
+        Cancellation lets the actual kernel run without waiting for returns or
+        reading their uninitialized payloads, and suppresses ready publication.
+        """
+        if self.compiled is None:
+            return
+        print(f"[gpu={self.exchange.down.up.cuda_device_id}] intra-node combine warmup begin",
+              flush=True)
+        with self.torch.cuda.stream(self.stream):
+            self.cancel.fill_(1)
+            self.compiled(*self.arguments, self.cuda.CUstream(self.stream.cuda_stream))
+            self.finished.record(self.stream)
+        # Do not clear cancellation until every warmup CTA has exited.
+        self.stream.synchronize()
+        with self.torch.cuda.stream(self.stream):
+            self.cancel.zero_()
+            if self.ready_groups is not None:
+                self.ready_groups.zero_()
+                self.completion_slots.zero_()
+        self.stream.synchronize()
+        print(f"[gpu={self.exchange.down.up.cuda_device_id}] intra-node combine warmup complete",
+              flush=True)
 
     def prepare_iteration(self):
         """Reset publication before allowing any work for the next iteration.
@@ -162,11 +189,18 @@ class IntraNodeCombine:
     def launch(self):
         # Called on the down stream after mapping/reset and down launch. This
         # event was recorded BEFORE down launch, so it does not wait for down.
+        trace = self.exchange.down._log_combine_startup
+        trace("intra-node combine stream wait-event begin")
         self.stream.wait_event(self.mapping_ready)
+        trace("intra-node combine stream wait-event returned")
         self.launched = True
         if self.compiled is not None:
+            trace("intra-node combine compiled invocation begin")
             self.compiled(*self.arguments, self.cuda.CUstream(self.stream.cuda_stream))
+            trace("intra-node combine compiled invocation returned")
+        trace("intra-node combine finished-event record begin")
         self.finished.record(self.stream)
+        trace("intra-node combine finished-event record returned")
 
     def finish(self):
         if self.launched:
