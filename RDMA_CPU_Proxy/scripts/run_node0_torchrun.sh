@@ -33,7 +33,7 @@ master_port="${MASTER_PORT:-29500}"
     --num_iterations=5 \
     --tokens_per_chunk=32 \
     --num_qps_per_peer=8 \
-    --num_tokens=204800 \
+    --num_tokens=20480 \
     --cpu_affinity=auto \
     --fill_test_data=false \
     --validate_data=false \
@@ -46,6 +46,7 @@ master_port="${MASTER_PORT:-29500}"
     --num_experts=128 \
     --top_k=8 \
     --router_seed=1234 \
+    --local_forwarding_rdma_overlap_enabled=true \
     --nvlink_forward_notification_flush_per_entry_enabled=false \
     --sequential_peer_transfers=true \
     --nvlink_forwarding_enabled=true \
@@ -53,6 +54,15 @@ master_port="${MASTER_PORT:-29500}"
     --nvlink_forward_use_batch_api=true \
     --nvlink_forward_synchronize_batches=true \
     --nvlink_forward_completion_notifications_enabled=true \
+    --nvlink_forward_preparation_enabled=true \
+    --nvlink_forward_prepared_batch_chunks=64 \
+    --nvlink_forward_submit_epilogue_enabled=true \
+    --nvlink_forward_prepared_atomic_ring_enabled=true \
+    --nvlink_forward_completion_mode=stream_sync \
+    --nvlink_forward_prepared_queue_depth=16 \
+    --nvlink_forward_ping_pong2_enabled=false \
+    --nvlink_forward_local_staging_prepared_enabled=true \
+    --nvlink_forward_prepared_nvtx_enabled=false \
     --nvlink_forward_notification_log_enabled=false \
     --nvlink_forward_notification_flush_only_enabled=false \
     --nvlink_forward_local_batch_sync_enabled=true \
@@ -64,11 +74,11 @@ master_port="${MASTER_PORT:-29500}"
     --concurrent-kernel \
     --grouped-gemm-m-tile=128 \
     --grouped-gemm-n-tile=128 \
-    --grouped-gemm-output-dimension=2048 \
+    --grouped-gemm-output-dimension=512 \
     --grouped-gemm-cluster-m=2 \
     --grouped-gemm-max-swizzle-size=8 \
     --grouped-gemm-activation=swiglu \
-    --down-projection2 --down-sm-count=40 --local-gpu-combine \
+    --down-projection2 --down-sm-count=70 --local-gpu-combine \
     --down-n-tile-major-output --down-tile-m=128 --down-tile-n=128 \
     --down-pingpong --down-gather-table --down-gather-table-expert-waves \
     --down-max-swizzle-size=1 --down-gather-table-wave-barrier \
@@ -79,13 +89,13 @@ master_port="${MASTER_PORT:-29500}"
     --nvlink_return_completion_notifications_enabled=true \
     --nvlink_return_ready_gpu_publication_enabled=true \
     --intra-node-combine \
+    --intra-node-combine-ctas=8 \
+    --intra-node-combine-n-tile-major-output \
     --check-intra-node-combine \
     --intra-node-combine-publish-ready \
+    --rdma-return-token-results \
+    --check-rdma-return-token-results \
+    --inter-node-combine \
+    --inter-node-combine-ctas=78 \
+    --check-inter-node-combine \
     "$@"
-
-
-    # --down-projection2 \
-    # --down-tile-m=128 --down-tile-n=128 \
-    # --down-pingpong --down-gather-table --down-gather-table-expert-waves \
-    # --down-max-swizzle-size=1 --down-gather-table-wave-barrier \
-    # --down-epilogue-store bulk_rows_reduce \

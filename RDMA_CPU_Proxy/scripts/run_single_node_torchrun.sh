@@ -76,7 +76,7 @@ master_port="${MASTER_PORT:-29500}"
     --grouped-gemm-cluster-m=2 \
     --grouped-gemm-max-swizzle-size=8 \
     --grouped-gemm-activation=swiglu \
-    --down-projection2 --down-sm-count=40 --local-gpu-combine \
+    --down-projection2 --down-sm-count=74 --local-gpu-combine \
     --down-n-tile-major-output --down-tile-m=128 --down-tile-n=128 \
     --down-pingpong --down-gather-table --down-gather-table-expert-waves \
     --down-max-swizzle-size=1 --down-gather-table-wave-barrier \
@@ -87,22 +87,10 @@ master_port="${MASTER_PORT:-29500}"
     --nvlink_return_completion_notifications_enabled=true \
     --nvlink_return_ready_gpu_publication_enabled=true \
     --intra-node-combine \
+    --intra-node-combine-n-tile-major-output \
     --check-intra-node-combine \
     --intra-node-combine-publish-ready \
+    --inter-node-combine \
+    --inter-node-combine-ctas=40 \
+    --check-inter-node-combine \
     "$@"
-
-
-    # --down-projection2 \
-    # --down-tile-m=128 --down-tile-n=128 \
-    # --down-pingpong --down-gather-table --down-gather-table-expert-waves \
-    # --down-max-swizzle-size=1 --down-gather-table-wave-barrier \
-    # --down-epilogue-store bulk_rows_reduce \
-
-    # --concurrent-kernel --grouped-gemm-activation=swiglu \
-    # --down-projection2 --local-gpu-combine \
-    # --down-n-tile-major-output --down-tile-m=128 --down-tile-n=128 \
-    # --down-pingpong --down-gather-table --down-gather-table-expert-waves \
-    # --down-max-swizzle-size=1 --down-gather-table-wave-barrier \
-    # --down-gather-table-publish-ready \
-    # --return-token-results --return-token-results-per-group \
-    # --check-return-token-results
