@@ -569,7 +569,8 @@ torchrun executable. Use a fixed node count and `--max_restarts=0`; the proxy's
 peer connections and synchronization barriers assume fixed membership.
 
 With router routing enabled, real (non-mock) runs log initialization metadata
-exchange timings at INFO level, once per GPU and exchange phase:
+exchange timings at INFO level during shutdown, after that worker's iteration
+results, once per GPU and exchange phase:
 
 ```text
 router metadata exchange: node=0 gpu=0 phase=expert_all_to_all peers=15 elapsed_ms=<measured milliseconds>

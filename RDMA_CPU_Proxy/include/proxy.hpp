@@ -190,7 +190,7 @@ private:
     uint64_t calibration_barrier_sequence_{0};
     std::chrono::steady_clock::time_point calibration_deadline_;
     RouterX3Metadata exchange_router_receive_metadata(
-        const PeerAddress& peer_addr) const;
+        const PeerAddress& peer_addr);
     void exchange_router_expert_metadata_all_to_all();
     void synchronize_peer_ready(const PeerAddress& peer_addr, const PeerState& peer) const;
     void initialize_local_iteration_sync();
@@ -402,6 +402,7 @@ private:
     std::mutex nvlink_forward_notification_log_mutex_;
     std::deque<std::string> nvlink_forward_notification_log_queue_;
     std::vector<double> rdma_iteration_bandwidth_gbps_;
+    std::vector<std::string> metadata_exchange_reports_;
     bool iteration_prepared_{false};
     uint64_t prepared_iteration_{0};
     LocalIterationSyncHeader* local_iteration_sync_header_{nullptr};

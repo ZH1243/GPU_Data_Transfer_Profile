@@ -447,6 +447,7 @@ void Proxy::initialize() {
     RDMA_PROXY_LOG_INFO("initializing proxy: ", config_summary(config_));
 
     rdma_iteration_bandwidth_gbps_.clear();
+    metadata_exchange_reports_.clear();
     initialize_local_iteration_sync();
     router_routing_.initialize();
     cuda_buffers_.initialize();
@@ -729,6 +730,12 @@ void Proxy::shutdown() {
     rdma_qp_calibration_complete_ = false;
     calibration_barrier_sequence_ = 0;
     initialized_ = false;
+    // The Python worker prints its iteration results before shutting down.
+    // Clear after reporting so the destructor's second shutdown is silent.
+    for (const auto& report : metadata_exchange_reports_) {
+        RDMA_PROXY_LOG_INFO(report);
+    }
+    metadata_exchange_reports_.clear();
     check_forwarding_error();
 }
 
@@ -1008,7 +1015,7 @@ void Proxy::calibrate_rdma_qps() {
 }
 
 RouterX3Metadata Proxy::exchange_router_receive_metadata(
-    const PeerAddress& peer_addr) const {
+    const PeerAddress& peer_addr) {
     const auto exchange_start = std::chrono::steady_clock::now();
     RouterX3Metadata local;
     local.source_node_rank = config_.node_rank;
@@ -1050,11 +1057,12 @@ RouterX3Metadata Proxy::exchange_router_receive_metadata(
     const double exchange_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - exchange_start).count();
     if (!config_.mock_mode) {
-        RDMA_PROXY_LOG_INFO(
-            "router metadata exchange: node=", config_.node_rank,
-            " gpu=", config_.local_gpu_index,
-            " phase=x3_x4 peer_node=", peer_addr.node_rank,
-            " elapsed_ms=", std::fixed, std::setprecision(4), exchange_ms);
+        std::ostringstream report;
+        report << "router metadata exchange: node=" << config_.node_rank
+               << " gpu=" << config_.local_gpu_index
+               << " phase=x3_x4 peer_node=" << peer_addr.node_rank
+               << " elapsed_ms=" << std::fixed << std::setprecision(4) << exchange_ms;
+        metadata_exchange_reports_.push_back(report.str());
     }
     RDMA_PROXY_LOG_INFO(
         "received router x3/x4 metadata peer=", peer_addr.node_rank,
@@ -1213,11 +1221,12 @@ void Proxy::exchange_router_expert_metadata_all_to_all() {
     }
     const double exchange_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - exchange_start).count();
-    RDMA_PROXY_LOG_INFO(
-        "router metadata exchange: node=", config_.node_rank,
-        " gpu=", config_.local_gpu_index,
-        " phase=expert_all_to_all peers=", total_gpus - 1,
-        " elapsed_ms=", std::fixed, std::setprecision(4), exchange_ms);
+    std::ostringstream report;
+    report << "router metadata exchange: node=" << config_.node_rank
+           << " gpu=" << config_.local_gpu_index
+           << " phase=expert_all_to_all peers=" << total_gpus - 1
+           << " elapsed_ms=" << std::fixed << std::setprecision(4) << exchange_ms;
+    metadata_exchange_reports_.push_back(report.str());
 }
 
 void Proxy::synchronize_peer_ready(const PeerAddress& peer_addr, const PeerState& peer) const {
