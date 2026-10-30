@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <functional>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <random>
@@ -1008,6 +1009,7 @@ void Proxy::calibrate_rdma_qps() {
 
 RouterX3Metadata Proxy::exchange_router_receive_metadata(
     const PeerAddress& peer_addr) const {
+    const auto exchange_start = std::chrono::steady_clock::now();
     RouterX3Metadata local;
     local.source_node_rank = config_.node_rank;
     local.destination_node_rank = peer_addr.node_rank;
@@ -1045,6 +1047,15 @@ RouterX3Metadata Proxy::exchange_router_receive_metadata(
         remote.tokens_per_chunk != config_.tokens_per_chunk) {
         throw std::runtime_error("router x3/x4 TCP metadata tensor/chunk configuration mismatch");
     }
+    const double exchange_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - exchange_start).count();
+    if (!config_.mock_mode) {
+        RDMA_PROXY_LOG_INFO(
+            "router metadata exchange: node=", config_.node_rank,
+            " gpu=", config_.local_gpu_index,
+            " phase=x3_x4 peer_node=", peer_addr.node_rank,
+            " elapsed_ms=", std::fixed, std::setprecision(4), exchange_ms);
+    }
     RDMA_PROXY_LOG_INFO(
         "received router x3/x4 metadata peer=", peer_addr.node_rank,
         " routed_tokens=", remote.token_indices.size(),
@@ -1055,6 +1066,7 @@ RouterX3Metadata Proxy::exchange_router_receive_metadata(
 
 void Proxy::exchange_router_expert_metadata_all_to_all() {
     if (!config_.router_routing_enabled || !config_.nvlink_forwarding_enabled) return;
+    const auto exchange_start = std::chrono::steady_clock::now();
 
     const auto maximum_index_count = config_.num_tokens *
         static_cast<std::size_t>(config_.router_top_k);
@@ -1199,6 +1211,13 @@ void Proxy::exchange_router_expert_metadata_all_to_all() {
             " indices=", remote.expert_token_indices.size());
         install(std::move(remote));
     }
+    const double exchange_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - exchange_start).count();
+    RDMA_PROXY_LOG_INFO(
+        "router metadata exchange: node=", config_.node_rank,
+        " gpu=", config_.local_gpu_index,
+        " phase=expert_all_to_all peers=", total_gpus - 1,
+        " elapsed_ms=", std::fixed, std::setprecision(4), exchange_ms);
 }
 
 void Proxy::synchronize_peer_ready(const PeerAddress& peer_addr, const PeerState& peer) const {

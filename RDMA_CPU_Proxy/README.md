@@ -568,6 +568,23 @@ than `RDMA_CPU_Proxy/build-hopper`, or `TORCHRUN_BIN` to select a different
 torchrun executable. Use a fixed node count and `--max_restarts=0`; the proxy's
 peer connections and synchronization barriers assume fixed membership.
 
+With router routing enabled, real (non-mock) runs log initialization metadata
+exchange timings at INFO level, once per GPU and exchange phase:
+
+```text
+router metadata exchange: node=0 gpu=0 phase=expert_all_to_all peers=15 elapsed_ms=<measured milliseconds>
+router metadata exchange: node=0 gpu=0 phase=x3_x4 peer_node=1 elapsed_ms=<measured milliseconds>
+```
+
+These are local CPU wall-clock durations measured with `steady_clock`. They
+include message preparation, serialization, TCP transfer and peer startup
+waiting, deserialization, and validation. The expert phase also includes
+metadata installation and any scheduler initialization it triggers. They
+exclude the earlier router kernels and GPU-to-host metadata copies, and do
+not contribute to the per-iteration GEMM timing. In the two-node test, adding
+the two durations gives that proxy's time spent in the metadata exchange
+functions; timings are not aggregated across GPUs.
+
 ### Python-controlled concurrent kernel
 
 Pass `--concurrent-kernel` to opt into a Python-controlled iteration loop:
