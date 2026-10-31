@@ -16,6 +16,76 @@ one position on that GPU.  Lists preserve input token order.
 
 ## Run
 
+### Standalone reproduction of the RDMA two-node metadata workload
+
+This benchmark needs **one CUDA GPU**, a CUDA toolkit, and a host C++ compiler.
+It does not need PyTorch, RDMA, a NIC, or a second node. Run it on the remote
+Hopper machine, not the local Mac:
+
+```bash
+bash get_expert_token_idx_list_gpu/build_rdma_metadata_benchmark.sh
+get_expert_token_idx_list_gpu/build/benchmark_rdma_metadata
+```
+
+Defaults match `RDMA_CPU_Proxy/scripts/run_node{0,1}_torchrun.sh`: 20,480 tokens,
+128 experts, top-k 8, two logical nodes, eight logical GPUs per node, eight
+experts per GPU, and seed 1234. `--device 0` selects the physical CUDA device;
+`--local-gpu-id 0` independently selects the logical source GPU (0 through 7).
+The 4,096-element token payload and 32-token RDMA chunks do not enter these
+metadata kernels; their internal chunk size is 256 tokens.
+
+The executable links the existing CUDA source in standalone mode and calls
+the **same raw six-kernel API on the default stream** as `RouterRouting`.
+It generates R once, allocates scratch once, and validates all meaningful
+outputs against an independent CPU reference before and after benchmarking.
+No production kernel or launch wrapper is modified. Build flags are `-O3`
+and `-lineinfo` with `sm_90`; use the same optimization/architecture settings
+in the proxy build when comparing results. `NVCC`, `CUDA_ARCH`, and
+`RDMA_METADATA_BUILD_DIR` can override the compiler, target, and output path.
+
+The default run reports a first-call measurement separately, then min,
+median, mean, p95, and max over 200 samples after 20 warmup calls. Each sample
+uses CUDA events around one complete six-kernel call and synchronizes after
+the ending event. It excludes R generation, allocations, D2H copies, and
+validation. The event span includes submission gaps and boundary event
+overhead, so it approximates, but is not identical to, Nsight's interval
+from the first kernel's start to the last kernel's end. The first call is
+not a full cold-process measurement: CUDA initialization and R generation
+have already run. Warm repetitions reuse cached data and do not reproduce
+the full proxy's CPU/GPU contention or initialization environment.
+
+For individual kernel durations and exact timeline gaps, capture the
+uninstrumented six-kernel chain with Nsight Systems:
+
+```bash
+nsys profile --trace=cuda --sample=none \
+  --capture-range=cudaProfilerApi --capture-range-end=stop \
+  -o rdma_metadata \
+  get_expert_token_idx_list_gpu/build/benchmark_rdma_metadata \
+  --profile --warmup 20 --iters 20
+nsys stats --report cuda_gpu_kern_sum,cuda_api_sum rdma_metadata.nsys-rep
+```
+
+The capture excludes generation, validation, and warmup. There are no events
+between kernels or calls in profile mode; a final synchronization drains
+the captured work. Each call contains the following six kernels, in order:
+
+1. `count_node_input_chunks_kernel`
+2. `scan_node_input_counts_kernel`
+3. `build_node_token_indices_kernel<8>`
+4. `count_reordered_node_chunks_kernel`
+5. `scan_reordered_node_counts_kernel`
+6. `scatter_reordered_chunks_kernel<8>`
+
+Use `cuda_gpu_kern_sum` for per-kernel averages. In the GUI, for each group
+of six, measure `last.end - first.start`; subtract the sum of the six kernel
+durations to obtain the five internal gaps. Do not include gaps between
+calls. `--profile --iters 1` isolates one warm chain. Profiling can perturb
+short timings; compare with an unprofiled event run. This benchmark measures
+local metadata generation, not RDMA/NVLink, metadata exchange, or GEMM.
+
+### Python driver
+
 PyTorch with CUDA and a CUDA toolkit are required.  The extension is compiled
 for Hopper (`sm_90`) by default.
 
