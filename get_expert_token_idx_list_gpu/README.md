@@ -106,8 +106,14 @@ two logical nodes, eight logical GPUs/node, seed 1234. `--local-gpu-id` selects
 mask ordering independently of `--device`. This first implementation specializes
 to that topology; `--tokens`, `--seed`, and `--local-gpu-id` are configurable.
 Inputs must contain eight **distinct** expert IDs in `[0,128)` per token.
-The synthetic R generator runs on the CPU outside timing and reproduces the
-existing CUDA generator's affine-permutation algorithm exactly.
+Before every warmup and measured invocation, a CuTe GPU generator overwrites
+the same R allocation with fresh routes. Its runtime seed advances by one
+(with uint64 wraparound), without recompilation or recapture. It reproduces
+the existing CUDA generator's affine-permutation algorithm; a CPU generator
+checks it during setup, including seed-wrap cases. Eager and graph modes use
+identical seed sequences for comparison. The initial call uses `--seed`;
+warmups use `seed+1..seed+warmup`, and measured calls start at
+`seed+warmup+1`. This preserves shape and device address while changing data.
 
 The six kernels are:
 
@@ -136,7 +142,12 @@ By default the benchmark reports **eager** and **graph** timings separately:
   host submission overhead; graph replay does not fuse kernels.
 
 Both modes warm up and validate every meaningful output against the existing
-CPU reference. CUDA-event spans include internal gaps and boundary event
+CPU reference after their final invocation; the first invocation is also
+checked. On the same CUDA stream, each timed sample enqueues input generation,
+then the start event, metadata processing, and the end event. Generation is
+excluded from elapsed time but can affect cache state, as a preceding router
+would. The metadata-only graph reads fresh R on every replay. CUDA-event spans
+include internal gaps and boundary event
 overhead. Compare kernel durations in nsys to distinguish implementation cost
 from host submission cost; eager-versus-graph timing is not a direct
 language-performance comparison. First execution is reported **after JIT**,
@@ -166,6 +177,11 @@ nsys stats --report cuda_gpu_kern_sum,cuda_api_sum metadata_cute_eager.nsys-rep
 ```
 
 Choose `--mode graph` and a different output name to profile graph replay.
+The CuTe profiling capture includes one `generate_routes` kernel before each
+six-kernel metadata chain. Exclude that generator and the gap before the first
+metadata kernel when computing metadata-only durations. The event benchmark
+already excludes generation. Compilation, correctness checks, and warmup are
+outside the capture.
 For library use, construct `MetadataPlan(r, local_gpu_id)`, then call
 `plan.launch(stream)` on an ordered stream. Outputs are `plan.x3`, `plan.x4`,
 `plan.node_offsets`, `plan.expert_offsets`, and `plan.expert_token_indices`.

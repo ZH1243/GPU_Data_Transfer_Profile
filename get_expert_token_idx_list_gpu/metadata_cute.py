@@ -15,6 +15,43 @@ from cutlass.cute.runtime import from_dlpack
 
 
 @cute.jit
+def _splitmix64(value: cutlass.Uint64):
+    value += cutlass.Uint64(0x9E3779B97F4A7C15)
+    value = (value ^ (value >> 30)) * cutlass.Uint64(0xBF58476D1CE4E5B9)
+    value = (value ^ (value >> 27)) * cutlass.Uint64(0x94D049BB133111EB)
+    return value ^ (value >> 31)
+
+
+class RouteGenerator:
+    """GPU input generator; seed is a runtime scalar, not a JIT specialization.
+
+    Matches generate_r_kernel for 128 experts/top-k 8. A stride coprime to
+    128 is odd, so rounding an even candidate up replaces the GCD loop.
+    """
+
+    @cute.jit
+    def __call__(self, r: cute.Tensor, seed: cutlass.Uint64, stream: cuda.CUstream):
+        self.generate_routes(r, seed).launch(
+            grid=(cute.ceil_div(r.shape[0], 256), 1, 1),
+            block=(256, 1, 1), stream=stream)
+
+    @cute.kernel
+    def generate_routes(self, r: cute.Tensor, seed: cutlass.Uint64):
+        thread, _, _ = cute.arch.thread_idx()
+        block, _, _ = cute.arch.block_idx()
+        token = block * 256 + thread
+        if token < r.shape[0]:
+            first = _splitmix64(seed ^ cutlass.Uint64(token))
+            second = _splitmix64(first)
+            start = cutlass.Int32(first % cutlass.Uint64(128))
+            stride = cutlass.Int32(second % cutlass.Uint64(127)) + 1
+            if stride % 2 == 0:
+                stride += 1
+            for k in cutlass.range_constexpr(8):
+                r[token, k] = (start + k * stride) % 128
+
+
+@cute.jit
 def _warp_scan(value: cutlass.Int32, lane: cutlass.Int32):
     for shift in cutlass.range_constexpr(5):
         other = cute.arch.shuffle_sync_up(value, offset=1 << shift, mask_and_clamp=0)

@@ -7,6 +7,10 @@ import statistics
 import time
 
 
+def iteration_seed(base, iteration):
+    return (base + iteration) & ((1 << 64) - 1)
+
+
 def make_routes(tokens, seed=1234, pattern="affine"):
     """CPU input setup, bit-identical to generate_r_kernel for 128 experts.
 
@@ -86,7 +90,7 @@ def main():
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--mode", choices=("eager", "graph", "both"), default="both")
     parser.add_argument("--profile", action="store_true",
-                        help="capture only warm launches via cudaProfilerStart/Stop")
+                        help="capture warm R generation + metadata calls via cudaProfilerStart/Stop")
     parser.add_argument("--compare-cuda", action="store_true",
                         help="also build the existing CUDA extension and compare outputs on identical R")
     parser.add_argument("--check-suite", action="store_true",
@@ -100,7 +104,11 @@ def main():
         parser.error("choose --mode eager or --mode graph when using --profile")
 
     import torch
-    from metadata_cute import MetadataPlan
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+    from metadata_cute import MetadataPlan, RouteGenerator
 
     if not torch.cuda.is_available():
         raise RuntimeError("Run this benchmark on a CUDA GPU, not the local Mac")
@@ -114,19 +122,36 @@ def main():
     r = torch.tensor(make_routes(args.tokens, args.seed), dtype=torch.int32, device=device)
     start = time.perf_counter()
     plan = MetadataPlan(r, args.local_gpu_id)
+    r_argument = from_dlpack(r)
+    stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
+    generator = cute.compile(RouteGenerator(), r_argument, cutlass.Uint64(args.seed), stream)
+
+    def update_r(seed):
+        generator(r_argument, cutlass.Uint64(seed), stream)
+
+    # Check the GPU generator against the independent CPU implementation,
+    # including uint64 seed wraparound, before relying on it for measurements.
+    for seed in (args.seed, iteration_seed(args.seed, 1), (1 << 64) - 1, 0):
+        update_r(seed)
+        expected_r = torch.tensor(make_routes(args.tokens, seed), dtype=torch.int32)
+        if not torch.equal(r.cpu(), expected_r):
+            raise AssertionError(f"CuTe route generator mismatch for seed={seed}")
     torch.cuda.synchronize(device)
     print(f"Validation/allocation/JIT setup: {time.perf_counter() - start:.3f} s (excluded)")
     begin = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
 
-    def sample(launch):
+    def sample(launch, seed):
+        # Same stream orders generator -> start event -> metadata -> end event.
+        # R keeps its address/shape; generation is excluded from elapsed time.
+        update_r(seed)
         begin.record()
         launch()
         end.record()
         end.synchronize()
         return begin.elapsed_time(end) * 1000.0
 
-    first = sample(plan.launch)
+    first = sample(plan.launch, args.seed)
     plan.check()
     print(f"CPU reference: PASS; first execution after JIT: {first:.3f} us")
 
@@ -151,7 +176,8 @@ def main():
                 raise AssertionError(f"CUDA C++ comparison failed for output {i}")
         print("CUDA C++ generator and all five metadata outputs: PASS")
 
-    for _ in range(args.warmup):
+    for i in range(args.warmup):
+        update_r(iteration_seed(args.seed, i + 1))
         plan.launch()
     torch.cuda.synchronize(device)
     graph = None
@@ -159,6 +185,7 @@ def main():
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             plan.launch()
+        update_r(iteration_seed(args.seed, args.warmup + 1))
         graph.replay()
         torch.cuda.synchronize(device)
         plan.check()
@@ -169,23 +196,30 @@ def main():
     if graph is not None:
         launchers.append(("graph", graph.replay))
     for mode, launch in launchers:
-        for _ in range(args.warmup):
+        # Both modes see identical seed sequences for a paired comparison.
+        for i in range(args.warmup):
+            update_r(iteration_seed(args.seed, i + 1))
             launch()
         torch.cuda.synchronize(device)
         if args.profile:
             torch.cuda.profiler.start()
-            for _ in range(args.iters):
+            for i in range(args.iters):
+                update_r(iteration_seed(args.seed, args.warmup + 1 + i))
                 launch()
             torch.cuda.synchronize(device)
             torch.cuda.profiler.stop()
-            print(f"Captured {args.iters} {mode} six-kernel calls; see nsys for durations/gaps")
+            print(f"Captured {args.iters} {mode} calls, each with fresh-R generation then "
+                  "six metadata kernels; exclude generate_routes when reading metadata timings")
         else:
-            times = sorted(sample(launch) for _ in range(args.iters))
+            times = sorted(sample(launch, iteration_seed(args.seed, args.warmup + 1 + i))
+                           for i in range(args.iters))
             print(f"{mode}: min={times[0]:.3f} median={statistics.median(times):.3f} "
                   f"mean={statistics.mean(times):.3f} p95={times[int(.95*(len(times)-1))]:.3f} "
                   f"max={times[-1]:.3f} us ({args.iters} samples)")
         plan.check()
-    print("Timings exclude JIT, allocation, input generation, and CPU checks. "
+    print("Fresh GPU-generated R before every warmup/measured invocation; fixed shape/address. "
+          "Eager and graph modes use the same seed sequence. "
+          "Timings exclude JIT, allocation, input generation, and CPU checks. "
           "Event spans include submission gaps and event-boundary overhead. "
           "Graph replay still executes six separate kernels.")
     if args.check_suite:

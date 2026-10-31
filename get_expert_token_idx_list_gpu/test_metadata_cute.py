@@ -6,7 +6,7 @@ These tests need neither PyTorch nor CUDA and do not claim to compile/test DSL.
 import random
 import unittest
 
-from benchmark_metadata_cute import make_routes
+from benchmark_metadata_cute import iteration_seed, make_routes
 
 
 def bitmap_positions(groups):
@@ -25,6 +25,17 @@ def bitmap_positions(groups):
 
 
 class MetadataContracts(unittest.TestCase):
+    def test_fresh_routes_keep_shape_and_wrap_seed(self):
+        previous = None
+        for i in range(4):
+            seed = iteration_seed((1 << 64) - 2, i)
+            self.assertEqual(seed, ((1 << 64) - 2, (1 << 64) - 1, 0, 1)[i])
+            routes = make_routes(33, seed)
+            self.assertEqual(len(routes), 33)
+            self.assertTrue(all(len(row) == 8 for row in routes))
+            self.assertNotEqual(routes, previous)
+            previous = routes
+
     def test_bitmap_stability_at_warp_and_chunk_boundaries(self):
         rng = random.Random(1234)
         for length in (1, 31, 32, 33, 255, 256):
