@@ -84,7 +84,103 @@ calls. `--profile --iters 1` isolates one warm chain. Profiling can perturb
 short timings; compare with an unprofiled event run. This benchmark measures
 local metadata generation, not RDMA/NVLink, metadata exchange, or GEMM.
 
-### Python driver
+### CuTe DSL metadata implementation (single GPU)
+
+`metadata_cute.py` implements the metadata pipeline in Python CuTe DSL. It
+does not modify the CUDA C++ kernels or integrate with the RDMA proxy yet.
+Use the remote environment that runs the existing CuTe GEMM/combine kernels:
+CUDA-enabled PyTorch, `cuda-python` (`cuda.bindings.driver`), and NVIDIA
+`nvidia-cutlass-dsl`. The implementation uses `cute.arch.atomic_or`,
+`atomic_add`, `popc`, shuffle operations, and `cutlass.utils.SmemAllocator`;
+these APIs are documented in the
+[CUTLASS 4.8 CuTe arch reference](https://docs.nvidia.com/cutlass/4.8.0/media/docs/pythonDSL/cute_dsl_api/cute_arch.html).
+No QuACK checkout is required. GPU JIT compilation and execution must be
+validated on the remote machine; local syntax/host tests are not GPU validation.
+
+```bash
+python get_expert_token_idx_list_gpu/benchmark_metadata_cute.py --device 0
+```
+
+Defaults match the standalone benchmark: `T=20480`, 128 experts, top-k eight,
+two logical nodes, eight logical GPUs/node, seed 1234. `--local-gpu-id` selects
+mask ordering independently of `--device`. This first implementation specializes
+to that topology; `--tokens`, `--seed`, and `--local-gpu-id` are configurable.
+Inputs must contain eight **distinct** expert IDs in `[0,128)` per token.
+The synthetic R generator runs on the CPU outside timing and reproduces the
+existing CUDA generator's affine-permutation algorithm exactly.
+
+The six kernels are:
+
+| CuTe kernel | Work |
+|---|---|
+| `count_input` | Cache two masks/token; count experts; build per-mask warp bitmaps |
+| `scan_input` | Chunk prefixes, expert offsets, descending mask/node offsets |
+| `build_node_indices` | Stable x3/x4 scatter using bitmap population-count ranks |
+| `count_reordered` | Build expert/GPU bitmaps and counts in reordered x3 order |
+| `scan_reordered` | Parallel prefix over chunks, one warp per expert/GPU bin |
+| `scatter_experts` | Stable expert lists with direct/compact input indexing |
+
+This is a six-kernel implementation, not a fused kernel or a line-by-line
+translation of CUB sorting. Bitmap ranks remove the local radix sorts at the
+cost of extra scratch traffic. The first scan still uses one CTA, but its
+expert and mask offset scans are parallel block scans. The second scan uses
+18 CTAs. There is no assumption that CuTe alone makes the pipeline faster;
+measure on H20 before drawing performance conclusions.
+
+By default the benchmark reports **eager** and **graph** timings separately:
+
+- Eager: a compiled CuTe host entry launches all six kernels. CPU submission
+  overhead can differ from the standalone C++ benchmark.
+- Graph: replay the same six kernels through one CUDA Graph launch. Capture
+  and JIT costs are excluded. This isolates repeated execution with reduced
+  host submission overhead; graph replay does not fuse kernels.
+
+Both modes warm up and validate every meaningful output against the existing
+CPU reference. CUDA-event spans include internal gaps and boundary event
+overhead. Compare kernel durations in nsys to distinguish implementation cost
+from host submission cost; eager-versus-graph timing is not a direct
+language-performance comparison. First execution is reported **after JIT**,
+so it is not equivalent to the standalone executable's first-use setup.
+
+For additional checks (extra specializations can take time to compile):
+
+```bash
+python get_expert_token_idx_list_gpu/benchmark_metadata_cute.py \
+  --device 0 --check-suite --compare-cuda
+```
+
+`--compare-cuda` additionally needs nvcc and the PyTorch extension build
+dependencies used by `run.py`. It compares the synthetic generator and all
+five metadata outputs with the existing CUDA implementation on the same R.
+`--check-suite` checks warp/chunk tails, empty destination nodes, hot experts,
+different mask rotations, non-affine random routing, and graph replay after
+changing R in place. These checks are outside all timed/captured regions.
+
+```bash
+nsys profile --trace=cuda --sample=none \
+  --capture-range=cudaProfilerApi --capture-range-end=stop \
+  -o metadata_cute_eager \
+  python get_expert_token_idx_list_gpu/benchmark_metadata_cute.py \
+  --device 0 --profile --mode eager --iters 20
+nsys stats --report cuda_gpu_kern_sum,cuda_api_sum metadata_cute_eager.nsys-rep
+```
+
+Choose `--mode graph` and a different output name to profile graph replay.
+For library use, construct `MetadataPlan(r, local_gpu_id)`, then call
+`plan.launch(stream)` on an ordered stream. Outputs are `plan.x3`, `plan.x4`,
+`plan.node_offsets`, `plan.expert_offsets`, and `plan.expert_token_indices`.
+Allocate/compile once; changing R in place is supported if its contract is
+preserved. One plan's scratch/output buffers cannot be used concurrently.
+Caller-provided streams must wait for any producer that updates R.
+
+Host-only contract tests (no CUDA/PyTorch dependency):
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
+  -s get_expert_token_idx_list_gpu -p 'test_metadata_cute.py'
+```
+
+### Original Python/CUDA C++ driver
 
 PyTorch with CUDA and a CUDA toolkit are required.  The extension is compiled
 for Hopper (`sm_90`) by default.
