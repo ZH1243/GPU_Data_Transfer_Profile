@@ -1962,3 +1962,31 @@ done
 `QUACK_ROOT` can supply the checkout path for the sweep. Standalone CTA counts
 can use SMs that the integrated test reserves for down GEMM; higher standalone
 performance does not imply the same improvement with concurrent computation.
+
+### Comparing readiness-polling implementations
+
+The production kernel now acquires input readiness once per thread per column
+ group when column-group output publication is enabled. All vectors in that
+ group use the acquired readiness; reduction order and completion publication
+ are unchanged. Modes without column-group publication retain per-vector polling.
+Cancellation is checked while waiting and during completion publication; an
+already acquired group can finish its finite payload work before cancellation
+is observed. Empty inputs still publish completion without waiting for payload.
+
+Compare both paths on the same Hopper GPU with identical synthetic inputs:
+
+```bash
+for ctas in 4 8; do
+  for polling in vector group; do
+    python scripts/benchmark_intra_node_combine.py \
+      --ctas "$ctas" --readiness-polling "$polling" --iterations 100 \
+      --json-output "results/combine_ctas${ctas}_${polling}.json"
+  done
+done
+```
+
+`group` is the new default; `vector` selects the original polling placement.
+This change does not yet implement domain-specific traversal or compact
+contributor metadata, allowing its effect to be measured independently.
+The opt-in `tests/test_intra_node_combine.py` GPU tests exercise both polling
+modes with delayed input readiness, cancellation, and repeated launches.

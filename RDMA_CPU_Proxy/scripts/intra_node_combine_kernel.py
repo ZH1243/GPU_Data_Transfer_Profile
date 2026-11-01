@@ -18,6 +18,7 @@ class RegisterIntraNodeKernel(_CombineKernel):
     """
 
     wait_for_inputs = True
+    poll_once_per_group = True
     publish_ready = False
     publish_rdma_ready = False
     source_tokens = None
@@ -53,6 +54,26 @@ class RegisterIntraNodeKernel(_CombineKernel):
                 first_vector = completed_group * self.group_tiles * vectors_per_tile
                 end_vector = cutlass.min(first_vector + self.group_tiles * vectors_per_tile,
                                         total_vectors)
+            group_cancelled = cutlass.Int32(0)
+            if cutlass.const_expr(self.wait_for_inputs and self.poll_once_per_group
+                                  and self.publish_ready and self.column_group_major):
+                # Every consuming thread performs its own system acquire. Once
+                # acquired, the entire group's payload is visible to that thread.
+                # Empty domains must still publish without waiting for payload.
+                if first_vector < end_vector:
+                    ready_ptr = cute.make_ptr(cutlass.Int32, ready_groups[0],
+                                              cute.AddressSpace.gmem, assumed_align=4)
+                    cancel_ptr = cute.make_ptr(cutlass.Int32, ready_groups[1],
+                                               cute.AddressSpace.gmem, assumed_align=4)
+                    ready = cute.arch.load(ready_ptr.llvm_ptr, cutlass.Int32,
+                                           sem="acquire", scope="sys")
+                    group_cancelled = cute.arch.load(cancel_ptr.llvm_ptr, cutlass.Int32,
+                                                     sem="acquire", scope="sys")
+                    while ready < completed_group + 1 and group_cancelled == 0:
+                        ready = cute.arch.load(ready_ptr.llvm_ptr, cutlass.Int32,
+                                               sem="acquire", scope="sys")
+                        group_cancelled = cute.arch.load(cancel_ptr.llvm_ptr, cutlass.Int32,
+                                                         sem="acquire", scope="sys")
             round_chunks = cute.ceil_div(end_vector - first_vector, self.threads_per_cta)
             for chunk in cutlass.range(block, round_chunks, self.num_ctas):
                 vector = first_vector + chunk * self.threads_per_cta + thread
@@ -69,8 +90,10 @@ class RegisterIntraNodeKernel(_CombineKernel):
                         column = (tile * self.tile_n
                                   + within_tile % groups_per_tile_row * (lanes * vec))
                     column += vector % lanes * 8
-                    cancelled = cutlass.Int32(0)
-                    if cutlass.const_expr(self.wait_for_inputs):
+                    cancelled = group_cancelled
+                    if cutlass.const_expr(self.wait_for_inputs and not (
+                            self.poll_once_per_group and self.publish_ready
+                            and self.column_group_major)):
                         ready_ptr = cute.make_ptr(cutlass.Int32, ready_groups[0],
                                                   cute.AddressSpace.gmem, assumed_align=4)
                         cancel_ptr = cute.make_ptr(cutlass.Int32, ready_groups[1],

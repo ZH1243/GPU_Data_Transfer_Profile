@@ -27,6 +27,8 @@ def parse_args():
     parser.add_argument('--threads', type=int, choices=(256, 512), default=512)
     parser.add_argument('--elements-per-thread', type=int, choices=(8, 16, 32, 64, 128), default=32)
     parser.add_argument('--prefetch-peers', type=int, choices=(1, 2, 4), default=4)
+    parser.add_argument('--readiness-polling', choices=('group', 'vector'), default='group',
+                        help='group: optimized acquisition; vector: original kernel baseline')
     parser.add_argument('--dtype', choices=('bfloat16', 'float16'), default='bfloat16')
     parser.add_argument('--warmup', type=int, default=10)
     parser.add_argument('--iterations', type=int, default=100)
@@ -120,6 +122,7 @@ def main():
     kernel.output_domains = domains
     kernel.group_tiles = args.group_tiles
     kernel.prefetch_peers = args.prefetch_peers
+    kernel.poll_once_per_group = args.readiness_polling == 'group'
     kernel.publish_ready = True
     kernel.publish_rdma_ready = not args.no_host_publication
     # Keep wait_for_inputs=True: the production acquire loads still execute.
@@ -186,7 +189,8 @@ def main():
                   output_GB_per_s=output_bytes / (median * 1e6),
                   effective_payload_GB_per_s=(input_bytes + output_bytes) / (median * 1e6),
                   samples_ms=samples, correctness='PASSED')
-    print(f'Correctness: PASSED; {total_rows} rows, {groups} column groups, {args.ctas} CTAs')
+    print(f'Correctness: PASSED; {total_rows} rows, {groups} column groups, {args.ctas} CTAs; '
+          f'readiness polling={args.readiness_polling}')
     print(f'Kernel latency: median={median:.4f} ms, min={min(samples):.4f} ms, '
           f'p95={result["latency_ms"]["p95"]:.4f} ms')
     print(f'Output rate: {result["output_GB_per_s"]:.2f} GB/s; '

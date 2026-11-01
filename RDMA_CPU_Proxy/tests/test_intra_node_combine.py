@@ -4,6 +4,7 @@ RDMA_PROXY_TEST_CUDA=1 QUACK_ROOT=/path/to/quack_for_communication_overlap \
 python -m unittest discover -s RDMA_CPU_Proxy/tests -p test_intra_node_combine.py -v
 """
 import os
+from itertools import product
 from pathlib import Path
 import sys
 import time
@@ -49,11 +50,12 @@ class KernelTests(unittest.TestCase):
         if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
             self.skipTest("requires SM90")
         width, tile, tokens = 512, 128, 56
-        for group_tiles in (1, 2, 3):
+        for group_tiles, poll_once in product((1, 2, 3), (False, True)):
             for dtype in (torch.bfloat16, torch.float16):
                 for tiled in (False, True):
                     for publish in (False, True):
-                        with self.subTest(group_tiles=group_tiles, dtype=dtype, tiled=tiled, publish=publish):
+                        with self.subTest(group_tiles=group_tiles, dtype=dtype, tiled=tiled,
+                                          publish=publish, poll_once=poll_once):
                             # Two original-source domains, each reduced over eight GPUs.
                             masks = [[1 + ((row * 37) % 127) for row in range(37)],
                                      [128 if row % 2 else 3 for row in range(19)]]
@@ -86,6 +88,7 @@ class KernelTests(unittest.TestCase):
                             stream = torch.cuda.Stream()
                             kernel = RegisterIntraNodeKernel(counts, width, tile, 4, 32, 512, True, tile if tiled else 0)
                             kernel.publish_ready = publish
+                            kernel.poll_once_per_group = poll_once
                             kernel.publish_rdma_ready = publish
                             kernel.output_domains = ((0, 37), (37, 0), (37, 19))
                             kernel.group_tiles, kernel.prefetch_peers, kernel.lanes_per_group = group_tiles, 4, 4
