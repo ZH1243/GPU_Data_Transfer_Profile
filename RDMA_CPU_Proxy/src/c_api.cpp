@@ -126,6 +126,21 @@ extern "C" int rdma_proxy_abi_version(void) {
     return 1;
 }
 
+extern "C" int rdma_proxy_configure_cpu_scatter(
+    RdmaProxyHandle* handle, const RdmaProxyCpuScatterConfig* config) {
+    clear_error();
+    try {
+        if (!handle || !config || !handle->initialized || handle->shut_down ||
+            handle->finished || handle->next_iteration != 0)
+            throw std::runtime_error("CPU scatter must be configured before iteration zero");
+        select_proxy_cuda_device(*handle);
+        handle->proxy.configure_cpu_scatter(*config);
+        return 0;
+    } catch (...) {
+        return record_current_exception();
+    }
+}
+
 extern "C" RdmaProxyHandle* rdma_proxy_create(
     int argc,
     const char* const* argv) {

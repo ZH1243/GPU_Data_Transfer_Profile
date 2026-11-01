@@ -101,6 +101,12 @@ target_link_libraries(rdma_cpu_proxy_shared PRIVATE rdma_cpu_proxy_lib)
 if(RDMA_PROXY_BUILD_TESTS)
   enable_testing()
 
+  add_executable(test_cpu_scatter tests/test_cpu_scatter.cpp)
+  target_link_libraries(test_cpu_scatter PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_cpu_scatter COMMAND test_cpu_scatter)
+  add_test(NAME test_cpu_scatter_cuda COMMAND test_cpu_scatter --cuda)
+  set_tests_properties(test_cpu_scatter_cuda PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+
   add_executable(test_chunking tests/test_chunking.cpp)
   target_link_libraries(test_chunking PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_chunking COMMAND test_chunking)

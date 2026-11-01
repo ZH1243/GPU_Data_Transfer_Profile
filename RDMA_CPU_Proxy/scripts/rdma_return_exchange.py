@@ -36,6 +36,8 @@ class ReturnExchange:
         self.received = {}
         self.received_valid_rows = {}
         self.rows_host = torch.empty(len(self.outputs), dtype=torch.int64, pin_memory=True)
+        if getattr(down, "cpu_scatter_counts", None) is not None:
+            self.rows_host.copy_(down.cpu_scatter_counts)
         self.down_done = torch.cuda.Event()
         self.down_done.record()
         torch.cuda.synchronize(device)
@@ -138,7 +140,8 @@ class ReturnExchange:
     def publish_counts(self):
         # Called on the compute stream after mapping, before down GEMM. Seeing a
         # positive system-release ready prefix establishes that this D2H is done.
-        self.rows_host.copy_(self.down.combine_valid_rows, non_blocking=True)
+        if getattr(self.down, "cpu_scatter_counts", None) is None:
+            self.rows_host.copy_(self.down.combine_valid_rows, non_blocking=True)
 
     def arm(self, iteration):
         # The event must be recorded before C++ may query this generation.

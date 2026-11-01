@@ -579,6 +579,12 @@ std::size_t Proxy::router_computation_num_tokens() const {
     return cuda_buffers_.router_computation_num_tokens();
 }
 
+void Proxy::configure_cpu_scatter(const RdmaProxyCpuScatterConfig& config) {
+    if (!initialized_ || iteration_prepared_)
+        throw std::runtime_error("CPU scatter requires initialized idle proxy");
+    cuda_buffers_.configure_cpu_scatter(config);
+}
+
 uintptr_t Proxy::configure_down_ready_trace(int groups) {
     if (!initialized_ || iteration_prepared_ || !config_.router_routing_enabled ||
         !config_.nvlink_forward_completion_notifications_enabled ||

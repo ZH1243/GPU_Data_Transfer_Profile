@@ -454,6 +454,8 @@ class GroupedGemmRunner:
 
 
 def add_down_arguments(parser):
+    parser.add_argument("--cpu-scatter-preparation", action="store_true",
+                        help="prepare down scatter addresses in the CPU notification receiver; requires local GPU combine")
     parser.add_argument("--inter-node-combine", action="store_true",
                         help="combine node sums into original token order after local combine and any RDMA returns")
     parser.add_argument("--inter-node-combine-ctas", type=int, default=None,
@@ -515,6 +517,8 @@ def add_down_arguments(parser):
 
 
 def validate_down_arguments(args):
+    if args.cpu_scatter_preparation and not args.local_gpu_combine:
+        raise ValueError("--cpu-scatter-preparation requires --local-gpu-combine")
     if args.inter_node_combine_ctas is not None:
         if not args.inter_node_combine or args.inter_node_combine_ctas <= 0:
             raise ValueError("--inter-node-combine-ctas requires --inter-node-combine and a positive count")
@@ -700,6 +704,8 @@ class DownProjectionRunner:
                           hidden=hidden, output_dim=output_dim, activation=None,
                           down_projection=False, iterations=1, timing_samples=1, warmup=0)
         self.combine = options.local_gpu_combine
+        self.cpu_scatter = options.cpu_scatter_preparation
+        self.cpu_scatter_counts = None
         self.up = up
         self.routes = routes
         if self.combine:
@@ -814,6 +820,48 @@ class DownProjectionRunner:
         if self._trace_first_combine_launch:
             print(f"[gpu={self.up.cuda_device_id}] combine startup: {message}", flush=True)
 
+    def configure_cpu_scatter(self, library, handle):
+        """Register borrowed scatter storage after warmup, before iteration zero."""
+        class Config(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_uint64) for name in
+                        ("struct_size", "num_sources", "routes", "capacity", "width",
+                         "tile_n", "element_bytes")] + [
+                ("scatter_addresses", ctypes.c_size_t),
+                ("source_pairs", ctypes.POINTER(ctypes.c_int32)),
+                ("output_bases", ctypes.POINTER(ctypes.c_uint64)),
+                ("counts", ctypes.POINTER(ctypes.c_int64)),
+                ("output_to_input", ctypes.POINTER(ctypes.c_int64))]
+
+        try:
+            configure = library.rdma_proxy_configure_cpu_scatter
+        except AttributeError as error:
+            raise RuntimeError("--cpu-scatter-preparation requires rebuilding librdma_cpu_proxy") from error
+        configure.argtypes = [ctypes.c_void_p, ctypes.POINTER(Config)]
+        configure.restype = ctypes.c_int
+        torch = self.up.torch
+        sources = len(self.up.source_pairs)
+        pairs = (ctypes.c_int32 * (2 * sources))(
+            *(value for pair in self.up.source_pairs for value in pair))
+        bases = (ctypes.c_uint64 * sources)(
+            *(buffer.data_ptr() for buffer in self.inputs.output_buffers()))
+        counts = torch.empty(sources, dtype=torch.int64)
+        inverse = torch.empty((sources, self.combine_rows), dtype=torch.int64)
+        config = Config(ctypes.sizeof(Config), sources, self.routes, self.combine_rows,
+                        int(self.up.x_buffers[0].shape[1]), self.combine_tile_n or 0,
+                        self.up.output.element_size(), self.inputs.scatter_row_addresses.data_ptr(),
+                        pairs, bases,
+                        ctypes.cast(counts.data_ptr(), ctypes.POINTER(ctypes.c_int64)),
+                        ctypes.cast(inverse.data_ptr(), ctypes.POINTER(ctypes.c_int64)))
+        require_proxy_success(library, configure(handle, ctypes.byref(config)),
+                              "configuring CPU scatter preparation")
+        with torch.inference_mode():
+            self.combine_valid_rows.copy_(counts)
+            self.combine_output_to_input.copy_(inverse)
+        self.cpu_scatter_counts = counts
+        torch.cuda.synchronize(self.up.cuda_device_id)
+        print("CPU scatter preparation enabled: compact metadata fixed at setup; "
+              "scatter batches published before gather readiness", flush=True)
+
     def _prepare_combine(self, work_table, a_idx):
         mapping = local_combine_mapping(
             self.up.torch, work_table, a_idx,
@@ -846,7 +894,7 @@ class DownProjectionRunner:
             self.reset_start.record()
             self.inputs.zero_up_output()
             self.mapping_start.record()
-            if self.combine:
+            if self.combine and not self.cpu_scatter:
                 self._log_combine_startup("route mapping begin")
                 self._prepare_combine(self.up.work_table, self.up.a_idx)
             if self.return_exchange is not None:
@@ -1345,6 +1393,8 @@ def run_proxy_with_concurrent_kernel(
                 trace_configure=trace.configure if trace is not None else None)
             with torch.cuda.stream(kernel_stream):
                 down.warmup()
+            if down.cpu_scatter:
+                down.configure_cpu_scatter(library, handle)
             if down_options.return_token_results:
                 from rdma_return_exchange import ReturnExchange
                 return_exchange = ReturnExchange(

@@ -38,6 +38,7 @@ public:
     void record_router_computation_end(uint64_t iteration, uintptr_t cuda_stream);
     float router_computation_elapsed_ms(uint64_t iteration);
     std::size_t router_computation_num_tokens() const;
+    void configure_cpu_scatter(const RdmaProxyCpuScatterConfig& config);
     void finish_run();
     uintptr_t configure_down_ready_trace(int groups);
     std::vector<std::pair<int32_t, double>> read_down_ready_trace(uint64_t iteration);

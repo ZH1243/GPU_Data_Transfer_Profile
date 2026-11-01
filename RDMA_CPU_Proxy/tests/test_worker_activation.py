@@ -18,6 +18,14 @@ spec.loader.exec_module(worker)
 
 
 class ActivationCliTests(unittest.TestCase):
+    def test_cpu_scatter_cli(self):
+        self.assertNotEqual(self.run_cli("--cpu-scatter-preparation").returncode, 0)
+        result = self.run_cli("--cpu-scatter-preparation", "--concurrent-kernel",
+                              "--grouped-gemm-activation=swiglu", "--down-projection2",
+                              "--local-gpu-combine")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--cpu-scatter-preparation", result.stdout)
+
     def test_return_results_cli(self):
         common = ("--concurrent-kernel", "--grouped-gemm-activation=swiglu",
                   "--down-projection2", "--local-gpu-combine", "--down-pingpong",

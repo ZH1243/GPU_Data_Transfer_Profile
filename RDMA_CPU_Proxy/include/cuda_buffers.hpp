@@ -2,6 +2,7 @@
 
 #include "config.hpp"
 #include "protocol.hpp"
+#include "rdma_proxy_c_api.h"
 
 #if RDMA_PROXY_HAVE_CUDA
 #include <cuda_runtime_api.h>
@@ -210,6 +211,7 @@ public:
     void record_router_computation_end(uint64_t iteration, uintptr_t cuda_stream);
     float router_computation_elapsed_ms(uint64_t iteration);
     std::size_t router_computation_num_tokens() const;
+    void configure_cpu_scatter(const RdmaProxyCpuScatterConfig& config);
     void update_expert_token_heads(
         int source_node_rank,
         int source_gpu_index,
@@ -259,6 +261,12 @@ private:
         std::size_t table_bytes);
 
     ProxyConfig config_;
+    void publish_cpu_scatter_batch(const std::vector<int32_t>& ranges);
+    CpuPinnedBuffer cpu_scatter_staging_;
+    uintptr_t cpu_scatter_device_{0};
+    std::size_t cpu_scatter_columns_{0};
+    // Per-source A_idx entry -> final address (and optional N-tile stride).
+    std::vector<std::vector<int64_t>> cpu_scatter_lookup_;
     ExternalDeviceBufferAllocator external_device_buffer_allocator_;
     GpuBuffer router_send_buffer_;
     std::vector<PeerGpuBuffers> buffers_;

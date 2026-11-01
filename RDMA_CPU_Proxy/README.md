@@ -857,6 +857,60 @@ needed. This adds GPU mapping work between up and down, reported separately as
 `mapping_ms`; `up_plus_down_ms` includes reset, mapping, and down time in addition
 to the existing up timing.
 
+### Optional CPU scatter preparation
+
+Append `--cpu-scatter-preparation` to both torchrun commands to move the
+per-iteration local-combine mapping work from the GPU to the proxy notification
+receiver. It requires `--local-gpu-combine` and its existing prerequisites.
+The option is disabled by default; without it the existing GPU mapping path is
+unchanged. Rebuild `rdma_cpu_proxy_shared` and update the Python scripts on both
+Hopper nodes before enabling it:
+
+```bash
+cmake --build RDMA_CPU_Proxy/build-hopper --target rdma_cpu_proxy_shared -j4
+# Node 0:
+bash RDMA_CPU_Proxy/scripts/run_node0_torchrun.sh --cpu-scatter-preparation
+# Node 1:
+bash RDMA_CPU_Proxy/scripts/run_node1_torchrun.sh --cpu-scatter-preparation
+```
+
+After metadata exchange and down-runner warmup, the CPU derives sorted compact
+destinations from all meaningful expert indices for each active source. It
+returns valid counts and output-to-input maps to Python once and precomputes
+each A_idx entry's destination address. N-tile-major output also stores the
+per-source valid-count-based tile stride; in this mode tile N must divide the
+output width. Routing metadata and output allocations must remain fixed through
+the run, as they do in the supplied test.
+
+During each iteration the notification receiver fills a pinned scatter range
+once per newly scheduled M batch (not per repeated N group). Its asynchronous
+H2D copy is ordered before the corresponding gather-ready publication on the
+same stream. Thus completed up work has published scatter metadata, and down
+continues on the compute stream without a new host wait. Staging rows are
+immutable within an iteration and reused only after publication-stream
+synchronization at the next iteration reset.
+
+The measured path skips `local_combine_mapping`, `compact_combine_mapping`,
+scatter-address tensor updates, and per-iteration return-count D2H copies.
+Only the final `scatter_row_addresses` tensor consumed by down is refreshed;
+the intermediate `scatter_mapping` and flat `scatter_table` are setup/warmup
+scratch in this mode. Output zeroing and down wave-counter resets remain.
+Warmup still exercises the GPU mapping path, so those kernels can appear before
+iteration zero. `mapping_ms` no longer measures CPU preparation: that work and
+its copies overlap dispatch/up and can delay gather readiness. Compare complete
+iteration latency as well as the up-to-down gap when profiling; speedup requires
+Hopper measurement.
+
+`test_cpu_scatter` checks published addresses against expert metadata with
+changed source arrival order, duplicate routes, empty sources, repeated N
+groups, both output layouts, both gather flush policies, and iteration reuse
+in mock mode. `test_cpu_scatter_cuda` runs the same checks with actual GPU
+metadata buffers and H2D publication (skipped when CUDA is unavailable). On a
+Hopper node, build `test_cpu_scatter` and run
+`ctest --test-dir RDMA_CPU_Proxy/build-hopper -R '^test_cpu_scatter' --output-on-failure`.
+The existing return and intra/inter-node correctness checks remain
+available in the two-node scripts for hardware validation.
+
 ### Intra-node combine concurrent with down GEMM
 
 Append `--intra-node-combine` to the prepared, per-group return configuration

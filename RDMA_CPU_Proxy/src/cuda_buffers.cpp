@@ -177,6 +177,7 @@ CudaBuffers::~CudaBuffers() {
     free_pinned_buffer(router_notification_publication_buffers_.host_table);
     free_pinned_buffer(router_notification_publication_buffers_.host_ready_rows);
     free_pinned_buffer(router_notification_ready_values_);
+    free_pinned_buffer(cpu_scatter_staging_);
 }
 
 void CudaBuffers::initialize() {
@@ -867,6 +868,108 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
         " a_idx_capacity=", a_idx_capacity);
 }
 
+void CudaBuffers::configure_cpu_scatter(const RdmaProxyCpuScatterConfig& c) {
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    if (c.struct_size != sizeof(c) || cpu_scatter_device_ ||
+        !router_computation_scheduler_state_.initialized ||
+        router_computation_scheduler_state_.iteration_initialized ||
+        !config_.nvlink_forward_completion_notifications_enabled ||
+        config_.nvlink_forward_notification_flush_only_enabled)
+        throw std::runtime_error("CPU scatter requires an unstarted notification scheduler");
+    if (c.num_sources != router_computation_buffer_indices_.size() ||
+        c.capacity != config_.num_tokens || c.width != config_.token_dimension ||
+        c.element_bytes != dtype_size(config_.dtype) ||
+        !c.source_pairs || !c.output_bases || !c.counts || !c.output_to_input ||
+        !c.scatter_addresses || c.scatter_addresses % alignof(int64_t) ||
+        (c.tile_n && (c.tile_n > c.width || c.width % c.tile_n)))
+        throw std::runtime_error("invalid CPU scatter shape, layout, or pointers");
+    const std::size_t columns = c.tile_n ? 2 : 1;
+    std::size_t routes = 0;
+    for (auto index : router_computation_buffer_indices_)
+        routes += nvlink_recv_buffers_[index].expert_metadata.expert_token_indices.size();
+    if (c.routes != routes || !routes ||
+        routes > std::numeric_limits<std::size_t>::max() / (columns * sizeof(int64_t)) ||
+        c.capacity > std::numeric_limits<std::size_t>::max() / c.num_sources)
+        throw std::runtime_error("invalid CPU scatter route count");
+
+    std::vector<std::vector<int64_t>> lookup(c.num_sources);
+    for (std::size_t j = 0; j < c.num_sources; ++j) {
+        const auto& source = nvlink_recv_buffers_[router_computation_buffer_indices_[j]];
+        if (c.source_pairs[2*j] != source.source_node_rank ||
+            c.source_pairs[2*j+1] != source.source_gpu_index || !c.output_bases[j])
+            throw std::runtime_error("CPU scatter source order differs from gather order");
+        const auto& indices = source.expert_metadata.expert_token_indices;
+        std::vector<int64_t> compact(c.capacity, -1);
+        for (auto row : indices) {
+            if (row < 0 || static_cast<uint64_t>(row) >= c.capacity)
+                throw std::runtime_error("CPU scatter input row out of bounds");
+            compact[row] = 0;
+        }
+        auto* inverse = c.output_to_input + j*c.capacity;
+        std::fill(inverse, inverse + c.capacity, -1);
+        int64_t count = 0;
+        for (std::size_t row = 0; row < c.capacity; ++row) {
+            if (compact[row] == 0) {
+                compact[row] = count;
+                inverse[count++] = static_cast<int64_t>(row);
+            }
+        }
+        c.counts[j] = count;
+        const auto row_bytes = (c.tile_n ? c.tile_n : c.width) * c.element_bytes;
+        if (c.output_bases[j] > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            c.capacity > (std::numeric_limits<int64_t>::max() - c.output_bases[j]) /
+                             (c.width * c.element_bytes))
+            throw std::runtime_error("CPU scatter output address overflow");
+        lookup[j].resize(indices.size() * columns);
+        for (std::size_t i = 0; i < indices.size(); ++i) {
+            lookup[j][i*columns] = static_cast<int64_t>(
+                c.output_bases[j] + compact[indices[i]] * row_bytes);
+            if (c.tile_n) lookup[j][i*columns+1] = count * row_bytes;
+        }
+    }
+    allocate_pinned_buffer(cpu_scatter_staging_, routes * columns * sizeof(int64_t));
+    cpu_scatter_lookup_ = std::move(lookup);
+    cpu_scatter_columns_ = columns;
+    cpu_scatter_device_ = c.scatter_addresses;
+}
+
+void CudaBuffers::publish_cpu_scatter_batch(const std::vector<int32_t>& ranges) {
+    std::size_t base = 0, count = 0;
+    for (std::size_t j = 0; j < cpu_scatter_lookup_.size(); ++j) {
+        const auto start = ranges[2*j], end = ranges[2*j+1];
+        if (start < 0 || end < start || static_cast<std::size_t>(end) >
+                cpu_scatter_lookup_[j].size() / cpu_scatter_columns_)
+            throw std::runtime_error("CPU scatter range out of bounds");
+        base += start;
+        count += end - start;
+    }
+    const auto row_bytes = cpu_scatter_columns_ * sizeof(int64_t);
+    if (base > cpu_scatter_staging_.bytes / row_bytes ||
+        count > cpu_scatter_staging_.bytes / row_bytes - base)
+        throw std::runtime_error("CPU scatter packed output out of bounds");
+    auto* destination = static_cast<int64_t*>(cpu_scatter_staging_.ptr) +
+                        base * cpu_scatter_columns_;
+    auto* cursor = destination;
+    for (std::size_t j = 0; j < cpu_scatter_lookup_.size(); ++j) {
+        const auto& lookup = cpu_scatter_lookup_[j];
+        cursor = std::copy(lookup.begin() + ranges[2*j]*cpu_scatter_columns_,
+                           lookup.begin() + ranges[2*j+1]*cpu_scatter_columns_, cursor);
+    }
+    // Every packed row is assigned once per iteration. Staging stays immutable
+    // until the publication stream is synchronized at the next iteration reset.
+    auto* device = reinterpret_cast<uint8_t*>(cpu_scatter_device_) + base * row_bytes;
+    if (config_.mock_mode) {
+        std::memcpy(device, destination, count * row_bytes);
+        return;
+    }
+#if RDMA_PROXY_HAVE_CUDA
+    check_cuda(cudaMemcpyAsync(device, destination, count * row_bytes,
+        cudaMemcpyHostToDevice,
+        reinterpret_cast<cudaStream_t>(router_notification_publication_stream_)),
+        "cudaMemcpyAsync H2D CPU scatter batch");
+#endif
+}
+
 void CudaBuffers::reset_router_computation_iteration_locked(uint64_t iteration) {
     auto& scheduler = router_computation_scheduler_state_;
     if (!scheduler.initialized) {
@@ -1200,6 +1303,10 @@ CudaBuffers::schedule_ready_computation_batches_for_expert_locked(
             throw std::runtime_error(
                 "num_ready_tokens is inconsistent with expert Head/Tail state");
         }
+
+        // One scatter range per M batch, shared by all repeated N groups.
+        // Its H2D copy precedes gather readiness on the publication stream.
+        if (cpu_scatter_device_) publish_cpu_scatter_batch(ranges);
 
         for (std::size_t n_group = 0;
              n_group < publication.n_groups_per_m_cluster; ++n_group) {

@@ -14,12 +14,32 @@ extern "C" {
 #define RDMA_PROXY_C_API
 #endif
 
+/* Optional CPU scatter setup, after initialization and before iteration zero.
+ * source_pairs is host int32[num_sources,2] in gather input order; output_bases
+ * is host uint64[num_sources]. Host outputs are counts[num_sources] and
+ * output_to_input[num_sources,capacity] (-1 in unused tails). All host arrays
+ * are used synchronously. scatter_addresses is borrowed CUDA int64[routes,2]
+ * for tile_n > 0, or int64[routes] for row-major; retain it and output buffers
+ * through shutdown. Routing and output allocations must remain fixed.
+ */
+typedef struct RdmaProxyCpuScatterConfig {
+    uint64_t struct_size;
+    uint64_t num_sources, routes, capacity, width, tile_n, element_bytes;
+    uintptr_t scatter_addresses;
+    const int32_t* source_pairs;
+    const uint64_t* output_bases;
+    int64_t* counts;
+    int64_t* output_to_input;
+} RdmaProxyCpuScatterConfig;
+
 /*
  * Stable C ABI for embedding the C++ proxy in another process (for example,
  * a Python worker using ctypes). The handle is intentionally opaque so C++
  * types and standard-library objects never cross the shared-library boundary.
  */
 typedef struct RdmaProxyHandle RdmaProxyHandle;
+RDMA_PROXY_C_API int rdma_proxy_configure_cpu_scatter(
+    RdmaProxyHandle* handle, const RdmaProxyCpuScatterConfig* config);
 
 /* Device-buffer kinds requested through RdmaProxyDeviceBufferAllocator. */
 typedef enum RdmaProxyDeviceBufferKind {
