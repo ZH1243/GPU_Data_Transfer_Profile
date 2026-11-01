@@ -48,19 +48,13 @@ def make_routes(tokens, seed=1234, pattern="affine"):
             row = [((token + route * 2) % 16) * 8 + token % 8 for route in range(8)]
         elif pattern == "random":
             row = rng.sample(range(128), 8)
-        elif pattern == "mixed":
-            # Non-adjacent repeated GPU owners, including the direct owner for
-            # local_gpu 0/7, with contributions to both nodes.
-            row = [0, 56, 64, 120, 1, 57, 65, 121]
-            shift = token % 8
-            row = row[shift:] + row[:shift]
         else:
             raise ValueError(f"unknown pattern: {pattern}")
         result.append(row)
     return result
 
 
-def run_check_suite(torch, MetadataPlan, device, scatter_variant):
+def run_check_suite(torch, MetadataPlan, device):
     def check_scan(plan):
         # Check scratch too: later scatters do not consume expert-bin prefixes,
         # so checking only final metadata would miss errors in those columns.
@@ -73,13 +67,13 @@ def run_check_suite(torch, MetadataPlan, device, scatter_variant):
 
     cases = [(n, 0, "affine") for n in (1, 31, 32, 33, 255, 256, 257)]
     cases += [(257, gpu, pattern) for gpu in (0, 7)
-              for pattern in ("node0", "node1", "spread", "random", "mixed")]
+              for pattern in ("node0", "node1", "spread", "random")]
     # Scan boundaries: 31, 32, 33, 34, and 65 chunks. Include partial chunks
     # and multiple carry steps; the main default benchmark covers 80 chunks.
     cases += [(n, 3, "random") for n in (7936, 8192, 8193, 8449, 16385)]
     for tokens, local_gpu, pattern in cases:
         r = torch.tensor(make_routes(tokens, pattern=pattern), dtype=torch.int32, device=device)
-        plan = MetadataPlan(r, local_gpu, scatter_variant=scatter_variant)
+        plan = MetadataPlan(r, local_gpu)
         for b in plan.buffers:
             b.fill_(127)  # Catch missing initialization or reads of scratch padding.
         plan.launch()
@@ -108,9 +102,6 @@ def main():
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--mode", choices=("eager", "graph", "both"), default="both")
-    parser.add_argument("--scatter-variant", default="shared-reuse",
-                        choices=("baseline", "shared", "reuse", "shared-reuse"),
-                        help="scatter-only specialization; baseline preserves the previous algorithm")
     parser.add_argument("--profile", action="store_true",
                         help="capture warm R generation + metadata calls via cudaProfilerStart/Stop")
     parser.add_argument("--compare-cuda", action="store_true",
@@ -140,11 +131,10 @@ def main():
     print(f"GPU: {properties.name}, SMs={properties.multi_processor_count}, "
           f"PyTorch={torch.__version__}, CUDA={torch.version.cuda}")
     print(f"tokens={args.tokens}, top_k=8, experts=128, nodes=2, GPUs/node=8, "
-          f"local_gpu_id={args.local_gpu_id}, seed={args.seed}, "
-          f"scatter_variant={args.scatter_variant}")
+          f"local_gpu_id={args.local_gpu_id}, seed={args.seed}")
     r = torch.tensor(make_routes(args.tokens, args.seed), dtype=torch.int32, device=device)
     start = time.perf_counter()
-    plan = MetadataPlan(r, args.local_gpu_id, scatter_variant=args.scatter_variant)
+    plan = MetadataPlan(r, args.local_gpu_id)
     r_argument = from_dlpack(r)
     stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
     generator = cute.compile(RouteGenerator(), r_argument, cutlass.Uint64(args.seed), stream)
@@ -246,7 +236,7 @@ def main():
           "Event spans include submission gaps and event-boundary overhead. "
           "Graph replay still executes seven separate metadata kernels.")
     if args.check_suite:
-        run_check_suite(torch, MetadataPlan, device, args.scatter_variant)
+        run_check_suite(torch, MetadataPlan, device)
 
 
 if __name__ == "__main__":
