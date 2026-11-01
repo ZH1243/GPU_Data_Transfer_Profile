@@ -44,6 +44,13 @@ def parse_args():
         parser.error('tile-n must divide hidden and elements-per-thread must divide tile-n')
     if args.domains * args.rows_per_domain * args.hidden > 2**31 - 1:
         parser.error('output exceeds kernel int32 indexing range')
+    args.quack_root = args.quack_root.expanduser().resolve()
+    if not (args.quack_root / 'run' / 'final_combine.py').is_file():
+        parser.error(
+            f'QuACK checkout not found at {args.quack_root}: expected run/final_combine.py. '
+            'Set --quack-root (or QUACK_ROOT) to your actual quack_for_communication_overlap '
+            'checkout. Omit --quack-root to use QUACK_ROOT or the sibling checkout default; '
+            '/path/to/... is only a documentation placeholder.')
     return args
 
 

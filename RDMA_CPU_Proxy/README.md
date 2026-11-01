@@ -1909,10 +1909,13 @@ embedded test, run from `RDMA_CPU_Proxy`:
 
 ```bash
 python scripts/benchmark_intra_node_combine.py \
-  --quack-root /path/to/quack_for_communication_overlap \
   --ctas 8 --iterations 100 \
   --json-output results/intra_node_combine_ctas8.json
 ```
+
+The command uses `QUACK_ROOT` if set, otherwise the `quack_for_communication_overlap`
+checkout beside `GPU_Data_Transfer_Profile`. If your checkout is elsewhere, pass
+`--quack-root` with its actual directory containing `run/final_combine.py`.
 
 This needs one GPU, no torchrun, RDMA devices, or proxy shared library. It calls
 `RegisterIntraNodeKernel` directly. All input buffers are local GPU allocations,
