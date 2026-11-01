@@ -1901,3 +1901,61 @@ python -m unittest discover -s RDMA_CPU_Proxy/tests -p test_inter_node_combine.p
 
 The tests cover unequal and shuffled x3 domains, missing contributions, empty
 inputs, BF16/FP16, multiple tile widths, and changed payloads across iterations.
+
+## Standalone all-ready intra-node combine benchmark
+
+On a remote Hopper machine, using the same Python/CuTe/QuACK environment as the
+embedded test, run from `RDMA_CPU_Proxy`:
+
+```bash
+python scripts/benchmark_intra_node_combine.py \
+  --quack-root /path/to/quack_for_communication_overlap \
+  --ctas 8 --iterations 100 \
+  --json-output results/intra_node_combine_ctas8.json
+```
+
+This needs one GPU, no torchrun, RDMA devices, or proxy shared library. It calls
+`RegisterIntraNodeKernel` directly. All input buffers are local GPU allocations,
+just as after NVLink returns have completed. The input-ready prefix is set to
+the final group before launch, but production readiness acquire loads remain
+active. Output is still processed and published column group by column group,
+including CTA completion slots, GPU output-ready publication, and by default
+mapped-host publication used by the RDMA-return coordinator. No consumer or
+communication runs concurrently. `--no-host-publication` isolates the variant
+without that final host-prefix store; GPU publication remains enabled.
+
+Defaults match the launch scripts' kernel configuration: BF16, hidden 4096,
+N tile 128, one tile per group (32 groups), 8 CTAs, 512 threads per CTA,
+32 elements per thread, and prefetch depth 4. The synthetic workload has two
+source-node domains, each with 20480 output rows, and exactly four randomly
+selected contributing GPUs out of eight per row. Inputs are compacted per
+(domain, peer) and use N-tile-major layout. These are controlled synthetic
+masks, not the two-node test's actual router output. In particular,
+`--rows-per-domain` counts post-routing combine rows, not original input tokens.
+Use `--contributors 1`, `4`, or `8` to compare fan-in, and adjust
+`--rows-per-domain` to model the observed domain sizes.
+
+The benchmark compiles and exercises the kernel, captures only its launch in a
+CUDA graph, warms up, then measures individual graph replays with CUDA events.
+Publication slots are reset before every replay, outside timing. It verifies
+completion prefixes each time and checks the final output against an independent
+FP32 gather/add reference with exact equality after conversion to output dtype.
+Compilation, allocation, resets, validation, and data generation are excluded
+from latency. It reports minimum, median, and p95 latency, output GB/s, and
+effective input-plus-output payload GB/s. JSON also includes every timing sample
+and the configuration. Buffers are reused, so cache reuse is possible; effective
+payload bandwidth excludes mapping/flag traffic and is not measured HBM bandwidth.
+The result measures full-output latency, not individual group publication times.
+
+For example, sweep CTA counts on an otherwise idle GPU:
+
+```bash
+for ctas in 4 8 16 32 64; do
+  python scripts/benchmark_intra_node_combine.py --ctas "$ctas" \
+    --json-output "results/intra_node_combine_ctas${ctas}.json"
+done
+```
+
+`QUACK_ROOT` can supply the checkout path for the sweep. Standalone CTA counts
+can use SMs that the integrated test reserves for down GEMM; higher standalone
+performance does not imply the same improvement with concurrent computation.
