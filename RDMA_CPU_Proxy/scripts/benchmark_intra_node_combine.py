@@ -29,6 +29,8 @@ def parse_args():
     parser.add_argument('--prefetch-peers', type=int, choices=(1, 2, 4), default=4)
     parser.add_argument('--readiness-polling', choices=('group', 'vector'), default='group',
                         help='group: optimized acquisition; vector: original kernel baseline')
+    parser.add_argument('--domain-traversal', choices=('local', 'all'), default='local',
+                        help='local: scan only this token domain; all: previous baseline')
     parser.add_argument('--dtype', choices=('bfloat16', 'float16'), default='bfloat16')
     parser.add_argument('--warmup', type=int, default=10)
     parser.add_argument('--iterations', type=int, default=100)
@@ -81,12 +83,15 @@ def main():
     groups = (tiles + args.group_tiles - 1) // args.group_tiles
     domains = tuple((d * args.rows_per_domain, args.rows_per_domain) for d in range(args.domains))
     selected = []
+    input_domains = []
     for offset, count in domains:
         peer_rows = [[] for _ in range(args.peers)]
         for row in range(count):
             for peer in rng.sample(range(args.peers), args.contributors):
                 peer_rows[peer].append(offset + row)
-        selected.extend(rows for rows in peer_rows if rows)
+        active_rows = [rows for rows in peer_rows if rows]
+        input_domains.append((offset, count, len(selected), len(active_rows)))
+        selected.extend(active_rows)
     counts = tuple(map(len, selected))
     rows = torch.full((len(counts), total_rows), -1, dtype=torch.int32, device='cuda')
     buffers = []
@@ -120,6 +125,7 @@ def main():
                                     args.elements_per_thread, args.threads, True, args.tile_n)
     kernel.source_tokens = total_rows
     kernel.output_domains = domains
+    kernel.input_domains = tuple(input_domains) if args.domain_traversal == 'local' else None
     kernel.group_tiles = args.group_tiles
     kernel.prefetch_peers = args.prefetch_peers
     kernel.poll_once_per_group = args.readiness_polling == 'group'
@@ -190,7 +196,7 @@ def main():
                   effective_payload_GB_per_s=(input_bytes + output_bytes) / (median * 1e6),
                   samples_ms=samples, correctness='PASSED')
     print(f'Correctness: PASSED; {total_rows} rows, {groups} column groups, {args.ctas} CTAs; '
-          f'readiness polling={args.readiness_polling}')
+          f'readiness polling={args.readiness_polling}; domain traversal={args.domain_traversal}')
     print(f'Kernel latency: median={median:.4f} ms, min={min(samples):.4f} ms, '
           f'p95={result["latency_ms"]["p95"]:.4f} ms')
     print(f'Output rate: {result["output_GB_per_s"]:.2f} GB/s; '

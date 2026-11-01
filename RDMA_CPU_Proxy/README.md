@@ -1990,3 +1990,28 @@ This change does not yet implement domain-specific traversal or compact
 contributor metadata, allowing its effect to be measured independently.
 The opt-in `tests/test_intra_node_combine.py` GPU tests exercise both polling
 modes with delayed input readiness, cancellation, and repeated launches.
+
+### Comparing domain traversal
+
+`--domain-traversal local` (default) selects only the active input buffers for
+ the token's source-node domain before loading row mappings and reducing peers.
+`--domain-traversal all` retains the scan across all active buffers. Both use
+ the same input data, accumulation order, output layout, and completion protocol.
+The integrated `IntraNodeCombine` wrapper also supplies domain metadata by
+ default; inter-node combine retains its all-input reduction.
+
+```bash
+for ctas in 4 8; do
+  for traversal in all local; do
+    python scripts/benchmark_intra_node_combine.py \
+      --ctas "$ctas" --readiness-polling group \
+      --domain-traversal "$traversal" --iterations 100 \
+      --json-output "results/combine_ctas${ctas}_domain_${traversal}.json"
+  done
+done
+```
+
+The domain metadata counts only nonempty input buffers, preserving their original
+peer order. Output publication still occurs after the CTA processes its assigned
+vectors across all domains for that column group. Compact contributor lists and
+cross-token load pipelining are not part of this change.

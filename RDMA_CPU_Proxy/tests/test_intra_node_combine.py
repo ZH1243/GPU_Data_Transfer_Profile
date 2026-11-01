@@ -50,20 +50,24 @@ class KernelTests(unittest.TestCase):
         if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
             self.skipTest("requires SM90")
         width, tile, tokens = 512, 128, 56
-        for group_tiles, poll_once in product((1, 2, 3), (False, True)):
+        for group_tiles, poll_once, local_domains in product((1, 2, 3), (False, True), (False, True)):
             for dtype in (torch.bfloat16, torch.float16):
                 for tiled in (False, True):
                     for publish in (False, True):
                         with self.subTest(group_tiles=group_tiles, dtype=dtype, tiled=tiled,
-                                          publish=publish, poll_once=poll_once):
+                                          publish=publish, poll_once=poll_once,
+                                          local_domains=local_domains):
                             # Two original-source domains, each reduced over eight GPUs.
                             masks = [[1 + ((row * 37) % 127) for row in range(37)],
                                      [128 if row % 2 else 3 for row in range(19)]]
                             selected = []
+                            input_domains = []
                             offset = 0
                             for domain in masks:
-                                selected += [[r + offset for r in rows]
-                                             for rows in contribution_indices(domain, 8) if rows]
+                                active_rows = [[r + offset for r in rows]
+                                               for rows in contribution_indices(domain, 8) if rows]
+                                input_domains.append((offset, len(domain), len(selected), len(active_rows)))
+                                selected += active_rows
                                 offset += len(domain)
                             rows = torch.full((len(selected), tokens), -1, dtype=torch.int32, device="cuda")
                             indices = [torch.tensor(x, dtype=torch.int64, device="cuda") for x in selected]
@@ -91,6 +95,7 @@ class KernelTests(unittest.TestCase):
                             kernel.poll_once_per_group = poll_once
                             kernel.publish_rdma_ready = publish
                             kernel.output_domains = ((0, 37), (37, 0), (37, 19))
+                            kernel.input_domains = tuple(input_domains) if local_domains else None
                             kernel.group_tiles, kernel.prefetch_peers, kernel.lanes_per_group = group_tiles, 4, 4
                             compiled = cute.compile(kernel, *args, cuda.CUstream(stream.cuda_stream))
                             for iteration in range(2):
@@ -201,6 +206,7 @@ class KernelTests(unittest.TestCase):
         args = (None, from_dlpack(rows), from_dlpack(output, assumed_align=16), from_dlpack(pointers))
         kernel = RegisterIntraNodeKernel((), 512, 128, 4, 32, 512, True, 128)
         kernel.source_tokens, kernel.publish_ready = 0, True
+        kernel.input_domains = ((0, 0, 0, 0),)
         kernel.output_domains = ((0, 0),)
         kernel.group_tiles, kernel.prefetch_peers, kernel.lanes_per_group = 3, 4, 4
         stream = torch.cuda.Stream()

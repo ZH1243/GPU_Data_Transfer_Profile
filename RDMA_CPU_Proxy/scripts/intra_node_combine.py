@@ -127,6 +127,13 @@ class IntraNodeCombine:
                 tuple(entry[3].numel() for entry in active), width, tile, ctas, vec,
                 threads, True, self.output_tile_n)
             kernel.output_domains = tuple((offset, count) for _, offset, count in self.domains)
+            first_peer = 0
+            input_domains = []
+            for node, offset, count in self.domains:
+                peers = sum(entry[0] == node for entry in active)
+                input_domains.append((offset, count, first_peer, peers))
+                first_peer += peers
+            kernel.input_domains = tuple(input_domains)
             kernel.group_tiles = self.group_tiles
             kernel.publish_ready = self.ready_groups is not None
             kernel.publish_rdma_ready = self.rdma_return is not None

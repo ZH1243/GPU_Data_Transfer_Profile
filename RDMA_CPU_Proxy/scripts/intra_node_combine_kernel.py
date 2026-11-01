@@ -22,6 +22,9 @@ class RegisterIntraNodeKernel(_CombineKernel):
     publish_ready = False
     publish_rdma_ready = False
     source_tokens = None
+    # (token start, token count, first active buffer, active buffer count).
+    # None retains the original scan, also used by inter-node combine.
+    input_domains = None
 
     @cute.kernel
     def kernel(self, received: Optional[tuple], rows: cute.Tensor, output: cute.Tensor,
@@ -109,29 +112,35 @@ class RegisterIntraNodeKernel(_CombineKernel):
                             cancelled = cute.arch.load(cancel_ptr.llvm_ptr, cutlass.Int32,
                                                        sem="acquire", scope="sys")
                     if cancelled == 0:
-                        for peer in cutlass.range_constexpr(peer_count):
-                            peer_rows[peer] = rows[peer, token]
                         total.fill(0.0)
-                        for first in cutlass.range_constexpr(0, peer_count, depth):
-                            for slot in cutlass.range_constexpr(min(depth, peer_count - first)):
-                                peer = first + slot
-                                row = peer_rows[peer]
-                                if row >= 0:
-                                    for stripe in cutlass.range_constexpr(vec // 8):
-                                        col = column + stripe * lanes * 8
-                                        offset = row * self.hidden + col
-                                        if cutlass.const_expr(self.tile_n > 0):
-                                            offset = ((col // self.tile_n * self.counts[peer] + row)
-                                                      * self.tile_n + col % self.tile_n)
-                                        source = cute.make_tensor(
-                                            received[peer].iterator + cute.assume(offset, divby=8),
-                                            cute.make_layout((8,)),
-                                        )
-                                        cute.copy(copy_atom, source, staged[None, stripe, slot])
-                            for slot in cutlass.range_constexpr(min(depth, peer_count - first)):
-                                if peer_rows[first + slot] >= 0:
-                                    total.store(total.load()
-                                                + staged[None, None, slot].load().to(cutlass.Float32))
+                        domains = self.input_domains
+                        if cutlass.const_expr(self.input_domains is None):
+                            domains = ((0, rows.shape[1], 0, peer_count),)
+                        for domain in cutlass.range_constexpr(len(domains)):
+                            token_start, token_count, first_peer, domain_peers = domains[domain]
+                            if token >= token_start and token < token_start + token_count:
+                                for peer in cutlass.range_constexpr(domain_peers):
+                                    peer_rows[peer] = rows[first_peer + peer, token]
+                                for first in cutlass.range_constexpr(0, domain_peers, depth):
+                                    for slot in cutlass.range_constexpr(min(depth, domain_peers - first)):
+                                        peer = first + slot
+                                        row = peer_rows[peer]
+                                        if row >= 0:
+                                            for stripe in cutlass.range_constexpr(vec // 8):
+                                                col = column + stripe * lanes * 8
+                                                offset = row * self.hidden + col
+                                                if cutlass.const_expr(self.tile_n > 0):
+                                                    offset = ((col // self.tile_n * self.counts[first_peer + peer] + row)
+                                                              * self.tile_n + col % self.tile_n)
+                                                source = cute.make_tensor(
+                                                    received[first_peer + peer].iterator + cute.assume(offset, divby=8),
+                                                    cute.make_layout((8,)),
+                                                )
+                                                cute.copy(copy_atom, source, staged[None, stripe, slot])
+                                    for slot in cutlass.range_constexpr(min(depth, domain_peers - first)):
+                                        if peer_rows[first + slot] >= 0:
+                                            total.store(total.load()
+                                                        + staged[None, None, slot].load().to(cutlass.Float32))
                         values.store(total.load().to(output.element_type))
                         if cutlass.const_expr(self.output_tile_n > 0):
                             # Each original-source domain has its own packed tiled
