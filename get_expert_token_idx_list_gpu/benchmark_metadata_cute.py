@@ -106,18 +106,23 @@ def check_staging(torch, staging, check_tail=False):
         raise AssertionError("CuTe local staging modified the unused tail")
 
 
-def run_staging_check_suite(torch, device):
+def run_staging_check_suite(torch, device, implementation, warps_per_cta, ctas_per_sm):
     from metadata_cute import MetadataPlan, LocalStagingPlan
 
-    for tokens, width in ((1, 1), (33, 7), (257, 4096)):
+    for tokens, width, byte_offset in ((1, 1, 0), (3, 8, 0), (33, 7, 0),
+                                       (33, 264, 0), (33, 264, 8),
+                                       (257, 4096, 0), (4097, 8, 0)):
         r = torch.tensor(make_routes(tokens), dtype=torch.int32, device=device)
         metadata = MetadataPlan(r, 7)
         # Arbitrary bits exercise bit-preserving copies, including BF16 NaNs.
-        source = torch.randint(0, 256, (tokens, width * 2),
-                               dtype=torch.uint8, device=device).view(torch.bfloat16)
+        storage = torch.randint(0, 256, (tokens * width * 2 + byte_offset,),
+                                dtype=torch.uint8, device=device)
+        source = storage[byte_offset:].reshape(tokens, width * 2).view(torch.bfloat16)
         for node in (0, 1):
             destination = torch.empty_like(source)
-            staging = LocalStagingPlan(metadata, source, destination, node)
+            staging = LocalStagingPlan(metadata, source, destination, node,
+                                       implementation=implementation,
+                                       warps_per_cta=warps_per_cta, ctas_per_sm=ctas_per_sm)
             destination.view(torch.uint8).fill_(0xA5)
             metadata.launch()
             staging.launch()
@@ -137,7 +142,9 @@ def run_staging_check_suite(torch, device):
                 torch.cuda.synchronize(device)
                 metadata.check()
                 check_staging(torch, staging, check_tail=True)
-            print(f"PASS staging T={tokens}, D={width}, node={node}; changed-R/payload graph replay")
+            print(f"PASS staging T={tokens}, D={width}, node={node}, "
+                  f"byte_offset={byte_offset}, implementation={staging.implementation}; "
+                  "changed-R/payload graph replay")
 
 
 def main():
@@ -153,6 +160,11 @@ def main():
                         default="metadata", help="time metadata, local gather, or both")
     parser.add_argument("--node-rank", type=int, choices=(0, 1), default=0)
     parser.add_argument("--token-dimension", type=int, default=4096)
+    parser.add_argument("--staging-implementation", choices=("baseline", "vectorized"),
+                        default="vectorized", help="128-bit warp-per-row gather or original gather")
+    parser.add_argument("--staging-warps-per-cta", type=int, choices=(4, 8), default=4)
+    parser.add_argument("--staging-ctas-per-sm", type=int, default=0,
+                        help="cap vectorized grid to this many CTAs/SM; 0 uses one CTA per row group")
     parser.add_argument("--profile", action="store_true",
                         help="capture warm R generation + metadata calls via cudaProfilerStart/Stop")
     parser.add_argument("--compare-cuda", action="store_true",
@@ -168,6 +180,8 @@ def main():
         parser.error("choose --mode eager or --mode graph when using --profile")
     if args.token_dimension < 1:
         parser.error("token-dimension must be positive")
+    if args.staging_ctas_per_sm < 0:
+        parser.error("staging-ctas-per-sm must be nonnegative")
 
     import torch
     import cuda.bindings.driver as cuda
@@ -192,7 +206,13 @@ def main():
     if args.workload != "metadata":
         payload = torch.randint(0, 256, (args.tokens, args.token_dimension * 2),
                                 dtype=torch.uint8, device=device).view(torch.bfloat16)
-        staging = LocalStagingPlan(plan, payload, torch.empty_like(payload), args.node_rank)
+        staging = LocalStagingPlan(plan, payload, torch.empty_like(payload), args.node_rank,
+                                   implementation=args.staging_implementation,
+                                   warps_per_cta=args.staging_warps_per_cta,
+                                   ctas_per_sm=args.staging_ctas_per_sm)
+        print(f"Staging: requested={args.staging_implementation}, actual={staging.implementation}, "
+              f"warps_per_cta={staging.warps_per_cta}, grid_ctas={staging.num_ctas}, "
+              f"node_rank={args.node_rank}, token_dimension={args.token_dimension}")
 
     def launch_workload():
         if args.workload != "staging":
@@ -312,7 +332,8 @@ def main():
           "Metadata/combined/staging graphs contain seven/eight/one kernels respectively.")
     if args.check_suite:
         run_check_suite(torch, MetadataPlan, device)
-        run_staging_check_suite(torch, device)
+        run_staging_check_suite(torch, device, args.staging_implementation,
+                                args.staging_warps_per_cta, args.staging_ctas_per_sm)
 
 
 if __name__ == "__main__":

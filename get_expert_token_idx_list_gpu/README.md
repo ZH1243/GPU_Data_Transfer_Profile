@@ -266,13 +266,29 @@ must not overlap. The plan retains the tensors; contents may change in place,
 but their shape, allocation, and layout must remain fixed. Callers must order
 payload and metadata producers before staging on the supplied PyTorch stream.
 
-The kernel launches one 256-thread CTA per possible output row and reads the
-current bounds on the GPU. Empty slices perform no copies. This fixed launch
-grid supports changing routes and slice lengths during CUDA Graph replay.
-Aligned rows divisible by eight bytes use integer 64-bit copies; other rows
-use byte copies. This preserves arbitrary payload bits, including BF16 NaNs.
-This initial implementation does not use the CUDA C++ gather's 128-bit loads.
-It is available to Python callers; the C++ proxy still uses its existing gather.
+The default `vectorized` implementation uses explicit 128-bit CuTe copy atoms
+and one warp per row. Consecutive lanes access adjacent 16-byte stripes; each
+lane loads four vectors into registers before storing them. Four warps per CTA
+copy four independent rows (eight warps is also supported). This reduces block
+count and exposes independent loads without shared-memory staging. Copy atoms
+request 128-bit accesses; verify the generated instructions and performance on
+the target GPU rather than assuming a speedup.
+
+Both row size and buffer pointers must be 16-byte aligned for this path. Other
+inputs automatically fall back to the original one-row/256-thread CTA kernel,
+which uses 64-bit words when aligned and byte copies otherwise. Integer views
+preserve arbitrary payload bits, including BF16 NaNs. The log reports which
+implementation actually runs. `--staging-implementation baseline` explicitly
+selects the original kernel for comparisons under the same benchmark conditions.
+
+`--staging-warps-per-cta 4|8` controls the vectorized layout.
+`--staging-ctas-per-sm N` caps its grid to `N * SM_count` CTAs, with a grid-stride
+loop over row groups; this is a grid-size cap, not a residency guarantee. The
+default zero launches one CTA per possible row group. Bounds remain on the GPU,
+empty slices perform no copies, and changing slice lengths work during graph
+replay. Python callers can pass `implementation`, `warps_per_cta`, and
+`ctas_per_sm` as keyword arguments to `LocalStagingPlan`. The C++ proxy continues
+to use its existing gather.
 
 Run on the remote Hopper machine:
 
@@ -285,10 +301,24 @@ python get_expert_token_idx_list_gpu/benchmark_metadata_cute.py \
 python get_expert_token_idx_list_gpu/benchmark_metadata_cute.py \
   --workload staging --node-rank 1 --token-dimension 4096
 
+# Original implementation, with the same route generation and timing protocol.
+python get_expert_token_idx_list_gpu/benchmark_metadata_cute.py \
+  --workload staging --staging-implementation baseline
+
+# Sweep warp mapping and grid size on the target Hopper GPU.
+for warps in 4 8; do
+  for ctas in 0 2 4 8 16; do
+    python get_expert_token_idx_list_gpu/benchmark_metadata_cute.py \
+      --workload staging --mode graph \
+      --staging-warps-per-cta "$warps" --staging-ctas-per-sm "$ctas"
+  done
+done
+
 # Includes bitwise payload/tail checks, both nodes, empty/full slices,
 # narrow/unaligned row widths, and changed-route/payload graph replay.
 python get_expert_token_idx_list_gpu/benchmark_metadata_cute.py \
-  --workload combined --tokens 257 --token-dimension 7 --check-suite
+  --workload combined --tokens 257 --token-dimension 4096 \
+  --staging-ctas-per-sm 2 --check-suite
 ```
 
 The default `--workload metadata` preserves the original seven-kernel benchmark.

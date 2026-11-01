@@ -335,6 +335,58 @@ class LocalStagingKernel:
                 destination[row, column] = source[token, column]
 
 
+class VectorizedLocalStagingKernel:
+    """One warp per row, adjacent 16-byte lane stripes, four loads before stores."""
+
+    def __init__(self, node_rank, warps_per_cta, num_ctas):
+        self.node_rank = node_rank
+        self.warps_per_cta = warps_per_cta
+        self.num_ctas = num_ctas
+
+    @cute.jit
+    def __call__(self, source: cute.Tensor, destination: cute.Tensor,
+                 x3: cute.Tensor, offsets: cute.Tensor, stream: cuda.CUstream):
+        self.gather_local_rows_128(source, destination, x3, offsets).launch(
+            grid=(self.num_ctas, 1, 1), block=(32 * self.warps_per_cta, 1, 1),
+            stream=stream)
+
+    @cute.kernel
+    def gather_local_rows_128(self, source: cute.Tensor, destination: cute.Tensor,
+                              x3: cute.Tensor, offsets: cute.Tensor):
+        thread, _, _ = cute.arch.thread_idx()
+        block, _, _ = cute.arch.block_idx()
+        lane = thread % 32
+        warp = thread // 32
+        begin = offsets[self.node_rank]
+        rows = offsets[self.node_rank + 1] - begin
+        words = source.shape[1]  # int64 words; two words per 128-bit copy
+        atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Int64,
+                                   num_bits_per_copy=128)
+        staged = cute.make_rmem_tensor((2, 4), cutlass.Int64)
+        for row in cutlass.range(block * self.warps_per_cta + warp, rows,
+                                 self.num_ctas * self.warps_per_cta):
+            token = x3[begin + row]
+            source_base = cutlass.Int64(token) * words
+            destination_base = cutlass.Int64(row) * words
+            # Four independent 16-byte loads per lane, then four stores.
+            # This exposes instruction-level parallelism without shared memory.
+            for first in cutlass.range(0, words, 256):
+                for stripe in cutlass.range_constexpr(4):
+                    column = first + stripe * 64 + lane * 2
+                    if column < words:
+                        src = cute.make_tensor(
+                            source.iterator + cute.assume(source_base + column, divby=2),
+                            cute.make_layout((2,)))
+                        cute.copy(atom, src, staged[None, stripe])
+                for stripe in cutlass.range_constexpr(4):
+                    column = first + stripe * 64 + lane * 2
+                    if column < words:
+                        dst = cute.make_tensor(
+                            destination.iterator + cute.assume(destination_base + column, divby=2),
+                            cute.make_layout((2,)))
+                        cute.copy(atom, staged[None, stripe], dst)
+
+
 class LocalStagingPlan:
     """Gather metadata.x3's node slice into a caller-owned payload-shaped buffer.
 
@@ -346,11 +398,16 @@ class LocalStagingPlan:
     and empty slices without host reads. No allocation/JIT/sync in launch().
     """
 
-    def __init__(self, metadata, source, destination, node_rank=0):
+    def __init__(self, metadata, source, destination, node_rank=0, *,
+                 implementation="vectorized", warps_per_cta=4, ctas_per_sm=0):
         import torch
 
         if node_rank not in (0, 1):
             raise ValueError("node_rank must be 0 or 1")
+        if implementation not in ("baseline", "vectorized"):
+            raise ValueError("implementation must be baseline or vectorized")
+        if warps_per_cta not in (4, 8) or ctas_per_sm < 0:
+            raise ValueError("warps_per_cta must be 4 or 8; ctas_per_sm must be nonnegative")
         for tensor in (source, destination):
             if (tensor.device != metadata.r.device or tensor.ndim != 2
                     or tensor.shape[0] != metadata.r.shape[0]
@@ -366,6 +423,18 @@ class LocalStagingPlan:
         self.source, self.destination = source, destination
         self.node_rank = node_rank
         row_bytes = source.shape[1] * source.element_size()
+        vectorized = (implementation == "vectorized" and row_bytes % 16 == 0
+                      and source.data_ptr() % 16 == 0 and destination.data_ptr() % 16 == 0)
+        self.implementation = "vectorized" if vectorized else "baseline"
+        self.warps_per_cta = warps_per_cta if vectorized else 8
+        self.num_ctas = source.shape[0]
+        kernel = LocalStagingKernel(node_rank)
+        if vectorized:
+            self.num_ctas = (source.shape[0] + warps_per_cta - 1) // warps_per_cta
+            if ctas_per_sm:
+                self.num_ctas = min(self.num_ctas, ctas_per_sm *
+                                    torch.cuda.get_device_properties(source.device).multi_processor_count)
+            kernel = VectorizedLocalStagingKernel(node_rank, warps_per_cta, self.num_ctas)
         # Integer views preserve all payload bits, including NaNs. Aligned rows
         # use 64-bit words; odd row widths or unaligned views use byte copies.
         word_type = (torch.int64 if row_bytes % 8 == 0
@@ -374,10 +443,11 @@ class LocalStagingPlan:
         self.views = (source.view(torch.uint8).view(word_type),
                       destination.view(torch.uint8).view(word_type))
         with torch.cuda.device(source.device):
-            self.arguments = tuple(from_dlpack(t) for t in
-                                   (*self.views, metadata.x3, metadata.node_offsets))
+            self.arguments = (tuple(from_dlpack(t, assumed_align=16) for t in self.views)
+                              if vectorized else tuple(from_dlpack(t) for t in self.views))
+            self.arguments += (from_dlpack(metadata.x3), from_dlpack(metadata.node_offsets))
             stream = cuda.CUstream(torch.cuda.current_stream(source.device).cuda_stream)
-            self.compiled = cute.compile(LocalStagingKernel(node_rank), *self.arguments, stream)
+            self.compiled = cute.compile(kernel, *self.arguments, stream)
 
     def launch(self, stream=None):
         import torch
