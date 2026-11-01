@@ -38,16 +38,34 @@ struct Event {
   ~Event() { cudaEventDestroy(event); }
 };
 
+// Payload setup only: the gather is a bitwise copy, so use deterministic
+// 16-bit patterns to validate every BF16-sized element without a host source.
+__host__ __device__ static uint16_t payload_value(size_t row, size_t column) {
+  uint32_t value = static_cast<uint32_t>(row) * 0x9e3779b9U
+                 ^ static_cast<uint32_t>(column) * 0x85ebca6bU;
+  value ^= value >> 16;
+  return static_cast<uint16_t>(value);
+}
+
+__global__ void initialize_payload(uint16_t* data, size_t elements, int dimension) {
+  for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < elements; i += static_cast<size_t>(gridDim.x) * blockDim.x)
+    data[i] = payload_value(i / dimension, i % dimension);
+}
+
 int main(int argc, char** argv) try {
   int device = 0, local_gpu = 0, tokens = 20480, warmup = 20, iters = 200;
+  int node_rank = 0, token_dimension = 4096;
   bool profile = false;
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
     if (arg == "--help") {
       std::cout << "Usage: benchmark_rdma_metadata [--device 0] [--local-gpu-id 0]\n"
                    "  [--tokens 20480] [--warmup 20] [--iters 200] [--profile]\n"
+                   "  [--node-rank 0] [--token-dimension 4096]\n"
                    "Fixed topology: 2 nodes, 8 GPUs/node, 128 experts, top-k 8, seed 1234.\n"
-                   "--profile captures only warm six-kernel calls via cudaProfilerStart/Stop.\n";
+                   "Payload uses 2 bytes/element, matching BF16 in the RDMA test.\n"
+                   "--profile captures six metadata kernels + local gather per invocation.\n";
       return 0;
     }
     if (arg == "--profile") { profile = true; continue; }
@@ -61,11 +79,15 @@ int main(int argc, char** argv) try {
     else if (arg == "--tokens") tokens = n;
     else if (arg == "--warmup") warmup = n;
     else if (arg == "--iters") iters = n;
+    else if (arg == "--node-rank") node_rank = n;
+    else if (arg == "--token-dimension") token_dimension = n;
     else throw std::runtime_error("unknown option: " + arg);
   }
   if (device < 0 || local_gpu < 0 || local_gpu >= 8 || tokens <= 0 ||
-      tokens > 10000000 || warmup < 1 || iters < 1)
-    throw std::runtime_error("invalid arguments (tokens: 1..10000000; warmup/iters >= 1)");
+      tokens > 10000000 || warmup < 1 || iters < 1 || node_rank < 0 || node_rank > 1 ||
+      token_dimension < 1 || token_dimension > 1048576)
+    throw std::runtime_error("invalid arguments (tokens: 1..10000000; warmup/iters >= 1; "
+                             "node-rank: 0..1; token-dimension: 1..1048576)");
   check(cudaSetDevice(device));
   cudaDeviceProp prop{};
   check(cudaGetDeviceProperties(&prop, device));
@@ -84,7 +106,7 @@ int main(int argc, char** argv) try {
   Buffer<int32_t> counts(chunks * 640), prefixes(counts.size), mask_offsets(512);
   Buffer<int32_t> reordered_counts(2 * chunks * 72), reordered_prefixes(reordered_counts.size);
   // nullptr is the default stream, matching RouterRouting::initialize_cuda().
-  auto launch = [&] {
+  auto launch_metadata = [&] {
     get_expert_token_idx_node_mask_cuda_raw(
         r.data, tokens, top_k, experts, experts_per_gpu, gpus, local_gpu,
         values.data, offsets.data, x3.data, x4.data, node_offsets.data,
@@ -94,16 +116,16 @@ int main(int argc, char** argv) try {
   generate_r_cuda_raw(r.data, tokens, top_k, experts, 1234, nullptr);
   check(cudaDeviceSynchronize());
   Event begin, end;
-  auto sample = [&] {
+  auto sample = [&](auto&& operation) {
     check(cudaEventRecord(begin.event, nullptr));
-    launch();
+    operation();
     check(cudaEventRecord(end.event, nullptr));
     check(cudaEventSynchronize(end.event));
     float ms = 0;
     check(cudaEventElapsedTime(&ms, begin.event, end.event));
     return static_cast<double>(ms) * 1000.0;
   };
-  const double first_us = sample();
+  const double first_us = sample(launch_metadata);
 
   // Independent CPU reference: descending mask, stable token order, then
   // expert lists indexing either the full node sequence or compact GPU input.
@@ -157,6 +179,51 @@ int main(int argc, char** argv) try {
   };
   validate();
   std::cout << "CPU reference: PASS (x3, x4, node offsets, expert offsets/indices)\n";
+
+  // Like the proxy, use the selected node's x3 slice. R is generated once in
+  // this C++ benchmark, so its offset/length can be read once outside timing.
+  // Each measured call still regenerates x3 on the GPU before gathering it.
+  const auto host_nodes = node_offsets.host();
+  const int local_begin = host_nodes[node_rank];
+  const int local_rows = host_nodes[node_rank + 1] - local_begin;
+  const size_t row_bytes = static_cast<size_t>(token_dimension) * sizeof(uint16_t);
+  Buffer<uint16_t> payload(static_cast<size_t>(tokens) * token_dimension);
+  Buffer<uint16_t> staging(payload.size);
+  initialize_payload<<<std::min<size_t>((payload.size + 255) / 256, 4096), 256>>>(
+      payload.data, payload.size, token_dimension);
+  check(cudaGetLastError());
+  check(cudaMemset(staging.data, 0xa5, staging.size * sizeof(uint16_t)));
+  check(cudaDeviceSynchronize());
+  auto launch_gather = [&] {
+    gather_token_rows_cuda_raw(staging.data, payload.data, x3.data + local_begin,
+                              local_rows, row_bytes, nullptr);
+  };
+  auto launch = [&] {
+    launch_metadata();
+    launch_gather();  // Seventh kernel, same stream; no intervening host read/sync.
+  };
+  auto validate_gather = [&] {
+    const auto actual = staging.host();
+    for (size_t i = 0; i < actual.size(); ++i) {
+      const size_t row = i / token_dimension;
+      uint16_t expected = 0xa5a5;
+      if (row < static_cast<size_t>(local_rows)) {
+        const auto source = expected_x3[static_cast<size_t>(local_begin) + row];
+        expected = payload_value(static_cast<size_t>(source), i % token_dimension);
+      }
+      if (actual[i] != expected)
+        throw std::runtime_error("local gather mismatch at element " + std::to_string(i));
+    }
+  };
+  std::cout << "Local staging: node_rank=" << node_rank << ", rows=" << local_rows
+            << ", token_dimension=" << token_dimension << ", row_bytes=" << row_bytes
+            << ", copied_bytes=" << static_cast<size_t>(local_rows) * row_bytes << '\n';
+  if (local_rows == 0)
+    std::cout << "Empty local-node slice: gather wrapper is a no-op (no seventh kernel).\n";
+  const double first_full_us = sample(launch);
+  validate();
+  validate_gather();
+  std::cout << "Local gather CPU reference: PASS (all valid elements and untouched tail)\n";
   for (int i = 0; i < warmup; ++i) launch();
   check(cudaDeviceSynchronize());
   if (profile) {
@@ -164,24 +231,34 @@ int main(int argc, char** argv) try {
     for (int i = 0; i < iters; ++i) launch();
     check(cudaDeviceSynchronize());
     check(cudaProfilerStop());
-    std::cout << "Captured " << iters << " six-kernel calls; inspect Nsight Systems for\n"
+    std::cout << "Captured " << iters << " metadata + local gather calls; inspect Nsight Systems for\n"
                  "individual durations and first-kernel-start to last-kernel-end spans.\n";
   } else {
-    std::vector<double> samples;
-    samples.reserve(iters);
-    for (int i = 0; i < iters; ++i) samples.push_back(sample());
-    std::sort(samples.begin(), samples.end());
-    auto percentile = [&](double q) { return samples[static_cast<size_t>(q * (samples.size() - 1))]; };
     std::cout << std::fixed << std::setprecision(3)
               << "First metadata call (not process startup): " << first_us << " us\n"
-              << "Warm six-kernel CUDA-event span, " << iters << " samples:\n"
-              << "  min=" << samples.front() << " median=" << percentile(0.5)
-              << " mean=" << std::accumulate(samples.begin(), samples.end(), 0.0) / samples.size()
-              << " p95=" << percentile(0.95) << " max=" << samples.back() << " us\n"
-              << "Includes submission gaps and boundary event overhead; excludes R generation,\n"
-                 "allocation, CPU validation, and D2H. Use nsys for exact kernel boundaries.\n";
+              << "First combined call (metadata already used): " << first_full_us << " us\n";
+    auto benchmark = [&](const char* label, auto&& operation) {
+      for (int i = 0; i < warmup; ++i) operation();
+      check(cudaDeviceSynchronize());
+      std::vector<double> samples;
+      samples.reserve(iters);
+      for (int i = 0; i < iters; ++i) samples.push_back(sample(operation));
+      std::sort(samples.begin(), samples.end());
+      auto percentile = [&](double q) { return samples[static_cast<size_t>(q * (samples.size() - 1))]; };
+      std::cout << label << ", " << iters << " samples:\n"
+                << "  min=" << samples.front() << " median=" << percentile(0.5)
+                << " mean=" << std::accumulate(samples.begin(), samples.end(), 0.0) / samples.size()
+                << " p95=" << percentile(0.95) << " max=" << samples.back() << " us\n";
+    };
+    benchmark("Warm metadata + local gather CUDA-event span (7 kernels)", launch);
+    benchmark("Warm metadata-only CUDA-event span (6 kernels)", launch_metadata);
+    benchmark("Warm gather-only CUDA-event span", launch_gather);
+    std::cout << "Separate timing runs: do not infer exact gather duration by subtracting medians.\n"
+                 "Includes submission gaps and boundary event overhead; excludes R generation,\n"
+                 "payload setup, allocation, CPU validation, and D2H. Use nsys for kernel durations.\n";
   }
   validate();
+  validate_gather();
   return 0;
 } catch (const std::exception& e) {
   std::cerr << "ERROR: " << e.what() << '\n';

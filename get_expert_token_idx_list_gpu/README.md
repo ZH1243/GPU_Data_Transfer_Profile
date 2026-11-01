@@ -31,23 +31,45 @@ Defaults match `RDMA_CPU_Proxy/scripts/run_node{0,1}_torchrun.sh`: 20,480 tokens
 128 experts, top-k 8, two logical nodes, eight logical GPUs per node, eight
 experts per GPU, and seed 1234. `--device 0` selects the physical CUDA device;
 `--local-gpu-id 0` independently selects the logical source GPU (0 through 7).
-The 4,096-element token payload and 32-token RDMA chunks do not enter these
-metadata kernels; their internal chunk size is 256 tokens.
+`--node-rank 0` selects the local-node x3 slice (0 or 1), independently of
+the physical device and logical source GPU. `--token-dimension 4096` controls
+the gathered payload width. Payload elements occupy two bytes, matching the
+RDMA test's BF16 rows; the gather copies bit patterns without arithmetic.
+The 32-token RDMA chunks do not enter these kernels; the metadata kernels'
+internal chunk size is 256 tokens.
 
 The executable links the existing CUDA source in standalone mode and calls
-the **same raw six-kernel API on the default stream** as `RouterRouting`.
-It generates R once, allocates scratch once, and validates all meaningful
-outputs against an independent CPU reference before and after benchmarking.
+the **same raw six-kernel API on the default stream** as `RouterRouting`,
+then calls `gather_token_rows_cuda_raw` as kernel 7, just as local staging
+does. It gathers `staging[row, :] = payload[local_x3[row], :]` into a separate
+buffer. x4 is not an input to this gather. It generates R once, allocates
+scratch/payload once, and validates all meaningful metadata and every gathered
+element against independent CPU references before and after benchmarking.
+The unused staging-buffer tail is checked for unintended writes too.
+R remains fixed in this C++ test, unlike the changing-R CuTe benchmark.
+Consequently the selected node's offset/row count can be copied to the host
+once during setup. No D2H copy or host synchronization separates the six
+metadata kernels and the gather in the measured chain. If the selected node
+has zero rows, the existing gather wrapper skips its launch and this is logged.
 No production kernel or launch wrapper is modified. Build flags are `-O3`
 and `-lineinfo` with `sm_90`; use the same optimization/architecture settings
 in the proxy build when comparing results. `NVCC`, `CUDA_ARCH`, and
 `RDMA_METADATA_BUILD_DIR` can override the compiler, target, and output path.
 
-The default run reports a first-call measurement separately, then min,
-median, mean, p95, and max over 200 samples after 20 warmup calls. Each sample
-uses CUDA events around one complete six-kernel call and synchronizes after
-the ending event. It excludes R generation, allocations, D2H copies, and
-validation. The event span includes submission gaps and boundary event
+The default run reports first metadata and first combined-call measurements
+separately, then min, median, mean, p95, and max over 200 samples after 20
+warmup calls for each of three separate runs:
+
+- Six metadata kernels followed by the local gather (seven kernels).
+- Metadata only (six kernels).
+- Gather only, using the already generated x3.
+
+Each sample uses CUDA events around the selected operation and synchronizes
+after the ending event. There is no event between metadata and gather in the
+combined measurement. Do not subtract the separate-run medians to infer exact
+gather time; use its Nsight kernel duration. Timings exclude R generation,
+payload initialization, allocations, D2H copies, and validation.
+The event span includes submission gaps and boundary event
 overhead, so it approximates, but is not identical to, Nsight's interval
 from the first kernel's start to the last kernel's end. The first call is
 not a full cold-process measurement: CUDA initialization and R generation
@@ -55,7 +77,7 @@ have already run. Warm repetitions reuse cached data and do not reproduce
 the full proxy's CPU/GPU contention or initialization environment.
 
 For individual kernel durations and exact timeline gaps, capture the
-uninstrumented six-kernel chain with Nsight Systems:
+uninstrumented seven-kernel chain with Nsight Systems:
 
 ```bash
 nsys profile --trace=cuda --sample=none \
@@ -68,7 +90,7 @@ nsys stats --report cuda_gpu_kern_sum,cuda_api_sum rdma_metadata.nsys-rep
 
 The capture excludes generation, validation, and warmup. There are no events
 between kernels or calls in profile mode; a final synchronization drains
-the captured work. Each call contains the following six kernels, in order:
+the captured work. Each call contains the following seven kernels, in order:
 
 1. `count_node_input_chunks_kernel`
 2. `scan_node_input_counts_kernel`
@@ -76,13 +98,26 @@ the captured work. Each call contains the following six kernels, in order:
 4. `count_reordered_node_chunks_kernel`
 5. `scan_reordered_node_counts_kernel`
 6. `scatter_reordered_chunks_kernel<8>`
+7. `gather_token_rows_vectorized_kernel` (or `gather_token_rows_bytes_kernel`
+   when the payload row size is not divisible by 16 bytes)
 
 Use `cuda_gpu_kern_sum` for per-kernel averages. In the GUI, for each group
-of six, measure `last.end - first.start`; subtract the sum of the six kernel
-durations to obtain the five internal gaps. Do not include gaps between
+of seven, measure `last.end - first.start`; subtract the sum of the seven kernel
+durations to obtain the six internal gaps. Do not include gaps between
 calls. `--profile --iters 1` isolates one warm chain. Profiling can perturb
 short timings; compare with an unprofiled event run. This benchmark measures
-local metadata generation, not RDMA/NVLink, metadata exchange, or GEMM.
+local metadata generation and local staging, not RDMA/NVLink, metadata
+exchange, or GEMM. The original proxy stages once before its first iteration;
+this benchmark deliberately repeats staging to measure its warm performance.
+
+For additional GPU correctness coverage, exercise node 1 and a non-vectorized
+row width with a partial metadata chunk:
+
+```bash
+get_expert_token_idx_list_gpu/build/benchmark_rdma_metadata \
+  --device 5 --node-rank 1 --local-gpu-id 7 --tokens 257 \
+  --token-dimension 7 --warmup 2 --iters 5
+```
 
 ### CuTe DSL metadata implementation (single GPU)
 
