@@ -331,6 +331,39 @@ checks run outside timing; `--check-suite` additionally verifies untouched tails
 against a sentinel. GPU JIT compilation, correctness, and performance must be
 verified remotely; host-only tests do not validate this kernel.
 
+### Paired actual-x3 versus identity gather
+
+To estimate the cost of source-row ordering with the same gather implementation:
+
+```bash
+python get_expert_token_idx_list_gpu/benchmark_metadata_cute.py \
+  --workload staging --compare-staging-identity --mode graph \
+  --node-rank 0 --token-dimension 4096 \
+  --staging-warps-per-cta 4 --staging-ctas-per-sm 0
+```
+
+Each sample pair uses the same fresh routing seed and selected-node row count
+`L`. Actual mode reads the routing x3 sequence; identity mode reads payload rows
+`0..L-1`. Both write the same contiguous output prefix. Both prepare indices in
+the same auxiliary allocation using a small GPU kernel before the start event;
+the original routing metadata stays intact. They reuse the same payload, output,
+compiled gather, launch geometry, and (in graph mode) the same one-kernel graph.
+The first pattern alternates between pairs to reduce order bias. No host reads
+or allocations separate input preparation and the timed gather.
+
+The report prints separate latency distributions, the actual/identity median
+ratio and difference, and the final sample's exact row count/payload bytes.
+Counts may change across seeds but are identical within each pair. Preparation,
+compilation, metadata correctness checks, bitwise payload checks, and untouched
+tail checks are outside timing. Eager mode and `--mode both` are also supported;
+this comparison cannot be combined with profile, compare-cuda, or check-suite.
+
+Caches are not flushed, and the two patterns access different source row sets
+as well as orders. This is a practical copy reference for the selected kernel,
+not a measurement of peak HBM bandwidth. The extra index preparation also means
+these timings should be compared within the paired run rather than directly
+against the original staging-only benchmark. The production gather is unchanged.
+
 ### Original Python/CUDA C++ driver
 
 PyTorch with CUDA and a CUDA toolkit are required.  The extension is compiled

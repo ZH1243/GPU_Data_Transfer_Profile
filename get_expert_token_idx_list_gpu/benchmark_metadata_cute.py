@@ -106,6 +106,116 @@ def check_staging(torch, staging, check_tail=False):
         raise AssertionError("CuTe local staging modified the unused tail")
 
 
+def compare_staging_identity(args, torch, plan, original_staging, update_r):
+    """Paired comparison: same gather, buffers, dynamic row counts and seed sequence."""
+    from types import SimpleNamespace
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+    from metadata_cute import LocalStagingPlan
+
+    class PrepareIndices:
+        @cute.jit
+        def __call__(self, actual: cute.Tensor, output: cute.Tensor,
+                     offsets: cute.Tensor, identity: cutlass.Int32, stream: cuda.CUstream):
+            self.prepare(actual, output, offsets, identity).launch(
+                grid=(cute.ceil_div(output.shape[0], 256), 1, 1),
+                block=(256, 1, 1), stream=stream)
+
+        @cute.kernel
+        def prepare(self, actual: cute.Tensor, output: cute.Tensor,
+                    offsets: cute.Tensor, identity: cutlass.Int32):
+            thread, _, _ = cute.arch.thread_idx()
+            block, _, _ = cute.arch.block_idx()
+            i = block * 256 + thread
+            if i < offsets[2]:
+                value = actual[i]
+                if identity != 0:
+                    base = offsets[0]
+                    if i >= offsets[1]:
+                        base = offsets[1]
+                    value = i - base
+                output[i] = value
+
+    index_buffer = torch.empty_like(plan.x3)
+    inputs = SimpleNamespace(r=plan.r, x3=index_buffer, node_offsets=plan.node_offsets)
+    staging = LocalStagingPlan(inputs, original_staging.source, original_staging.destination,
+                               args.node_rank, implementation=args.staging_implementation,
+                               warps_per_cta=args.staging_warps_per_cta,
+                               ctas_per_sm=args.staging_ctas_per_sm)
+    stream = cuda.CUstream(torch.cuda.current_stream(plan.r.device).cuda_stream)
+    arguments = tuple(from_dlpack(t) for t in (plan.x3, index_buffer, plan.node_offsets))
+    prepare_indices = cute.compile(PrepareIndices(), *arguments, cutlass.Int32(0), stream)
+
+    def prepare(seed, identity):
+        update_r(seed)
+        plan.launch()
+        prepare_indices(*arguments, cutlass.Int32(identity), stream)
+
+    def validate(launch, seed, identity):
+        prepare(seed, identity)
+        staging.destination.view(torch.uint8).fill_(0xA5)
+        launch()
+        torch.cuda.synchronize(plan.r.device)
+        plan.check()
+        offsets = plan.node_offsets.cpu().tolist()
+        begin, end = offsets[args.node_rank:args.node_rank + 2]
+        expected = (torch.arange(end - begin, dtype=torch.int32, device=plan.r.device)
+                    if identity else plan.x3[begin:end])
+        if not torch.equal(index_buffer[begin:end], expected):
+            raise AssertionError("comparison index preparation mismatch")
+        check_staging(torch, staging, check_tail=True)
+        return end - begin
+
+    for identity in (0, 1):
+        validate(staging.launch, args.seed, identity)
+    graph = None
+    if args.mode in ("graph", "both"):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            staging.launch()
+    launchers = []
+    if args.mode in ("eager", "both"):
+        launchers.append(("eager", staging.launch))
+    if graph is not None:
+        launchers.append(("graph", graph.replay))
+    begin_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    for mode, launch in launchers:
+        for i in range(args.warmup):
+            for identity in (i % 2, 1 - i % 2):
+                prepare(iteration_seed(args.seed, i + 1), identity)
+                launch()
+        torch.cuda.synchronize(plan.r.device)
+        timings = [[], []]
+        for i in range(args.iters):
+            seed = iteration_seed(args.seed, args.warmup + 1 + i)
+            # Alternate which pattern runs first to reduce systematic order bias.
+            for identity in (i % 2, 1 - i % 2):
+                prepare(seed, identity)
+                begin_event.record()
+                launch()
+                end_event.record()
+                end_event.synchronize()
+                timings[identity].append(begin_event.elapsed_time(end_event) * 1000)
+        for identity, label in enumerate(("actual-x3", "identity")):
+            rows = validate(launch, seed, identity)
+            times = sorted(timings[identity])
+            print(f"{mode} {label}: min={times[0]:.3f} median={statistics.median(times):.3f} "
+                  f"mean={statistics.mean(times):.3f} p95={times[int(.95*(len(times)-1))]:.3f} "
+                  f"max={times[-1]:.3f} us ({args.iters} paired samples); "
+                  f"final_sample_rows={rows}, payload_bytes={rows * args.token_dimension * 2}")
+        actual, identity = map(statistics.median, timings)
+        print(f"{mode} actual/identity median ratio={actual / identity:.4f}; "
+              f"difference={actual - identity:.3f} us; payload/index/tail checks PASS")
+    print("Paired comparison uses identical seeds, row counts, payload/output/index allocations, "
+          "and the same compiled gather (one shared graph in graph mode). "
+          "Generation, metadata, and index preparation precede the start event for both patterns. "
+          "Caches are not flushed; source row sets/order differ. Identity is a copy-bandwidth "
+          "reference for this kernel, not a guaranteed hardware ceiling.")
+
+
 def run_staging_check_suite(torch, device, implementation, warps_per_cta, ctas_per_sm):
     from metadata_cute import MetadataPlan, LocalStagingPlan
 
@@ -165,6 +275,8 @@ def main():
     parser.add_argument("--staging-warps-per-cta", type=int, choices=(4, 8), default=4)
     parser.add_argument("--staging-ctas-per-sm", type=int, default=0,
                         help="cap vectorized grid to this many CTAs/SM; 0 uses one CTA per row group")
+    parser.add_argument("--compare-staging-identity", action="store_true",
+                        help="paired actual-x3/identity gather timings with identical row counts")
     parser.add_argument("--profile", action="store_true",
                         help="capture warm R generation + metadata calls via cudaProfilerStart/Stop")
     parser.add_argument("--compare-cuda", action="store_true",
@@ -182,6 +294,10 @@ def main():
         parser.error("token-dimension must be positive")
     if args.staging_ctas_per_sm < 0:
         parser.error("staging-ctas-per-sm must be nonnegative")
+    if args.compare_staging_identity and (args.workload != "staging" or args.profile
+                                          or args.compare_cuda or args.check_suite):
+        parser.error("--compare-staging-identity requires --workload staging and cannot be "
+                     "combined with --profile, --compare-cuda, or --check-suite")
 
     import torch
     import cuda.bindings.driver as cuda
@@ -246,6 +362,9 @@ def main():
             raise AssertionError(f"CuTe route generator mismatch for seed={seed}")
     torch.cuda.synchronize(device)
     print(f"Validation/allocation/JIT setup: {time.perf_counter() - start:.3f} s (excluded)")
+    if args.compare_staging_identity:
+        compare_staging_identity(args, torch, plan, staging, update_r)
+        return
     begin = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
 
