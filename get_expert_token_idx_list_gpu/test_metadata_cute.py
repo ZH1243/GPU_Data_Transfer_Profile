@@ -45,7 +45,7 @@ class MetadataContracts(unittest.TestCase):
                 self.assertEqual(bitmap_positions(groups), expected)
 
     def test_generator_contract(self):
-        for pattern in ("affine", "node0", "node1", "spread", "random"):
+        for pattern in ("affine", "node0", "node1", "spread", "random", "mixed"):
             for row in make_routes(257, pattern=pattern):
                 self.assertEqual(len(row), 8)
                 self.assertEqual(len(set(row)), 8)

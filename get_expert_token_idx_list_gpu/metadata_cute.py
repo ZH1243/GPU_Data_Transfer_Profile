@@ -95,10 +95,12 @@ def _bitmap_rank(bits: cute.Tensor, group: cutlass.Int32, thread: cutlass.Int32)
 
 
 class MetadataKernels:
-    def __init__(self, tokens, local_gpu_id):
+    def __init__(self, tokens, local_gpu_id, scatter_variant="shared-reuse"):
         self.tokens = tokens
         self.chunks = (tokens + 255) // 256
         self.local_gpu_id = local_gpu_id
+        self.scatter_shared = scatter_variant in ("shared", "shared-reuse")
+        self.scatter_reuse = scatter_variant in ("reuse", "shared-reuse")
 
     @cute.jit
     def __call__(self, r: cute.Tensor, b: tuple, stream: cuda.CUstream):
@@ -294,6 +296,24 @@ class MetadataKernels:
         chunk, node, _ = cute.arch.block_idx()
         position = chunk * 256 + thread
         absolute = node_offsets[node] + position
+        if cutlass.const_expr(self.scatter_shared):
+            smem = cutlass.utils.SmemAllocator()
+            # Keep group contiguous in shared memory so a fixed warp column
+            # can address all 32 banks, unlike the global [group, warp] layout.
+            rank_bits = smem.allocate_tensor(
+                cutlass.Int32, cute.make_layout((72, 8), stride=(1, 72)))
+            for i in cutlass.range(thread, 576, 256):
+                rank_bits[i // 8, i % 8] = bits[node, chunk, i // 8, i % 8]
+            # Includes inactive lanes/tail CTAs; never put this barrier inside
+            # the valid-token branch below.
+            cute.arch.sync_threads()
+        else:
+            rank_bits = bits[node, chunk, None, None]
+        if cutlass.const_expr(self.scatter_reuse):
+            # Compile-time slot selection avoids dynamic register-array indexing.
+            # -1 is safe: compact row indices are always nonnegative.
+            gpu_indices = cute.make_rmem_tensor((8,), cutlass.Int32)
+            gpu_indices.fill(-1)
         if absolute < node_offsets[node + 1]:
             token = x3[absolute]
             for k in cutlass.range_constexpr(8):
@@ -301,12 +321,20 @@ class MetadataKernels:
                 if expert // 64 == node:
                     local_expert = expert % 64
                     gpu = local_expert // 8
-                    rank = _bitmap_rank(bits[node, chunk, None, None], local_expert, thread)
+                    rank = _bitmap_rank(rank_bits, local_expert, thread)
                     dst = expert_offsets[expert] + prefixes[node, chunk, local_expert] + rank
                     index = position
                     if gpu != self.local_gpu_id:
-                        index = prefixes[node, chunk, 64 + gpu] + _bitmap_rank(
-                            bits[node, chunk, None, None], 64 + gpu, thread)
+                        if cutlass.const_expr(self.scatter_reuse):
+                            for g in cutlass.range_constexpr(8):
+                                if gpu == g:
+                                    if gpu_indices[g] < 0:
+                                        gpu_indices[g] = prefixes[node, chunk, 64 + g] + _bitmap_rank(
+                                            rank_bits, cutlass.Int32(64 + g), thread)
+                                    index = gpu_indices[g]
+                        else:
+                            index = prefixes[node, chunk, 64 + gpu] + _bitmap_rank(
+                                rank_bits, 64 + gpu, thread)
                     values[dst] = index
 
 
@@ -319,9 +347,11 @@ class MetadataPlan:
     Calls sharing a plan must be ordered on one stream or externally synchronized.
     """
 
-    def __init__(self, r, local_gpu_id=0):
+    def __init__(self, r, local_gpu_id=0, scatter_variant="shared-reuse"):
         import torch
 
+        if scatter_variant not in ("baseline", "shared", "reuse", "shared-reuse"):
+            raise ValueError("invalid scatter_variant")
         if (not r.is_cuda or r.dtype != torch.int32 or r.ndim != 2
                 or r.shape[1] != 8 or not r.is_contiguous()):
             raise ValueError("R must be a contiguous CUDA int32 tensor of shape [T,8]")
@@ -335,6 +365,7 @@ class MetadataPlan:
             raise ValueError("each token must select eight distinct experts")
         self.r = r
         self.local_gpu_id = local_gpu_id
+        self.scatter_variant = scatter_variant
         tokens = r.shape[0]
         chunks = (tokens + 255) // 256
 
@@ -356,7 +387,7 @@ class MetadataPlan:
         with torch.cuda.device(r.device):
             self.arguments = (from_dlpack(r), tuple(from_dlpack(b) for b in self.buffers))
             stream = cuda.CUstream(torch.cuda.current_stream(r.device).cuda_stream)
-            self.compiled = cute.compile(MetadataKernels(tokens, local_gpu_id),
+            self.compiled = cute.compile(MetadataKernels(tokens, local_gpu_id, scatter_variant),
                                          *self.arguments, stream)
 
     def launch(self, stream=None):

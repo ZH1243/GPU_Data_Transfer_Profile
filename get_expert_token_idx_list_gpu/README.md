@@ -136,11 +136,50 @@ last step. A 640-int32 (2,560-byte) scratch array carries bin totals between
 the two kernels. Same-stream ordering supplies the global dependency; there
 is no CPU synchronization between them. The small offsets kernel retains
 the existing parallel block scans. The reordered scan still uses 18 CTAs.
-All other metadata kernels and their count layouts remain unchanged.
+The count layouts remain unchanged.
 Compare the **combined** time of the two new kernels against the former
 `scan_input`, and the full graph span against the prior ~68.2 us baseline.
 The new scan retains strided chunk-count access; layout tuning is a separate
 optimization. Actual performance must be measured on H20.
+
+`scatter_experts` now has four compile-time variants selected with
+`--scatter-variant` (default: `shared-reuse`):
+
+| Variant | Bitmap reads | Compact GPU index |
+|---|---|---|
+| `baseline` | Global memory | Recomputed for each expert route (previous version) |
+| `shared` | Cooperatively staged in shared memory | Recomputed per route |
+| `reuse` | Global memory | Cached per token/destination GPU |
+| `shared-reuse` | Staged in shared memory | Cached per token/destination GPU |
+
+Shared variants load 576 int32 words (2,304 bytes) per block with a barrier
+outside the valid-token branch, including partial/empty chunks. Their shared
+layout makes the bin dimension contiguous to distribute rank reads across
+more banks. Reuse variants lazily calculate a compact index on the first
+route to a GPU, then reuse it for later routes to that GPU. Register slots
+are selected with compile-time indices. The source-local GPU still uses
+the uncompressed node position directly. All variants preserve stable expert
+ordering and execute seven metadata kernels; the other six kernels are
+unchanged by this scatter optimization.
+
+Compare on the same physical GPU, using identical seeds and shapes:
+
+```bash
+for variant in baseline shared reuse shared-reuse; do
+  python get_expert_token_idx_list_gpu/benchmark_metadata_cute.py \
+    --device 5 --scatter-variant "$variant" --mode graph \
+    --check-suite --compare-cuda
+done
+```
+
+`--check-suite` applies to the selected variant and includes repeated GPU
+owners separated by other routes, local-GPU IDs 0/7, chunk tails, and graph
+replay with changed routes. Benchmark both the full graph span and the
+`scatter_experts` duration in Nsight. Prior measurements were ~31.776 us for
+the graph and ~7.146 us for scatter; rerun `baseline` on the same GPU for a
+controlled comparison. Shared staging adds a barrier, and caching adds
+register/control-flow work, so the combined variant is an experimental
+default, not a measured speedup claim.
 
 By default the benchmark reports **eager** and **graph** timings separately:
 
@@ -195,7 +234,8 @@ seven-kernel metadata chain. Exclude that generator and the gap before the first
 metadata kernel when computing metadata-only durations. The event benchmark
 already excludes generation. Compilation, correctness checks, and warmup are
 outside the capture.
-For library use, construct `MetadataPlan(r, local_gpu_id)`, then call
+For library use, construct
+`MetadataPlan(r, local_gpu_id, scatter_variant="shared-reuse")`, then call
 `plan.launch(stream)` on an ordered stream. Outputs are `plan.x3`, `plan.x4`,
 `plan.node_offsets`, `plan.expert_offsets`, and `plan.expert_token_indices`.
 Allocate/compile once; changing R in place is supported if its contract is
