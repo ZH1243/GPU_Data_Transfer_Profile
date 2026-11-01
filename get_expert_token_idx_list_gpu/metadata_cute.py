@@ -310,6 +310,86 @@ class MetadataKernels:
                     values[dst] = index
 
 
+class LocalStagingKernel:
+    """One CTA per possible local row; read the current slice bounds on GPU."""
+
+    def __init__(self, node_rank):
+        self.node_rank = node_rank
+
+    @cute.jit
+    def __call__(self, source: cute.Tensor, destination: cute.Tensor,
+                 x3: cute.Tensor, offsets: cute.Tensor, stream: cuda.CUstream):
+        self.gather_local_rows(source, destination, x3, offsets).launch(
+            grid=(source.shape[0], 1, 1), block=(256, 1, 1), stream=stream)
+
+    @cute.kernel
+    def gather_local_rows(self, source: cute.Tensor, destination: cute.Tensor,
+                          x3: cute.Tensor, offsets: cute.Tensor):
+        thread, _, _ = cute.arch.thread_idx()
+        row, _, _ = cute.arch.block_idx()
+        begin = offsets[self.node_rank]
+        end = offsets[self.node_rank + 1]
+        if row < end - begin:
+            token = x3[begin + row]
+            for column in cutlass.range(thread, source.shape[1], 256):
+                destination[row, column] = source[token, column]
+
+
+class LocalStagingPlan:
+    """Gather metadata.x3's node slice into a caller-owned payload-shaped buffer.
+
+    Source/destination must be distinct contiguous CUDA tensors [T,D] with the
+    same dtype/shape and device as metadata.r. Metadata must have been launched
+    before staging on the same stream (or with an explicit dependency). Only
+    destination[:node_offsets[node+1]-node_offsets[node]] is written; the tail
+    remains unchanged. Bounds stay on the GPU, supporting changed-R graph replay
+    and empty slices without host reads. No allocation/JIT/sync in launch().
+    """
+
+    def __init__(self, metadata, source, destination, node_rank=0):
+        import torch
+
+        if node_rank not in (0, 1):
+            raise ValueError("node_rank must be 0 or 1")
+        for tensor in (source, destination):
+            if (tensor.device != metadata.r.device or tensor.ndim != 2
+                    or tensor.shape[0] != metadata.r.shape[0]
+                    or tensor.shape[1] < 1 or not tensor.is_contiguous()):
+                raise ValueError("staging tensors must be contiguous CUDA [T,D] on the metadata GPU")
+        if source.shape != destination.shape or source.dtype != destination.dtype:
+            raise ValueError("staging source/destination shapes and dtypes must match")
+        source_end = source.data_ptr() + source.numel() * source.element_size()
+        destination_end = destination.data_ptr() + destination.numel() * destination.element_size()
+        if source.data_ptr() < destination_end and destination.data_ptr() < source_end:
+            raise ValueError("staging source and destination must not overlap")
+        self.metadata = metadata
+        self.source, self.destination = source, destination
+        self.node_rank = node_rank
+        row_bytes = source.shape[1] * source.element_size()
+        # Integer views preserve all payload bits, including NaNs. Aligned rows
+        # use 64-bit words; odd row widths or unaligned views use byte copies.
+        word_type = (torch.int64 if row_bytes % 8 == 0
+                     and source.data_ptr() % 8 == 0 and destination.data_ptr() % 8 == 0
+                     else torch.uint8)
+        self.views = (source.view(torch.uint8).view(word_type),
+                      destination.view(torch.uint8).view(word_type))
+        with torch.cuda.device(source.device):
+            self.arguments = tuple(from_dlpack(t) for t in
+                                   (*self.views, metadata.x3, metadata.node_offsets))
+            stream = cuda.CUstream(torch.cuda.current_stream(source.device).cuda_stream)
+            self.compiled = cute.compile(LocalStagingKernel(node_rank), *self.arguments, stream)
+
+    def launch(self, stream=None):
+        import torch
+
+        if stream is None:
+            stream = torch.cuda.current_stream(self.source.device)
+        if stream.device != self.source.device:
+            raise ValueError("launch stream and staging tensors must use the same GPU")
+        with torch.cuda.device(self.source.device):
+            self.compiled(*self.arguments, cuda.CUstream(stream.cuda_stream))
+
+
 class MetadataPlan:
     """Own fixed-shape buffers and a compiled seven-kernel launch callable.
 

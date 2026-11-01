@@ -93,6 +93,53 @@ def run_check_suite(torch, MetadataPlan, device):
         print(f"PASS T={tokens}, local_gpu={local_gpu}, pattern={pattern}; changed-R graph replay")
 
 
+def check_staging(torch, staging, check_tail=False):
+    metadata = staging.metadata
+    offsets = metadata.node_offsets.cpu().tolist()
+    begin, end = offsets[staging.node_rank:staging.node_rank + 2]
+    indices = metadata.x3[begin:end].long()
+    expected = staging.source.index_select(0, indices).view(torch.uint8)
+    actual = staging.destination[:end - begin].view(torch.uint8)
+    if not torch.equal(actual, expected):
+        raise AssertionError("CuTe local staging payload mismatch")
+    if check_tail and not torch.all(staging.destination[end - begin:].view(torch.uint8) == 0xA5):
+        raise AssertionError("CuTe local staging modified the unused tail")
+
+
+def run_staging_check_suite(torch, device):
+    from metadata_cute import MetadataPlan, LocalStagingPlan
+
+    for tokens, width in ((1, 1), (33, 7), (257, 4096)):
+        r = torch.tensor(make_routes(tokens), dtype=torch.int32, device=device)
+        metadata = MetadataPlan(r, 7)
+        # Arbitrary bits exercise bit-preserving copies, including BF16 NaNs.
+        source = torch.randint(0, 256, (tokens, width * 2),
+                               dtype=torch.uint8, device=device).view(torch.bfloat16)
+        for node in (0, 1):
+            destination = torch.empty_like(source)
+            staging = LocalStagingPlan(metadata, source, destination, node)
+            destination.view(torch.uint8).fill_(0xA5)
+            metadata.launch()
+            staging.launch()
+            torch.cuda.synchronize(device)
+            check_staging(torch, staging, check_tail=True)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                metadata.launch()
+                staging.launch()
+            # Full/empty slices and changed lengths on the same captured graph.
+            for pattern in ("node0", "node1", "random"):
+                r.copy_(torch.tensor(make_routes(tokens, pattern=pattern),
+                                     dtype=torch.int32, device=device))
+                source.view(torch.uint8).bitwise_xor_(0x5A)
+                destination.view(torch.uint8).fill_(0xA5)
+                graph.replay()
+                torch.cuda.synchronize(device)
+                metadata.check()
+                check_staging(torch, staging, check_tail=True)
+            print(f"PASS staging T={tokens}, D={width}, node={node}; changed-R/payload graph replay")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, default=0)
@@ -102,6 +149,10 @@ def main():
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--mode", choices=("eager", "graph", "both"), default="both")
+    parser.add_argument("--workload", choices=("metadata", "staging", "combined"),
+                        default="metadata", help="time metadata, local gather, or both")
+    parser.add_argument("--node-rank", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--token-dimension", type=int, default=4096)
     parser.add_argument("--profile", action="store_true",
                         help="capture warm R generation + metadata calls via cudaProfilerStart/Stop")
     parser.add_argument("--compare-cuda", action="store_true",
@@ -115,13 +166,15 @@ def main():
         parser.error("require device >= 0, local-gpu-id in 0..7, seed in 0..2^64-1")
     if args.profile and args.mode == "both":
         parser.error("choose --mode eager or --mode graph when using --profile")
+    if args.token_dimension < 1:
+        parser.error("token-dimension must be positive")
 
     import torch
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
-    from metadata_cute import MetadataPlan, RouteGenerator
+    from metadata_cute import MetadataPlan, RouteGenerator, LocalStagingPlan
 
     if not torch.cuda.is_available():
         raise RuntimeError("Run this benchmark on a CUDA GPU, not the local Mac")
@@ -135,12 +188,34 @@ def main():
     r = torch.tensor(make_routes(args.tokens, args.seed), dtype=torch.int32, device=device)
     start = time.perf_counter()
     plan = MetadataPlan(r, args.local_gpu_id)
+    staging = None
+    if args.workload != "metadata":
+        payload = torch.randint(0, 256, (args.tokens, args.token_dimension * 2),
+                                dtype=torch.uint8, device=device).view(torch.bfloat16)
+        staging = LocalStagingPlan(plan, payload, torch.empty_like(payload), args.node_rank)
+
+    def launch_workload():
+        if args.workload != "staging":
+            plan.launch()
+        if staging is not None:
+            staging.launch()
+
     r_argument = from_dlpack(r)
     stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
     generator = cute.compile(RouteGenerator(), r_argument, cutlass.Uint64(args.seed), stream)
 
     def update_r(seed):
         generator(r_argument, cutlass.Uint64(seed), stream)
+
+    def prepare_input(seed):
+        update_r(seed)
+        if args.workload == "staging":
+            plan.launch()  # Fresh x3/offsets, outside gather-only timing/capture graph.
+
+    def check_outputs():
+        plan.check()
+        if staging is not None:
+            check_staging(torch, staging)
 
     # Check the GPU generator against the independent CPU implementation,
     # including uint64 seed wraparound, before relying on it for measurements.
@@ -157,16 +232,16 @@ def main():
     def sample(launch, seed):
         # Same stream orders generator -> start event -> metadata -> end event.
         # R keeps its address/shape; generation is excluded from elapsed time.
-        update_r(seed)
+        prepare_input(seed)
         begin.record()
         launch()
         end.record()
         end.synchronize()
         return begin.elapsed_time(end) * 1000.0
 
-    first = sample(plan.launch, args.seed)
-    plan.check()
-    print(f"CPU reference: PASS; first execution after JIT: {first:.3f} us")
+    first = sample(launch_workload, args.seed)
+    check_outputs()
+    print(f"CPU reference: PASS; workload={args.workload}; first execution after JIT: {first:.3f} us")
 
     if args.compare_cuda:
         from run import allocate_node_mask_outputs, load_extension
@@ -190,53 +265,54 @@ def main():
         print("CUDA C++ generator and all five metadata outputs: PASS")
 
     for i in range(args.warmup):
-        update_r(iteration_seed(args.seed, i + 1))
-        plan.launch()
+        prepare_input(iteration_seed(args.seed, i + 1))
+        launch_workload()
     torch.cuda.synchronize(device)
     graph = None
     if args.mode in ("graph", "both"):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            plan.launch()
-        update_r(iteration_seed(args.seed, args.warmup + 1))
+            launch_workload()
+        prepare_input(iteration_seed(args.seed, args.warmup + 1))
         graph.replay()
         torch.cuda.synchronize(device)
-        plan.check()
+        check_outputs()
 
     launchers = []
     if args.mode in ("eager", "both"):
-        launchers.append(("eager", plan.launch))
+        launchers.append(("eager", launch_workload))
     if graph is not None:
         launchers.append(("graph", graph.replay))
     for mode, launch in launchers:
         # Both modes see identical seed sequences for a paired comparison.
         for i in range(args.warmup):
-            update_r(iteration_seed(args.seed, i + 1))
+            prepare_input(iteration_seed(args.seed, i + 1))
             launch()
         torch.cuda.synchronize(device)
         if args.profile:
             torch.cuda.profiler.start()
             for i in range(args.iters):
-                update_r(iteration_seed(args.seed, args.warmup + 1 + i))
+                prepare_input(iteration_seed(args.seed, args.warmup + 1 + i))
                 launch()
             torch.cuda.synchronize(device)
             torch.cuda.profiler.stop()
-            print(f"Captured {args.iters} {mode} calls, each with fresh-R generation then "
-                  "seven metadata kernels; exclude generate_routes when reading metadata timings")
+            print(f"Captured {args.iters} {mode} {args.workload} calls; exclude generate_routes "
+                  "and, for staging-only, the preceding seven metadata kernels from timing")
         else:
             times = sorted(sample(launch, iteration_seed(args.seed, args.warmup + 1 + i))
                            for i in range(args.iters))
-            print(f"{mode}: min={times[0]:.3f} median={statistics.median(times):.3f} "
+            print(f"{mode} {args.workload}: min={times[0]:.3f} median={statistics.median(times):.3f} "
                   f"mean={statistics.mean(times):.3f} p95={times[int(.95*(len(times)-1))]:.3f} "
                   f"max={times[-1]:.3f} us ({args.iters} samples)")
-        plan.check()
+        check_outputs()
     print("Fresh GPU-generated R before every warmup/measured invocation; fixed shape/address. "
           "Eager and graph modes use the same seed sequence. "
           "Timings exclude JIT, allocation, input generation, and CPU checks. "
           "Event spans include submission gaps and event-boundary overhead. "
-          "Graph replay still executes seven separate metadata kernels.")
+          "Metadata/combined/staging graphs contain seven/eight/one kernels respectively.")
     if args.check_suite:
         run_check_suite(torch, MetadataPlan, device)
+        run_staging_check_suite(torch, device)
 
 
 if __name__ == "__main__":

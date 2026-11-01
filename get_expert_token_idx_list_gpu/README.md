@@ -244,6 +244,63 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
   -s get_expert_token_idx_list_gpu -p 'test_metadata_cute.py'
 ```
 
+### CuTe DSL local staging gather
+
+`LocalStagingPlan` in `metadata_cute.py` adds one kernel that copies the
+selected node's x3 rows from a payload into a separate local staging buffer:
+
+```python
+from metadata_cute import MetadataPlan, LocalStagingPlan
+
+metadata = MetadataPlan(r, local_gpu_id=0)
+staging_buffer = torch.empty_like(payload)  # contiguous [T,D], same GPU as r
+staging = LocalStagingPlan(metadata, payload, staging_buffer, node_rank=0)
+metadata.launch()
+staging.launch()  # same stream; no host offset read or synchronization
+```
+
+The valid output is `staging_buffer[:node_offsets[node+1]-node_offsets[node]]`;
+row `i` copies `payload[x3[node_offsets[node]+i]]` exactly, without arithmetic.
+The unused tail is untouched. Both buffers must have identical shape/dtype and
+must not overlap. The plan retains the tensors; contents may change in place,
+but their shape, allocation, and layout must remain fixed. Callers must order
+payload and metadata producers before staging on the supplied PyTorch stream.
+
+The kernel launches one 256-thread CTA per possible output row and reads the
+current bounds on the GPU. Empty slices perform no copies. This fixed launch
+grid supports changing routes and slice lengths during CUDA Graph replay.
+Aligned rows divisible by eight bytes use integer 64-bit copies; other rows
+use byte copies. This preserves arbitrary payload bits, including BF16 NaNs.
+This initial implementation does not use the CUDA C++ gather's 128-bit loads.
+It is available to Python callers; the C++ proxy still uses its existing gather.
+
+Run on the remote Hopper machine:
+
+```bash
+# Eight kernels: seven metadata kernels followed by the local staging gather.
+python get_expert_token_idx_list_gpu/benchmark_metadata_cute.py \
+  --workload combined --node-rank 0 --token-dimension 4096
+
+# One timed gather kernel; fresh metadata is generated before the start event.
+python get_expert_token_idx_list_gpu/benchmark_metadata_cute.py \
+  --workload staging --node-rank 1 --token-dimension 4096
+
+# Includes bitwise payload/tail checks, both nodes, empty/full slices,
+# narrow/unaligned row widths, and changed-route/payload graph replay.
+python get_expert_token_idx_list_gpu/benchmark_metadata_cute.py \
+  --workload combined --tokens 257 --token-dimension 7 --check-suite
+```
+
+The default `--workload metadata` preserves the original seven-kernel benchmark.
+All workloads support eager and graph modes. Combined timings exclude route
+generation and include metadata plus gather without an intervening host read.
+Staging-only timings exclude metadata generation, although that preceding work
+can affect caches. Profiling captures input preparation too: omit the generator
+and, for staging-only measurements, the preceding metadata kernels. GPU payload
+checks run outside timing; `--check-suite` additionally verifies untouched tails
+against a sentinel. GPU JIT compilation, correctness, and performance must be
+verified remotely; host-only tests do not validate this kernel.
+
 ### Original Python/CUDA C++ driver
 
 PyTorch with CUDA and a CUDA toolkit are required.  The extension is compiled
