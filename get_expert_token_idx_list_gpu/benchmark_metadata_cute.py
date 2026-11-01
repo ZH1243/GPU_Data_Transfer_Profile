@@ -55,11 +55,22 @@ def make_routes(tokens, seed=1234, pattern="affine"):
 
 
 def run_check_suite(torch, MetadataPlan, device):
+    def check_scan(plan):
+        # Check scratch too: later scatters do not consume expert-bin prefixes,
+        # so checking only final metadata would miss errors in those columns.
+        counts = plan.buffers[2].cpu().to(torch.int64)
+        inclusive = counts.cumsum(dim=0)
+        if not torch.equal(plan.buffers[3].cpu().to(torch.int64), inclusive - counts):
+            raise AssertionError("parallel input chunk-prefix scan mismatch")
+        if not torch.equal(plan.input_totals.cpu().to(torch.int64), inclusive[-1]):
+            raise AssertionError("parallel input bin-total mismatch")
+
     cases = [(n, 0, "affine") for n in (1, 31, 32, 33, 255, 256, 257)]
     cases += [(257, gpu, pattern) for gpu in (0, 7)
               for pattern in ("node0", "node1", "spread", "random")]
-    # More than 32 chunks, with both a chunk tail and a warp-scan tail.
-    cases.append((8449, 3, "random"))
+    # Scan boundaries: 31, 32, 33, 34, and 65 chunks. Include partial chunks
+    # and multiple carry steps; the main default benchmark covers 80 chunks.
+    cases += [(n, 3, "random") for n in (7936, 8192, 8193, 8449, 16385)]
     for tokens, local_gpu, pattern in cases:
         r = torch.tensor(make_routes(tokens, pattern=pattern), dtype=torch.int32, device=device)
         plan = MetadataPlan(r, local_gpu)
@@ -68,6 +79,7 @@ def run_check_suite(torch, MetadataPlan, device):
         plan.launch()
         torch.cuda.synchronize(device)
         plan.check()
+        check_scan(plan)
         # Same plan/addresses, different routes: test scratch reset and graph replay.
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -77,6 +89,7 @@ def run_check_suite(torch, MetadataPlan, device):
         graph.replay()
         torch.cuda.synchronize(device)
         plan.check()
+        check_scan(plan)
         print(f"PASS T={tokens}, local_gpu={local_gpu}, pattern={pattern}; changed-R graph replay")
 
 
@@ -209,7 +222,7 @@ def main():
             torch.cuda.synchronize(device)
             torch.cuda.profiler.stop()
             print(f"Captured {args.iters} {mode} calls, each with fresh-R generation then "
-                  "six metadata kernels; exclude generate_routes when reading metadata timings")
+                  "seven metadata kernels; exclude generate_routes when reading metadata timings")
         else:
             times = sorted(sample(launch, iteration_seed(args.seed, args.warmup + 1 + i))
                            for i in range(args.iters))
@@ -221,7 +234,7 @@ def main():
           "Eager and graph modes use the same seed sequence. "
           "Timings exclude JIT, allocation, input generation, and CPU checks. "
           "Event spans include submission gaps and event-boundary overhead. "
-          "Graph replay still executes six separate kernels.")
+          "Graph replay still executes seven separate metadata kernels.")
     if args.check_suite:
         run_check_suite(torch, MetadataPlan, device)
 

@@ -1,4 +1,4 @@
-"""Six-stage CuTe DSL routing metadata implementation for the two-node test.
+"""Seven-kernel CuTe DSL routing metadata implementation for the two-node test.
 
 Contract: contiguous CUDA int32 R[T, 8], distinct expert IDs per row in [0,128).
 Topology: two nodes, eight GPUs/node, eight experts/GPU. All outputs match the
@@ -104,10 +104,12 @@ class MetadataKernels:
     def __call__(self, r: cute.Tensor, b: tuple, stream: cuda.CUstream):
         (masks, bits, counts, prefixes, mask_offsets, expert_offsets,
          x3, x4, node_offsets, reordered_bits, reordered_counts,
-         reordered_prefixes, values) = b
+         reordered_prefixes, values, input_totals) = b
         self.count_input(r, masks, bits, counts).launch(
             grid=(self.chunks, 1, 1), block=(256, 1, 1), stream=stream)
-        self.scan_input(counts, prefixes, mask_offsets, expert_offsets, node_offsets).launch(
+        self.scan_input_chunks(counts, prefixes, input_totals).launch(
+            grid=(80, 1, 1), block=(256, 1, 1), stream=stream)
+        self.build_input_offsets(input_totals, mask_offsets, expert_offsets, node_offsets).launch(
             grid=(1, 1, 1), block=(256, 1, 1), stream=stream)
         self.build_node_indices(masks, bits, prefixes, mask_offsets, x3, x4).launch(
             grid=(self.chunks, 1, 1), block=(256, 1, 1), stream=stream)
@@ -163,20 +165,39 @@ class MetadataKernels:
             counts[chunk, 128 + group] = total
 
     @cute.kernel
-    def scan_input(self, counts: cute.Tensor, prefixes: cute.Tensor,
-                   mask_offsets: cute.Tensor, expert_offsets: cute.Tensor,
-                   node_offsets: cute.Tensor):
+    def scan_input_chunks(self, counts: cute.Tensor, prefixes: cute.Tensor,
+                          totals: cute.Tensor):
+        """One warp per bin: 80 CTAs cover all 640 expert/node-mask bins.
+
+        Scan 32 chunks concurrently per step. Invalid lanes contribute zero
+        but participate in every shuffle, including the final carry broadcast.
+        Each warp owns all prefixes and the total for its bin; no atomics or
+        inter-block synchronization are needed inside this kernel.
+        """
+        thread, _, _ = cute.arch.thread_idx()
+        block, _, _ = cute.arch.block_idx()
+        group = block * 8 + thread // 32
+        lane = thread % 32
+        carry = cutlass.Int32(0)
+        for first in cutlass.range(0, self.chunks, 32):
+            chunk = first + lane
+            value = cutlass.Int32(0)
+            if chunk < self.chunks:
+                value = counts[chunk, group]
+            prefix = _warp_scan(value, lane)
+            if chunk < self.chunks:
+                prefixes[chunk, group] = carry + prefix - value
+            carry += cute.arch.shuffle_sync(prefix, offset=31)
+        if lane == 0:
+            totals[group] = carry
+
+    @cute.kernel
+    def build_input_offsets(self, totals: cute.Tensor, mask_offsets: cute.Tensor,
+                            expert_offsets: cute.Tensor, node_offsets: cute.Tensor):
+        """Only scan 640 bin totals; chunk-prefix work is already complete."""
         thread, _, _ = cute.arch.thread_idx()
         smem = cutlass.utils.SmemAllocator()
-        totals = smem.allocate_tensor(cutlass.Int32, cute.make_layout((640,)))
         sums = smem.allocate_tensor(cutlass.Int32, cute.make_layout((8,)))
-        for group in cutlass.range(thread, 640, 256):
-            total = cutlass.Int32(0)
-            for chunk in cutlass.range(self.chunks):
-                prefixes[chunk, group] = total
-                total += counts[chunk, group]
-            totals[group] = total
-        cute.arch.sync_threads()
         value = cutlass.Int32(0)
         if thread < 128:
             value = totals[thread]
@@ -290,7 +311,7 @@ class MetadataKernels:
 
 
 class MetadataPlan:
-    """Own fixed-shape buffers and a compiled six-kernel launch callable.
+    """Own fixed-shape buffers and a compiled seven-kernel launch callable.
 
     Construction validates R (including copying routes to CPU); launch() does
     not allocate, compile, synchronize, or validate. R may be updated in place
@@ -326,10 +347,12 @@ class MetadataPlan:
             allocate((129,)), allocate((tokens * 2,)), allocate((tokens * 2,), torch.uint8),
             allocate((3,)), allocate((2, chunks, 72, 8)), allocate((2, chunks, 72)),
             allocate((2, chunks, 72)), allocate((tokens * 8,)),
+            allocate((640,)),  # Bin totals between the two input-scan kernels.
         )
         self.expert_offsets = self.buffers[5]
         self.x3, self.x4, self.node_offsets = self.buffers[6:9]
         self.expert_token_indices = self.buffers[12]
+        self.input_totals = self.buffers[13]
         with torch.cuda.device(r.device):
             self.arguments = (from_dlpack(r), tuple(from_dlpack(b) for b in self.buffers))
             stream = cuda.CUstream(torch.cuda.current_stream(r.device).cuda_stream)

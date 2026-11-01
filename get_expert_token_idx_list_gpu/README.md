@@ -115,29 +115,38 @@ identical seed sequences for comparison. The initial call uses `--seed`;
 warmups use `seed+1..seed+warmup`, and measured calls start at
 `seed+warmup+1`. This preserves shape and device address while changing data.
 
-The six kernels are:
+The seven CuTe metadata kernels are:
 
 | CuTe kernel | Work |
 |---|---|
 | `count_input` | Cache two masks/token; count experts; build per-mask warp bitmaps |
-| `scan_input` | Chunk prefixes, expert offsets, descending mask/node offsets |
+| `scan_input_chunks` | Parallel chunk prefixes and totals: 80 CTAs, one warp per bin |
+| `build_input_offsets` | Small single-CTA scan of 640 totals into expert/mask/node offsets |
 | `build_node_indices` | Stable x3/x4 scatter using bitmap population-count ranks |
 | `count_reordered` | Build expert/GPU bitmaps and counts in reordered x3 order |
 | `scan_reordered` | Parallel prefix over chunks, one warp per expert/GPU bin |
 | `scatter_experts` | Stable expert lists with direct/compact input indexing |
 
-This is a six-kernel implementation, not a fused kernel or a line-by-line
+This is a seven-kernel implementation, not a fused kernel or a line-by-line
 translation of CUB sorting. Bitmap ranks remove the local radix sorts at the
-cost of extra scratch traffic. The first scan still uses one CTA, but its
-expert and mask offset scans are parallel block scans. The second scan uses
-18 CTAs. There is no assumption that CuTe alone makes the pipeline faster;
-measure on H20 before drawing performance conclusions.
+cost of extra scratch traffic. The former single-CTA `scan_input` is split
+into `scan_input_chunks` and `build_input_offsets`. For 20,480 tokens, each
+warp scans 80 chunk counts in three 32-lane steps, with zero padding in the
+last step. A 640-int32 (2,560-byte) scratch array carries bin totals between
+the two kernels. Same-stream ordering supplies the global dependency; there
+is no CPU synchronization between them. The small offsets kernel retains
+the existing parallel block scans. The reordered scan still uses 18 CTAs.
+All other metadata kernels and their count layouts remain unchanged.
+Compare the **combined** time of the two new kernels against the former
+`scan_input`, and the full graph span against the prior ~68.2 us baseline.
+The new scan retains strided chunk-count access; layout tuning is a separate
+optimization. Actual performance must be measured on H20.
 
 By default the benchmark reports **eager** and **graph** timings separately:
 
-- Eager: a compiled CuTe host entry launches all six kernels. CPU submission
+- Eager: a compiled CuTe host entry launches all seven kernels. CPU submission
   overhead can differ from the standalone C++ benchmark.
-- Graph: replay the same six kernels through one CUDA Graph launch. Capture
+- Graph: replay the same seven kernels through one CUDA Graph launch. Capture
   and JIT costs are excluded. This isolates repeated execution with reduced
   host submission overhead; graph replay does not fuse kernels.
 
@@ -165,7 +174,9 @@ dependencies used by `run.py`. It compares the synthetic generator and all
 five metadata outputs with the existing CUDA implementation on the same R.
 `--check-suite` checks warp/chunk tails, empty destination nodes, hot experts,
 different mask rotations, non-affine random routing, and graph replay after
-changing R in place. These checks are outside all timed/captured regions.
+changing R in place. The suite also checks every input chunk prefix and bin
+total against a CPU cumulative sum, including 31/32/33/34/65-chunk cases and
+changed-R graph replay. These checks are outside all timed/captured regions.
 
 ```bash
 nsys profile --trace=cuda --sample=none \
@@ -177,8 +188,10 @@ nsys stats --report cuda_gpu_kern_sum,cuda_api_sum metadata_cute_eager.nsys-rep
 ```
 
 Choose `--mode graph` and a different output name to profile graph replay.
+Add `--cuda-graph-trace=node` to the `nsys profile` options to expose the
+individual graph kernel durations.
 The CuTe profiling capture includes one `generate_routes` kernel before each
-six-kernel metadata chain. Exclude that generator and the gap before the first
+seven-kernel metadata chain. Exclude that generator and the gap before the first
 metadata kernel when computing metadata-only durations. The event benchmark
 already excludes generation. Compilation, correctness checks, and warmup are
 outside the capture.
