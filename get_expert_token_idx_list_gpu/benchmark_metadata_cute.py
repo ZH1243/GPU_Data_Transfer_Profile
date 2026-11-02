@@ -189,6 +189,7 @@ def compare_staging_identity(args, torch, plan, original_staging, update_r):
                 launch()
         torch.cuda.synchronize(plan.r.device)
         timings = [[], []]
+        sample_payload_bytes = []
         for i in range(args.iters):
             seed = iteration_seed(args.seed, args.warmup + 1 + i)
             # Alternate which pattern runs first to reduce systematic order bias.
@@ -199,19 +200,33 @@ def compare_staging_identity(args, torch, plan, original_staging, update_r):
                 end_event.record()
                 end_event.synchronize()
                 timings[identity].append(begin_event.elapsed_time(end_event) * 1000)
+            # Both patterns use the same seed and row count. Read the bounds
+            # after the pair so this host transfer is outside both timed regions.
+            offsets = plan.node_offsets.cpu().tolist()
+            rows = offsets[args.node_rank + 1] - offsets[args.node_rank]
+            sample_payload_bytes.append(rows * staging.source.shape[1] *
+                                        staging.source.element_size())
         for identity, label in enumerate(("actual-x3", "identity")):
             rows = validate(launch, seed, identity)
             times = sorted(timings[identity])
+            # bytes / microseconds / 1e6 gives decimal TB/s. Each payload byte
+            # is read once and written once, so the two logical rates are equal.
+            median_rate = statistics.median(
+                nbytes / elapsed_us / 1e6
+                for nbytes, elapsed_us in zip(sample_payload_bytes, timings[identity]))
             print(f"{mode} {label}: min={times[0]:.3f} median={statistics.median(times):.3f} "
                   f"mean={statistics.mean(times):.3f} p95={times[int(.95*(len(times)-1))]:.3f} "
                   f"max={times[-1]:.3f} us ({args.iters} paired samples); "
-                  f"final_sample_rows={rows}, payload_bytes={rows * args.token_dimension * 2}")
+                  f"final_sample_rows={rows}, payload_bytes={rows * args.token_dimension * 2}; "
+                  f"median_read_TB/s={median_rate:.3f}, median_write_TB/s={median_rate:.3f}")
         actual, identity = map(statistics.median, timings)
         print(f"{mode} actual/identity median ratio={actual / identity:.4f}; "
               f"difference={actual - identity:.3f} us; payload/index/tail checks PASS")
     print("Paired comparison uses identical seeds, row counts, payload/output/index allocations, "
           "and the same compiled gather (one shared graph in graph mode). "
           "Generation, metadata, and index preparation precede the start event for both patterns. "
+          "Read/write rates are medians of per-sample payload bytes/time (decimal TB/s), "
+          "excluding index/offset traffic; they are logical rates, not measured HBM traffic. "
           "Caches are not flushed; source row sets/order differ. Identity is a copy-bandwidth "
           "reference for this kernel, not a guaranteed hardware ceiling.")
 
