@@ -10,14 +10,14 @@ import threading
 
 INT_FIELDS = ("rank", "world", "gpus_per_node", "port_base", "node_port_stride",
               "num_tokens", "num_experts", "top_k", "token_dimension", "element_bytes",
-              "tokens_per_chunk", "datasets", "warmup", "iterations", "preserialized", "verify", "binary", "disable_expert_index_validation", "local_shared_memory", "receive_drain", "receive_drain_max_steps", "same_index_aggregation")
+              "tokens_per_chunk", "datasets", "warmup", "iterations", "preserialized", "verify", "binary", "disable_expert_index_validation", "local_shared_memory", "receive_drain", "receive_drain_max_steps", "same_index_aggregation", "rdma", "rdma_port", "rdma_gid_index")
 
 
 class NativeConfig(ctypes.Structure):
     _fields_ = ([(name, ctypes.c_int32) for name in INT_FIELDS] +
                 [("seed", ctypes.c_uint64), ("timeout", ctypes.c_double),
                  ("hosts", ctypes.c_char_p), ("bind_host", ctypes.c_char_p),
-                 ("output", ctypes.c_char_p)])
+                 ("output", ctypes.c_char_p), ("rdma_devices", ctypes.c_char_p)])
 
 
 def require(condition, message):
@@ -68,7 +68,19 @@ def arguments():
                    help="native shared library (build with CMake before launching)")
     p.add_argument("--verify", action="store_true",
                    help="check received content against regenerated source metadata outside timing")
+    p.add_argument("--transport", choices=("tcp", "rdma"), default="tcp",
+                   help="RDMA enables binary same-index aggregation and shared memory")
+    p.add_argument("--rdma-device-map", default=os.environ.get("RDMA_DEVICE_MAP", ""),
+                   help="one verbs device, or a comma-separated device per local GPU")
+    p.add_argument("--rdma-port", type=int, default=1)
+    p.add_argument("--rdma-gid-index", type=int, default=3)
     a = p.parse_args()
+    a.rdma = a.transport == "rdma"
+    a.same_index_aggregation = a.same_index_aggregation or a.rdma
+    if a.rdma:
+        devices = a.rdma_device_map.split(",")
+        require(all(devices) and len(devices) in (1, a.gpus_per_node), "RDMA requires a device map with one device or one per local GPU")
+        require(1 <= a.rdma_port <= 255 and -1 <= a.rdma_gid_index <= 255, "invalid RDMA port/GID index")
     require(1 <= a.receive_drain_max_steps <= 1024, "--receive-drain-max-steps must be in 1..1024")
     a.binary = a.wire_format == "binary"
     require(not a.same_index_aggregation or a.binary, "--same-index-aggregation requires --wire-format=binary")
@@ -103,7 +115,7 @@ def main():
             "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j")
     library = ctypes.CDLL(str(a.library.resolve()))
     library.router_metadata_bench_abi_version.restype = ctypes.c_uint32
-    require(library.router_metadata_bench_abi_version() == 6, "native benchmark ABI mismatch; rebuild the shared library")
+    require(library.router_metadata_bench_abi_version() == 7, "native benchmark ABI mismatch; rebuild the shared library")
     library.router_metadata_bench_run.argtypes = [ctypes.POINTER(NativeConfig),
                                                  ctypes.POINTER(ctypes.c_char), ctypes.c_size_t]
     library.router_metadata_bench_run.restype = ctypes.c_int
@@ -112,7 +124,7 @@ def main():
     require(0 <= a.seed < (1 << 64), "seed exceeds uint64")
     config = NativeConfig(**{name: int(getattr(a, name)) for name in INT_FIELDS},
                           seed=a.seed, timeout=a.timeout, hosts=",".join(a.hosts).encode(),
-                          bind_host=a.bind_host.encode(), output=os.fsencode(a.output) if a.output else b"")
+                          rdma_devices=a.rdma_device_map.encode(), bind_host=a.bind_host.encode(), output=os.fsencode(a.output) if a.output else b"")
     error = ctypes.create_string_buffer(4096)
     outcome = []
 

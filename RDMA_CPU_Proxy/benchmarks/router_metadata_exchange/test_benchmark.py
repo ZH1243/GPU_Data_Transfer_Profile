@@ -175,7 +175,7 @@ class ProcessTests(unittest.TestCase):
                 self.assertEqual(report["configuration"]["expert_index_validation_enabled"], not disable_validation)
                 self.assertEqual(report["wire_format"], wire_format)
                 self.assertEqual(report["configuration"]["wire_format"], wire_format)
-                self.assertEqual(report["configuration"]["timing_schema"], 8)
+                self.assertEqual(report["configuration"]["timing_schema"], 9)
                 self.assertEqual(report["configuration"]["receive_storage"],
                                  "shared_aggregate_arenas" if aggregate else ("direct_reusable_vectors" if wire_format == "binary" else "payload_buffer"))
                 self.assertEqual(len(report["iterations"]), 3)
@@ -239,7 +239,7 @@ class ProcessTests(unittest.TestCase):
                         self.assertEqual(result["installed_x3x4_sources"], nodes - 1)
                         self.assertGreater(result["elapsed_ms"], 0)
                         diagnostics = result["exchange_diagnostics"]
-                        self.assertEqual(len(diagnostics), 28)
+                        self.assertEqual(len(diagnostics), 37)
                         exchange_span = result["exchange_ms"] + result["receive_process_ms"]
                         for name, value in diagnostics.items():
                             self.assertGreaterEqual(value, 0)
@@ -373,6 +373,19 @@ class ProcessTests(unittest.TestCase):
 
     def test_receive_drain_default_workload(self):
         self.run_job(2, 8, num_tokens=20480, num_experts=128, top_k=8, local_shared_memory=True, receive_drain=True)
+
+    def test_rdma_invalid_options(self):
+        for args, expected in (
+            (["--transport=rdma"], "RDMA requires a device map"),
+            (["--transport=rdma", "--rdma-device-map=mlx5_0", "--wire-format=text"], "requires --wire-format=binary"),
+            (["--transport=rdma", "--rdma-device-map=mlx5_0", "--rdma-port=0"], "invalid RDMA port/GID index"),
+        ):
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).with_name("benchmark.py")), "--hosts=127.0.0.1"] + args,
+                env={k: v for k, v in os.environ.items() if k != "RDMA_DEVICE_MAP"},
+                capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(expected, result.stderr)
 
     def test_receive_drain_invalid_budget(self):
         for budget in (0, 1025):

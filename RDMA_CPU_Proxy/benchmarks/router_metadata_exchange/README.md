@@ -7,7 +7,7 @@ input preparation, synchronization, serialization, exchange, validation, CPU
 installation, all timing, and report generation. Python performs no metadata
 processing or communication and the GIL is released during the native call.
 
-The experiment remains CPU-only: no CUDA, RDMA verbs, GPU allocations, actual
+The experiment remains CPU-only: no CUDA, GPU allocations, actual
 token transfers, or GPU scheduler initialization. It reuses the main project's
 `RouterRouting` CPU generator, `protocol.cpp` serializers/deserializers, and
 `compute_chunks_from_token_indices()`. The standalone library does not initialize
@@ -26,7 +26,8 @@ cmake --build build -j
 
 This produces `build/librouter_metadata_bench.so` on Linux (`.dylib` on macOS).
 The build needs a C++17 compiler, CMake, and POSIX sockets/threads; it requires
-neither CUDA nor libibverbs and does not modify the main proxy build. Build once
+no CUDA and does not modify the main proxy build. Libibverbs is optional for TCP;
+CMake enables RDMA when its headers and library are available. Build once
 before launching workers, not separately in every torchrun process. Rebuild on
 both nodes after native source changes.
 
@@ -35,6 +36,67 @@ process group. Override the shared-library location with `--library=/path/to/lib
 or `ROUTER_METADATA_BENCH_LIBRARY`. The C ABI is declared in `native_proxy.h`;
 exceptions return a nonzero status and an error string to Python. Native sockets
 use deadlines and close via RAII on success or failure.
+
+## Optional RDMA transport (ABI 7, timing schema 9)
+
+`--transport=rdma` automatically enables binary same-index aggregation and local
+shared memory. TCP remains the default. RDMA requires Linux, libibverbs development
+headers/library and a working verbs-capable fabric; there is no mock or automatic
+TCP fallback. Rebuild on **both Hopper nodes**:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DROUTER_METADATA_REQUIRE_RDMA=ON
+cmake --build build -j
+```
+
+Set the device map on both nodes (this is the map used by the main project's
+Hopper configuration; adjust for your machines). One device name may also be
+provided to use the same NIC for every local proxy:
+
+```bash
+export RDMA_DEVICE_MAP=mlx5_bond_1,mlx5_bond_4,mlx5_bond_3,mlx5_bond_2,mlx5_bond_7,mlx5_bond_6,mlx5_bond_8,mlx5_bond_5
+# Node 0
+bash ./run_node0_torchrun.sh --transport=rdma --rdma-port=1 --rdma-gid-index=3 --disable-expert-index-validation --verify
+# Node 1, with the same environment and options
+bash ./run_node1_torchrun.sh --transport=rdma --rdma-port=1 --rdma-gid-index=3 --disable-expert-index-validation --verify
+```
+
+`--rdma-device-map=...` overrides the environment. Port defaults to 1 and GID
+index to 3; use a valid RoCE GID index for your fabric, or -1 for LID routing on
+InfiniBand. The reused production RC QP implementation selects path MTU 4096;
+the fabric must support that setting. Device maps and options currently must
+match across ranks. The host buffers need sufficient locked-memory allowance
+for registration. No GPU memory registration is involved.
+
+Each matching local-index pair establishes one RC QP per remote node. TCP
+connections exchange QP/MR descriptors and carry the existing control barriers;
+metadata uses RDMA Write With Immediate. Allocation, registration, connection
+setup and the initial receive WQE are outside timing. Each iteration packs the
+aggregate into a reusable registered send buffer and posts one signaled write
+per remote node. The NIC writes the frame/header/body directly into that peer's
+registered shared-memory ingress arena. A receive CQ completion is required
+before validating the frame and release-publishing the expert slices to local
+proxies. Send completion is required before reusing the send buffer. The global
+completion barrier prevents overwrite while any local consumer still reads.
+Receive credits are reposted inside timing. Sequence/length checks remain enabled
+when expert-index validation is disabled. `--verify` checks exact installed
+metadata outside timing and should be used for the first remote run.
+
+Reports identify `transport`. `rdma_pack_ms`, `rdma_post_ms`, `rdma_poll_ms` and
+`rdma_post_recv_ms` are disjoint timed work; `rdma_poll_calls`, `rdma_sent_bytes`
+and `rdma_received_bytes` report CQ polling and wire volume. The completion
+milestones `rdma_sends_complete_ms` and `rdma_work_complete_ms` overlap other
+measurements. TCP send/receive/poll diagnostics and TCP byte counters are zero
+for RDMA metadata. The configured TCP channel count includes retained bootstrap
+connections. `tcp_exchange_ms` remains a legacy alias for the general exchange
+stage, including RDMA and shared-memory work. The existing `shm_scan_after_socket_*`
+fields mean scans after this rank's **transport** completes in RDMA mode.
+`--receive-drain` applies only to TCP.
+
+For an instrumentation-matched comparison, rerun with `--transport=tcp
+--same-index-aggregation` and otherwise identical workload/validation options.
+Local tests cover TCP regressions and RDMA frame/layout validation; actual verbs
+transfer correctness and latency must be validated on the remote machines.
 
 ## Run on two nodes
 
@@ -89,7 +151,7 @@ CPU/NUMA placement. This benchmark does not pin processes automatically.
 
 ## Optional within-node shared memory
 
-Rebuild the library and update `benchmark.py` on both nodes (C ABI version 6).
+Rebuild the library and update `benchmark.py` on both nodes (C ABI version 7).
 The default remains all-TCP. To replace local expert-metadata TCP connections
 with shared host memory, pass `--local-shared-memory` on **both nodes**:
 
@@ -303,7 +365,7 @@ deserialization. Timers do not change the validation policy or wire format.
 Self installation is excluded from this breakdown and remains `self_install_ms`.
 Single-node runs have zero x3/x4 and chunk-build times because no such messages
 are exchanged. Rebuild the shared library on both nodes before rerunning; report
-configuration `timing_schema: 8` identifies the current instrumentation version.
+configuration `timing_schema: 9` identifies the current instrumentation version.
 
 The maximum rank-local duration needs no synchronized clocks. It is not an exact
 global makespan: barrier-release and OS scheduling skew can influence it. A send
@@ -390,7 +452,7 @@ RESULT_JSON=results/text.json bash ./run_node0_torchrun.sh --wire-format=text
 ```
 
 Run node 1 with the matching mode for each run. Upgrade/rebuild the library on
-both nodes: the Python/native C ABI is now version 6. Reports identify the wire
+both nodes: the Python/native C ABI is now version 7. Reports identify the wire
 format; timing field names remain stable for comparisons.
 
 For direct binary reception, time inside socket `recv()` calls belongs to
@@ -399,7 +461,7 @@ validation belong to the corresponding `*_deserialize_ms` field. The latter now
 sums work before and after the array transfers; it excludes waiting for bytes.
 `configuration.receive_storage` is `direct_reusable_vectors` for binary and
 `payload_buffer` for text. The binary wire format is unchanged; the current wrapper requires C ABI
-version 6. Rebuild both nodes for comparable timing/schema reports. Native tests check
+version 7. Rebuild both nodes for comparable timing/schema reports. Native tests check
 that receive-array addresses stay stable across changing routing datasets.
 
 ### Isolated expert index-bounds scan
@@ -448,7 +510,7 @@ still includes identity/configuration checks, so neither parent stage should
 be expected to become zero. If `--verify` is also enabled, exact-content checks
 still run outside the timed interval.
 
-Rebuild on both nodes before using the updated wrapper (C ABI version 6):
+Rebuild on both nodes before using the updated wrapper (C ABI version 7):
 
 ```bash
 cmake --build build -j
@@ -459,7 +521,7 @@ and metadata exchange are unchanged.
 
 ### Exchange completion and polling diagnostics (timing schema 5)
 
-Rebuild the native library on both nodes; update the wrapper as well (current C ABI version 6). No additional
+Rebuild the native library on both nodes; update the wrapper as well (current C ABI version 7). No additional
 command-line flag is needed to collect diagnostics. The console and JSON now include
 `critical_rank_exchange_diagnostics`. Each iteration's diagnostics come from
 that iteration's slowest-total-time rank, just like the existing stage report.
@@ -495,7 +557,7 @@ and rerun both transport modes for an instrumentation-matched comparison.
 
 ### Socket I/O diagnostics and optional receive draining (timing schema 6)
 
-Update `benchmark.py` and rebuild the native library on **both nodes** (ABI 6).
+Update `benchmark.py` and rebuild the native library on **both nodes** (ABI 7).
 The new diagnostics are always collected, including in the unchanged default
 one-receive-step-per-socket mode. Enable the alternative with `--receive-drain`
 on both nodes; it supports binary and text modes, with or without local shared
@@ -556,7 +618,7 @@ arrays, text/binary messages, local-only/hybrid exchanges, the default 16-proxy
 workload, and nonblocking partial-I/O/backpressure counters.
 
 
-### Same-index TCP aggregation (timing schema 7, ABI 6)
+### Same-index TCP aggregation (timing schema 7, ABI 7)
 
 `--same-index-aggregation` enables binary aggregation and automatically enables
 local shared memory. Update the Python wrapper and rebuild the native library
@@ -650,7 +712,7 @@ placement consistent when evaluating the latency change.
 ### Publication, observation, and readiness scans (timing schema 8)
 
 Rebuild on both nodes and run the same commands; these diagnostics are always
-collected. The C ABI remains 6. Upgrade all workers together because the shared
+collected. The C ABI is now 7. Upgrade all workers together because the shared
 arena layout and internal timing-record format have changed.
 
 Each per-rank iteration record now contains `exchange_start_ns` and a

@@ -2,6 +2,7 @@
 #include "router_routing.hpp"
 #include "protocol.hpp"
 #include "logging.hpp"
+#include "rdma_connection.hpp"
 
 #include <algorithm>
 #include <array>
@@ -48,7 +49,7 @@ const std::array<const char*, 9> ReceiveFields = {
     "expert_progress_init_ms", "x3x4_deserialize_ms", "x3x4_validate_ms",
     "chunk_build_ms", "x3x4_record_install_ms", "overhead_ms"};
 // Completion timestamps share the exchange-stage origin and overlap.
-const std::array<const char*, 28> DiagnosticFields = {
+const std::array<const char*, 37> DiagnosticFields = {
     "local_expert_complete_ms", "remote_expert_complete_ms", "remote_x3x4_complete_ms",
     "socket_sends_complete_ms", "poll_ms", "poll_calls", "poll_zero_returns",
     "sendmsg_ms", "sendmsg_calls", "sendmsg_would_block", "sendmsg_interrupted",
@@ -56,13 +57,16 @@ const std::array<const char*, 28> DiagnosticFields = {
     "shm_publish_ms", "shm_receive_copy_ms", "receive_budget_yields", "exchange_other_ms",
     "shm_scan_ms", "shm_scan_after_socket_ms", "shm_scan_passes", "shm_scan_after_socket_passes",
     "shm_sequence_checks", "shm_not_ready_checks", "remote_observation_delay_max_ms",
-    "remote_consume_delay_max_ms", "socket_work_complete_ms"};
+    "remote_consume_delay_max_ms", "socket_work_complete_ms", "rdma_pack_ms", "rdma_post_ms", "rdma_poll_ms",
+    "rdma_poll_calls", "rdma_post_recv_ms", "rdma_sent_bytes", "rdma_received_bytes",
+    "rdma_sends_complete_ms", "rdma_work_complete_ms"};
 enum DiagnosticIndex : size_t {
     SendMs = 7, SendCalls, SendWouldBlock, SendInterrupted,
     RecvMs, RecvCalls, RecvWouldBlock, RecvInterrupted,
     ShmPublishMs, ShmReceiveCopyMs, ReceiveBudgetYields, ExchangeOtherMs,
     ShmScanMs, ShmScanAfterSocketMs, ShmScanPasses, ShmScanAfterSocketPasses,
-    ShmSequenceChecks, ShmNotReadyChecks, RemoteObserveMaxMs, RemoteConsumeMaxMs, SocketWorkCompleteMs
+    ShmSequenceChecks, ShmNotReadyChecks, RemoteObserveMaxMs, RemoteConsumeMaxMs, SocketWorkCompleteMs, RdmaPackMs, RdmaPostMs, RdmaPollMs,
+    RdmaPollCalls, RdmaPostRecvMs, RdmaSentBytes, RdmaReceivedBytes, RdmaSendsCompleteMs, RdmaWorkCompleteMs
 };
 using ExchangeDiagnostics = std::array<double, DiagnosticFields.size()>;
 struct ReceiveTimes : std::array<double, ReceiveFields.size()> {
@@ -248,6 +252,9 @@ struct Config {
         require(!a.local_shared_memory || a.binary, "shared memory requires binary mode");
         require(a.receive_drain_max_steps >= 1 && a.receive_drain_max_steps <= 1024, "invalid receive drain step budget");
         require(!a.same_index_aggregation || (a.binary && a.local_shared_memory), "aggregation requires binary shared memory");
+        require(!a.rdma || RDMA_PROXY_HAVE_VERBS, "RDMA unavailable: rebuild with libibverbs development files installed");
+        require(!a.rdma || (a.same_index_aggregation && a.rdma_devices && *a.rdma_devices), "RDMA requires aggregation and a device map");
+        require(!a.rdma || (a.rdma_port >= 1 && a.rdma_port <= 255 && a.rdma_gid_index >= -1 && a.rdma_gid_index <= 255), "invalid RDMA port/GID index");
         const uint32_t endian_probe = 1;
         require(!a.binary || (sizeof(size_t) == 8 && *reinterpret_cast<const uint8_t*>(&endian_probe) == 1),
                 "binary mode requires 64-bit size_t and little-endian hosts");
@@ -275,7 +282,7 @@ struct Config {
     int epg() const { return a.num_experts / a.world; }
     std::string json() const {
         std::ostringstream out;
-        out << "{\"backend\":\"cpp\",\"timing_schema\":8,\"wire_format\":"
+        out << "{\"backend\":\"cpp\",\"timing_schema\":9,\"wire_format\":"
             << quote(a.binary ? "binary" : "text") << ",\"receive_storage\":"
             << quote(a.same_index_aggregation ? "shared_aggregate_arenas" : (a.binary ? "direct_reusable_vectors" : "payload_buffer")) << ",\"binary_protocol_version\":1,\"hosts\":[";
         for (size_t i = 0; i < hosts.size(); ++i) { if (i) out << ','; out << quote(hosts[i]); }
@@ -285,6 +292,9 @@ struct Config {
         FIELD(num_tokens); FIELD(num_experts); FIELD(top_k); FIELD(token_dimension);
         FIELD(element_bytes); FIELD(tokens_per_chunk); FIELD(datasets); FIELD(warmup);
         FIELD(iterations); FIELD(seed); FIELD(timeout);
+        out << ",\"transport\":" << quote(a.rdma ? "rdma" : "tcp")
+            << ",\"rdma_device_map\":" << quote(a.rdma_devices ? a.rdma_devices : "");
+        FIELD(rdma_port); FIELD(rdma_gid_index);
         out << ",\"metadata_tcp_channels_per_rank\":" << (a.same_index_aggregation ? hosts.size() - 1 :
             a.world - 1 - (a.local_shared_memory ? a.gpus_per_node - 1 : 0) + hosts.size() - 1);
         out << ",\"same_index_aggregation\":" << (a.same_index_aggregation ? "true" : "false");
@@ -388,7 +398,7 @@ struct LocalMemory {
     };
     std::string name;
     void* base = MAP_FAILED;
-    size_t bytes = 0, stride = 0;
+    size_t bytes = 0, stride = 0, wire_prefix = 0;
     bool owner = false;
     LocalMemory() = default;
     LocalMemory(const LocalMemory&) = delete;
@@ -399,8 +409,9 @@ struct LocalMemory {
     Header* header(int source_gpu) const {
         return reinterpret_cast<Header*>(static_cast<char*>(base) + stride * source_gpu);
     }
+    char* wire(int slot) const { return reinterpret_cast<char*>(header(slot)) + sizeof(Header); }
     int32_t* offsets(int source_gpu) const {
-        return reinterpret_cast<int32_t*>(reinterpret_cast<char*>(header(source_gpu)) + sizeof(Header));
+        return reinterpret_cast<int32_t*>(wire(source_gpu) + wire_prefix);
     }
     int32_t* indices(const Config& c, int source_gpu) const {
         return offsets(source_gpu) + c.a.gpus_per_node * (c.epg() + 1);
@@ -418,7 +429,8 @@ struct LocalMemory {
         id << std::hex << getpid() << "_" << Clock::now().time_since_epoch().count();
         auto identity = mesh.gather(c, "shm_run", id.str()).front();
         name = "/rmeta_" + identity + "_" + std::to_string(c.node(c.a.rank));
-        stride = (sizeof(Header) + sizeof(int32_t) *
+        wire_prefix = c.a.rdma ? FrameBytes + (13 + c.a.gpus_per_node) * 8 : 0;
+        stride = (sizeof(Header) + wire_prefix + sizeof(int32_t) *
             (size_t(c.a.gpus_per_node) * (c.epg() + 1) + size_t(c.a.num_tokens) * c.a.top_k) + (c.a.same_index_aggregation ? size_t(c.a.num_tokens) * 9 : 0) + 63) & ~size_t(63);
         require(stride <= std::numeric_limits<size_t>::max() / c.a.gpus_per_node, "shared memory size overflow");
         size_t slots = c.a.same_index_aggregation ? c.a.world : c.a.gpus_per_node;
@@ -459,6 +471,66 @@ struct LocalMemory {
         if (owner) { require(shm_unlink(name.c_str()) == 0, "cannot unlink metadata shared memory"); owner = false; }
     }
 };
+// Registered buffers and QPs live across all iterations. Destroy QPs before MRs,
+// and deregister MRs before freeing buffers or unmapping the shared arena.
+struct RdmaTransport {
+    struct Peer {
+        std::vector<char> send;
+        MemoryRegionInfo send_mr, remote;
+        std::unique_ptr<RdmaQueuePair> qp;
+        std::vector<Completion> completions;
+    };
+    std::unique_ptr<RdmaContext> context;
+    std::map<int, Peer> peers;
+    ~RdmaTransport() {
+        for (auto& entry : peers) entry.second.qp.reset();
+        context.reset();
+    }
+    void initialize(const Config& c, Mesh& mesh, LocalMemory& local) {
+        if (!c.a.rdma) return;
+        std::vector<std::string> devices;
+        std::istringstream in(c.a.rdma_devices); std::string device;
+        while (std::getline(in, device, ',')) { require(!device.empty(), "empty RDMA device"); devices.push_back(device); }
+        require(std::string(c.a.rdma_devices).back() != ',' &&
+                (devices.size() == 1 || devices.size() == size_t(c.a.gpus_per_node)), "invalid RDMA device map");
+        ProxyConfig config;
+        config.mock_mode = false;
+        config.rdma_device_name = devices.at(devices.size() == 1 ? 0 : c.gpu(c.a.rank));
+        config.rdma_port = c.a.rdma_port; config.gid_index = c.a.rdma_gid_index;
+        context = std::make_unique<RdmaContext>(config);
+        context->initialize();
+        const size_t capacity = local.stride - sizeof(LocalMemory::Header);
+        require(capacity <= UINT32_MAX, "RDMA arena exceeds single-write capacity");
+        for (auto& [key, socket] : mesh.channels) {
+            auto& peer = peers[key.first];
+            peer.send.resize(capacity); peer.completions.reserve(2);
+            peer.send_mr = context->register_memory(peer.send.data(), capacity, "metadata send");
+            PeerConnectionInfo info;
+            info.node_rank = c.node(c.a.rank); info.gpu_index = c.gpu(c.a.rank);
+            info.recv_buffer = context->register_memory(local.wire(local.slot(c, key.first)), capacity, "metadata ingress");
+            peer.qp = std::make_unique<RdmaQueuePair>(*context, config, key.first, 0);
+            info.qps.push_back(peer.qp->local_info());
+            auto until = deadline(c.a.timeout);
+            std::string remote;
+            if (c.a.rank < key.first) {
+                send_message(socket.fd, serialize_peer_info(info), until);
+                remote = recv_message(socket.fd, until);
+            } else {
+                remote = recv_message(socket.fd, until);
+                send_message(socket.fd, serialize_peer_info(info), until);
+            }
+            auto other = deserialize_peer_info(remote);
+            require(other.node_rank == c.node(key.first) && other.gpu_index == c.gpu(c.a.rank) &&
+                    other.qps.size() == 1 && other.recv_buffer.length == capacity && other.recv_buffer.addr,
+                    "invalid RDMA peer descriptor");
+            peer.remote = other.recv_buffer;
+            peer.qp->connect(other.qps.front());
+            peer.qp->post_receive(0);
+        }
+        mesh.gather(c, "rdma_ready", "");
+    }
+};
+
 struct Dataset {
     std::vector<RouterExpertMetadata> experts;
     std::map<int, RouterX3Metadata> nodes;
@@ -855,13 +927,25 @@ void prepare_aggregate_receive(const Config& c, Transfer& t, LocalMemory& local)
     t.receive_arrays = {iovec{local.offsets(slot), bytes}, iovec{nullptr, 0}};
     t.arrays_ready = true;
 }
+// CQ completion establishes DMA visibility; publication remains a CPU release store.
+void prepare_rdma_receive(const Config& c, Transfer& t, LocalMemory& local,
+                          uint64_t iteration, size_t received_bytes, size_t capacity) {
+    require(received_bytes >= FrameBytes + t.input.size() && received_bytes <= capacity,
+            "invalid RDMA receive length");
+    const char* wire = local.wire(local.slot(c, t.key.first));
+    require(read64(wire + 8) == iteration && read64(wire) == received_bytes - FrameBytes,
+            "invalid RDMA frame");
+    t.payload_bytes = received_bytes - FrameBytes;
+    std::memcpy(t.input.data(), wire + FrameBytes, t.input.size());
+    prepare_aggregate_receive(c, t, local);
+}
 bool direct_arrays_complete(Transfer& t) {
     while (t.array_index < t.receive_arrays.size() && t.array_offset == t.receive_arrays[t.array_index].iov_len) {
         ++t.array_index; t.array_offset = 0;
     }
     return t.array_index == t.receive_arrays.size();
 }
-std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& local, const Dataset& data, uint64_t iteration, Installed installed) {
+std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& local, RdmaTransport& rdma, const Dataset& data, uint64_t iteration, Installed installed) {
     auto started = Clock::now();
     std::map<Key, std::string> serialized_payloads;
     if (!c.a.preserialized)
@@ -938,6 +1022,42 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
         require(incoming_pending[path] > 0, "duplicate path completion");
         if (--incoming_pending[path] == 0) diagnostics[path] = ms(Clock::now(), prepared);
     };
+    auto finish_binary = [&](Transfer& t) {
+        // Publish expert slices before x3/x4 chunk construction.
+        if (t.key.second == Aggregate) {
+            int slot = local.slot(c, t.key.first);
+            auto* h = local.header(slot);
+            h->receive_complete_ns = monotonic_ns();
+            h->ingress_start_ns = exchange_start_ns;
+            size_t count = 0;
+            for (int gpu = 0; gpu < c.a.gpus_per_node; ++gpu) count += h->counts[gpu];
+            shm_sent += (size_t(c.a.gpus_per_node) * (c.epg() + 1) + count) * 4;
+            h->publish_ns = monotonic_ns();
+            __atomic_store_n(&h->sequence, iteration + 1, __ATOMIC_RELEASE);
+            auto before = Clock::now();
+            auto& x = installed.nodes.at(t.key.first);
+            x.source_node_rank = c.node(t.key.first); x.destination_node_rank = c.node(c.a.rank);
+            x.local_gpu_index = c.gpu(c.a.rank); x.num_nodes = c.hosts.size();
+            x.num_gpus_per_node = c.a.gpus_per_node; x.num_experts = c.a.num_experts;
+            x.top_k = c.a.top_k; x.num_tokens = c.a.num_tokens;
+            x.token_dimension = c.a.token_dimension; x.element_bytes = c.a.element_bytes;
+            x.tokens_per_chunk = c.a.tokens_per_chunk;
+            resize_reserved(x.token_indices, h->x3_count); resize_reserved(x.token_masks, h->x3_count);
+            auto* bytes = reinterpret_cast<char*>(local.indices(c, slot) + count);
+            if (h->x3_count) {
+                std::memcpy(x.token_indices.data(), bytes, h->x3_count * 8);
+                std::memcpy(x.token_masks.data(), bytes + h->x3_count * 8, h->x3_count);
+            }
+            double elapsed = ms(Clock::now(), before);
+            receive_times[4] += elapsed; receive_ms += elapsed;
+            before = Clock::now(); install(c, {t.key.first, X3}, "", installed, receive_times);
+            receive_ms += ms(Clock::now(), before);
+        } else {
+            auto before = Clock::now(); install(c, t.key, t.input, installed, receive_times);
+            receive_ms += ms(Clock::now(), before);
+        }
+        t.done = true;
+    };
     if (c.a.local_shared_memory) {
         auto publish_started = Clock::now();
         int gpu = c.gpu(c.a.rank);
@@ -961,6 +1081,24 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
         h->publish_ns = monotonic_ns();
         __atomic_store_n(&h->sequence, iteration + 1, __ATOMIC_RELEASE);
         diagnostics[ShmPublishMs] += ms(Clock::now(), publish_started);
+    }
+    if (c.a.rdma) {
+        for (auto& t : transfers) {
+            auto& peer = rdma.peers.at(t.key.first);
+            require(t.output_bytes <= peer.send.size(), "RDMA send capacity exceeded");
+            auto before = Clock::now();
+            size_t offset = 0;
+            for (const auto& segment : t.segments) {
+                if (segment.iov_len) std::memcpy(peer.send.data() + offset, segment.iov_base, segment.iov_len);
+                offset += segment.iov_len;
+            }
+            diagnostics[RdmaPackMs] += ms(Clock::now(), before);
+            before = Clock::now();
+            peer.qp->post_write_with_immediate(iteration, peer.send_mr.addr, peer.send_mr.lkey,
+                peer.remote.addr, peer.remote.rkey, t.output_bytes, uint32_t(iteration), true, {}, true);
+            diagnostics[RdmaPostMs] += ms(Clock::now(), before);
+            diagnostics[RdmaSentBytes] += t.output_bytes;
+        }
     }
     while (pending || local_pending) {
         // Never block on sockets while a shared-memory producer may publish.
@@ -1031,6 +1169,43 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
             wait_ms = 0;
         }
         if (!pending) continue;
+        if (c.a.rdma) {
+            for (size_t i = 0; i < transfers.size(); ++i) {
+                auto& t = transfers[i];
+                if (descriptors[i].fd < 0) continue;
+                auto& peer = rdma.peers.at(t.key.first);
+                peer.completions.clear();
+                auto before = Clock::now();
+                peer.qp->poll(peer.completions, 2);
+                diagnostics[RdmaPollMs] += ms(Clock::now(), before);
+                ++diagnostics[RdmaPollCalls];
+                for (const auto& completion : peer.completions) {
+                    require(completion.wr_id == iteration, "stale RDMA completion");
+                    if (completion.kind == CompletionKind::kSend) {
+                        require(t.sent == 0, "duplicate RDMA send completion");
+                        t.sent = t.output_bytes;
+                        if (--sends_pending == 0) diagnostics[RdmaSendsCompleteMs] = ms(Clock::now(), prepared);
+                    } else {
+                        require(!t.done && completion.imm_data == iteration, "invalid RDMA receive completion");
+                        before = Clock::now();
+                        prepare_rdma_receive(c, t, local, iteration, completion.byte_len, peer.send.size());
+                        double elapsed = ms(Clock::now(), before);
+                        receive_times[4] += elapsed; receive_ms += elapsed;
+                        finish_binary(t);
+                        received_one(receive_path(t.key));
+                        diagnostics[RdmaReceivedBytes] += completion.byte_len;
+                        before = Clock::now();
+                        peer.qp->post_receive(iteration + 1);
+                        diagnostics[RdmaPostRecvMs] += ms(Clock::now(), before);
+                    }
+                }
+                if (t.done && t.sent == t.output_bytes) {
+                    descriptors[i].fd = -1;
+                    if (--pending == 0) diagnostics[RdmaWorkCompleteMs] = ms(Clock::now(), prepared);
+                }
+            }
+            continue;
+        }
         auto poll_started = Clock::now();
         int rc = poll(descriptors.data(), descriptors.size(), wait_ms);
         const int poll_errno = errno;
@@ -1087,40 +1262,7 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
                             std::min(size_t(262144), array.iov_len - t.array_offset));
                     }
                     if (t.arrays_ready && direct_arrays_complete(t)) {
-                        // Publish expert slices before x3/x4 chunk construction.
-                        if (t.key.second == Aggregate) {
-                            int slot = local.slot(c, t.key.first);
-                            auto* h = local.header(slot);
-                            h->receive_complete_ns = monotonic_ns();
-                            h->ingress_start_ns = exchange_start_ns;
-                            size_t count = 0;
-                            for (int gpu = 0; gpu < c.a.gpus_per_node; ++gpu) count += h->counts[gpu];
-                            shm_sent += (size_t(c.a.gpus_per_node) * (c.epg() + 1) + count) * 4;
-                            h->publish_ns = monotonic_ns();
-                            __atomic_store_n(&h->sequence, iteration + 1, __ATOMIC_RELEASE);
-                            auto before = Clock::now();
-                            auto& x = installed.nodes.at(t.key.first);
-                            x.source_node_rank = c.node(t.key.first); x.destination_node_rank = c.node(c.a.rank);
-                            x.local_gpu_index = c.gpu(c.a.rank); x.num_nodes = c.hosts.size();
-                            x.num_gpus_per_node = c.a.gpus_per_node; x.num_experts = c.a.num_experts;
-                            x.top_k = c.a.top_k; x.num_tokens = c.a.num_tokens;
-                            x.token_dimension = c.a.token_dimension; x.element_bytes = c.a.element_bytes;
-                            x.tokens_per_chunk = c.a.tokens_per_chunk;
-                            resize_reserved(x.token_indices, h->x3_count); resize_reserved(x.token_masks, h->x3_count);
-                            auto* bytes = reinterpret_cast<char*>(local.indices(c, slot) + count);
-                            if (h->x3_count) {
-                                std::memcpy(x.token_indices.data(), bytes, h->x3_count * 8);
-                                std::memcpy(x.token_masks.data(), bytes + h->x3_count * 8, h->x3_count);
-                            }
-                            double elapsed = ms(Clock::now(), before);
-                            receive_times[4] += elapsed; receive_ms += elapsed;
-                            before = Clock::now(); install(c, {t.key.first, X3}, "", installed, receive_times);
-                            receive_ms += ms(Clock::now(), before);
-                        } else {
-                            auto before = Clock::now(); install(c, t.key, t.input, installed, receive_times);
-                            receive_ms += ms(Clock::now(), before);
-                        }
-                        t.done = true;
+                        finish_binary(t);
                     }
                 } else {
                     t.received += receive(p.fd, &t.input[t.received], std::min(size_t(262144), t.input.size() - t.received));
@@ -1154,13 +1296,14 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
     r.exchange_start_ns = exchange_start_ns;
     r.shared_sources = std::move(observations);
     diagnostics[ExchangeOtherMs] = ms(finished, prepared) - receive_ms - diagnostics[4]
-        - diagnostics[SendMs] - diagnostics[RecvMs] - diagnostics[ShmPublishMs] - diagnostics[ShmReceiveCopyMs];
+        - diagnostics[SendMs] - diagnostics[RecvMs] - diagnostics[ShmPublishMs] - diagnostics[ShmReceiveCopyMs]
+        - diagnostics[RdmaPackMs] - diagnostics[RdmaPostMs] - diagnostics[RdmaPollMs] - diagnostics[RdmaPostRecvMs];
     r.diagnostics = diagnostics;
     r.shm_sent = shm_sent; r.shm_received = shm_received;
     r.times = {ms(finished, started), ms(serialized, started), ms(self_installed, serialized),
                ms(prepared, self_installed), ms(finished, prepared) - receive_ms, receive_ms};
     r.experts = installed.experts.size(); r.nodes = installed.nodes.size();
-    for (const auto& t : transfers) { r.sent += t.output_bytes; r.received += t.payload_bytes + FrameBytes; }
+    if (!c.a.rdma) for (const auto& t : transfers) { r.sent += t.output_bytes; r.received += t.payload_bytes + FrameBytes; }
     return {r, std::move(installed)};
 }
 std::string summary(std::vector<double> values) {
@@ -1226,6 +1369,7 @@ void report(const Config& c, const std::vector<std::vector<Record>>& records) {
         ",\"critical_rank_receive_process_ms\":" + receive_summary(critical) +
         ",\"critical_rank_expert_index_bounds_ms\":" + index_bounds_summary(critical) +
         ",\"expert_index_validation_enabled\":" + (c.a.disable_expert_index_validation ? "false" : "true") +
+        ",\"transport\":" + quote(c.a.rdma ? "rdma" : "tcp") +
         ",\"same_index_aggregation\":" + (c.a.same_index_aggregation ? "true" : "false") +
         ",\"receive_drain\":" + (c.a.receive_drain ? "true" : "false") +
         ",\"local_shared_memory\":" + (c.a.local_shared_memory ? "true" : "false") +
@@ -1259,6 +1403,8 @@ int run(const RouterMetadataBenchConfig& raw) {
     mesh.gather(c, "configuration", c.json());
     LocalMemory local;
     local.initialize(c, mesh);
+    RdmaTransport rdma;
+    rdma.initialize(c, mesh, local);
     if (!c.a.rank) std::cout << "Connected " << c.a.world << " C++ CPU proxies; preparing "
                             << c.a.datasets << " routing datasets per rank" << std::endl;
     std::vector<Dataset> datasets;
@@ -1284,7 +1430,7 @@ int run(const RouterMetadataBenchConfig& raw) {
     for (int iteration = 0; iteration < c.a.warmup + c.a.iterations; ++iteration) {
         int d = iteration % c.a.datasets;
         mesh.gather(c, "start:" + std::to_string(iteration), "");
-        auto result = exchange(c, mesh, local, datasets[d], iteration, std::move(reusable));
+        auto result = exchange(c, mesh, local, rdma, datasets[d], iteration, std::move(reusable));
         if (c.a.verify) {
             for (const auto& [source, metadata] : result.second.experts)
                 require(serialize_router_expert_metadata(metadata) == expected[d].at({source, Expert}), "expert content verification failed");
@@ -1304,7 +1450,7 @@ int run(const RouterMetadataBenchConfig& raw) {
 }
 } // namespace
 
-extern "C" uint32_t router_metadata_bench_abi_version() { return 6; }
+extern "C" uint32_t router_metadata_bench_abi_version() { return 7; }
 extern "C" int router_metadata_bench_run(const RouterMetadataBenchConfig* config, char* error, size_t capacity) {
     if (error && capacity) error[0] = '\0';
     try {
@@ -1328,6 +1474,16 @@ int main() {
         raw.token_dimension = 4096; raw.element_bytes = 2; raw.tokens_per_chunk = 7;
         raw.datasets = 1; raw.iterations = 1; raw.timeout = 5; raw.seed = 1234; raw.binary = 1;
         raw.hosts = "127.0.0.1,127.0.0.1"; raw.bind_host = "0.0.0.0"; raw.output = "";
+#if !RDMA_PROXY_HAVE_VERBS
+        auto unsupported = raw;
+        unsupported.rdma = 1;
+        bool rejected_rdma = false;
+        try { Config unavailable(unsupported); }
+        catch (const std::exception& e) {
+            rejected_rdma = std::string(e.what()).find("RDMA unavailable") != std::string::npos;
+        }
+        require(rejected_rdma, "build without verbs silently accepted RDMA");
+#endif
         Config c(raw);
         Logger::instance().set_level(LogLevel::kError);
         auto data = prepare(c, 0, 0);
@@ -1387,6 +1543,26 @@ int main() {
         prepare_aggregate_receive(c, aggregate, arena);
         require(aggregate.receive_arrays[0].iov_base == arena.offsets(arena.slot(c, 0)) &&
                 aggregate.receive_arrays[0].iov_len == aggregate_bytes, "aggregate receive does not target shared arena");
+        // Exercise the direct-RDMA wire layout and reject stale/truncated writes
+        // without needing an RNIC. No publication may occur on validation alone.
+        arena.wire_prefix = FrameBytes + aggregate.input.size();
+        std::string frame;
+        append64(frame, aggregate.payload_bytes); append64(frame, 7); frame += aggregate.input;
+        auto* wire = arena.wire(arena.slot(c, 0));
+        std::memcpy(wire, frame.data(), frame.size());
+        prepare_rdma_receive(c, aggregate, arena, 7, FrameBytes + aggregate.payload_bytes, arena.stride - sizeof(LocalMemory::Header));
+        require(aggregate.receive_arrays[0].iov_base == wire + frame.size(), "RDMA body layout mismatch");
+        require(arena.header(arena.slot(c, 0))->sequence == 0, "RDMA validation published data");
+        for (int corruption = 0; corruption < 3; ++corruption) {
+            bool rejected = false;
+            try {
+                prepare_rdma_receive(c, aggregate, arena, corruption == 0 ? 8 : 7,
+                    corruption == 1 ? FrameBytes : FrameBytes + aggregate.payload_bytes,
+                    corruption == 2 ? 1 : arena.stride - sizeof(LocalMemory::Header));
+            } catch (const std::exception&) { rejected = true; }
+            require(rejected, "invalid RDMA completion/frame accepted");
+        }
+        arena.wire_prefix = 0;
         auto reject_aggregate = [&](Transfer bad) {
             bool failed = false;
             try { prepare_aggregate_receive(c, bad, arena); } catch (const std::exception&) { failed = true; }
