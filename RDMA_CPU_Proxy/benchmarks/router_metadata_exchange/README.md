@@ -89,7 +89,7 @@ CPU/NUMA placement. This benchmark does not pin processes automatically.
 
 ## Optional within-node shared memory
 
-Rebuild the library and update `benchmark.py` on both nodes (C ABI version 5).
+Rebuild the library and update `benchmark.py` on both nodes (C ABI version 6).
 The default remains all-TCP. To replace local expert-metadata TCP connections
 with shared host memory, pass `--local-shared-memory` on **both nodes**:
 
@@ -303,7 +303,7 @@ deserialization. Timers do not change the validation policy or wire format.
 Self installation is excluded from this breakdown and remains `self_install_ms`.
 Single-node runs have zero x3/x4 and chunk-build times because no such messages
 are exchanged. Rebuild the shared library on both nodes before rerunning; report
-configuration `timing_schema: 6` identifies the current instrumentation version.
+configuration `timing_schema: 7` identifies the current instrumentation version.
 
 The maximum rank-local duration needs no synchronized clocks. It is not an exact
 global makespan: barrier-release and OS scheduling skew can influence it. A send
@@ -390,7 +390,7 @@ RESULT_JSON=results/text.json bash ./run_node0_torchrun.sh --wire-format=text
 ```
 
 Run node 1 with the matching mode for each run. Upgrade/rebuild the library on
-both nodes: the Python/native C ABI is now version 5. Reports identify the wire
+both nodes: the Python/native C ABI is now version 6. Reports identify the wire
 format; timing field names remain stable for comparisons.
 
 For direct binary reception, time inside socket `recv()` calls belongs to
@@ -399,7 +399,7 @@ validation belong to the corresponding `*_deserialize_ms` field. The latter now
 sums work before and after the array transfers; it excludes waiting for bytes.
 `configuration.receive_storage` is `direct_reusable_vectors` for binary and
 `payload_buffer` for text. The binary wire format is unchanged; the current wrapper requires C ABI
-version 5. Rebuild both nodes for comparable timing/schema reports. Native tests check
+version 6. Rebuild both nodes for comparable timing/schema reports. Native tests check
 that receive-array addresses stay stable across changing routing datasets.
 
 ### Isolated expert index-bounds scan
@@ -422,7 +422,7 @@ For the mean on the selected critical ranks, divide
 fraction attributable to this scan. Text mode reports zero for the isolated
 field because its checks remain interleaved with parsing in the unchanged
 production deserializer; zero there means **not separately measured**.
-Rebuild on both nodes. the nested timing is also included in current `timing_schema: 6` reports.
+Rebuild on both nodes. The nested timing is also included in current `timing_schema: 7` reports.
 
 ### Disable the two expert-index scans
 
@@ -448,7 +448,7 @@ still includes identity/configuration checks, so neither parent stage should
 be expected to become zero. If `--verify` is also enabled, exact-content checks
 still run outside the timed interval.
 
-Rebuild on both nodes before using the updated wrapper (C ABI version 5):
+Rebuild on both nodes before using the updated wrapper (C ABI version 6):
 
 ```bash
 cmake --build build -j
@@ -459,7 +459,7 @@ and metadata exchange are unchanged.
 
 ### Exchange completion and polling diagnostics (timing schema 5)
 
-Rebuild the native library on both nodes; update the wrapper as well (current C ABI version 5). No additional
+Rebuild the native library on both nodes; update the wrapper as well (current C ABI version 6). No additional
 command-line flag is needed to collect diagnostics. The console and JSON now include
 `critical_rank_exchange_diagnostics`. Each iteration's diagnostics come from
 that iteration's slowest-total-time rank, just like the existing stage report.
@@ -495,7 +495,7 @@ and rerun both transport modes for an instrumentation-matched comparison.
 
 ### Socket I/O diagnostics and optional receive draining (timing schema 6)
 
-Update `benchmark.py` and rebuild the native library on **both nodes** (ABI 5).
+Update `benchmark.py` and rebuild the native library on **both nodes** (ABI 6).
 The new diagnostics are always collected, including in the unchanged default
 one-receive-step-per-socket mode. Enable the alternative with `--receive-drain`
 on both nodes; it supports binary and text modes, with or without local shared
@@ -554,3 +554,95 @@ Configuration records `receive_drain` and `receive_max_steps_per_socket`
 in the Python wrapper. Tests exercise both receive modes, small budgets, empty
 arrays, text/binary messages, local-only/hybrid exchanges, the default 16-proxy
 workload, and nonblocking partial-I/O/backpressure counters.
+
+
+### Same-index TCP aggregation (timing schema 7, ABI 6)
+
+`--same-index-aggregation` enables binary aggregation and automatically enables
+local shared memory. Update the Python wrapper and rebuild the native library
+on **both nodes**. It is opt-in; omit it to retain the previous transport.
+Text mode is rejected. All ranks must use matching options.
+
+```bash
+# Build from this directory on both nodes
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+# Node 0
+RESULT_JSON=results/aggregate.json bash ./run_node0_torchrun.sh \
+  --same-index-aggregation --disable-expert-index-validation --receive-drain
+
+# Node 1
+bash ./run_node1_torchrun.sh \
+  --same-index-aggregation --disable-expert-index-validation --receive-drain
+```
+
+For each remote node, source proxy i sends **one message to proxy i** containing
+expert offsets/indices for every destination GPU on that node, followed by x3/x4.
+The message references the existing source arrays with up to 19 scatter/gather
+segments (including its header); there is no contiguous sender payload packing.
+There is one full-duplex metadata connection per matching-rank pair per node
+pair, and no separate x3/x4 connection. With two nodes and eight GPUs, this means
+8 cross-node metadata connections globally instead of 72, and one outgoing
+message per proxy instead of nine. Control connections remain separate.
+The implementation also supports more than two nodes.
+
+The iteration envelope and aggregate header identify source, destination node,
+topology, tensor/chunk dimensions, every destination index count, and x3 length.
+The receiver checks identities, counts, and total payload length before directing
+socket reception into its source-specific shared-memory arena. The body contains
+all destination offset arrays, all destination index arrays, uint64 x3, and uint8
+x4. Each arena has exactly one ingress writer and one immutable destination slice
+per consumer. All payload bytes must arrive before a release-store publishes the
+iteration sequence. Incomplete messages are never published.
+
+Every local proxy acquires the publication and copies its expert slice into its
+existing source-specific vectors, including the ingress proxy's own slice.
+Validation and progress initialization retain their existing policy. Expert
+slices are published before the ingress proxy copies/validates x3/x4 and builds
+receive chunks. That allows other local proxies to consume expert metadata while
+chunk construction runs. The ingress proxy consumes its own expert slice on a
+subsequent exchange-loop pass. The existing global completion barrier prevents
+arena reuse while any consumer still reads the previous iteration.
+
+Shared arenas are allocated and prefaulted before measurements, using the same
+unique run identity, mapping barrier, early unlink, and RAII teardown as the
+local-only shared transport. Aggregation reserves one arena per source rank;
+default two-node shared storage is approximately 12.8 MiB **per node**. Local
+workers must share a POSIX shared-memory namespace. Network bytes are received
+directly into these arenas; ordinary socket reception still performs the kernel
+to user-memory copy. The extra shared-memory-to-record copies are timed.
+
+The report identifies `same_index_aggregation: true`,
+`receive_storage: "shared_aggregate_arenas"`, and
+`metadata_tcp_channels_per_rank` (1 for the default two-node aggregate run).
+Existing socket counters report actual calls: one message is not a guarantee of
+one send or receive syscall. The 256 KiB receive cap and partial I/O may require
+multiple body calls. `--receive-drain` and `--preserialized` both remain supported.
+Pre-serialization caches only aggregate headers; all transfers and consumer copies
+remain timed.
+
+In this mode, `shm_sent_bytes` counts expert-array bytes **published for local
+consumers**, including remotely received slices, and `shm_received_bytes` counts
+consumer expert-array copies. These logical shared-distribution bytes balance
+across ranks; they do not represent an additional producer memcpy for the remote
+payload. TCP wire-byte counts include the aggregate header/envelope. The x3/x4
+copy from the ingress arena belongs to `x3x4_deserialize_ms`; expert consumer
+copies belong to `shm_receive_copy_ms`. Aggregate-header decoding is also included
+in `x3x4_deserialize_ms`. The release publication of remote expert slices is part
+of `exchange_other_ms`; `shm_publish_ms` still measures local-source publication.
+Completion milestones retain their meanings: `remote_expert_complete_ms` waits
+for installation from **all remote source ranks**, not just the same-index peer.
+
+Use `--verify` on all ranks for content checks outside timing. Tests cover
+changing datasets, empty destination slices, eight-destination source-specific
+oracles, multiple remote nodes, single-GPU nodes, partial 19-segment sends,
+malformed aggregate headers, and both aggregate receive progression modes.
+Compare performance against the non-aggregated transport using the same build,
+CPU placement, workload, and validation settings.
+
+While any shared expert slice is pending, including slices published by other
+ingress proxies, the aggregate exchange scans shared sequence counters and uses
+nonblocking socket polls. This avoids sleeping through a shared-memory-only
+publication but can increase CPU use while remote arrivals are pending. Keep CPU
+placement consistent when evaluating the latency change.

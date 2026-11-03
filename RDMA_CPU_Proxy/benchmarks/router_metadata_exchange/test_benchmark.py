@@ -13,6 +13,28 @@ import unittest
 import python_reference as b
 
 
+def free_port_range(count):
+    # Check every port used by the emulated nodes, not only the first listener.
+    for _ in range(100):
+        probes = []
+        try:
+            first = socket.socket(); probes.append(first)
+            first.bind(("127.0.0.1", 0))
+            port = first.getsockname()[1]
+            if port + count > 65536:
+                continue
+            for offset in range(1, count):
+                probe = socket.socket(); probes.append(probe)
+                probe.bind(("127.0.0.1", port + offset))
+            return port
+        except OSError:
+            pass
+        finally:
+            for probe in probes:
+                probe.close()
+    raise RuntimeError("could not find a free contiguous test port range")
+
+
 def config(**overrides):
     args = dict(rank=0, world=4, hosts=["node0", "node1"], gpus_per_node=2,
                 num_tokens=53, num_experts=16, top_k=4, seed=1234,
@@ -101,12 +123,11 @@ class ProcessTests(unittest.TestCase):
         self.assertIn("TCP operation timed out", result.stderr)
 
     def run_job(self, nodes, per_node, preserialized=False, num_tokens=137,
-                num_experts=16, top_k=4, wire_format="binary", disable_validation=False, local_shared_memory=False, receive_drain=False, drain_steps=16):
+                num_experts=16, top_k=4, wire_format="binary", disable_validation=False, local_shared_memory=False, receive_drain=False, drain_steps=16, aggregate=False):
+        local_shared_memory = local_shared_memory or aggregate
         # Distinct node port ranges emulate hosts without loopback aliases.
         hosts = ["127.0.0.1"] * nodes
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
+        port = free_port_range(nodes * per_node)
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "report.json"
             processes = []
@@ -125,6 +146,8 @@ class ProcessTests(unittest.TestCase):
                            f"--num-tokens={num_tokens}", f"--num-experts={num_experts}", f"--top-k={top_k}",
                            "--datasets=2", "--warmup=1", "--iterations=3", "--timeout=60",
                            f"--output={output}"]
+                    if aggregate:
+                        cmd.append("--same-index-aggregation")
                     if receive_drain:
                         cmd.extend(["--receive-drain", f"--receive-drain-max-steps={drain_steps}"])
                     if local_shared_memory:
@@ -142,6 +165,9 @@ class ProcessTests(unittest.TestCase):
                     self.assertEqual(code, 0, log.read())
                 report = json.loads(output.read_text())
                 self.assertEqual(report["backend"], "cpp")
+                self.assertEqual(report["same_index_aggregation"], aggregate)
+                channels = nodes - 1 if aggregate else nodes * per_node - 1 - (per_node - 1 if local_shared_memory else 0) + nodes - 1
+                self.assertEqual(report["configuration"]["metadata_tcp_channels_per_rank"], channels)
                 self.assertEqual(report["receive_drain"], receive_drain)
                 self.assertEqual(report["configuration"]["receive_max_steps_per_socket"], drain_steps if receive_drain else 1)
                 self.assertEqual(report["configuration"]["local_shared_memory"], local_shared_memory)
@@ -149,9 +175,9 @@ class ProcessTests(unittest.TestCase):
                 self.assertEqual(report["configuration"]["expert_index_validation_enabled"], not disable_validation)
                 self.assertEqual(report["wire_format"], wire_format)
                 self.assertEqual(report["configuration"]["wire_format"], wire_format)
-                self.assertEqual(report["configuration"]["timing_schema"], 6)
+                self.assertEqual(report["configuration"]["timing_schema"], 7)
                 self.assertEqual(report["configuration"]["receive_storage"],
-                                 "direct_reusable_vectors" if wire_format == "binary" else "payload_buffer")
+                                 "shared_aggregate_arenas" if aggregate else ("direct_reusable_vectors" if wire_format == "binary" else "payload_buffer"))
                 self.assertEqual(len(report["iterations"]), 3)
                 critical = [max(rows, key=lambda r: r["elapsed_ms"]) for rows in report["iterations"]]
                 self.assertAlmostEqual(report["critical_rank_expert_index_bounds_ms"]["mean"],
@@ -169,7 +195,7 @@ class ProcessTests(unittest.TestCase):
                     self.assertEqual(sum(r["sent_bytes"] for r in row), sum(r["received_bytes"] for r in row))
                     self.assertEqual(sum(r["shm_sent_bytes"] for r in row),
                                      sum(r["shm_received_bytes"] for r in row))
-                    if local_shared_memory and per_node > 1:
+                    if local_shared_memory and (per_node > 1 or (aggregate and nodes > 1)):
                         self.assertGreater(sum(r["shm_sent_bytes"] for r in row), 0)
                     else:
                         self.assertEqual(sum(r["shm_sent_bytes"] for r in row), 0)
@@ -248,6 +274,41 @@ class ProcessTests(unittest.TestCase):
                     process.wait()
                 for log in logs:
                     log.close()
+
+    def test_aggregate(self):
+        self.run_job(2, 2, aggregate=True)
+
+    def test_aggregate_draining(self):
+        self.run_job(2, 2, aggregate=True, receive_drain=True, drain_steps=2)
+
+    def test_aggregate_empty_slices(self):
+        self.run_job(2, 2, num_tokens=1, top_k=1, aggregate=True, receive_drain=True)
+
+    def test_aggregate_preserialized(self):
+        self.run_job(2, 2, aggregate=True, preserialized=True, disable_validation=True)
+
+    def test_aggregate_three_nodes(self):
+        self.run_job(3, 2, num_experts=24, aggregate=True, receive_drain=True)
+
+    def test_aggregate_one_proxy(self):
+        self.run_job(2, 1, aggregate=True)
+
+    def test_aggregate_single_node(self):
+        self.run_job(1, 4, aggregate=True)
+
+    def test_aggregate_sixteen_source_oracles(self):
+        self.run_job(2, 8, num_experts=128, top_k=8, aggregate=True, receive_drain=True)
+
+    def test_aggregate_default_workload(self):
+        self.run_job(2, 8, num_tokens=20480, num_experts=128, top_k=8, aggregate=True, receive_drain=True)
+
+    def test_aggregate_rejects_text(self):
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("benchmark.py")),
+             "--hosts=127.0.0.1", "--same-index-aggregation", "--wire-format=text"],
+            capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--same-index-aggregation requires --wire-format=binary", result.stderr)
 
     def test_receive_drain_hybrid(self):
         self.run_job(2, 2, local_shared_memory=True, receive_drain=True)

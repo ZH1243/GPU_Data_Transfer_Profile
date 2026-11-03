@@ -38,7 +38,7 @@ using namespace rdma_proxy;
 using Clock = std::chrono::steady_clock;
 using Time = Clock::time_point;
 using Key = std::pair<int, int>;
-constexpr int Expert = 0, X3 = 1, Control = 2;
+constexpr int Expert = 0, X3 = 1, Control = 2, Aggregate = 3;
 constexpr size_t FrameBytes = 16;
 const std::array<const char*, 6> Fields = {"elapsed_ms", "serialize_ms", "self_install_ms",
     "communication_prepare_ms", "tcp_exchange_ms", "receive_process_ms"};
@@ -232,6 +232,7 @@ struct Config {
                 "disabling expert index validation requires binary mode");
         require(!a.local_shared_memory || a.binary, "shared memory requires binary mode");
         require(a.receive_drain_max_steps >= 1 && a.receive_drain_max_steps <= 1024, "invalid receive drain step budget");
+        require(!a.same_index_aggregation || (a.binary && a.local_shared_memory), "aggregation requires binary shared memory");
         const uint32_t endian_probe = 1;
         require(!a.binary || (sizeof(size_t) == 8 && *reinterpret_cast<const uint8_t*>(&endian_probe) == 1),
                 "binary mode requires 64-bit size_t and little-endian hosts");
@@ -259,9 +260,9 @@ struct Config {
     int epg() const { return a.num_experts / a.world; }
     std::string json() const {
         std::ostringstream out;
-        out << "{\"backend\":\"cpp\",\"timing_schema\":6,\"wire_format\":"
+        out << "{\"backend\":\"cpp\",\"timing_schema\":7,\"wire_format\":"
             << quote(a.binary ? "binary" : "text") << ",\"receive_storage\":"
-            << quote(a.binary ? "direct_reusable_vectors" : "payload_buffer") << ",\"binary_protocol_version\":1,\"hosts\":[";
+            << quote(a.same_index_aggregation ? "shared_aggregate_arenas" : (a.binary ? "direct_reusable_vectors" : "payload_buffer")) << ",\"binary_protocol_version\":1,\"hosts\":[";
         for (size_t i = 0; i < hosts.size(); ++i) { if (i) out << ','; out << quote(hosts[i]); }
         out << ']';
 #define FIELD(name) out << ",\"" #name "\":" << a.name
@@ -269,6 +270,9 @@ struct Config {
         FIELD(num_tokens); FIELD(num_experts); FIELD(top_k); FIELD(token_dimension);
         FIELD(element_bytes); FIELD(tokens_per_chunk); FIELD(datasets); FIELD(warmup);
         FIELD(iterations); FIELD(seed); FIELD(timeout);
+        out << ",\"metadata_tcp_channels_per_rank\":" << (a.same_index_aggregation ? hosts.size() - 1 :
+            a.world - 1 - (a.local_shared_memory ? a.gpus_per_node - 1 : 0) + hosts.size() - 1);
+        out << ",\"same_index_aggregation\":" << (a.same_index_aggregation ? "true" : "false");
         out << ",\"receive_drain\":" << (a.receive_drain ? "true" : "false")
             << ",\"receive_max_steps_per_socket\":" << (a.receive_drain ? a.receive_drain_max_steps : 1);
         out << ",\"local_shared_memory\":" << (a.local_shared_memory ? "true" : "false");
@@ -281,8 +285,12 @@ struct Config {
 };
 std::vector<int> kinds(const Config& c, int left, int right) {
     std::vector<int> result;
-    if (!c.a.local_shared_memory || c.node(left) != c.node(right)) result.push_back(Expert);
-    if (c.gpu(left) == c.gpu(right)) result.push_back(X3);
+    if (c.a.same_index_aggregation) {
+        if (c.gpu(left) == c.gpu(right)) result.push_back(Aggregate);
+    } else {
+        if (!c.a.local_shared_memory || c.node(left) != c.node(right)) result.push_back(Expert);
+        if (c.gpu(left) == c.gpu(right)) result.push_back(X3);
+    }
     if (left == 0) result.push_back(Control);
     return result;
 }
@@ -360,6 +368,7 @@ struct LocalMemory {
     struct alignas(64) Header {
         uint64_t sequence;
         uint64_t counts[8];
+        uint64_t x3_count;
     };
     std::string name;
     void* base = MAP_FAILED;
@@ -380,6 +389,11 @@ struct LocalMemory {
     int32_t* indices(const Config& c, int source_gpu) const {
         return offsets(source_gpu) + c.a.gpus_per_node * (c.epg() + 1);
     }
+    int slot(const Config& c, int source) const {
+        if (c.node(source) == c.node(c.a.rank)) return c.gpu(source);
+        int remote_node = c.node(source) - (c.node(source) > c.node(c.a.rank) ? 1 : 0);
+        return c.a.gpus_per_node + remote_node * c.a.gpus_per_node + c.gpu(source);
+    }
     void initialize(const Config& c, Mesh& mesh) {
         if (!c.a.local_shared_memory) return;
         static_assert(__atomic_always_lock_free(sizeof(uint64_t), nullptr),
@@ -389,9 +403,11 @@ struct LocalMemory {
         auto identity = mesh.gather(c, "shm_run", id.str()).front();
         name = "/rmeta_" + identity + "_" + std::to_string(c.node(c.a.rank));
         stride = (sizeof(Header) + sizeof(int32_t) *
-            (size_t(c.a.gpus_per_node) * (c.epg() + 1) + size_t(c.a.num_tokens) * c.a.top_k) + 63) & ~size_t(63);
+            (size_t(c.a.gpus_per_node) * (c.epg() + 1) + size_t(c.a.num_tokens) * c.a.top_k) + (c.a.same_index_aggregation ? size_t(c.a.num_tokens) * 9 : 0) + 63) & ~size_t(63);
         require(stride <= std::numeric_limits<size_t>::max() / c.a.gpus_per_node, "shared memory size overflow");
-        bytes = stride * c.a.gpus_per_node;
+        size_t slots = c.a.same_index_aggregation ? c.a.world : c.a.gpus_per_node;
+        require(stride <= std::numeric_limits<size_t>::max() / slots, "aggregate memory size overflow");
+        bytes = stride * slots;
         auto until = deadline(c.a.timeout);
         Socket fd;
         if (c.gpu(c.a.rank) == 0) {
@@ -419,6 +435,9 @@ struct LocalMemory {
         require(base != MAP_FAILED, "cannot map metadata shared memory");
         // Each process prefaults only its own arena; no concurrent initialization writes.
         std::memset(header(c.gpu(c.a.rank)), 0, stride);
+        if (c.a.same_index_aggregation)
+            for (int source = c.gpu(c.a.rank); source < c.a.world; source += c.a.gpus_per_node)
+                if (c.node(source) != c.node(c.a.rank)) std::memset(header(slot(c, source)), 0, stride);
         mesh.gather(c, "shm_mapped", "");
         // All ranks now hold mappings; unlink early so killed runs leave no named object.
         if (owner) { require(shm_unlink(name.c_str()) == 0, "cannot unlink metadata shared memory"); owner = false; }
@@ -464,7 +483,16 @@ constexpr uint64_t BinaryMagic = 0x524d455842494e01ULL; // RMEXBIN + version 1
 std::string binary_header(const Dataset& d, Key key) {
     std::string header;
     append64(header, BinaryMagic); append64(header, key.second);
-    if (key.second == Expert) {
+    if (key.second == Aggregate) {
+        const auto& x = d.nodes.at(key.first);
+        for (uint64_t value : {uint64_t(x.source_node_rank * x.num_gpus_per_node + x.local_gpu_index),
+                uint64_t(x.destination_node_rank), uint64_t(x.num_nodes), uint64_t(x.num_gpus_per_node),
+                uint64_t(x.num_experts), uint64_t(x.num_tokens), uint64_t(x.top_k),
+                uint64_t(x.token_dimension), uint64_t(x.element_bytes), uint64_t(x.tokens_per_chunk)}) append64(header, value);
+        for (int gpu = 0; gpu < x.num_gpus_per_node; ++gpu)
+            append64(header, d.experts.at(x.destination_node_rank * x.num_gpus_per_node + gpu).expert_token_indices.size());
+        append64(header, x.token_indices.size());
+    } else if (key.second == Expert) {
         const auto& m = d.experts.at(key.first);
         for (uint64_t value : {uint64_t(m.source_node_rank), uint64_t(m.source_gpu_index),
                 uint64_t(m.destination_node_rank), uint64_t(m.destination_gpu_index),
@@ -683,8 +711,9 @@ struct Transfer {
 };
 // sendmsg references the existing arrays; no packed copy or decimal conversion.
 size_t send_segments(int fd, const Transfer& t, ExchangeDiagnostics* diagnostics = nullptr) {
-    std::array<iovec, 3> remaining_segments{};
+    std::array<iovec, 19> remaining_segments{};
     size_t skip = t.sent, count = 0;
+    require(t.segments.size() <= remaining_segments.size(), "too many send segments");
     for (auto segment : t.segments) {
         if (skip >= segment.iov_len) { skip -= segment.iov_len; continue; }
         segment.iov_base = static_cast<char*>(segment.iov_base) + skip;
@@ -749,6 +778,29 @@ void prepare_direct_receive(const Config& c, Transfer& t, Installed& storage) {
     }
     t.arrays_ready = true;
 }
+void prepare_aggregate_receive(const Config& c, Transfer& t, LocalMemory& local) {
+    BinaryReader r{t.input}; r.prefix(Aggregate);
+    for (uint64_t expected : {uint64_t(t.key.first), uint64_t(c.node(c.a.rank)),
+            uint64_t(c.hosts.size()), uint64_t(c.a.gpus_per_node), uint64_t(c.a.num_experts),
+            uint64_t(c.a.num_tokens), uint64_t(c.a.top_k), uint64_t(c.a.token_dimension),
+            uint64_t(c.a.element_bytes), uint64_t(c.a.tokens_per_chunk)})
+        require(r.word() == expected, "aggregate identity/dimensions mismatch");
+    require(c.gpu(t.key.first) == c.gpu(c.a.rank) && c.node(t.key.first) != c.node(c.a.rank), "invalid aggregate peer");
+    int slot = local.slot(c, t.key.first);
+    auto* h = local.header(slot);
+    size_t total = 0;
+    for (int gpu = 0; gpu < c.a.gpus_per_node; ++gpu) {
+        auto count = r.word();
+        require(count <= size_t(c.a.num_tokens) * c.a.top_k - total, "aggregate index count exceeds capacity");
+        h->counts[gpu] = count; total += count;
+    }
+    h->x3_count = r.word();
+    require(h->x3_count <= size_t(c.a.num_tokens), "aggregate x3 count exceeds capacity");
+    size_t bytes = (size_t(c.a.gpus_per_node) * (c.epg() + 1) + total) * 4 + h->x3_count * 9;
+    require(t.payload_bytes == t.input.size() + bytes, "aggregate payload length mismatch");
+    t.receive_arrays = {iovec{local.offsets(slot), bytes}, iovec{nullptr, 0}};
+    t.arrays_ready = true;
+}
 bool direct_arrays_complete(Transfer& t) {
     while (t.array_index < t.receive_arrays.size() && t.array_offset == t.receive_arrays[t.array_index].iov_len) {
         ++t.array_index; t.array_offset = 0;
@@ -773,9 +825,22 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
         auto& t = transfers.back(); t.key = key;
         const auto& payload = payloads.at(key);
         size_t array_bytes = 0;
-        std::array<iovec, 2> arrays{};
+        std::vector<iovec> arrays;
         if (c.a.binary) {
-            if (key.second == Expert) {
+            if (key.second == Aggregate) {
+                int first = c.node(key.first) * c.a.gpus_per_node;
+                for (int gpu = 0; gpu < c.a.gpus_per_node; ++gpu) {
+                    const auto& m = data.experts.at(first + gpu);
+                    arrays.push_back({const_cast<int32_t*>(m.expert_offsets.data()), m.expert_offsets.size() * 4});
+                }
+                for (int gpu = 0; gpu < c.a.gpus_per_node; ++gpu) {
+                    const auto& m = data.experts.at(first + gpu);
+                    arrays.push_back({const_cast<int32_t*>(m.expert_token_indices.data()), m.expert_token_indices.size() * 4});
+                }
+                const auto& x = data.nodes.at(key.first);
+                arrays.push_back({const_cast<size_t*>(x.token_indices.data()), x.token_indices.size() * 8});
+                arrays.push_back({const_cast<uint8_t*>(x.token_masks.data()), x.token_masks.size()});
+            } else if (key.second == Expert) {
                 const auto& m = data.experts.at(key.first);
                 arrays = {iovec{const_cast<int32_t*>(m.expert_offsets.data()), m.expert_offsets.size() * sizeof(int32_t)},
                           iovec{const_cast<int32_t*>(m.expert_token_indices.data()), m.expert_token_indices.size() * sizeof(int32_t)}};
@@ -792,7 +857,7 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
         t.segments.push_back(iovec{t.output.data(), t.output.size()});
         if (c.a.binary) for (const auto& array : arrays) t.segments.push_back(array);
         t.output_bytes = t.output.size() + array_bytes;
-        if (c.a.binary) t.input.resize(key.second == Expert ? 13 * 8 : 14 * 8);
+        if (c.a.binary) t.input.resize(key.second == Aggregate ? (13 + c.a.gpus_per_node) * 8 : (key.second == Expert ? 13 * 8 : 14 * 8));
         descriptors.push_back(pollfd{socket.fd, POLLIN | POLLOUT, 0});
     }
     auto until = deadline(c.a.timeout);
@@ -800,13 +865,14 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
     const uint64_t max_payload = 4096 + (uint64_t(c.a.num_tokens) * c.a.top_k + c.epg() + 1) * 32;
     double receive_ms = 0;
     ReceiveTimes receive_times{};
-    std::array<bool, 8> local_done{};
-    size_t local_pending = c.a.local_shared_memory ? c.a.gpus_per_node - 1 : 0;
+    std::vector<bool> local_done(c.a.world, false);
+    size_t local_pending = c.a.same_index_aggregation ? c.a.world - 1 : (c.a.local_shared_memory ? c.a.gpus_per_node - 1 : 0);
     uint64_t shm_sent = 0, shm_received = 0;
     ExchangeDiagnostics diagnostics{};
-    std::array<size_t, 3> incoming_pending{local_pending, 0, 0};
+    std::array<size_t, 3> incoming_pending{c.a.local_shared_memory ? size_t(c.a.gpus_per_node - 1) : 0,
+        c.a.same_index_aggregation ? size_t(c.a.world - c.a.gpus_per_node) : 0, 0};
     auto receive_path = [&](Key key) -> size_t {
-        return key.second == X3 ? 2 : (c.node(key.first) == c.node(c.a.rank) ? 0 : 1);
+        return (key.second == X3 || key.second == Aggregate) ? 2 : (c.node(key.first) == c.node(c.a.rank) ? 0 : 1);
     };
     for (const auto& t : transfers) ++incoming_pending[receive_path(t.key)];
     size_t sends_pending = transfers.size();
@@ -840,9 +906,12 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
         // Never block on sockets while a shared-memory producer may publish.
         int wait_ms = remaining(until);
         if (local_pending) {
-            for (int gpu = 0; gpu < c.a.gpus_per_node; ++gpu) {
-                if (gpu == c.gpu(c.a.rank) || local_done[gpu]) continue;
-                auto* h = local.header(gpu);
+            for (int source = 0; source < c.a.world; ++source) {
+                if (source == c.a.rank || local_done[source] ||
+                    (!c.a.same_index_aggregation && c.node(source) != c.node(c.a.rank))) continue;
+                int gpu = c.gpu(source);
+                int slot = local.slot(c, source);
+                auto* h = local.header(slot);
                 auto sequence = __atomic_load_n(&h->sequence, __ATOMIC_ACQUIRE);
                 require(sequence <= iteration + 1, "future shared-memory iteration");
                 if (sequence != iteration + 1) continue;
@@ -853,7 +922,6 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
                     if (d < c.gpu(c.a.rank)) cursor += h->counts[d];
                 }
                 auto before = Clock::now();
-                int source = c.node(c.a.rank) * c.a.gpus_per_node + gpu;
                 auto& m = installed.experts.at(source);
                 m.source_node_rank = c.node(source); m.source_gpu_index = gpu;
                 m.destination_node_rank = c.node(c.a.rank); m.destination_gpu_index = c.gpu(c.a.rank);
@@ -864,17 +932,17 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
                 resize_reserved(m.expert_token_indices, h->counts[c.gpu(c.a.rank)]);
                 double decode_ms = ms(Clock::now(), before);
                 receive_times[0] += decode_ms; receive_ms += decode_ms;
-                auto* offsets = local.offsets(gpu) + c.gpu(c.a.rank) * (c.epg() + 1);
+                auto* offsets = local.offsets(slot) + c.gpu(c.a.rank) * (c.epg() + 1);
                 auto copy_started = Clock::now();
                 std::copy_n(offsets, m.expert_offsets.size(), m.expert_offsets.data());
-                std::copy_n(local.indices(c, gpu) + cursor, m.expert_token_indices.size(), m.expert_token_indices.data());
+                std::copy_n(local.indices(c, slot) + cursor, m.expert_token_indices.size(), m.expert_token_indices.data());
                 diagnostics[ShmReceiveCopyMs] += ms(Clock::now(), copy_started);
                 shm_received += (m.expert_offsets.size() + m.expert_token_indices.size()) * sizeof(int32_t);
                 before = Clock::now();
                 install(c, {source, Expert}, "", installed, receive_times);
                 receive_ms += ms(Clock::now(), before);
-                local_done[gpu] = true; --local_pending;
-                received_one(0);
+                local_done[source] = true; --local_pending;
+                received_one(c.node(source) == c.node(c.a.rank) ? 0 : 1);
             }
             wait_ms = 0;
         }
@@ -923,7 +991,8 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
                         t.received += receive(p.fd, &t.input[t.received], t.input.size() - t.received);
                         if (t.received == t.input.size()) {
                             auto before = Clock::now();
-                            prepare_direct_receive(c, t, installed);
+                            if (t.key.second == Aggregate) prepare_aggregate_receive(c, t, local);
+                            else prepare_direct_receive(c, t, installed);
                             double elapsed = ms(Clock::now(), before);
                             receive_times[t.key.second == Expert ? 0 : 4] += elapsed;
                             receive_ms += elapsed;
@@ -934,8 +1003,37 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
                             std::min(size_t(262144), array.iov_len - t.array_offset));
                     }
                     if (t.arrays_ready && direct_arrays_complete(t)) {
-                        auto before = Clock::now(); install(c, t.key, t.input, installed, receive_times);
-                        receive_ms += ms(Clock::now(), before); t.done = true;
+                        // Publish expert slices before x3/x4 chunk construction.
+                        if (t.key.second == Aggregate) {
+                            int slot = local.slot(c, t.key.first);
+                            auto* h = local.header(slot);
+                            size_t count = 0;
+                            for (int gpu = 0; gpu < c.a.gpus_per_node; ++gpu) count += h->counts[gpu];
+                            shm_sent += (size_t(c.a.gpus_per_node) * (c.epg() + 1) + count) * 4;
+                            __atomic_store_n(&h->sequence, iteration + 1, __ATOMIC_RELEASE);
+                            auto before = Clock::now();
+                            auto& x = installed.nodes.at(t.key.first);
+                            x.source_node_rank = c.node(t.key.first); x.destination_node_rank = c.node(c.a.rank);
+                            x.local_gpu_index = c.gpu(c.a.rank); x.num_nodes = c.hosts.size();
+                            x.num_gpus_per_node = c.a.gpus_per_node; x.num_experts = c.a.num_experts;
+                            x.top_k = c.a.top_k; x.num_tokens = c.a.num_tokens;
+                            x.token_dimension = c.a.token_dimension; x.element_bytes = c.a.element_bytes;
+                            x.tokens_per_chunk = c.a.tokens_per_chunk;
+                            resize_reserved(x.token_indices, h->x3_count); resize_reserved(x.token_masks, h->x3_count);
+                            auto* bytes = reinterpret_cast<char*>(local.indices(c, slot) + count);
+                            if (h->x3_count) {
+                                std::memcpy(x.token_indices.data(), bytes, h->x3_count * 8);
+                                std::memcpy(x.token_masks.data(), bytes + h->x3_count * 8, h->x3_count);
+                            }
+                            double elapsed = ms(Clock::now(), before);
+                            receive_times[4] += elapsed; receive_ms += elapsed;
+                            before = Clock::now(); install(c, {t.key.first, X3}, "", installed, receive_times);
+                            receive_ms += ms(Clock::now(), before);
+                        } else {
+                            auto before = Clock::now(); install(c, t.key, t.input, installed, receive_times);
+                            receive_ms += ms(Clock::now(), before);
+                        }
+                        t.done = true;
                     }
                 } else {
                     t.received += receive(p.fd, &t.input[t.received], std::min(size_t(262144), t.input.size() - t.received));
@@ -959,7 +1057,8 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
     auto finished = Clock::now();
     // Function entry/exit, temporary destruction, and instrumentation bookkeeping
     // are retained as a residual so the receive substages sum to the parent.
-    receive_times.back() = receive_ms - std::accumulate(receive_times.begin(), receive_times.end() - 1, 0.0);
+    // Roundoff can make an otherwise zero residual a tiny negative number.
+    receive_times.back() = std::max(0.0, receive_ms - std::accumulate(receive_times.begin(), receive_times.end() - 1, 0.0));
     Record r; r.rank = c.a.rank;
     r.receive_times = receive_times;
     diagnostics[ExchangeOtherMs] = ms(finished, prepared) - receive_ms - diagnostics[4]
@@ -1035,6 +1134,7 @@ void report(const Config& c, const std::vector<std::vector<Record>>& records) {
         ",\"critical_rank_receive_process_ms\":" + receive_summary(critical) +
         ",\"critical_rank_expert_index_bounds_ms\":" + index_bounds_summary(critical) +
         ",\"expert_index_validation_enabled\":" + (c.a.disable_expert_index_validation ? "false" : "true") +
+        ",\"same_index_aggregation\":" + (c.a.same_index_aggregation ? "true" : "false") +
         ",\"receive_drain\":" + (c.a.receive_drain ? "true" : "false") +
         ",\"local_shared_memory\":" + (c.a.local_shared_memory ? "true" : "false") +
         ",\"backend\":\"cpp\",\"wire_format\":" + quote(c.a.binary ? "binary" : "text") + ",\"mode\":" + quote(c.a.preserialized ? "preserialized" : "serialize-in-timer");
@@ -1112,7 +1212,7 @@ int run(const RouterMetadataBenchConfig& raw) {
 }
 } // namespace
 
-extern "C" uint32_t router_metadata_bench_abi_version() { return 5; }
+extern "C" uint32_t router_metadata_bench_abi_version() { return 6; }
 extern "C" int router_metadata_bench_run(const RouterMetadataBenchConfig* config, char* error, size_t capacity) {
     if (error && capacity) error[0] = '\0';
     try {
@@ -1180,6 +1280,34 @@ int main() {
         // Header preparation must retain the same typed-array storage across
         // changing routing tables, including empty input lists.
         c.a.rank = 2;
+        // Aggregate headers must be validated before direct shared-memory reception.
+        LocalMemory arena;
+        arena.stride = 4096; arena.bytes = arena.stride * c.a.world;
+        arena.base = mmap(nullptr, arena.bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+        require(arena.base != MAP_FAILED, "test aggregate arena mapping failed");
+        Transfer aggregate; aggregate.key = {0, Aggregate};
+        aggregate.input = binary_header(data, {2, Aggregate});
+        size_t aggregate_bytes = 0;
+        for (int dest = 2; dest < 4; ++dest)
+            aggregate_bytes += (data.experts.at(dest).expert_offsets.size() + data.experts.at(dest).expert_token_indices.size()) * 4;
+        aggregate_bytes += data.nodes.at(2).token_indices.size() * 9;
+        aggregate.payload_bytes = aggregate.input.size() + aggregate_bytes;
+        prepare_aggregate_receive(c, aggregate, arena);
+        require(aggregate.receive_arrays[0].iov_base == arena.offsets(arena.slot(c, 0)) &&
+                aggregate.receive_arrays[0].iov_len == aggregate_bytes, "aggregate receive does not target shared arena");
+        auto reject_aggregate = [&](Transfer bad) {
+            bool failed = false;
+            try { prepare_aggregate_receive(c, bad, arena); } catch (const std::exception&) { failed = true; }
+            require(failed, "malformed aggregate accepted");
+            require(arena.header(arena.slot(c, 0))->sequence == 0, "incomplete aggregate published");
+        };
+        auto bad = aggregate; --bad.payload_bytes; reject_aggregate(bad);
+        bad = aggregate; bad.input[0] ^= 1; reject_aggregate(bad);
+        bad = aggregate; bad.input[2 * 8 + 7] = 1; reject_aggregate(bad); // wrong source
+        bad = aggregate; bad.input.replace(12 * 8, 8, 8, char(0xff)); reject_aggregate(bad);
+        bad = aggregate; bad.input.replace(bad.input.size() - 8, 8, 8, char(0xff)); reject_aggregate(bad);
+        bad = aggregate; bad.input.resize(16); reject_aggregate(bad);
+
         auto storage = reserve_binary_receive_storage(c);
         auto* expert_base = storage.experts.at(0).expert_token_indices.data();
         auto* x3_base = storage.nodes.at(0).token_indices.data();
@@ -1236,7 +1364,14 @@ int main() {
         int small = 1024; setsockopt(sender.fd, SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
         std::string a(100003, 'a'), b(70001, 'b'), received;
         Transfer t;
-        t.segments = {{a.data(), a.size()}, {nullptr, 0}, {b.data(), b.size()}};
+        auto add_slices = [&](std::string& value) {
+            size_t begin = 0;
+            for (size_t slice = 1; slice <= 9; ++slice) {
+                size_t end = value.size() * slice / 9;
+                t.segments.push_back({value.data() + begin, end - begin}); begin = end;
+            }
+        };
+        add_slices(a); t.segments.push_back({nullptr, 0}); add_slices(b); // aggregate maximum: 19 segments
         t.output_bytes = a.size() + b.size();
         ExchangeDiagnostics io{};
         char probe;
