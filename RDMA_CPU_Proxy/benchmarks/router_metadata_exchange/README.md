@@ -303,7 +303,7 @@ deserialization. Timers do not change the validation policy or wire format.
 Self installation is excluded from this breakdown and remains `self_install_ms`.
 Single-node runs have zero x3/x4 and chunk-build times because no such messages
 are exchanged. Rebuild the shared library on both nodes before rerunning; report
-configuration `timing_schema: 4` identifies this instrumentation version.
+configuration `timing_schema: 5` identifies the current instrumentation version.
 
 The maximum rank-local duration needs no synchronized clocks. It is not an exact
 global makespan: barrier-release and OS scheduling skew can influence it. A send
@@ -456,3 +456,38 @@ cmake --build build -j
 
 This option changes only the benchmark. Production `RDMA_CPU_Proxy` validation
 and metadata exchange are unchanged.
+
+### Exchange completion and polling diagnostics (timing schema 5)
+
+Rebuild the native library on both nodes; the C ABI remains version 4 and no
+additional command-line flag is needed. The console and JSON now include
+`critical_rank_exchange_diagnostics`. Each iteration's diagnostics come from
+that iteration's slowest-total-time rank, just like the existing stage report.
+The JSON also contains `exchange_diagnostics` in individual records and in
+per-rank statistical summaries.
+
+| Field | Meaning |
+|---|---|
+| `local_expert_complete_ms` | Time until all other same-node expert tables are installed, through shared memory or TCP according to the selected mode; excludes self installation |
+| `remote_expert_complete_ms` | Time until all cross-node expert tables are installed |
+| `remote_x3x4_complete_ms` | Time until all remote x3/x4 tables and their receive chunks are installed |
+| `socket_sends_complete_ms` | Time until all metadata socket sends finish; means the local sockets accepted the bytes, not that peers installed them |
+| `poll_ms` | Accumulated wall time inside exchange-loop `poll()` calls, including zero-timeout calls and interrupted calls |
+| `poll_calls` | Number of exchange-loop `poll()` calls |
+| `poll_zero_returns` | Number of calls returning zero (no ready descriptors) |
+
+The four completion times share one origin: the start of the exchange stage,
+**after** serialization, self installation, and communication preparation, but
+**before** shared-memory publication. Each receive completion includes that
+path's validation and installation. A path with no peers has value zero.
+They overlap: do not sum them or add them to the existing stages. The latest
+completion in an individual record identifies the last completed path on that
+rank. Compare individual records as well as summary statistics; marginal
+medians/p95 values can come from different iterations.
+
+`poll_ms` is already included in `tcp_exchange_ms` / `exchange_ms`. It measures
+both waiting and the cost of polling; it is not pure network latency. The
+counters exclude connection setup and control collectives. A shared-memory-only
+exchange has zero socket polling, even if it spends time checking local sequence
+counters. Additional timestamps/counters add some measured overhead, so rebuild
+and rerun both transport modes for an instrumentation-matched comparison.

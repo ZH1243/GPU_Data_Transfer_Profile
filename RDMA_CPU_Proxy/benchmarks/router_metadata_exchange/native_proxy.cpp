@@ -46,6 +46,11 @@ const std::array<const char*, 9> ReceiveFields = {
     "expert_deserialize_ms", "expert_validate_ms", "expert_record_install_ms",
     "expert_progress_init_ms", "x3x4_deserialize_ms", "x3x4_validate_ms",
     "chunk_build_ms", "x3x4_record_install_ms", "overhead_ms"};
+// Completion timestamps share the exchange-stage origin and overlap.
+const std::array<const char*, 7> DiagnosticFields = {
+    "local_expert_complete_ms", "remote_expert_complete_ms", "remote_x3x4_complete_ms",
+    "socket_sends_complete_ms", "poll_ms", "poll_calls", "poll_zero_returns"};
+using ExchangeDiagnostics = std::array<double, DiagnosticFields.size()>;
 struct ReceiveTimes : std::array<double, ReceiveFields.size()> {
     // Nested measurement, already included in expert_deserialize_ms.
     double expert_index_bounds_ms = 0;
@@ -236,7 +241,7 @@ struct Config {
     int epg() const { return a.num_experts / a.world; }
     std::string json() const {
         std::ostringstream out;
-        out << "{\"backend\":\"cpp\",\"timing_schema\":4,\"wire_format\":"
+        out << "{\"backend\":\"cpp\",\"timing_schema\":5,\"wire_format\":"
             << quote(a.binary ? "binary" : "text") << ",\"receive_storage\":"
             << quote(a.binary ? "direct_reusable_vectors" : "payload_buffer") << ",\"binary_protocol_version\":1,\"hosts\":[";
         for (size_t i = 0; i < hosts.size(); ++i) { if (i) out << ','; out << quote(hosts[i]); }
@@ -600,12 +605,14 @@ struct Record {
     int rank = 0;
     std::array<double, 6> times{};
     ReceiveTimes receive_times{};
+    ExchangeDiagnostics diagnostics{};
     uint64_t sent = 0, received = 0, experts = 0, nodes = 0, shm_sent = 0, shm_received = 0;
     std::string wire() const {
         std::ostringstream out; out << std::setprecision(17) << rank;
         for (double t : times) out << ' ' << t;
         for (double t : receive_times) out << ' ' << t;
         out << ' ' << receive_times.expert_index_bounds_ms;
+        for (double value : diagnostics) out << ' ' << value;
         out << ' ' << sent << ' ' << received << ' ' << experts << ' ' << nodes << ' ' << shm_sent << ' ' << shm_received;
         return out.str();
     }
@@ -614,12 +621,19 @@ struct Record {
         for (double& t : r.times) in >> t;
         for (double& t : r.receive_times) in >> t;
         in >> r.receive_times.expert_index_bounds_ms;
+        for (double& value : r.diagnostics) in >> value;
         require(bool(in >> r.sent >> r.received >> r.experts >> r.nodes >> r.shm_sent >> r.shm_received), "invalid timing record");
         return r;
     }
     std::string json() const {
         std::ostringstream out; out << std::setprecision(17) << "{\"rank\":" << rank;
         for (size_t i = 0; i < times.size(); ++i) out << ',' << quote(Fields[i]) << ':' << times[i];
+        out << ",\"exchange_diagnostics\":{";
+        for (size_t i = 0; i < diagnostics.size(); ++i) {
+            if (i) out << ',';
+            out << quote(DiagnosticFields[i]) << ':' << diagnostics[i];
+        }
+        out << '}';
         out << ",\"receive_process_breakdown_ms\":{";
         for (size_t i = 0; i < receive_times.size(); ++i) {
             if (i) out << ',';
@@ -760,7 +774,18 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
     std::array<bool, 8> local_done{};
     size_t local_pending = c.a.local_shared_memory ? c.a.gpus_per_node - 1 : 0;
     uint64_t shm_sent = 0, shm_received = 0;
+    ExchangeDiagnostics diagnostics{};
+    std::array<size_t, 3> incoming_pending{local_pending, 0, 0};
+    auto receive_path = [&](Key key) -> size_t {
+        return key.second == X3 ? 2 : (c.node(key.first) == c.node(c.a.rank) ? 0 : 1);
+    };
+    for (const auto& t : transfers) ++incoming_pending[receive_path(t.key)];
+    size_t sends_pending = transfers.size();
     auto prepared = Clock::now();
+    auto received_one = [&](size_t path) {
+        require(incoming_pending[path] > 0, "duplicate path completion");
+        if (--incoming_pending[path] == 0) diagnostics[path] = ms(Clock::now(), prepared);
+    };
     if (c.a.local_shared_memory) {
         int gpu = c.gpu(c.a.rank);
         auto* h = local.header(gpu);
@@ -816,11 +841,18 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
                 install(c, {source, Expert}, "", installed, receive_times);
                 receive_ms += ms(Clock::now(), before);
                 local_done[gpu] = true; --local_pending;
+                received_one(0);
             }
             wait_ms = 0;
         }
         if (!pending) continue;
+        auto poll_started = Clock::now();
         int rc = poll(descriptors.data(), descriptors.size(), wait_ms);
+        const int poll_errno = errno;
+        diagnostics[4] += ms(Clock::now(), poll_started);
+        ++diagnostics[5];
+        if (rc == 0) ++diagnostics[6];
+        errno = poll_errno;
         if (rc < 0 && errno == EINTR) continue;
         if (rc == 0 && wait_ms == 0) continue;
         require(rc > 0, rc == 0 ? "metadata exchange timed out" : "exchange poll failed");
@@ -828,7 +860,12 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
             auto& p = descriptors[i]; auto& t = transfers[i];
             if (p.fd < 0 || !p.revents) continue;
             require(!(p.revents & (POLLERR | POLLNVAL)), "metadata socket error");
-            if (p.revents & POLLOUT) t.sent += send_segments(p.fd, t);
+            if (p.revents & POLLOUT) {
+                t.sent += send_segments(p.fd, t);
+                if (t.sent == t.output_bytes && --sends_pending == 0)
+                    diagnostics[3] = ms(Clock::now(), prepared);
+            }
+            const bool was_done = t.done;
             if ((p.revents & (POLLIN | POLLHUP)) && !t.done) {
                 if (t.header_received < FrameBytes) {
                     t.header_received += try_recv(p.fd, t.header.data() + t.header_received, FrameBytes - t.header_received);
@@ -867,6 +904,7 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
                     }
                 }
             }
+            if (t.done && !was_done) received_one(receive_path(t.key));
             p.events = static_cast<short>((t.done ? 0 : POLLIN) | (t.sent == t.output_bytes ? 0 : POLLOUT));
             if (!p.events) { p.fd = -1; --pending; }
             else require(!(p.revents & POLLHUP), "peer disconnected during metadata exchange");
@@ -880,6 +918,7 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
     receive_times.back() = receive_ms - std::accumulate(receive_times.begin(), receive_times.end() - 1, 0.0);
     Record r; r.rank = c.a.rank;
     r.receive_times = receive_times;
+    r.diagnostics = diagnostics;
     r.shm_sent = shm_sent; r.shm_received = shm_received;
     r.times = {ms(finished, started), ms(serialized, started), ms(self_installed, serialized),
                ms(prepared, self_installed), ms(finished, prepared) - receive_ms, receive_ms};
@@ -913,6 +952,16 @@ std::string receive_summary(const std::vector<Record>& rows) {
     }
     out << '}'; return out.str();
 }
+std::string diagnostic_summary(const std::vector<Record>& rows) {
+    std::ostringstream out; out << '{';
+    for (size_t field = 0; field < DiagnosticFields.size(); ++field) {
+        if (field) out << ',';
+        std::vector<double> values;
+        for (const auto& row : rows) values.push_back(row.diagnostics[field]);
+        out << quote(DiagnosticFields[field]) << ':' << summary(values);
+    }
+    out << '}'; return out.str();
+}
 std::string stage_summary(const std::vector<Record>& rows, bool full) {
     std::ostringstream out; out << '{';
     for (size_t field = full ? 0 : 1; field < Fields.size(); ++field) {
@@ -923,6 +972,7 @@ std::string stage_summary(const std::vector<Record>& rows, bool full) {
     if (full) {
         std::vector<double> values; for (const auto& row : rows) values.push_back(row.times[2] + row.times[5]);
         out << ",\"install_ms\":" << summary(values);
+        out << ",\"exchange_diagnostics\":" << diagnostic_summary(rows);
         out << ",\"receive_process_breakdown_ms\":" << receive_summary(rows);
         out << ",\"expert_index_bounds_ms\":" << index_bounds_summary(rows);
     }
@@ -935,6 +985,7 @@ void report(const Config& c, const std::vector<std::vector<Record>>& records) {
     std::vector<double> totals; for (const auto& row : critical) totals.push_back(row.times[0]);
     std::string common = "\"critical_rank_ms\":" + summary(totals) +
         ",\"critical_rank_stage_ms\":" + stage_summary(critical, false) +
+        ",\"critical_rank_exchange_diagnostics\":" + diagnostic_summary(critical) +
         ",\"critical_rank_receive_process_ms\":" + receive_summary(critical) +
         ",\"critical_rank_expert_index_bounds_ms\":" + index_bounds_summary(critical) +
         ",\"expert_index_validation_enabled\":" + (c.a.disable_expert_index_validation ? "false" : "true") +

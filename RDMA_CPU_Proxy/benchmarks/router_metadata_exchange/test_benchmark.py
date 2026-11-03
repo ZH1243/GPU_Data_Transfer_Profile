@@ -145,7 +145,7 @@ class ProcessTests(unittest.TestCase):
                 self.assertEqual(report["configuration"]["expert_index_validation_enabled"], not disable_validation)
                 self.assertEqual(report["wire_format"], wire_format)
                 self.assertEqual(report["configuration"]["wire_format"], wire_format)
-                self.assertEqual(report["configuration"]["timing_schema"], 4)
+                self.assertEqual(report["configuration"]["timing_schema"], 5)
                 self.assertEqual(report["configuration"]["receive_storage"],
                                  "direct_reusable_vectors" if wire_format == "binary" else "payload_buffer")
                 self.assertEqual(len(report["iterations"]), 3)
@@ -158,6 +158,9 @@ class ProcessTests(unittest.TestCase):
                 self.assertAlmostEqual(sum(report["critical_rank_stage_ms"][field]["mean"]
                                            for field in b.STAGE_FIELDS),
                                        report["critical_rank_ms"]["mean"], places=7)
+                for name, stats in report["critical_rank_exchange_diagnostics"].items():
+                    self.assertAlmostEqual(stats["mean"],
+                        sum(r["exchange_diagnostics"][name] for r in critical) / len(critical), places=7)
                 for row in report["iterations"]:
                     self.assertEqual(sum(r["sent_bytes"] for r in row), sum(r["received_bytes"] for r in row))
                     self.assertEqual(sum(r["shm_sent_bytes"] for r in row),
@@ -173,6 +176,29 @@ class ProcessTests(unittest.TestCase):
                         self.assertEqual(result["installed_expert_sources"], nodes * per_node)
                         self.assertEqual(result["installed_x3x4_sources"], nodes - 1)
                         self.assertGreater(result["elapsed_ms"], 0)
+                        diagnostics = result["exchange_diagnostics"]
+                        self.assertEqual(len(diagnostics), 7)
+                        exchange_span = result["exchange_ms"] + result["receive_process_ms"]
+                        for name, value in diagnostics.items():
+                            self.assertGreaterEqual(value, 0)
+                            if name.endswith("_ms"):
+                                self.assertLessEqual(value, exchange_span + 1e-9)
+                        self.assertLessEqual(diagnostics["poll_ms"], result["exchange_ms"] + 1e-9)
+                        self.assertLessEqual(diagnostics["poll_zero_returns"], diagnostics["poll_calls"])
+                        for name in ("poll_calls", "poll_zero_returns"):
+                            self.assertEqual(diagnostics[name], int(diagnostics[name]))
+                        for name, present in (
+                            ("local_expert_complete_ms", per_node > 1),
+                            ("remote_expert_complete_ms", nodes > 1),
+                            ("remote_x3x4_complete_ms", nodes > 1),
+                            ("socket_sends_complete_ms", nodes > 1 or (per_node > 1 and not local_shared_memory))):
+                            if present:
+                                self.assertGreater(diagnostics[name], 0)
+                            else:
+                                self.assertEqual(diagnostics[name], 0)
+                        if local_shared_memory and nodes == 1:
+                            self.assertEqual(diagnostics["poll_calls"], 0)
+                            self.assertEqual(diagnostics["poll_ms"], 0)
                         breakdown = result["receive_process_breakdown_ms"]
                         self.assertGreaterEqual(result["expert_index_bounds_ms"], 0)
                         self.assertLessEqual(result["expert_index_bounds_ms"], breakdown["expert_deserialize_ms"])
