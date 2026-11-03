@@ -10,7 +10,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 
-import benchmark as b
+import python_reference as b
 
 
 def config(**overrides):
@@ -87,6 +87,19 @@ class MetadataTests(unittest.TestCase):
 
 
 class ProcessTests(unittest.TestCase):
+    def test_native_timeout_reaches_python(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        env = dict(os.environ, RANK="0", WORLD_SIZE="2", LOCAL_RANK="0")
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("benchmark.py")),
+             "--hosts=127.0.0.1,127.0.0.1", "--gpus-per-node=1",
+             f"--port-base={port}", "--timeout=0.1"], env=env,
+            capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TCP operation timed out", result.stderr)
+
     def run_job(self, nodes, per_node, preserialized=False, num_tokens=137,
                 num_experts=16, top_k=4):
         # Distinct node port ranges emulate hosts without loopback aliases.
@@ -113,12 +126,15 @@ class ProcessTests(unittest.TestCase):
                            f"--output={output}"]
                     if preserialized:
                         cmd.append("--preserialized")
+                    if num_tokens < 1000:
+                        cmd.append("--verify")
                     processes.append(subprocess.Popen(cmd, env=env, stdout=log, stderr=log))
                 for process, log in zip(processes, logs):
                     code = process.wait(timeout=90)
                     log.seek(0)
                     self.assertEqual(code, 0, log.read())
                 report = json.loads(output.read_text())
+                self.assertEqual(report["backend"], "cpp")
                 self.assertEqual(len(report["iterations"]), 3)
                 self.assertAlmostEqual(sum(report["critical_rank_stage_ms"][field]["mean"]
                                            for field in b.STAGE_FIELDS),

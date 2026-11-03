@@ -1,10 +1,40 @@
 # CPU router metadata exchange benchmark
 
-This standalone Python benchmark models the metadata path in `RDMA_CPU_Proxy`.
-It uses CPU memory and TCP sockets only: no CUDA, RDMA verbs, GPU allocations,
-token payload transfers, or GPU scheduler initialization. The benchmark itself
-uses only Python's standard library (Python 3.9+). PyTorch is needed only for the
-`torchrun` launcher; no Torch distributed process group is initialized.
+This benchmark embeds a **C++ shared library** in each torchrun Python worker.
+`benchmark.py` parses options and rank environment variables, loads the library
+with `ctypes.CDLL`, and starts one proxy thread. C++ performs connection setup,
+input preparation, synchronization, serialization, exchange, validation, CPU
+installation, all timing, and report generation. Python performs no metadata
+processing or communication and the GIL is released during the native call.
+
+The experiment remains CPU-only: no CUDA, RDMA verbs, GPU allocations, actual
+token transfers, or GPU scheduler initialization. It reuses the main project's
+`RouterRouting` CPU generator, `protocol.cpp` serializers/deserializers, and
+`compute_chunks_from_token_indices()`. The standalone library does not initialize
+the full GPU/RDMA `Proxy` class. This first C++ version preserves the text protocol,
+self-table copy, and full validation to isolate the language/runtime change.
+Binary encoding and reference-only self installation are not enabled yet.
+
+## Build on both remote machines
+
+From this directory, before starting torchrun:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+This produces `build/librouter_metadata_bench.so` on Linux (`.dylib` on macOS).
+The build needs a C++17 compiler, CMake, and POSIX sockets/threads; it requires
+neither CUDA nor libibverbs and does not modify the main proxy build. Build once
+before launching workers, not separately in every torchrun process. Rebuild on
+both nodes after native source changes.
+
+Python 3.9+ and torchrun are needed for launching; there is no Torch distributed
+process group. Override the shared-library location with `--library=/path/to/lib`
+or `ROUTER_METADATA_BENCH_LIBRARY`. The C ABI is declared in `native_proxy.h`;
+exceptions return a nonzero status and an error string to Python. Native sockets
+use deadlines and close via RAII on success or failure.
 
 ## Run on two nodes
 
@@ -47,6 +77,7 @@ variables:
 | `NPROC_PER_NODE` | `8` | Processes representing GPUs on each node |
 | `METADATA_PORT_BASE` | `20515` | Listener port = base + local rank |
 | `TORCHRUN_BIN` | `torchrun` | Launcher executable |
+| `ROUTER_METADATA_BENCH_LIBRARY` | `build/librouter_metadata_bench.so` | Native library path |
 | `RESULT_JSON` | `results/metadata_exchange.json` in this directory | Rank-0 report |
 
 Only node 0 writes the report; the same path is overwritten on later runs.
@@ -76,15 +107,15 @@ topology) to each recipient. x3/x4 are sent only to matching local ranks on remo
 nodes. Self expert metadata is copied locally. For 16 processes, each iteration
 contains 240 directed expert messages and 16 directed x3/x4 messages.
 
-Message bodies preserve the C++ decimal-text formats `router_expert_metadata_v1`
+Message bodies use the production C++ decimal-text formats `router_expert_metadata_v1`
 and `router_x3_x4_v2`. A benchmark-specific network-order envelope contains two
 uint64 values: payload length and iteration number. The iteration number detects
 stale messages. These persistent benchmark channels are **not wire-compatible
 endpoints for a running production proxy**.
 
-A single nonblocking selector loop progresses sending and receiving on both
-metadata paths. They can overlap on the network; Python serialization and
-parsing execute serially in each process. Received expert lists are validated
+A single nonblocking C++ `poll()` loop progresses sending and receiving on both
+metadata paths. They can overlap on the network; native serialization and
+parsing execute serially on each proxy thread. Socket addresses use IPv4. Received expert lists are validated
 and attached to source-specific CPU records, including zeroed head/tail state.
 Received x3/x4 are validated, retained, and used to construct receive-chunk
 descriptions with the same fields as `compute_chunks_from_token_indices()`.
@@ -104,11 +135,12 @@ Each iteration has this sequence:
 
 Connection setup, CPU routing generation, warmup, result aggregation, logging,
 and disposal of the installed records after the iteration are excluded.
-Serialization, framing, selector setup, receive buffering, parsing, validation,
+Serialization, framing, poll descriptor setup, receive buffering, parsing, validation,
 self installation, and receive-chunk construction are included. The receive
 tables are rebuilt on each iteration rather than updated in place.
 
-The report contains all measured per-rank/per-iteration records and:
+The report identifies `backend: "cpp"` and `wire_format: "text"` (in configuration),
+and contains all measured per-rank/per-iteration records and:
 
 - `critical_rank_ms`: statistics of the **maximum rank-local elapsed time** for
   each iteration (minimum, mean, median, nearest-rank p95/p99, maximum).
@@ -126,14 +158,14 @@ Every per-rank record contains five non-overlapping local wall-time stages:
 |---|---|
 | `serialize_ms` | Outgoing text serialization, or cached-payload selection in pre-serialized mode |
 | `self_install_ms` | Local expert-table copy and construction of its CPU record |
-| `communication_prepare_ms` | Frame buffers, receive state, selector creation/registration, deadline setup |
-| `tcp_exchange_ms` | Exchange-loop elapsed time excluding receive processing: socket waits, sends/receives, buffering, envelope checks, selector bookkeeping/cleanup, and final completeness check |
+| `communication_prepare_ms` | Frame buffers, receive state, poll descriptor construction, deadline setup |
+| `tcp_exchange_ms` | Exchange-loop elapsed time excluding receive processing: socket waits, sends/receives, buffering, envelope checks, poll bookkeeping, and final completeness check |
 | `receive_process_ms` | Sum of incoming-message text parsing, validation, CPU installation, and receive-chunk construction |
 
 The five stages sum to `elapsed_ms` for each sample. For compatibility,
 `install_ms` remains the sum of `self_install_ms` and `receive_process_ms`;
 do not add it again. `tcp_exchange_ms` is computed as the exchange-loop interval
-minus the accumulated receive processing intervals; it includes Python/OS
+minus the accumulated receive processing intervals; it includes C++/OS
 overhead and waiting for remote CPU work, not just network transfer latency.
 Instrumentation overhead is included in the measured stages.
 
@@ -158,17 +190,30 @@ bash ./run_node1_torchrun.sh --preserialized
 In this mode payloads are precomputed; framing and all receiver work remain
 timed. `serialize_ms` is then only the negligible cached-payload selection cost.
 Do not interpret total time minus parsing time as pure network latency: work
-overlaps across ranks and socket progress includes Python and OS overhead.
+overlaps across ranks and socket progress includes C++ and OS overhead.
 
 ## Scope of comparisons
 
 This measures a proposed repeated-exchange path. Unlike current initialization,
 TCP connections persist and x3/x4 is not separated from expert exchange by RDMA
 setup. Expert peers also progress concurrently rather than following the current
-sequential outgoing send loop. Python object storage, copying, text conversion,
-and validation differ from C++ vectors and streams. Absolute numbers therefore
-are not predictions of C++ performance or full per-iteration router overhead.
-Use this as a controlled CPU/TCP experiment and confirm optimizations in C++.
+sequential outgoing send loop. The production metadata generation/serialization
+and chunk-building code is reused, but this standalone transport and CPU record
+installation are benchmark implementations, not the full production proxy.
+
+All metadata arrays are native C++ vectors. Self installation copies the local
+expert vectors and initializes progress counters. Received vectors are moved
+into source-specific records after parsing/validation. Message framing still
+copies outgoing payloads; the text format still requires integer conversion.
+Those are deliberate baseline behaviors for later binary/reuse optimizations.
+GPU routing, D2H/H2D copies, and GPU scheduler initialization remain excluded.
+Compare C++ reports with prior Python reports as separate implementations; the
+Python selector implementation has been replaced by native `poll()`.
+
+Use `--verify` on both nodes to regenerate expected source-specific metadata in
+C++ before timing and check every received expert/x3/x4 table after timing.
+This is for correctness checks, not performance runs: it consumes extra memory
+and CPU and changes cache state, although verification itself is outside timing.
 
 ## Local correctness tests
 
@@ -176,9 +221,11 @@ Use this as a controlled CPU/TCP experiment and confirm optimizations in C++.
 python3 -m unittest discover -s . -p 'test_benchmark.py' -v
 ```
 
-Tests check expert membership after resolving compact indices, empty expert
+Build the library first. Tests check expert membership after resolving compact indices, empty expert
 lists, malformed metadata rejection, chunk construction, and real subprocess
-exchanges. Transport smoke tests use four same-node ranks and two logical nodes
+exchanges through the Python wrapper and C++ library. The small native runs
+use `--verify`; an additional test checks native timeout propagation to Python.
+Transport smoke tests use four same-node ranks and two logical nodes
 with two ranks each, including pre-serialized mode. Both logical nodes use
 `127.0.0.1`, with `--node-port-stride=2` giving them distinct port ranges.
 The default stride is zero for real separate hosts.
@@ -195,3 +242,6 @@ torchrun --standalone --nproc_per_node=4 benchmark.py \
 ```
 
 Run `python3 benchmark.py --help` for all benchmark arguments.
+
+`python_reference.py` is an independent metadata oracle for unit tests only;
+it is not imported by the benchmark worker.
