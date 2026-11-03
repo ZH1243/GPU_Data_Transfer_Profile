@@ -138,7 +138,9 @@ class ProcessTests(unittest.TestCase):
                 self.assertEqual(report["backend"], "cpp")
                 self.assertEqual(report["wire_format"], wire_format)
                 self.assertEqual(report["configuration"]["wire_format"], wire_format)
-                self.assertEqual(report["configuration"]["timing_schema"], 2)
+                self.assertEqual(report["configuration"]["timing_schema"], 3)
+                self.assertEqual(report["configuration"]["receive_storage"],
+                                 "direct_reusable_vectors" if wire_format == "binary" else "payload_buffer")
                 self.assertEqual(len(report["iterations"]), 3)
                 self.assertAlmostEqual(sum(stats["mean"] for stats in
                                            report["critical_rank_receive_process_ms"].values()),

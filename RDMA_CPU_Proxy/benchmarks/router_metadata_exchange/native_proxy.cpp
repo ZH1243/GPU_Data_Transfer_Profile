@@ -228,8 +228,9 @@ struct Config {
     int epg() const { return a.num_experts / a.world; }
     std::string json() const {
         std::ostringstream out;
-        out << "{\"backend\":\"cpp\",\"timing_schema\":2,\"wire_format\":"
-            << quote(a.binary ? "binary" : "text") << ",\"binary_protocol_version\":1,\"hosts\":[";
+        out << "{\"backend\":\"cpp\",\"timing_schema\":3,\"wire_format\":"
+            << quote(a.binary ? "binary" : "text") << ",\"receive_storage\":"
+            << quote(a.binary ? "direct_reusable_vectors" : "payload_buffer") << ",\"binary_protocol_version\":1,\"hosts\":[";
         for (size_t i = 0; i < hosts.size(); ++i) { if (i) out << ','; out << quote(hosts[i]); }
         out << ']';
 #define FIELD(name) out << ",\"" #name "\":" << a.name
@@ -388,9 +389,8 @@ struct BinaryReader {
         require(word() == uint64_t(kind), "binary metadata kind mismatch");
     }
 };
-RouterExpertMetadata decode_expert_binary(const Config& c, const std::string& payload) {
-    BinaryReader r{payload}; r.prefix(Expert);
-    RouterExpertMetadata m;
+size_t read_expert_header(const Config& c, const std::string& header, size_t payload_bytes, RouterExpertMetadata& m) {
+    BinaryReader r{header}; r.prefix(Expert);
     m.source_node_rank = r.integer(); m.source_gpu_index = r.integer();
     m.destination_node_rank = r.integer(); m.destination_gpu_index = r.integer();
     m.num_nodes = r.integer(); m.num_gpus_per_node = r.integer(); m.num_experts = r.integer();
@@ -399,19 +399,26 @@ RouterExpertMetadata decode_expert_binary(const Config& c, const std::string& pa
     require(m.num_nodes > 0 && m.num_gpus_per_node > 0 && m.num_experts > 0 &&
             m.experts_per_gpu == c.epg() && m.num_tokens <= size_t(c.a.num_tokens) &&
             count <= uint64_t(c.a.num_tokens) * c.a.top_k, "invalid binary expert dimensions");
-    require(payload.size() - r.offset == (size_t(m.experts_per_gpu) + 1 + count) * sizeof(int32_t),
+    require(payload_bytes >= r.offset && payload_bytes - r.offset == (size_t(m.experts_per_gpu) + 1 + count) * sizeof(int32_t),
             "binary expert payload length mismatch");
-    r.array(m.expert_offsets, size_t(m.experts_per_gpu) + 1);
-    r.array(m.expert_token_indices, count);
+    return count;
+}
+void validate_expert_arrays(const RouterExpertMetadata& m) {
+    auto count = m.expert_token_indices.size();
     require(m.expert_offsets.front() == 0 && m.expert_offsets.back() == int64_t(count) &&
             std::is_sorted(m.expert_offsets.begin(), m.expert_offsets.end()), "invalid binary expert offsets");
     require(std::all_of(m.expert_token_indices.begin(), m.expert_token_indices.end(),
             [&](int32_t i) { return i >= 0 && size_t(i) < m.num_tokens; }), "binary expert index out of range");
-    return m;
 }
-RouterX3Metadata decode_x3_binary(const Config& c, const std::string& payload) {
-    BinaryReader r{payload}; r.prefix(X3);
-    RouterX3Metadata m;
+[[maybe_unused]] RouterExpertMetadata decode_expert_binary(const Config& c, const std::string& payload) {
+    RouterExpertMetadata m;
+    auto count = read_expert_header(c, payload, payload.size(), m);
+    BinaryReader r{payload, 13 * 8};
+    r.array(m.expert_offsets, size_t(m.experts_per_gpu) + 1); r.array(m.expert_token_indices, count);
+    validate_expert_arrays(m); return m;
+}
+size_t read_x3_header(const Config& c, const std::string& header, size_t payload_bytes, RouterX3Metadata& m) {
+    BinaryReader r{header}; r.prefix(X3);
     m.source_node_rank = r.integer(); m.destination_node_rank = r.integer(); m.local_gpu_index = r.integer();
     m.num_nodes = r.integer(); m.num_gpus_per_node = r.integer(); m.num_experts = r.integer(); m.top_k = r.integer();
     m.num_tokens = r.word(); m.token_dimension = r.word(); m.element_bytes = r.word(); m.tokens_per_chunk = r.word();
@@ -420,15 +427,23 @@ RouterX3Metadata decode_x3_binary(const Config& c, const std::string& payload) {
             m.num_experts > 0 && m.top_k > 0 && m.num_tokens <= size_t(c.a.num_tokens) &&
             count <= m.num_tokens && m.token_dimension > 0 && m.element_bytes > 0 && m.tokens_per_chunk > 0,
             "invalid binary x3/x4 dimensions");
-    require(payload.size() - r.offset == count * (sizeof(uint64_t) + sizeof(uint8_t)),
+    require(payload_bytes >= r.offset && payload_bytes - r.offset == count * (sizeof(uint64_t) + sizeof(uint8_t)),
             "binary x3/x4 payload length mismatch");
-    r.array(m.token_indices, count); r.array(m.token_masks, count);
+    return count;
+}
+void validate_x3_arrays(const RouterX3Metadata& m) {
     require(std::all_of(m.token_indices.begin(), m.token_indices.end(),
             [&](size_t i) { return i < m.num_tokens; }), "binary x3 index out of range");
     require(std::all_of(m.token_masks.begin(), m.token_masks.end(),
             [&](uint8_t mask) { return mask > 0 && unsigned(mask) < (1u << m.num_gpus_per_node); }),
             "binary x4 mask out of range");
-    return m;
+ }
+[[maybe_unused]] RouterX3Metadata decode_x3_binary(const Config& c, const std::string& payload) {
+    RouterX3Metadata m;
+    auto count = read_x3_header(c, payload, payload.size(), m);
+    BinaryReader r{payload, 14 * 8};
+    r.array(m.token_indices, count); r.array(m.token_masks, count);
+    validate_x3_arrays(m); return m;
 }
 struct Installed {
     std::map<int, RouterExpertMetadata> experts;
@@ -445,8 +460,10 @@ void install(const Config& c, Key key, const std::string& payload, Installed& in
     };
     int source = key.first;
     if (key.second == Expert) {
-        auto m = c.a.binary ? decode_expert_binary(c, payload) :
-            deserialize_router_expert_metadata(payload, c.a.num_tokens, size_t(c.a.num_tokens) * c.a.top_k);
+        RouterExpertMetadata parsed;
+        if (!c.a.binary) parsed = deserialize_router_expert_metadata(payload, c.a.num_tokens, size_t(c.a.num_tokens) * c.a.top_k);
+        auto& m = c.a.binary ? installed.experts.at(source) : parsed;
+        if (c.a.binary) validate_expert_arrays(m);
         mark(0);
         require(m.source_node_rank == c.node(source) && m.source_gpu_index == c.gpu(source) &&
                 m.destination_node_rank == c.node(c.a.rank) && m.destination_gpu_index == c.gpu(c.a.rank) &&
@@ -458,12 +475,19 @@ void install(const Config& c, Key key, const std::string& payload, Installed& in
             require(std::is_sorted(m.expert_token_indices.begin() + m.expert_offsets[e],
                                    m.expert_token_indices.begin() + m.expert_offsets[e + 1]), "unsorted expert indices");
         mark(1);
-        require(installed.experts.emplace(source, std::move(m)).second, "duplicate expert source");
+        if (!c.a.binary) require(installed.experts.emplace(source, std::move(m)).second, "duplicate expert source");
         mark(2);
-        installed.progress.emplace(source, std::make_pair(std::vector<int32_t>(c.epg()), std::vector<int32_t>(c.epg())));
+        if (c.a.binary) {
+            auto& progress = installed.progress.at(source);
+            std::fill(progress.first.begin(), progress.first.end(), 0);
+            std::fill(progress.second.begin(), progress.second.end(), 0);
+        } else installed.progress.emplace(source, std::make_pair(std::vector<int32_t>(c.epg()), std::vector<int32_t>(c.epg())));
         mark(3);
     } else {
-        auto m = c.a.binary ? decode_x3_binary(c, payload) : deserialize_router_x3_metadata(payload, c.a.num_tokens);
+        RouterX3Metadata parsed;
+        if (!c.a.binary) parsed = deserialize_router_x3_metadata(payload, c.a.num_tokens);
+        auto& m = c.a.binary ? installed.nodes.at(source) : parsed;
+        if (c.a.binary) validate_x3_arrays(m);
         mark(4);
         require(m.source_node_rank == c.node(source) && m.destination_node_rank == c.node(c.a.rank) &&
                 m.local_gpu_index == c.gpu(c.a.rank) && c.gpu(source) == c.gpu(c.a.rank) &&
@@ -474,8 +498,8 @@ void install(const Config& c, Key key, const std::string& payload, Installed& in
         mark(5);
         auto chunks = compute_chunks_from_token_indices(m.token_indices, m.token_dimension, m.element_bytes, m.tokens_per_chunk, 1);
         mark(6);
-        require(installed.nodes.emplace(source, std::move(m)).second, "duplicate x3/x4 source");
-        installed.chunks.emplace(source, std::move(chunks));
+        if (!c.a.binary) require(installed.nodes.emplace(source, std::move(m)).second, "duplicate x3/x4 source");
+        installed.chunks.insert_or_assign(source, std::move(chunks));
         mark(7);
     }
 }
@@ -517,6 +541,9 @@ struct Transfer {
     Key key;
     std::string output, input;
     std::vector<iovec> segments;
+    std::array<iovec, 2> receive_arrays{};
+    size_t payload_bytes = 0, array_index = 0, array_offset = 0;
+    bool arrays_ready = false;
     size_t output_bytes = 0;
     std::array<char, FrameBytes> header{};
     size_t sent = 0, header_received = 0, received = 0;
@@ -544,15 +571,57 @@ size_t send_segments(int fd, const Transfer& t) {
     require(n > 0, "sendmsg failed/peer disconnected");
     return size_t(n);
 }
-std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, const Dataset& data, uint64_t iteration) {
+Installed reserve_binary_receive_storage(const Config& c) {
+    Installed storage;
+    for (int source = 0; source < c.a.world; ++source) {
+        auto& m = storage.experts[source];
+        m.expert_offsets.reserve(size_t(c.epg()) + 1);
+        m.expert_token_indices.reserve(size_t(c.a.num_tokens) * c.a.top_k);
+        storage.progress.emplace(source, std::make_pair(std::vector<int32_t>(c.epg()), std::vector<int32_t>(c.epg())));
+        if (source != c.a.rank && c.gpu(source) == c.gpu(c.a.rank)) {
+            auto& x = storage.nodes[source];
+            x.token_indices.reserve(c.a.num_tokens); x.token_masks.reserve(c.a.num_tokens);
+        }
+    }
+    return storage;
+}
+// Capacity is reserved once before warmup. Changing lengths can zero-initialize
+// newly exposed elements, but cannot allocate or invalidate the array pointers.
+template<class T> void resize_reserved(std::vector<T>& v, size_t count) {
+    require(count <= v.capacity(), "binary receive capacity exceeded");
+    v.resize(count);
+}
+void prepare_direct_receive(const Config& c, Transfer& t, Installed& storage) {
+    if (t.key.second == Expert) {
+        auto& m = storage.experts.at(t.key.first);
+        auto count = read_expert_header(c, t.input, t.payload_bytes, m);
+        resize_reserved(m.expert_offsets, size_t(c.epg()) + 1);
+        resize_reserved(m.expert_token_indices, count);
+        t.receive_arrays = {iovec{m.expert_offsets.data(), m.expert_offsets.size() * sizeof(int32_t)},
+                            iovec{m.expert_token_indices.data(), m.expert_token_indices.size() * sizeof(int32_t)}};
+    } else {
+        auto& m = storage.nodes.at(t.key.first);
+        auto count = read_x3_header(c, t.input, t.payload_bytes, m);
+        resize_reserved(m.token_indices, count); resize_reserved(m.token_masks, count);
+        t.receive_arrays = {iovec{m.token_indices.data(), m.token_indices.size() * sizeof(size_t)},
+                            iovec{m.token_masks.data(), m.token_masks.size()}};
+    }
+    t.arrays_ready = true;
+}
+bool direct_arrays_complete(Transfer& t) {
+    while (t.array_index < t.receive_arrays.size() && t.array_offset == t.receive_arrays[t.array_index].iov_len) {
+        ++t.array_index; t.array_offset = 0;
+    }
+    return t.array_index == t.receive_arrays.size();
+}
+std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, const Dataset& data, uint64_t iteration, Installed installed) {
     auto started = Clock::now();
     std::map<Key, std::string> serialized_payloads;
     if (!c.a.preserialized)
         for (const auto& pair : mesh.channels) serialized_payloads.emplace(pair.first, c.a.binary ? binary_header(data, pair.first) : encode(data, pair.first));
     const auto& payloads = c.a.preserialized ? data.cached : serialized_payloads;
     auto serialized = Clock::now();
-    Installed installed;
-    installed.experts.emplace(c.a.rank, data.experts.at(c.a.rank)); // native vector copy, baseline semantics
+    installed.experts.insert_or_assign(c.a.rank, data.experts.at(c.a.rank)); // native vector copy, baseline semantics
     installed.progress.emplace(c.a.rank, std::make_pair(std::vector<int32_t>(c.epg()), std::vector<int32_t>(c.epg())));
     auto self_installed = Clock::now();
     std::vector<Transfer> transfers;
@@ -582,6 +651,7 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, const Dataset
         t.segments.push_back(iovec{t.output.data(), t.output.size()});
         if (c.a.binary) for (const auto& array : arrays) t.segments.push_back(array);
         t.output_bytes = t.output.size() + array_bytes;
+        if (c.a.binary) t.input.resize(key.second == Expert ? 13 * 8 : 14 * 8);
         descriptors.push_back(pollfd{socket.fd, POLLIN | POLLOUT, 0});
     }
     auto until = deadline(c.a.timeout);
@@ -606,7 +676,28 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, const Dataset
                         uint64_t size = read64(t.header.data());
                         require(read64(t.header.data() + 8) == iteration, "stale/mixed iteration");
                         require(size > 0 && size <= max_payload, "invalid payload size");
-                        t.input.resize(static_cast<size_t>(size));
+                        t.payload_bytes = size;
+                        if (c.a.binary) require(size >= t.input.size(), "truncated binary protocol header");
+                        else t.input.resize(static_cast<size_t>(size));
+                    }
+                } else if (c.a.binary) {
+                    if (!t.arrays_ready) {
+                        t.received += try_recv(p.fd, &t.input[t.received], t.input.size() - t.received);
+                        if (t.received == t.input.size()) {
+                            auto before = Clock::now();
+                            prepare_direct_receive(c, t, installed);
+                            double elapsed = ms(Clock::now(), before);
+                            receive_times[t.key.second == Expert ? 0 : 4] += elapsed;
+                            receive_ms += elapsed;
+                        }
+                    } else if (!direct_arrays_complete(t)) {
+                        auto& array = t.receive_arrays[t.array_index];
+                        t.array_offset += try_recv(p.fd, static_cast<char*>(array.iov_base) + t.array_offset,
+                            std::min(size_t(262144), array.iov_len - t.array_offset));
+                    }
+                    if (t.arrays_ready && direct_arrays_complete(t)) {
+                        auto before = Clock::now(); install(c, t.key, t.input, installed, receive_times);
+                        receive_ms += ms(Clock::now(), before); t.done = true;
                     }
                 } else {
                     t.received += try_recv(p.fd, &t.input[t.received], std::min(size_t(262144), t.input.size() - t.received));
@@ -632,7 +723,7 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, const Dataset
     r.times = {ms(finished, started), ms(serialized, started), ms(self_installed, serialized),
                ms(prepared, self_installed), ms(finished, prepared) - receive_ms, receive_ms};
     r.experts = installed.experts.size(); r.nodes = installed.nodes.size();
-    for (const auto& t : transfers) { r.sent += t.output_bytes; r.received += t.input.size() + FrameBytes; }
+    for (const auto& t : transfers) { r.sent += t.output_bytes; r.received += t.payload_bytes + FrameBytes; }
     return {r, std::move(installed)};
 }
 std::string summary(std::vector<double> values) {
@@ -726,17 +817,19 @@ int run(const RouterMetadataBenchConfig& raw) {
             }
         }
     }
+    Installed reusable = c.a.binary ? reserve_binary_receive_storage(c) : Installed{};
     std::vector<std::vector<Record>> records;
     for (int iteration = 0; iteration < c.a.warmup + c.a.iterations; ++iteration) {
         int d = iteration % c.a.datasets;
         mesh.gather(c, "start:" + std::to_string(iteration), "");
-        auto result = exchange(c, mesh, datasets[d], iteration);
+        auto result = exchange(c, mesh, datasets[d], iteration, std::move(reusable));
         if (c.a.verify) {
             for (const auto& [source, metadata] : result.second.experts)
                 require(serialize_router_expert_metadata(metadata) == expected[d].at({source, Expert}), "expert content verification failed");
             for (const auto& [source, metadata] : result.second.nodes)
                 require(serialize_router_x3_metadata(metadata) == expected[d].at({source, X3}), "x3/x4 content verification failed");
         }
+        if (c.a.binary) reusable = std::move(result.second);
         auto gathered = mesh.gather(c, "complete:" + std::to_string(iteration), result.first.wire());
         if (!c.a.rank && iteration >= c.a.warmup) {
             std::vector<Record> row;
@@ -812,6 +905,36 @@ int main() {
                 "binary/text x3/x4 roundtrip mismatch");
         reject(bytes.substr(0, 20), X3);
         auto corrupt = bytes; corrupt.back() = 0; reject(corrupt, X3);
+
+        // Header preparation must retain the same typed-array storage across
+        // changing routing tables, including empty input lists.
+        c.a.rank = 2;
+        auto storage = reserve_binary_receive_storage(c);
+        auto* expert_base = storage.experts.at(0).expert_token_indices.data();
+        auto* x3_base = storage.nodes.at(0).token_indices.data();
+        for (int dataset = 0; dataset < 4; ++dataset) {
+            data = prepare(c, 0, dataset);
+            for (int kind : {Expert, X3}) {
+                auto payload = pack_for_test({2, kind});
+                Transfer t; t.key = {0, kind}; t.payload_bytes = payload.size();
+                size_t header_size = kind == Expert ? 13 * 8 : 14 * 8;
+                t.input = payload.substr(0, header_size);
+                prepare_direct_receive(c, t, storage);
+                size_t offset = header_size;
+                for (const auto& array : t.receive_arrays) {
+                    if (array.iov_len) std::memcpy(array.iov_base, payload.data() + offset, array.iov_len);
+                    offset += array.iov_len;
+                }
+                ReceiveTimes times{};
+                install(c, t.key, t.input, storage, times);
+                require(offset == payload.size(), "direct receive size mismatch");
+                const auto actual = kind == Expert ? serialize_router_expert_metadata(storage.experts.at(0)) :
+                                                     serialize_router_x3_metadata(storage.nodes.at(0));
+                require(actual == encode(data, {2, kind}), "direct receive changed metadata");
+                require(expert_base == storage.experts.at(0).expert_token_indices.data() &&
+                        x3_base == storage.nodes.at(0).token_indices.data(), "receive storage reallocated");
+            }
+        }
 
         // Force short scatter/gather writes: advance correctly across all segment
         // boundaries, including zero-length arrays, on a nonblocking socket.

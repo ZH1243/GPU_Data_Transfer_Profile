@@ -126,10 +126,20 @@ have 13 header words; x3/x4 messages have 14. Arrays follow immediately:
 The x3 width matches the existing CPU `vector<size_t>` representation. Binary
 mode explicitly requires little-endian hosts with 64-bit `size_t` (the target
 Hopper hosts satisfy this). It does not transmit raw C++ structs or pointers.
-Header/count/length checks run before allocations and array access. The receiver
-currently receives into a byte buffer, allocates typed vectors, and copies array
-bytes into them before validation. This removes text parsing but is **not
-zero-copy reception**. The ordinary TCP stack may also copy bytes internally.
+Header/count/length checks run before allocations and array access. The receiver reads the fixed-size header first, checks its counts and envelope
+length, and receives each array directly into source-specific typed vectors.
+Their capacities are reserved once before warmup and retained across iterations.
+There is no full binary payload buffer and no payload-to-vector `memcpy`.
+Ordinary TCP still copies from kernel socket storage into application memory;
+this is not kernel-bypass or zero-copy networking.
+
+Expert index capacity is conservatively reserved at `num_tokens * top_k` entries
+per source, offsets at `experts_per_gpu + 1`, and x3/x4 at `num_tokens` each.
+This trades memory capacity for avoiding per-iteration reallocation. Vector
+lengths still change to match each message, and growth within reserved capacity
+can zero-initialize newly exposed elements. That work remains measured.
+Incomplete or invalid messages never reach computation/verification; validation
+runs only after both arrays finish arriving, before the exchange completes.
 
 Text mode uses production `router_expert_metadata_v1` / `router_x3_x4_v2` bodies
 with the same iteration envelope. All ranks must choose the same wire format;
@@ -160,8 +170,8 @@ Each iteration has this sequence:
 Connection setup, CPU routing generation, warmup, result aggregation, logging,
 and disposal of the installed records after the iteration are excluded.
 Serialization, framing, poll descriptor setup, receive buffering, parsing, validation,
-self installation, and receive-chunk construction are included. The receive
-tables are rebuilt on each iteration rather than updated in place.
+self installation, and receive-chunk construction are included. Binary metadata records and typed storage are reused in place. Text-mode records
+are rebuilt; receive-chunk descriptors are still rebuilt in both modes.
 
 The report identifies `backend: "cpp"` and `wire_format: "binary"` or `"text"` (in configuration),
 and contains all measured per-rank/per-iteration records and:
@@ -207,25 +217,25 @@ records contain `receive_process_breakdown_ms`. These nine substages sum to
 
 | Field | Included work |
 |---|---|
-| `expert_deserialize_ms` | Binary decoding and array-byte copies, or production text parsing; includes vector allocation/filling and built-in header/offset/index validation |
+| `expert_deserialize_ms` | Binary header decoding, reserved-vector resizing, and array validation; or production text parsing/allocation/validation |
 | `expert_validate_ms` | Additional source/destination/topology checks and per-expert index ordering checks |
-| `expert_record_install_ms` | Moving parsed expert vectors into the source-indexed map, including map-node allocation and duplicate-source check |
-| `expert_progress_init_ms` | Allocating/zeroing per-expert head/tail vectors and inserting their source record |
-| `x3x4_deserialize_ms` | Binary decoding and array-byte copies, or production text parsing; includes vector allocation/filling and built-in validation |
+| `expert_record_install_ms` | Text mode moves vectors into the source map; binary mode already receives into that record, so this boundary has only instrumentation overhead |
+| `expert_progress_init_ms` | Text mode allocates head/tail vectors and inserts a record; binary mode zeroes existing counters |
+| `x3x4_deserialize_ms` | Binary header decoding, reserved-vector resizing, and array validation; or production text parsing/allocation/validation |
 | `x3x4_validate_ms` | Additional source/destination/topology and tensor/chunk-configuration checks |
 | `chunk_build_ms` | `compute_chunks_from_token_indices()`: descriptor allocation/filling and copies of per-chunk source-token-index lists |
-| `x3x4_record_install_ms` | Moving parsed x3/x4 vectors and chunk descriptors into their source-indexed maps |
+| `x3x4_record_install_ms` | Stores/replaces chunk descriptors; text mode also moves parsed x3/x4 vectors into a new source record |
 | `overhead_ms` | Remaining time inside the parent receive-processing interval, including function entry/exit, temporary cleanup, and timing bookkeeping |
 
 The `*_deserialize_ms` names are retained in both modes. In binary mode they
-measure fixed-header decoding, vector allocation, binary copies, and validation;
+measure fixed-header decoding, resizing within reserved vector capacity, and validation;
 there is no decimal parsing. In text mode, validation and allocation are
 interleaved inside the production deserializers and remain timed as a unit. The explicit `*_validate_ms` fields cover only the additional checks after
 deserialization. Timers do not change the validation policy or wire format.
 Self installation is excluded from this breakdown and remains `self_install_ms`.
 Single-node runs have zero x3/x4 and chunk-build times because no such messages
 are exchanged. Rebuild the shared library on both nodes before rerunning; report
-configuration `timing_schema: 2` identifies this instrumentation version.
+configuration `timing_schema: 3` identifies this instrumentation version.
 
 The maximum rank-local duration needs no synchronized clocks. It is not an exact
 global makespan: barrier-release and OS scheduling skew can influence it. A send
@@ -256,11 +266,10 @@ and chunk-building code is reused, but this standalone transport and CPU record
 installation are benchmark implementations, not the full production proxy.
 
 All metadata arrays are native C++ vectors. Self installation copies the local
-expert vectors and initializes progress counters. Received vectors are moved
-into source-specific records after parsing/validation. Binary framing references the original arrays and copies only the small header;
+expert vectors and initializes progress counters. Binary arrays are received into reusable source records and validated there;
+text-mode vectors are moved into records after parsing. Binary framing references the original arrays and copies only the small header;
 text mode still copies framed payloads and converts integers to/from text.
-Reference-only self installation and direct-to-vector reception remain possible
-future optimizations.
+Reference-only self installation remains a possible future optimization.
 GPU routing, D2H/H2D copies, and GPU scheduler initialization remain excluded.
 Compare C++ reports with prior Python reports as separate implementations; the
 Python selector implementation has been replaced by native `poll()`.
@@ -315,3 +324,12 @@ RESULT_JSON=results/text.json bash ./run_node0_torchrun.sh --wire-format=text
 Run node 1 with the matching mode for each run. Upgrade/rebuild the library on
 both nodes: the Python/native C ABI is now version 2. Reports identify the wire
 format; timing field names remain stable for comparisons.
+
+For direct binary reception, time inside socket `recv()` calls belongs to
+`tcp_exchange_ms`. Header decoding/vector-length preparation and completed-array
+validation belong to the corresponding `*_deserialize_ms` field. The latter now
+sums work before and after the array transfers; it excludes waiting for bytes.
+`configuration.receive_storage` is `direct_reusable_vectors` for binary and
+`payload_buffer` for text. The binary wire format and C ABI are unchanged, but
+rebuild both nodes for comparable timing/schema reports. Native tests check
+that receive-array addresses stay stable across changing routing datasets.
