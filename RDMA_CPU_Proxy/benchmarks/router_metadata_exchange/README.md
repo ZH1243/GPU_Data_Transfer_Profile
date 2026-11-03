@@ -322,7 +322,7 @@ RESULT_JSON=results/text.json bash ./run_node0_torchrun.sh --wire-format=text
 ```
 
 Run node 1 with the matching mode for each run. Upgrade/rebuild the library on
-both nodes: the Python/native C ABI is now version 2. Reports identify the wire
+both nodes: the Python/native C ABI is now version 3. Reports identify the wire
 format; timing field names remain stable for comparisons.
 
 For direct binary reception, time inside socket `recv()` calls belongs to
@@ -355,3 +355,36 @@ fraction attributable to this scan. Text mode reports zero for the isolated
 field because its checks remain interleaved with parsing in the unchanged
 production deserializer; zero there means **not separately measured**.
 Rebuild on both nodes. `timing_schema: 4` identifies the new nested timing.
+
+### Disable the two expert-index scans
+
+For binary-mode measurements, append this option on **both nodes**:
+
+```bash
+# Node 0
+bash ./run_node0_torchrun.sh --disable-expert-index-validation
+# Node 1
+bash ./run_node1_torchrun.sh --disable-expert-index-validation
+```
+
+This skips only the expert index-bounds scan (`0 <= index < num_tokens`) and
+per-expert sorted-order scans. Header, identity, topology, byte-length, capacity,
+and expert-offset checks remain enabled, as do x3/x4 checks. Validation is on
+by default. The option is binary-only: text mode keeps using the unchanged
+production deserializer and rejects this option rather than partially applying it.
+
+Console and JSON reports include `expert_index_validation_enabled: false`.
+`expert_index_bounds_ms` becomes exactly zero. `expert_deserialize_ms` still
+includes header/length handling and offset validation; `expert_validate_ms`
+still includes identity/configuration checks, so neither parent stage should
+be expected to become zero. If `--verify` is also enabled, exact-content checks
+still run outside the timed interval.
+
+Rebuild on both nodes before using the updated wrapper (C ABI version 3):
+
+```bash
+cmake --build build -j
+```
+
+This option changes only the benchmark. Production `RDMA_CPU_Proxy` validation
+and metadata exchange are unchanged.

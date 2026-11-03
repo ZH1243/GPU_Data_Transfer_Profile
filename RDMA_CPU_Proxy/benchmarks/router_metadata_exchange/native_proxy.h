@@ -5,7 +5,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI v2. Strings and this struct must stay alive throughout run().
+/* ABI v3. Strings and this struct must stay alive throughout run().
  * One synchronous run per process; the caller may invoke it on a worker thread.
  * All exceptions are translated into a nonzero status and a bounded error string.
  */
@@ -13,6 +13,7 @@ typedef struct RouterMetadataBenchConfig {
     int32_t rank, world, gpus_per_node, port_base, node_port_stride;
     int32_t num_tokens, num_experts, top_k, token_dimension, element_bytes;
     int32_t tokens_per_chunk, datasets, warmup, iterations, preserialized, verify, binary;
+    int32_t disable_expert_index_validation;
     uint64_t seed;
     double timeout;
     const char* hosts;

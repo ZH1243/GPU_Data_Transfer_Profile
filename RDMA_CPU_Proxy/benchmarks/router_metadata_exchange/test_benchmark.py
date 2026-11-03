@@ -101,7 +101,7 @@ class ProcessTests(unittest.TestCase):
         self.assertIn("TCP operation timed out", result.stderr)
 
     def run_job(self, nodes, per_node, preserialized=False, num_tokens=137,
-                num_experts=16, top_k=4, wire_format="binary"):
+                num_experts=16, top_k=4, wire_format="binary", disable_validation=False):
         # Distinct node port ranges emulate hosts without loopback aliases.
         hosts = ["127.0.0.1"] * nodes
         with socket.socket() as probe:
@@ -127,6 +127,8 @@ class ProcessTests(unittest.TestCase):
                            f"--output={output}"]
                     if preserialized:
                         cmd.append("--preserialized")
+                    if disable_validation:
+                        cmd.append("--disable-expert-index-validation")
                     if num_tokens < 1000:
                         cmd.append("--verify")
                     processes.append(subprocess.Popen(cmd, env=env, stdout=log, stderr=log))
@@ -136,6 +138,8 @@ class ProcessTests(unittest.TestCase):
                     self.assertEqual(code, 0, log.read())
                 report = json.loads(output.read_text())
                 self.assertEqual(report["backend"], "cpp")
+                self.assertEqual(report["expert_index_validation_enabled"], not disable_validation)
+                self.assertEqual(report["configuration"]["expert_index_validation_enabled"], not disable_validation)
                 self.assertEqual(report["wire_format"], wire_format)
                 self.assertEqual(report["configuration"]["wire_format"], wire_format)
                 self.assertEqual(report["configuration"]["timing_schema"], 4)
@@ -160,7 +164,7 @@ class ProcessTests(unittest.TestCase):
                         breakdown = result["receive_process_breakdown_ms"]
                         self.assertGreaterEqual(result["expert_index_bounds_ms"], 0)
                         self.assertLessEqual(result["expert_index_bounds_ms"], breakdown["expert_deserialize_ms"])
-                        if wire_format == "text":
+                        if wire_format == "text" or disable_validation:
                             self.assertEqual(result["expert_index_bounds_ms"], 0)
                         self.assertEqual(len(breakdown), 9)
                         for value in breakdown.values():
@@ -197,6 +201,9 @@ class ProcessTests(unittest.TestCase):
 
     def test_text_baseline(self):
         self.run_job(2, 2, wire_format="text")
+
+    def test_disable_expert_validation(self):
+        self.run_job(2, 2, disable_validation=True)
 
     def test_text_preserialized(self):
         self.run_job(2, 2, preserialized=True, wire_format="text")

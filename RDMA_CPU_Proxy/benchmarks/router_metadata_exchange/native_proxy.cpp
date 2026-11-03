@@ -204,6 +204,8 @@ struct Config {
     std::vector<std::string> hosts;
     explicit Config(const RouterMetadataBenchConfig& c) : a(c) {
         require(a.hosts && a.bind_host && a.output, "null config string");
+        require(!a.disable_expert_index_validation || a.binary,
+                "disabling expert index validation requires binary mode");
         const uint32_t endian_probe = 1;
         require(!a.binary || (sizeof(size_t) == 8 && *reinterpret_cast<const uint8_t*>(&endian_probe) == 1),
                 "binary mode requires 64-bit size_t and little-endian hosts");
@@ -242,6 +244,7 @@ struct Config {
         FIELD(element_bytes); FIELD(tokens_per_chunk); FIELD(datasets); FIELD(warmup);
         FIELD(iterations); FIELD(seed); FIELD(timeout);
 #undef FIELD
+        out << ",\"expert_index_validation_enabled\":" << (a.disable_expert_index_validation ? "false" : "true");
         out << ",\"preserialized\":" << (a.preserialized ? "true" : "false")
             << ",\"verify\":" << (a.verify ? "true" : "false") << '}';
         return out.str();
@@ -406,10 +409,11 @@ size_t read_expert_header(const Config& c, const std::string& header, size_t pay
             "binary expert payload length mismatch");
     return count;
 }
-void validate_expert_arrays(const RouterExpertMetadata& m, double* index_bounds_ms = nullptr) {
+void validate_expert_arrays(const RouterExpertMetadata& m, double* index_bounds_ms = nullptr, bool skip_index_bounds = false) {
     auto count = m.expert_token_indices.size();
     require(m.expert_offsets.front() == 0 && m.expert_offsets.back() == int64_t(count) &&
             std::is_sorted(m.expert_offsets.begin(), m.expert_offsets.end()), "invalid binary expert offsets");
+    if (skip_index_bounds) return;
     const auto before = Clock::now();
     const bool valid = std::all_of(m.expert_token_indices.begin(), m.expert_token_indices.end(),
             [&](int32_t i) { return i >= 0 && size_t(i) < m.num_tokens; });
@@ -422,7 +426,7 @@ void validate_expert_arrays(const RouterExpertMetadata& m, double* index_bounds_
     auto count = read_expert_header(c, payload, payload.size(), m);
     BinaryReader r{payload, 13 * 8};
     r.array(m.expert_offsets, size_t(m.experts_per_gpu) + 1); r.array(m.expert_token_indices, count);
-    validate_expert_arrays(m); return m;
+    validate_expert_arrays(m, nullptr, c.a.disable_expert_index_validation); return m;
 }
 size_t read_x3_header(const Config& c, const std::string& header, size_t payload_bytes, RouterX3Metadata& m) {
     BinaryReader r{header}; r.prefix(X3);
@@ -470,7 +474,7 @@ void install(const Config& c, Key key, const std::string& payload, Installed& in
         RouterExpertMetadata parsed;
         if (!c.a.binary) parsed = deserialize_router_expert_metadata(payload, c.a.num_tokens, size_t(c.a.num_tokens) * c.a.top_k);
         auto& m = c.a.binary ? installed.experts.at(source) : parsed;
-        if (c.a.binary) validate_expert_arrays(m, &times.expert_index_bounds_ms);
+        if (c.a.binary) validate_expert_arrays(m, &times.expert_index_bounds_ms, c.a.disable_expert_index_validation);
         mark(0);
         require(m.source_node_rank == c.node(source) && m.source_gpu_index == c.gpu(source) &&
                 m.destination_node_rank == c.node(c.a.rank) && m.destination_gpu_index == c.gpu(c.a.rank) &&
@@ -478,7 +482,7 @@ void install(const Config& c, Key key, const std::string& payload, Installed& in
                 m.num_experts == c.a.num_experts && m.experts_per_gpu == c.epg() &&
                 m.first_global_expert == c.a.rank * c.epg() && m.num_tokens == size_t(c.a.num_tokens),
                 "expert identity/dimensions mismatch");
-        for (int e = 0; e < c.epg(); ++e)
+        for (int e = 0; !c.a.disable_expert_index_validation && e < c.epg(); ++e)
             require(std::is_sorted(m.expert_token_indices.begin() + m.expert_offsets[e],
                                    m.expert_token_indices.begin() + m.expert_offsets[e + 1]), "unsorted expert indices");
         mark(1);
@@ -786,6 +790,7 @@ void report(const Config& c, const std::vector<std::vector<Record>>& records) {
         ",\"critical_rank_stage_ms\":" + stage_summary(critical, false) +
         ",\"critical_rank_receive_process_ms\":" + receive_summary(critical) +
         ",\"critical_rank_expert_index_bounds_ms\":" + index_bounds_summary(critical) +
+        ",\"expert_index_validation_enabled\":" + (c.a.disable_expert_index_validation ? "false" : "true") +
         ",\"backend\":\"cpp\",\"wire_format\":" + quote(c.a.binary ? "binary" : "text") + ",\"mode\":" + quote(c.a.preserialized ? "preserialized" : "serialize-in-timer");
     std::cout << pretty('{' + common + '}') << std::endl;
     if (!*c.a.output) return;
@@ -859,7 +864,7 @@ int run(const RouterMetadataBenchConfig& raw) {
 }
 } // namespace
 
-extern "C" uint32_t router_metadata_bench_abi_version() { return 2; }
+extern "C" uint32_t router_metadata_bench_abi_version() { return 3; }
 extern "C" int router_metadata_bench_run(const RouterMetadataBenchConfig* config, char* error, size_t capacity) {
     if (error && capacity) error[0] = '\0';
     try {
@@ -929,6 +934,28 @@ int main() {
         auto storage = reserve_binary_receive_storage(c);
         auto* expert_base = storage.experts.at(0).expert_token_indices.data();
         auto* x3_base = storage.nodes.at(0).token_indices.data();
+        auto check_validation_switch = [&](bool disabled, bool expect_failure) {
+            c.a.disable_expert_index_validation = disabled;
+            ReceiveTimes times{};
+            bool failed = false;
+            try { install(c, {0, Expert}, "", storage, times); }
+            catch (const std::exception&) { failed = true; }
+            require(failed == expect_failure, "expert validation switch behaved incorrectly");
+            if (disabled) require(times.expert_index_bounds_ms == 0, "disabled bounds scan was timed");
+        };
+        auto& malformed = storage.experts.at(0);
+        malformed = data.experts.at(2);
+        malformed.expert_offsets.assign(c.epg() + 1, 2);
+        malformed.expert_offsets.front() = 0;
+        malformed.expert_token_indices = {1, 0}; // valid bounds, unsorted first expert
+        check_validation_switch(false, true);
+        check_validation_switch(true, false);
+        malformed.expert_token_indices = {0, c.a.num_tokens}; // sorted, out of bounds
+        check_validation_switch(false, true);
+        check_validation_switch(true, false);
+        malformed.expert_offsets.front() = 1; // structural check must remain active
+        check_validation_switch(true, true);
+        c.a.disable_expert_index_validation = false;
         for (int dataset = 0; dataset < 4; ++dataset) {
             data = prepare(c, 0, dataset);
             for (int kind : {Expert, X3}) {
