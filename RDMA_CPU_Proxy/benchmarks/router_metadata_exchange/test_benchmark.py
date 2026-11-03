@@ -138,10 +138,13 @@ class ProcessTests(unittest.TestCase):
                 self.assertEqual(report["backend"], "cpp")
                 self.assertEqual(report["wire_format"], wire_format)
                 self.assertEqual(report["configuration"]["wire_format"], wire_format)
-                self.assertEqual(report["configuration"]["timing_schema"], 3)
+                self.assertEqual(report["configuration"]["timing_schema"], 4)
                 self.assertEqual(report["configuration"]["receive_storage"],
                                  "direct_reusable_vectors" if wire_format == "binary" else "payload_buffer")
                 self.assertEqual(len(report["iterations"]), 3)
+                critical = [max(rows, key=lambda r: r["elapsed_ms"]) for rows in report["iterations"]]
+                self.assertAlmostEqual(report["critical_rank_expert_index_bounds_ms"]["mean"],
+                                       sum(r["expert_index_bounds_ms"] for r in critical) / len(critical), places=7)
                 self.assertAlmostEqual(sum(stats["mean"] for stats in
                                            report["critical_rank_receive_process_ms"].values()),
                                        report["critical_rank_stage_ms"]["receive_process_ms"]["mean"], places=7)
@@ -155,6 +158,10 @@ class ProcessTests(unittest.TestCase):
                         self.assertEqual(result["installed_x3x4_sources"], nodes - 1)
                         self.assertGreater(result["elapsed_ms"], 0)
                         breakdown = result["receive_process_breakdown_ms"]
+                        self.assertGreaterEqual(result["expert_index_bounds_ms"], 0)
+                        self.assertLessEqual(result["expert_index_bounds_ms"], breakdown["expert_deserialize_ms"])
+                        if wire_format == "text":
+                            self.assertEqual(result["expert_index_bounds_ms"], 0)
                         self.assertEqual(len(breakdown), 9)
                         for value in breakdown.values():
                             self.assertGreaterEqual(value, 0)

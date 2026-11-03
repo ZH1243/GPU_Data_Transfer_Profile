@@ -44,7 +44,10 @@ const std::array<const char*, 9> ReceiveFields = {
     "expert_deserialize_ms", "expert_validate_ms", "expert_record_install_ms",
     "expert_progress_init_ms", "x3x4_deserialize_ms", "x3x4_validate_ms",
     "chunk_build_ms", "x3x4_record_install_ms", "overhead_ms"};
-using ReceiveTimes = std::array<double, ReceiveFields.size()>;
+struct ReceiveTimes : std::array<double, ReceiveFields.size()> {
+    // Nested measurement, already included in expert_deserialize_ms.
+    double expert_index_bounds_ms = 0;
+};
 void require(bool value, const std::string& message) {
     if (!value) throw std::runtime_error(message);
 }
@@ -228,7 +231,7 @@ struct Config {
     int epg() const { return a.num_experts / a.world; }
     std::string json() const {
         std::ostringstream out;
-        out << "{\"backend\":\"cpp\",\"timing_schema\":3,\"wire_format\":"
+        out << "{\"backend\":\"cpp\",\"timing_schema\":4,\"wire_format\":"
             << quote(a.binary ? "binary" : "text") << ",\"receive_storage\":"
             << quote(a.binary ? "direct_reusable_vectors" : "payload_buffer") << ",\"binary_protocol_version\":1,\"hosts\":[";
         for (size_t i = 0; i < hosts.size(); ++i) { if (i) out << ','; out << quote(hosts[i]); }
@@ -403,12 +406,16 @@ size_t read_expert_header(const Config& c, const std::string& header, size_t pay
             "binary expert payload length mismatch");
     return count;
 }
-void validate_expert_arrays(const RouterExpertMetadata& m) {
+void validate_expert_arrays(const RouterExpertMetadata& m, double* index_bounds_ms = nullptr) {
     auto count = m.expert_token_indices.size();
     require(m.expert_offsets.front() == 0 && m.expert_offsets.back() == int64_t(count) &&
             std::is_sorted(m.expert_offsets.begin(), m.expert_offsets.end()), "invalid binary expert offsets");
-    require(std::all_of(m.expert_token_indices.begin(), m.expert_token_indices.end(),
-            [&](int32_t i) { return i >= 0 && size_t(i) < m.num_tokens; }), "binary expert index out of range");
+    const auto before = Clock::now();
+    const bool valid = std::all_of(m.expert_token_indices.begin(), m.expert_token_indices.end(),
+            [&](int32_t i) { return i >= 0 && size_t(i) < m.num_tokens; });
+    const auto after = Clock::now();
+    if (index_bounds_ms) *index_bounds_ms += ms(after, before);
+    require(valid, "binary expert index out of range");
 }
 [[maybe_unused]] RouterExpertMetadata decode_expert_binary(const Config& c, const std::string& payload) {
     RouterExpertMetadata m;
@@ -463,7 +470,7 @@ void install(const Config& c, Key key, const std::string& payload, Installed& in
         RouterExpertMetadata parsed;
         if (!c.a.binary) parsed = deserialize_router_expert_metadata(payload, c.a.num_tokens, size_t(c.a.num_tokens) * c.a.top_k);
         auto& m = c.a.binary ? installed.experts.at(source) : parsed;
-        if (c.a.binary) validate_expert_arrays(m);
+        if (c.a.binary) validate_expert_arrays(m, &times.expert_index_bounds_ms);
         mark(0);
         require(m.source_node_rank == c.node(source) && m.source_gpu_index == c.gpu(source) &&
                 m.destination_node_rank == c.node(c.a.rank) && m.destination_gpu_index == c.gpu(c.a.rank) &&
@@ -512,6 +519,7 @@ struct Record {
         std::ostringstream out; out << std::setprecision(17) << rank;
         for (double t : times) out << ' ' << t;
         for (double t : receive_times) out << ' ' << t;
+        out << ' ' << receive_times.expert_index_bounds_ms;
         out << ' ' << sent << ' ' << received << ' ' << experts << ' ' << nodes;
         return out.str();
     }
@@ -519,6 +527,7 @@ struct Record {
         Record r; std::istringstream in(text); in >> r.rank;
         for (double& t : r.times) in >> t;
         for (double& t : r.receive_times) in >> t;
+        in >> r.receive_times.expert_index_bounds_ms;
         require(bool(in >> r.sent >> r.received >> r.experts >> r.nodes), "invalid timing record");
         return r;
     }
@@ -531,6 +540,7 @@ struct Record {
             out << quote(ReceiveFields[i]) << ':' << receive_times[i];
         }
         out << '}';
+        out << ",\"expert_index_bounds_ms\":" << receive_times.expert_index_bounds_ms;
         out << ",\"install_ms\":" << times[2] + times[5] << ",\"sent_bytes\":" << sent
             << ",\"received_bytes\":" << received << ",\"installed_expert_sources\":" << experts
             << ",\"installed_x3x4_sources\":" << nodes << '}';
@@ -737,6 +747,11 @@ std::string summary(std::vector<double> values) {
         << ",\"p99\":" << values[size_t(std::ceil(n * .99)) - 1] << ",\"max\":" << values.back() << '}';
     return out.str();
 }
+std::string index_bounds_summary(const std::vector<Record>& rows) {
+    std::vector<double> values;
+    for (const auto& row : rows) values.push_back(row.receive_times.expert_index_bounds_ms);
+    return summary(values);
+}
 std::string receive_summary(const std::vector<Record>& rows) {
     std::ostringstream out; out << '{';
     for (size_t field = 0; field < ReceiveFields.size(); ++field) {
@@ -758,6 +773,7 @@ std::string stage_summary(const std::vector<Record>& rows, bool full) {
         std::vector<double> values; for (const auto& row : rows) values.push_back(row.times[2] + row.times[5]);
         out << ",\"install_ms\":" << summary(values);
         out << ",\"receive_process_breakdown_ms\":" << receive_summary(rows);
+        out << ",\"expert_index_bounds_ms\":" << index_bounds_summary(rows);
     }
     out << '}'; return out.str();
 }
@@ -769,6 +785,7 @@ void report(const Config& c, const std::vector<std::vector<Record>>& records) {
     std::string common = "\"critical_rank_ms\":" + summary(totals) +
         ",\"critical_rank_stage_ms\":" + stage_summary(critical, false) +
         ",\"critical_rank_receive_process_ms\":" + receive_summary(critical) +
+        ",\"critical_rank_expert_index_bounds_ms\":" + index_bounds_summary(critical) +
         ",\"backend\":\"cpp\",\"wire_format\":" + quote(c.a.binary ? "binary" : "text") + ",\"mode\":" + quote(c.a.preserialized ? "preserialized" : "serialize-in-timer");
     std::cout << pretty('{' + common + '}') << std::endl;
     if (!*c.a.output) return;

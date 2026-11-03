@@ -235,7 +235,7 @@ deserialization. Timers do not change the validation policy or wire format.
 Self installation is excluded from this breakdown and remains `self_install_ms`.
 Single-node runs have zero x3/x4 and chunk-build times because no such messages
 are exchanged. Rebuild the shared library on both nodes before rerunning; report
-configuration `timing_schema: 3` identifies this instrumentation version.
+configuration `timing_schema: 4` identifies this instrumentation version.
 
 The maximum rank-local duration needs no synchronized clocks. It is not an exact
 global makespan: barrier-release and OS scheduling skew can influence it. A send
@@ -333,3 +333,25 @@ sums work before and after the array transfers; it excludes waiting for bytes.
 `payload_buffer` for text. The binary wire format and C ABI are unchanged, but
 rebuild both nodes for comparable timing/schema reports. Native tests check
 that receive-array addresses stay stable across changing routing datasets.
+
+### Isolated expert index-bounds scan
+
+In binary mode, `critical_rank_expert_index_bounds_ms` reports the time spent
+inside the existing `std::all_of` scan checking `0 <= index < num_tokens` for
+received expert indices. It uses the same slowest-total-time rank as the other
+critical-rank summaries. `expert_index_bounds_ms` is also present in each rank
+summary and per-iteration record.
+
+This is a **nested subcomponent of `expert_deserialize_ms`**, not an additional
+stage: do not add it to the receive-stage or total-stage sums. It excludes offset
+checks, header decoding, vector resizing, per-expert sorted-order checks, and
+error-message handling. No validation is skipped or duplicated. The measurement
+contains timer overhead; very short or empty scans may have zero measured duration.
+
+For the mean on the selected critical ranks, divide
+`critical_rank_expert_index_bounds_ms.mean` by
+`critical_rank_receive_process_ms.expert_deserialize_ms.mean` to estimate the
+fraction attributable to this scan. Text mode reports zero for the isolated
+field because its checks remain interleaved with parsing in the unchanged
+production deserializer; zero there means **not separately measured**.
+Rebuild on both nodes. `timing_schema: 4` identifies the new nested timing.
