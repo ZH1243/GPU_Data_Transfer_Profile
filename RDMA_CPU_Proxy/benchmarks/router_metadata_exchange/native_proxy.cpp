@@ -28,6 +28,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 namespace {
@@ -200,6 +201,9 @@ struct Config {
     std::vector<std::string> hosts;
     explicit Config(const RouterMetadataBenchConfig& c) : a(c) {
         require(a.hosts && a.bind_host && a.output, "null config string");
+        const uint32_t endian_probe = 1;
+        require(!a.binary || (sizeof(size_t) == 8 && *reinterpret_cast<const uint8_t*>(&endian_probe) == 1),
+                "binary mode requires 64-bit size_t and little-endian hosts");
         std::istringstream input(a.hosts); std::string host;
         while (std::getline(input, host, ',')) { require(!host.empty(), "empty node address"); hosts.push_back(host); }
         require(!hosts.empty() && std::string(a.hosts).back() != ',', "invalid hosts");
@@ -224,7 +228,8 @@ struct Config {
     int epg() const { return a.num_experts / a.world; }
     std::string json() const {
         std::ostringstream out;
-        out << "{\"backend\":\"cpp\",\"timing_schema\":2,\"wire_format\":\"text\",\"hosts\":[";
+        out << "{\"backend\":\"cpp\",\"timing_schema\":2,\"wire_format\":"
+            << quote(a.binary ? "binary" : "text") << ",\"binary_protocol_version\":1,\"hosts\":[";
         for (size_t i = 0; i < hosts.size(); ++i) { if (i) out << ','; out << quote(hosts[i]); }
         out << ']';
 #define FIELD(name) out << ",\"" #name "\":" << a.name
@@ -339,6 +344,92 @@ std::string encode(const Dataset& d, Key key) {
     return key.second == Expert ? serialize_router_expert_metadata(d.experts.at(key.first)) :
                                  serialize_router_x3_metadata(d.nodes.at(key.first));
 }
+// Fixed big-endian uint64 header fields; array storage is sent directly in
+// little-endian native widths (int32 offsets/indices, uint64 x3, uint8 x4).
+constexpr uint64_t BinaryMagic = 0x524d455842494e01ULL; // RMEXBIN + version 1
+std::string binary_header(const Dataset& d, Key key) {
+    std::string header;
+    append64(header, BinaryMagic); append64(header, key.second);
+    if (key.second == Expert) {
+        const auto& m = d.experts.at(key.first);
+        for (uint64_t value : {uint64_t(m.source_node_rank), uint64_t(m.source_gpu_index),
+                uint64_t(m.destination_node_rank), uint64_t(m.destination_gpu_index),
+                uint64_t(m.num_nodes), uint64_t(m.num_gpus_per_node), uint64_t(m.num_experts),
+                uint64_t(m.experts_per_gpu), uint64_t(m.first_global_expert),
+                uint64_t(m.num_tokens), uint64_t(m.expert_token_indices.size())}) append64(header, value);
+    } else {
+        const auto& m = d.nodes.at(key.first);
+        for (uint64_t value : {uint64_t(m.source_node_rank), uint64_t(m.destination_node_rank),
+                uint64_t(m.local_gpu_index), uint64_t(m.num_nodes), uint64_t(m.num_gpus_per_node),
+                uint64_t(m.num_experts), uint64_t(m.top_k), uint64_t(m.num_tokens),
+                uint64_t(m.token_dimension), uint64_t(m.element_bytes), uint64_t(m.tokens_per_chunk),
+                uint64_t(m.token_indices.size())}) append64(header, value);
+    }
+    return header;
+}
+struct BinaryReader {
+    const std::string& payload;
+    size_t offset = 0;
+    uint64_t word() {
+        require(payload.size() - offset >= 8, "truncated binary header");
+        auto v = read64(payload.data() + offset); offset += 8; return v;
+    }
+    int integer() {
+        auto v = word(); require(v <= INT32_MAX, "binary header integer out of range"); return int(v);
+    }
+    template<class T> void array(std::vector<T>& values, size_t count) {
+        require(count <= (payload.size() - offset) / sizeof(T), "truncated binary array");
+        values.resize(count);
+        if (count) std::memcpy(values.data(), payload.data() + offset, count * sizeof(T));
+        offset += count * sizeof(T);
+    }
+    void prefix(int kind) {
+        require(word() == BinaryMagic, "binary protocol version mismatch");
+        require(word() == uint64_t(kind), "binary metadata kind mismatch");
+    }
+};
+RouterExpertMetadata decode_expert_binary(const Config& c, const std::string& payload) {
+    BinaryReader r{payload}; r.prefix(Expert);
+    RouterExpertMetadata m;
+    m.source_node_rank = r.integer(); m.source_gpu_index = r.integer();
+    m.destination_node_rank = r.integer(); m.destination_gpu_index = r.integer();
+    m.num_nodes = r.integer(); m.num_gpus_per_node = r.integer(); m.num_experts = r.integer();
+    m.experts_per_gpu = r.integer(); m.first_global_expert = r.integer();
+    m.num_tokens = r.word(); auto count = r.word();
+    require(m.num_nodes > 0 && m.num_gpus_per_node > 0 && m.num_experts > 0 &&
+            m.experts_per_gpu == c.epg() && m.num_tokens <= size_t(c.a.num_tokens) &&
+            count <= uint64_t(c.a.num_tokens) * c.a.top_k, "invalid binary expert dimensions");
+    require(payload.size() - r.offset == (size_t(m.experts_per_gpu) + 1 + count) * sizeof(int32_t),
+            "binary expert payload length mismatch");
+    r.array(m.expert_offsets, size_t(m.experts_per_gpu) + 1);
+    r.array(m.expert_token_indices, count);
+    require(m.expert_offsets.front() == 0 && m.expert_offsets.back() == int64_t(count) &&
+            std::is_sorted(m.expert_offsets.begin(), m.expert_offsets.end()), "invalid binary expert offsets");
+    require(std::all_of(m.expert_token_indices.begin(), m.expert_token_indices.end(),
+            [&](int32_t i) { return i >= 0 && size_t(i) < m.num_tokens; }), "binary expert index out of range");
+    return m;
+}
+RouterX3Metadata decode_x3_binary(const Config& c, const std::string& payload) {
+    BinaryReader r{payload}; r.prefix(X3);
+    RouterX3Metadata m;
+    m.source_node_rank = r.integer(); m.destination_node_rank = r.integer(); m.local_gpu_index = r.integer();
+    m.num_nodes = r.integer(); m.num_gpus_per_node = r.integer(); m.num_experts = r.integer(); m.top_k = r.integer();
+    m.num_tokens = r.word(); m.token_dimension = r.word(); m.element_bytes = r.word(); m.tokens_per_chunk = r.word();
+    auto count = r.word();
+    require(m.num_nodes > 0 && m.num_gpus_per_node > 0 && m.num_gpus_per_node <= 8 &&
+            m.num_experts > 0 && m.top_k > 0 && m.num_tokens <= size_t(c.a.num_tokens) &&
+            count <= m.num_tokens && m.token_dimension > 0 && m.element_bytes > 0 && m.tokens_per_chunk > 0,
+            "invalid binary x3/x4 dimensions");
+    require(payload.size() - r.offset == count * (sizeof(uint64_t) + sizeof(uint8_t)),
+            "binary x3/x4 payload length mismatch");
+    r.array(m.token_indices, count); r.array(m.token_masks, count);
+    require(std::all_of(m.token_indices.begin(), m.token_indices.end(),
+            [&](size_t i) { return i < m.num_tokens; }), "binary x3 index out of range");
+    require(std::all_of(m.token_masks.begin(), m.token_masks.end(),
+            [&](uint8_t mask) { return mask > 0 && unsigned(mask) < (1u << m.num_gpus_per_node); }),
+            "binary x4 mask out of range");
+    return m;
+}
 struct Installed {
     std::map<int, RouterExpertMetadata> experts;
     std::map<int, RouterX3Metadata> nodes;
@@ -354,7 +445,8 @@ void install(const Config& c, Key key, const std::string& payload, Installed& in
     };
     int source = key.first;
     if (key.second == Expert) {
-        auto m = deserialize_router_expert_metadata(payload, c.a.num_tokens, size_t(c.a.num_tokens) * c.a.top_k);
+        auto m = c.a.binary ? decode_expert_binary(c, payload) :
+            deserialize_router_expert_metadata(payload, c.a.num_tokens, size_t(c.a.num_tokens) * c.a.top_k);
         mark(0);
         require(m.source_node_rank == c.node(source) && m.source_gpu_index == c.gpu(source) &&
                 m.destination_node_rank == c.node(c.a.rank) && m.destination_gpu_index == c.gpu(c.a.rank) &&
@@ -371,7 +463,7 @@ void install(const Config& c, Key key, const std::string& payload, Installed& in
         installed.progress.emplace(source, std::make_pair(std::vector<int32_t>(c.epg()), std::vector<int32_t>(c.epg())));
         mark(3);
     } else {
-        auto m = deserialize_router_x3_metadata(payload, c.a.num_tokens);
+        auto m = c.a.binary ? decode_x3_binary(c, payload) : deserialize_router_x3_metadata(payload, c.a.num_tokens);
         mark(4);
         require(m.source_node_rank == c.node(source) && m.destination_node_rank == c.node(c.a.rank) &&
                 m.local_gpu_index == c.gpu(c.a.rank) && c.gpu(source) == c.gpu(c.a.rank) &&
@@ -424,15 +516,39 @@ struct Record {
 struct Transfer {
     Key key;
     std::string output, input;
+    std::vector<iovec> segments;
+    size_t output_bytes = 0;
     std::array<char, FrameBytes> header{};
     size_t sent = 0, header_received = 0, received = 0;
     bool done = false;
 };
+// sendmsg references the existing arrays; no packed copy or decimal conversion.
+size_t send_segments(int fd, const Transfer& t) {
+    std::array<iovec, 3> remaining_segments{};
+    size_t skip = t.sent, count = 0;
+    for (auto segment : t.segments) {
+        if (skip >= segment.iov_len) { skip -= segment.iov_len; continue; }
+        segment.iov_base = static_cast<char*>(segment.iov_base) + skip;
+        segment.iov_len -= skip; skip = 0;
+        remaining_segments[count++] = segment;
+    }
+    msghdr message{};
+    message.msg_iov = remaining_segments.data(); message.msg_iovlen = count;
+#ifdef MSG_NOSIGNAL
+    constexpr int flags = MSG_NOSIGNAL;
+#else
+    constexpr int flags = 0;
+#endif
+    auto n = ::sendmsg(fd, &message, flags);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
+    require(n > 0, "sendmsg failed/peer disconnected");
+    return size_t(n);
+}
 std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, const Dataset& data, uint64_t iteration) {
     auto started = Clock::now();
     std::map<Key, std::string> serialized_payloads;
     if (!c.a.preserialized)
-        for (const auto& pair : mesh.channels) serialized_payloads.emplace(pair.first, encode(data, pair.first));
+        for (const auto& pair : mesh.channels) serialized_payloads.emplace(pair.first, c.a.binary ? binary_header(data, pair.first) : encode(data, pair.first));
     const auto& payloads = c.a.preserialized ? data.cached : serialized_payloads;
     auto serialized = Clock::now();
     Installed installed;
@@ -440,13 +556,32 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, const Dataset
     installed.progress.emplace(c.a.rank, std::make_pair(std::vector<int32_t>(c.epg()), std::vector<int32_t>(c.epg())));
     auto self_installed = Clock::now();
     std::vector<Transfer> transfers;
+    transfers.reserve(mesh.channels.size()); // keep segment pointers stable
     std::vector<pollfd> descriptors;
     for (const auto& [key, socket] : mesh.channels) {
-        Transfer t; t.key = key;
+        transfers.emplace_back();
+        auto& t = transfers.back(); t.key = key;
         const auto& payload = payloads.at(key);
-        t.output.reserve(FrameBytes + payload.size()); append64(t.output, payload.size()); append64(t.output, iteration);
+        size_t array_bytes = 0;
+        std::array<iovec, 2> arrays{};
+        if (c.a.binary) {
+            if (key.second == Expert) {
+                const auto& m = data.experts.at(key.first);
+                arrays = {iovec{const_cast<int32_t*>(m.expert_offsets.data()), m.expert_offsets.size() * sizeof(int32_t)},
+                          iovec{const_cast<int32_t*>(m.expert_token_indices.data()), m.expert_token_indices.size() * sizeof(int32_t)}};
+            } else {
+                const auto& m = data.nodes.at(key.first);
+                arrays = {iovec{const_cast<size_t*>(m.token_indices.data()), m.token_indices.size() * sizeof(uint64_t)},
+                          iovec{const_cast<uint8_t*>(m.token_masks.data()), m.token_masks.size()}};
+            }
+            for (const auto& array : arrays) array_bytes += array.iov_len;
+        }
+        t.output.reserve(FrameBytes + payload.size());
+        append64(t.output, payload.size() + array_bytes); append64(t.output, iteration);
         t.output += payload;
-        transfers.push_back(std::move(t));
+        t.segments.push_back(iovec{t.output.data(), t.output.size()});
+        if (c.a.binary) for (const auto& array : arrays) t.segments.push_back(array);
+        t.output_bytes = t.output.size() + array_bytes;
         descriptors.push_back(pollfd{socket.fd, POLLIN | POLLOUT, 0});
     }
     auto until = deadline(c.a.timeout);
@@ -463,7 +598,7 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, const Dataset
             auto& p = descriptors[i]; auto& t = transfers[i];
             if (p.fd < 0 || !p.revents) continue;
             require(!(p.revents & (POLLERR | POLLNVAL)), "metadata socket error");
-            if (p.revents & POLLOUT) t.sent += try_send(p.fd, t.output.data() + t.sent, t.output.size() - t.sent);
+            if (p.revents & POLLOUT) t.sent += send_segments(p.fd, t);
             if ((p.revents & (POLLIN | POLLHUP)) && !t.done) {
                 if (t.header_received < FrameBytes) {
                     t.header_received += try_recv(p.fd, t.header.data() + t.header_received, FrameBytes - t.header_received);
@@ -481,7 +616,7 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, const Dataset
                     }
                 }
             }
-            p.events = static_cast<short>((t.done ? 0 : POLLIN) | (t.sent == t.output.size() ? 0 : POLLOUT));
+            p.events = static_cast<short>((t.done ? 0 : POLLIN) | (t.sent == t.output_bytes ? 0 : POLLOUT));
             if (!p.events) { p.fd = -1; --pending; }
             else require(!(p.revents & POLLHUP), "peer disconnected during metadata exchange");
         }
@@ -497,7 +632,7 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, const Dataset
     r.times = {ms(finished, started), ms(serialized, started), ms(self_installed, serialized),
                ms(prepared, self_installed), ms(finished, prepared) - receive_ms, receive_ms};
     r.experts = installed.experts.size(); r.nodes = installed.nodes.size();
-    for (const auto& t : transfers) { r.sent += t.output.size(); r.received += t.input.size() + FrameBytes; }
+    for (const auto& t : transfers) { r.sent += t.output_bytes; r.received += t.input.size() + FrameBytes; }
     return {r, std::move(installed)};
 }
 std::string summary(std::vector<double> values) {
@@ -543,7 +678,7 @@ void report(const Config& c, const std::vector<std::vector<Record>>& records) {
     std::string common = "\"critical_rank_ms\":" + summary(totals) +
         ",\"critical_rank_stage_ms\":" + stage_summary(critical, false) +
         ",\"critical_rank_receive_process_ms\":" + receive_summary(critical) +
-        ",\"backend\":\"cpp\",\"mode\":" + quote(c.a.preserialized ? "preserialized" : "serialize-in-timer");
+        ",\"backend\":\"cpp\",\"wire_format\":" + quote(c.a.binary ? "binary" : "text") + ",\"mode\":" + quote(c.a.preserialized ? "preserialized" : "serialize-in-timer");
     std::cout << pretty('{' + common + '}') << std::endl;
     if (!*c.a.output) return;
     std::filesystem::path path(c.a.output);
@@ -580,7 +715,7 @@ int run(const RouterMetadataBenchConfig& raw) {
     for (int d = 0; d < c.a.datasets; ++d) {
         auto data = prepare(c, c.a.rank, d);
         if (c.a.preserialized)
-            for (const auto& entry : mesh.channels) data.cached.emplace(entry.first, encode(data, entry.first));
+            for (const auto& entry : mesh.channels) data.cached.emplace(entry.first, c.a.binary ? binary_header(data, entry.first) : encode(data, entry.first));
         datasets.push_back(std::move(data));
         if (c.a.verify) {
             for (int source = 0; source < c.a.world; ++source) {
@@ -614,7 +749,7 @@ int run(const RouterMetadataBenchConfig& raw) {
 }
 } // namespace
 
-extern "C" uint32_t router_metadata_bench_abi_version() { return 1; }
+extern "C" uint32_t router_metadata_bench_abi_version() { return 2; }
 extern "C" int router_metadata_bench_run(const RouterMetadataBenchConfig* config, char* error, size_t capacity) {
     if (error && capacity) error[0] = '\0';
     try {
@@ -627,3 +762,79 @@ extern "C" int router_metadata_bench_run(const RouterMetadataBenchConfig* config
     }
     return 1;
 }
+
+#ifdef ROUTER_METADATA_BENCH_CODEC_TEST
+int main() {
+    try {
+        RouterMetadataBenchConfig raw{};
+        raw.rank = 0; raw.world = 4; raw.gpus_per_node = 2;
+        raw.port_base = 20515; raw.num_tokens = 137; raw.num_experts = 16; raw.top_k = 4;
+        raw.token_dimension = 4096; raw.element_bytes = 2; raw.tokens_per_chunk = 7;
+        raw.datasets = 1; raw.iterations = 1; raw.timeout = 5; raw.seed = 1234; raw.binary = 1;
+        raw.hosts = "127.0.0.1,127.0.0.1"; raw.bind_host = "0.0.0.0"; raw.output = "";
+        Config c(raw);
+        Logger::instance().set_level(LogLevel::kError);
+        auto data = prepare(c, 0, 0);
+        auto pack_for_test = [&](Key key) {
+            auto payload = binary_header(data, key);
+            auto append = [&](const auto& array) {
+                if (!array.empty()) payload.append(reinterpret_cast<const char*>(array.data()),
+                                                   array.size() * sizeof(array[0]));
+            };
+            if (key.second == Expert) {
+                append(data.experts.at(key.first).expert_offsets);
+                append(data.experts.at(key.first).expert_token_indices);
+            } else {
+                append(data.nodes.at(key.first).token_indices);
+                append(data.nodes.at(key.first).token_masks);
+            }
+            return payload;
+        };
+        auto reject = [&](const std::string& payload, int kind) {
+            bool failed = false;
+            try {
+                if (kind == Expert) (void)decode_expert_binary(c, payload);
+                else (void)decode_x3_binary(c, payload);
+            } catch (const std::exception&) { failed = true; }
+            require(failed, "malformed binary payload was accepted");
+        };
+        for (int dest = 0; dest < c.a.world; ++dest) {
+            auto bytes = pack_for_test({dest, Expert});
+            require(serialize_router_expert_metadata(decode_expert_binary(c, bytes)) == encode(data, {dest, Expert}),
+                    "binary/text expert roundtrip mismatch");
+            reject(bytes.substr(0, bytes.size() - 1), Expert);
+            auto corrupt = bytes; corrupt[0] ^= 1; reject(corrupt, Expert);
+            corrupt = bytes; corrupt[13 * 8] = 1; reject(corrupt, Expert); // nonzero first offset
+            reject(bytes + 'x', Expert);
+        }
+        auto bytes = pack_for_test({2, X3});
+        require(serialize_router_x3_metadata(decode_x3_binary(c, bytes)) == encode(data, {2, X3}),
+                "binary/text x3/x4 roundtrip mismatch");
+        reject(bytes.substr(0, 20), X3);
+        auto corrupt = bytes; corrupt.back() = 0; reject(corrupt, X3);
+
+        // Force short scatter/gather writes: advance correctly across all segment
+        // boundaries, including zero-length arrays, on a nonblocking socket.
+        int fds[2]; require(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "socketpair failed");
+        Socket sender(fds[0]), receiver(fds[1]); nonblocking(sender.fd); nonblocking(receiver.fd);
+        int small = 1024; setsockopt(sender.fd, SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+        std::string a(100003, 'a'), b(70001, 'b'), received;
+        Transfer t;
+        t.segments = {{a.data(), a.size()}, {nullptr, 0}, {b.data(), b.size()}};
+        t.output_bytes = a.size() + b.size();
+        auto until = deadline(5);
+        while (received.size() < t.output_bytes) {
+            remaining(until);
+            if (t.sent < t.output_bytes) t.sent += send_segments(sender.fd, t);
+            char buffer[113];
+            auto n = try_recv(receiver.fd, buffer, sizeof(buffer));
+            received.append(buffer, size_t(n));
+        }
+        require(t.sent == t.output_bytes && received == a + b, "partial sendmsg corrupted array bytes");
+        std::cout << "Binary codec and partial-send tests passed\n";
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << '\n'; return 1;
+    }
+}
+#endif

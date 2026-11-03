@@ -101,7 +101,7 @@ class ProcessTests(unittest.TestCase):
         self.assertIn("TCP operation timed out", result.stderr)
 
     def run_job(self, nodes, per_node, preserialized=False, num_tokens=137,
-                num_experts=16, top_k=4):
+                num_experts=16, top_k=4, wire_format="binary"):
         # Distinct node port ranges emulate hosts without loopback aliases.
         hosts = ["127.0.0.1"] * nodes
         with socket.socket() as probe:
@@ -121,6 +121,7 @@ class ProcessTests(unittest.TestCase):
                            "--hosts=" + ",".join(hosts), f"--gpus-per-node={per_node}",
                            f"--bind-host={hosts[rank // per_node]}", f"--port-base={port}",
                            f"--node-port-stride={per_node}",
+                           f"--wire-format={wire_format}",
                            f"--num-tokens={num_tokens}", f"--num-experts={num_experts}", f"--top-k={top_k}",
                            "--datasets=2", "--warmup=1", "--iterations=3", "--timeout=60",
                            f"--output={output}"]
@@ -135,6 +136,8 @@ class ProcessTests(unittest.TestCase):
                     self.assertEqual(code, 0, log.read())
                 report = json.loads(output.read_text())
                 self.assertEqual(report["backend"], "cpp")
+                self.assertEqual(report["wire_format"], wire_format)
+                self.assertEqual(report["configuration"]["wire_format"], wire_format)
                 self.assertEqual(report["configuration"]["timing_schema"], 2)
                 self.assertEqual(len(report["iterations"]), 3)
                 self.assertAlmostEqual(sum(stats["mean"] for stats in
@@ -158,7 +161,7 @@ class ProcessTests(unittest.TestCase):
                             for field in ("x3x4_deserialize_ms", "x3x4_validate_ms",
                                           "chunk_build_ms", "x3x4_record_install_ms"):
                                 self.assertEqual(breakdown[field], 0)
-                        else:
+                        elif num_tokens > 1:
                             self.assertGreater(breakdown["chunk_build_ms"], 0)
                         for field in b.STAGE_FIELDS:
                             self.assertGreaterEqual(result[field], 0)
@@ -182,6 +185,15 @@ class ProcessTests(unittest.TestCase):
 
     def test_preserialized(self):
         self.run_job(2, 2, preserialized=True)
+
+    def test_text_baseline(self):
+        self.run_job(2, 2, wire_format="text")
+
+    def test_text_preserialized(self):
+        self.run_job(2, 2, preserialized=True, wire_format="text")
+
+    def test_binary_empty_lists(self):
+        self.run_job(2, 2, num_tokens=1, top_k=1)
 
     def test_default_workload_sixteen_proxies(self):
         self.run_job(2, 8, num_tokens=20480, num_experts=128, top_k=8)

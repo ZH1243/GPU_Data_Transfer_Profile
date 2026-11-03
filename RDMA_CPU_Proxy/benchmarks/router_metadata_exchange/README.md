@@ -11,9 +11,9 @@ The experiment remains CPU-only: no CUDA, RDMA verbs, GPU allocations, actual
 token transfers, or GPU scheduler initialization. It reuses the main project's
 `RouterRouting` CPU generator, `protocol.cpp` serializers/deserializers, and
 `compute_chunks_from_token_indices()`. The standalone library does not initialize
-the full GPU/RDMA `Proxy` class. This first C++ version preserves the text protocol,
-self-table copy, and full validation to isolate the language/runtime change.
-Binary encoding and reference-only self installation are not enabled yet.
+the full GPU/RDMA `Proxy` class. Binary array transfer is now the default. `--wire-format=text` retains the original
+text baseline. Self-table copying and full validation remain enabled. Changes
+are confined to this benchmark; the production proxy protocol is unchanged.
 
 ## Build on both remote machines
 
@@ -107,15 +107,38 @@ topology) to each recipient. x3/x4 are sent only to matching local ranks on remo
 nodes. Self expert metadata is copied locally. For 16 processes, each iteration
 contains 240 directed expert messages and 16 directed x3/x4 messages.
 
-Message bodies use the production C++ decimal-text formats `router_expert_metadata_v1`
-and `router_x3_x4_v2`. A benchmark-specific network-order envelope contains two
-uint64 values: payload length and iteration number. The iteration number detects
-stale messages. These persistent benchmark channels are **not wire-compatible
-endpoints for a running production proxy**.
+Binary mode sends the existing contiguous array storage directly with `sendmsg()`
+scatter/gather I/O. A message consists of three segments: the framing/protocol
+header, the first array, and the second array. No decimal conversion or packed
+array copy occurs on the sender. Partial sends advance across segment boundaries.
+Input datasets stay alive until all sends finish.
+
+The 16-byte network-order envelope contains payload length and iteration number.
+The binary header contains a magic/version word, message kind, identities,
+dimensions, and array counts, all as big-endian uint64 fields. Expert messages
+have 13 header words; x3/x4 messages have 14. Arrays follow immediately:
+
+| Message | First array | Second array |
+|---|---|---|
+| Expert metadata | Little-endian `int32` offsets | Little-endian `int32` indices |
+| x3/x4 | Little-endian `uint64` x3 indices | `uint8` x4 masks |
+
+The x3 width matches the existing CPU `vector<size_t>` representation. Binary
+mode explicitly requires little-endian hosts with 64-bit `size_t` (the target
+Hopper hosts satisfy this). It does not transmit raw C++ structs or pointers.
+Header/count/length checks run before allocations and array access. The receiver
+currently receives into a byte buffer, allocates typed vectors, and copies array
+bytes into them before validation. This removes text parsing but is **not
+zero-copy reception**. The ordinary TCP stack may also copy bytes internally.
+
+Text mode uses production `router_expert_metadata_v1` / `router_x3_x4_v2` bodies
+with the same iteration envelope. All ranks must choose the same wire format;
+configuration exchange checks this before measurements. Neither benchmark mode
+is a wire-compatible endpoint for a running production proxy.
 
 A single nonblocking C++ `poll()` loop progresses sending and receiving on both
-metadata paths. They can overlap on the network; native serialization and
-parsing execute serially on each proxy thread. Socket addresses use IPv4. Received expert lists are validated
+metadata paths. They can overlap on the network; native header preparation/serialization and
+decoding execute serially on each proxy thread. Socket addresses use IPv4. Received expert lists are validated
 and attached to source-specific CPU records, including zeroed head/tail state.
 Received x3/x4 are validated, retained, and used to construct receive-chunk
 descriptions with the same fields as `compute_chunks_from_token_indices()`.
@@ -127,7 +150,8 @@ Each iteration has this sequence:
 
 1. Barrier on separate control sockets, outside timing.
 2. Start a local monotonic timer.
-3. Serialize all outgoing metadata (default mode).
+3. Prepare binary headers, or serialize outgoing text in text mode.
+   `--preserialized` moves this preparation outside timing.
 4. Copy the self expert table; frame and exchange peer messages.
 5. Decode, validate, and install all received CPU metadata.
 6. Stop after all local sends and all local installations complete.
@@ -139,7 +163,7 @@ Serialization, framing, poll descriptor setup, receive buffering, parsing, valid
 self installation, and receive-chunk construction are included. The receive
 tables are rebuilt on each iteration rather than updated in place.
 
-The report identifies `backend: "cpp"` and `wire_format: "text"` (in configuration),
+The report identifies `backend: "cpp"` and `wire_format: "binary"` or `"text"` (in configuration),
 and contains all measured per-rank/per-iteration records and:
 
 - `critical_rank_ms`: statistics of the **maximum rank-local elapsed time** for
@@ -156,11 +180,11 @@ Every per-rank record contains five non-overlapping local wall-time stages:
 
 | Field | Included work |
 |---|---|
-| `serialize_ms` | Outgoing text serialization, or cached-payload selection in pre-serialized mode |
+| `serialize_ms` | Binary protocol-header construction or outgoing text serialization; cached-header/payload selection in pre-serialized mode |
 | `self_install_ms` | Local expert-table copy and construction of its CPU record |
 | `communication_prepare_ms` | Frame buffers, receive state, poll descriptor construction, deadline setup |
 | `tcp_exchange_ms` | Exchange-loop elapsed time excluding receive processing: socket waits, sends/receives, buffering, envelope checks, poll bookkeeping, and final completeness check |
-| `receive_process_ms` | Sum of incoming-message text parsing, validation, CPU installation, and receive-chunk construction |
+| `receive_process_ms` | Sum of incoming binary decoding or text parsing, validation, CPU installation, and receive-chunk construction |
 
 The five stages sum to `elapsed_ms` for each sample. For compatibility,
 `install_ms` remains the sum of `self_install_ms` and `receive_process_ms`;
@@ -183,19 +207,20 @@ records contain `receive_process_breakdown_ms`. These nine substages sum to
 
 | Field | Included work |
 |---|---|
-| `expert_deserialize_ms` | Production expert deserializer: text parsing, vector allocation/filling, and its built-in header/offset/index validation |
+| `expert_deserialize_ms` | Binary decoding and array-byte copies, or production text parsing; includes vector allocation/filling and built-in header/offset/index validation |
 | `expert_validate_ms` | Additional source/destination/topology checks and per-expert index ordering checks |
 | `expert_record_install_ms` | Moving parsed expert vectors into the source-indexed map, including map-node allocation and duplicate-source check |
 | `expert_progress_init_ms` | Allocating/zeroing per-expert head/tail vectors and inserting their source record |
-| `x3x4_deserialize_ms` | Production x3/x4 deserializer: parsing, vector allocation/filling, and built-in validation |
+| `x3x4_deserialize_ms` | Binary decoding and array-byte copies, or production text parsing; includes vector allocation/filling and built-in validation |
 | `x3x4_validate_ms` | Additional source/destination/topology and tensor/chunk-configuration checks |
 | `chunk_build_ms` | `compute_chunks_from_token_indices()`: descriptor allocation/filling and copies of per-chunk source-token-index lists |
 | `x3x4_record_install_ms` | Moving parsed x3/x4 vectors and chunk descriptors into their source-indexed maps |
 | `overhead_ms` | Remaining time inside the parent receive-processing interval, including function entry/exit, temporary cleanup, and timing bookkeeping |
 
-Deserialization is **not pure text conversion**: validation and allocation are
-interleaved inside the existing production deserializers and remain timed as a
-unit. The explicit `*_validate_ms` fields cover only the additional checks after
+The `*_deserialize_ms` names are retained in both modes. In binary mode they
+measure fixed-header decoding, vector allocation, binary copies, and validation;
+there is no decimal parsing. In text mode, validation and allocation are
+interleaved inside the production deserializers and remain timed as a unit. The explicit `*_validate_ms` fields cover only the additional checks after
 deserialization. Timers do not change the validation policy or wire format.
 Self installation is excluded from this breakdown and remains `self_install_ms`.
 Single-node runs have zero x3/x4 and chunk-build times because no such messages
@@ -215,8 +240,9 @@ bash ./run_node0_torchrun.sh --preserialized
 bash ./run_node1_torchrun.sh --preserialized
 ```
 
-In this mode payloads are precomputed; framing and all receiver work remain
-timed. `serialize_ms` is then only the negligible cached-payload selection cost.
+In this mode binary headers or text payloads are precomputed; framing, socket
+I/O setup, and all receiver work remain timed. Binary arrays are already in DRAM
+in either mode, so `--preserialized` saves only small-header preparation for binary. `serialize_ms` is then only the negligible cached-payload selection cost.
 Do not interpret total time minus parsing time as pure network latency: work
 overlaps across ranks and socket progress includes C++ and OS overhead.
 
@@ -231,9 +257,10 @@ installation are benchmark implementations, not the full production proxy.
 
 All metadata arrays are native C++ vectors. Self installation copies the local
 expert vectors and initializes progress counters. Received vectors are moved
-into source-specific records after parsing/validation. Message framing still
-copies outgoing payloads; the text format still requires integer conversion.
-Those are deliberate baseline behaviors for later binary/reuse optimizations.
+into source-specific records after parsing/validation. Binary framing references the original arrays and copies only the small header;
+text mode still copies framed payloads and converts integers to/from text.
+Reference-only self installation and direct-to-vector reception remain possible
+future optimizations.
 GPU routing, D2H/H2D copies, and GPU scheduler initialization remain excluded.
 Compare C++ reports with prior Python reports as separate implementations; the
 Python selector implementation has been replaced by native `poll()`.
@@ -246,10 +273,13 @@ and CPU and changes cache state, although verification itself is outside timing.
 ## Local correctness tests
 
 ```bash
+ctest --test-dir build --output-on-failure
 python3 -m unittest discover -s . -p 'test_benchmark.py' -v
 ```
 
-Build the library first. Tests check expert membership after resolving compact indices, empty expert
+Build the library first. Native codec tests check binary/text equivalence,
+malformed payload rejection, and partial scatter/gather sends. Subprocess tests
+cover both wire formats and empty arrays. Additional tests check expert membership after resolving compact indices, empty expert
 lists, malformed metadata rejection, chunk construction, and real subprocess
 exchanges through the Python wrapper and C++ library. The small native runs
 use `--verify`; an additional test checks native timeout propagation to Python.
@@ -273,3 +303,15 @@ Run `python3 benchmark.py --help` for all benchmark arguments.
 
 `python_reference.py` is an independent metadata oracle for unit tests only;
 it is not imported by the benchmark worker.
+
+For a comparison, run both nodes once with the default binary mode and once with
+`--wire-format=text`, using different output paths. For example, on node 0:
+
+```bash
+RESULT_JSON=results/binary.json bash ./run_node0_torchrun.sh --wire-format=binary
+RESULT_JSON=results/text.json bash ./run_node0_torchrun.sh --wire-format=text
+```
+
+Run node 1 with the matching mode for each run. Upgrade/rebuild the library on
+both nodes: the Python/native C ABI is now version 2. Reports identify the wire
+format; timing field names remain stable for comparisons.
