@@ -27,3 +27,11 @@ if(BUILD_TESTING)
   add_test(NAME binary_codec COMMAND test_binary_codec)
   set_tests_properties(binary_codec PROPERTIES TIMEOUT 15)
 endif()
+
+# shm_open lived in librt on older Linux/glibc installations.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_libraries(router_metadata_bench PRIVATE rt)
+  if(BUILD_TESTING)
+    target_link_libraries(test_binary_codec PRIVATE rt)
+  endif()
+endif()

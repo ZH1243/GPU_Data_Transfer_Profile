@@ -28,6 +28,8 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -206,6 +208,7 @@ struct Config {
         require(a.hosts && a.bind_host && a.output, "null config string");
         require(!a.disable_expert_index_validation || a.binary,
                 "disabling expert index validation requires binary mode");
+        require(!a.local_shared_memory || a.binary, "shared memory requires binary mode");
         const uint32_t endian_probe = 1;
         require(!a.binary || (sizeof(size_t) == 8 && *reinterpret_cast<const uint8_t*>(&endian_probe) == 1),
                 "binary mode requires 64-bit size_t and little-endian hosts");
@@ -243,6 +246,7 @@ struct Config {
         FIELD(num_tokens); FIELD(num_experts); FIELD(top_k); FIELD(token_dimension);
         FIELD(element_bytes); FIELD(tokens_per_chunk); FIELD(datasets); FIELD(warmup);
         FIELD(iterations); FIELD(seed); FIELD(timeout);
+        out << ",\"local_shared_memory\":" << (a.local_shared_memory ? "true" : "false");
 #undef FIELD
         out << ",\"expert_index_validation_enabled\":" << (a.disable_expert_index_validation ? "false" : "true");
         out << ",\"preserialized\":" << (a.preserialized ? "true" : "false")
@@ -251,7 +255,8 @@ struct Config {
     }
 };
 std::vector<int> kinds(const Config& c, int left, int right) {
-    std::vector<int> result{Expert};
+    std::vector<int> result;
+    if (!c.a.local_shared_memory || c.node(left) != c.node(right)) result.push_back(Expert);
     if (c.gpu(left) == c.gpu(right)) result.push_back(X3);
     if (left == 0) result.push_back(Control);
     return result;
@@ -301,7 +306,12 @@ struct Mesh {
         auto until = deadline(c.a.timeout);
         if (c.a.rank) {
             send_message(controls.at(0).fd, tag + "\n" + value, until);
-            require(recv_message(controls.at(0).fd, until) == tag, "control phase mismatch");
+            auto reply = recv_message(controls.at(0).fd, until);
+            if (tag == "shm_run") {
+                require(reply.compare(0, tag.size() + 1, tag + "\n") == 0, "control phase mismatch");
+                return {reply.substr(tag.size() + 1)};
+            }
+            require(reply == tag, "control phase mismatch");
             return {};
         }
         std::vector<std::string> values{value};
@@ -313,8 +323,80 @@ struct Mesh {
         // Validate configuration before releasing other ranks.
         if (tag == "configuration")
             for (const auto& v : values) require(v == value, "ranks have different configurations");
-        for (int peer = 1; peer < c.a.world; ++peer) send_message(controls.at(peer).fd, tag, until);
+        for (int peer = 1; peer < c.a.world; ++peer) send_message(controls.at(peer).fd, tag == "shm_run" ? tag + "\n" + value : tag, until);
+        if (tag == "shm_run") return {value};
         return values;
+    }
+};
+// Each source owns one arena. Destination slices together are bounded by T*K,
+// avoiding a worst-case T*K allocation for every source/destination pair.
+// Payloads are immutable until the existing global completion barrier releases.
+struct LocalMemory {
+    struct alignas(64) Header {
+        uint64_t sequence;
+        uint64_t counts[8];
+    };
+    std::string name;
+    void* base = MAP_FAILED;
+    size_t bytes = 0, stride = 0;
+    bool owner = false;
+    LocalMemory() = default;
+    LocalMemory(const LocalMemory&) = delete;
+    ~LocalMemory() {
+        if (base != MAP_FAILED) munmap(base, bytes);
+        if (owner) shm_unlink(name.c_str());
+    }
+    Header* header(int source_gpu) const {
+        return reinterpret_cast<Header*>(static_cast<char*>(base) + stride * source_gpu);
+    }
+    int32_t* offsets(int source_gpu) const {
+        return reinterpret_cast<int32_t*>(reinterpret_cast<char*>(header(source_gpu)) + sizeof(Header));
+    }
+    int32_t* indices(const Config& c, int source_gpu) const {
+        return offsets(source_gpu) + c.a.gpus_per_node * (c.epg() + 1);
+    }
+    void initialize(const Config& c, Mesh& mesh) {
+        if (!c.a.local_shared_memory) return;
+        static_assert(__atomic_always_lock_free(sizeof(uint64_t), nullptr),
+                      "shared sequence requires lock-free 64-bit atomics");
+        std::ostringstream id;
+        id << std::hex << getpid() << "_" << Clock::now().time_since_epoch().count();
+        auto identity = mesh.gather(c, "shm_run", id.str()).front();
+        name = "/rmeta_" + identity + "_" + std::to_string(c.node(c.a.rank));
+        stride = (sizeof(Header) + sizeof(int32_t) *
+            (size_t(c.a.gpus_per_node) * (c.epg() + 1) + size_t(c.a.num_tokens) * c.a.top_k) + 63) & ~size_t(63);
+        require(stride <= std::numeric_limits<size_t>::max() / c.a.gpus_per_node, "shared memory size overflow");
+        bytes = stride * c.a.gpus_per_node;
+        auto until = deadline(c.a.timeout);
+        Socket fd;
+        if (c.gpu(c.a.rank) == 0) {
+            fd = Socket(shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600));
+            require(fd.fd >= 0, "cannot create metadata shared memory: " + std::string(std::strerror(errno)));
+            owner = true;
+            require(ftruncate(fd.fd, static_cast<off_t>(bytes)) == 0, "cannot size metadata shared memory");
+        } else {
+            for (;;) {
+                fd = Socket(shm_open(name.c_str(), O_RDWR, 0600));
+                if (fd.fd >= 0) break;
+                require(errno == ENOENT, "cannot open metadata shared memory");
+                remaining(until);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            for (;;) {
+                struct stat st{};
+                require(fstat(fd.fd, &st) == 0, "cannot stat metadata shared memory");
+                if (st.st_size >= static_cast<off_t>(bytes)) break;
+                remaining(until);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        base = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd.fd, 0);
+        require(base != MAP_FAILED, "cannot map metadata shared memory");
+        // Each process prefaults only its own arena; no concurrent initialization writes.
+        std::memset(header(c.gpu(c.a.rank)), 0, stride);
+        mesh.gather(c, "shm_mapped", "");
+        // All ranks now hold mappings; unlink early so killed runs leave no named object.
+        if (owner) { require(shm_unlink(name.c_str()) == 0, "cannot unlink metadata shared memory"); owner = false; }
     }
 };
 struct Dataset {
@@ -518,13 +600,13 @@ struct Record {
     int rank = 0;
     std::array<double, 6> times{};
     ReceiveTimes receive_times{};
-    uint64_t sent = 0, received = 0, experts = 0, nodes = 0;
+    uint64_t sent = 0, received = 0, experts = 0, nodes = 0, shm_sent = 0, shm_received = 0;
     std::string wire() const {
         std::ostringstream out; out << std::setprecision(17) << rank;
         for (double t : times) out << ' ' << t;
         for (double t : receive_times) out << ' ' << t;
         out << ' ' << receive_times.expert_index_bounds_ms;
-        out << ' ' << sent << ' ' << received << ' ' << experts << ' ' << nodes;
+        out << ' ' << sent << ' ' << received << ' ' << experts << ' ' << nodes << ' ' << shm_sent << ' ' << shm_received;
         return out.str();
     }
     static Record parse(const std::string& text) {
@@ -532,7 +614,7 @@ struct Record {
         for (double& t : r.times) in >> t;
         for (double& t : r.receive_times) in >> t;
         in >> r.receive_times.expert_index_bounds_ms;
-        require(bool(in >> r.sent >> r.received >> r.experts >> r.nodes), "invalid timing record");
+        require(bool(in >> r.sent >> r.received >> r.experts >> r.nodes >> r.shm_sent >> r.shm_received), "invalid timing record");
         return r;
     }
     std::string json() const {
@@ -546,7 +628,9 @@ struct Record {
         out << '}';
         out << ",\"expert_index_bounds_ms\":" << receive_times.expert_index_bounds_ms;
         out << ",\"install_ms\":" << times[2] + times[5] << ",\"sent_bytes\":" << sent
-            << ",\"received_bytes\":" << received << ",\"installed_expert_sources\":" << experts
+            << ",\"received_bytes\":" << received << ",\"shm_sent_bytes\":" << shm_sent << ",\"shm_received_bytes\":" << shm_received
+            << ",\"exchange_ms\":" << times[4]
+            << ",\"installed_expert_sources\":" << experts
             << ",\"installed_x3x4_sources\":" << nodes << '}';
         return out.str();
     }
@@ -628,7 +712,7 @@ bool direct_arrays_complete(Transfer& t) {
     }
     return t.array_index == t.receive_arrays.size();
 }
-std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, const Dataset& data, uint64_t iteration, Installed installed) {
+std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& local, const Dataset& data, uint64_t iteration, Installed installed) {
     auto started = Clock::now();
     std::map<Key, std::string> serialized_payloads;
     if (!c.a.preserialized)
@@ -673,10 +757,72 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, const Dataset
     const uint64_t max_payload = 4096 + (uint64_t(c.a.num_tokens) * c.a.top_k + c.epg() + 1) * 32;
     double receive_ms = 0;
     ReceiveTimes receive_times{};
+    std::array<bool, 8> local_done{};
+    size_t local_pending = c.a.local_shared_memory ? c.a.gpus_per_node - 1 : 0;
+    uint64_t shm_sent = 0, shm_received = 0;
     auto prepared = Clock::now();
-    while (pending) {
-        int rc = poll(descriptors.data(), descriptors.size(), remaining(until));
+    if (c.a.local_shared_memory) {
+        int gpu = c.gpu(c.a.rank);
+        auto* h = local.header(gpu);
+        size_t cursor = 0;
+        for (int dest = 0; dest < c.a.gpus_per_node; ++dest) {
+            h->counts[dest] = 0;
+            if (dest == gpu) continue;
+            const auto& m = data.experts.at(c.node(c.a.rank) * c.a.gpus_per_node + dest);
+            require(m.expert_token_indices.size() <= size_t(c.a.num_tokens) * c.a.top_k - cursor,
+                    "shared-memory producer capacity exceeded");
+            require(m.expert_offsets.size() == size_t(c.epg() + 1), "invalid producer offsets");
+            h->counts[dest] = m.expert_token_indices.size();
+            std::copy(m.expert_offsets.begin(), m.expert_offsets.end(), local.offsets(gpu) + dest * (c.epg() + 1));
+            std::copy(m.expert_token_indices.begin(), m.expert_token_indices.end(), local.indices(c, gpu) + cursor);
+            cursor += m.expert_token_indices.size();
+            shm_sent += (m.expert_offsets.size() + m.expert_token_indices.size()) * sizeof(int32_t);
+        }
+        __atomic_store_n(&h->sequence, iteration + 1, __ATOMIC_RELEASE);
+    }
+    while (pending || local_pending) {
+        // Never block on sockets while a shared-memory producer may publish.
+        int wait_ms = remaining(until);
+        if (local_pending) {
+            for (int gpu = 0; gpu < c.a.gpus_per_node; ++gpu) {
+                if (gpu == c.gpu(c.a.rank) || local_done[gpu]) continue;
+                auto* h = local.header(gpu);
+                auto sequence = __atomic_load_n(&h->sequence, __ATOMIC_ACQUIRE);
+                require(sequence <= iteration + 1, "future shared-memory iteration");
+                if (sequence != iteration + 1) continue;
+                size_t cursor = 0, total = 0;
+                for (int d = 0; d < c.a.gpus_per_node; ++d) {
+                    require(h->counts[d] <= size_t(c.a.num_tokens) * c.a.top_k - total, "invalid shared-memory count");
+                    total += h->counts[d];
+                    if (d < c.gpu(c.a.rank)) cursor += h->counts[d];
+                }
+                auto before = Clock::now();
+                int source = c.node(c.a.rank) * c.a.gpus_per_node + gpu;
+                auto& m = installed.experts.at(source);
+                m.source_node_rank = c.node(source); m.source_gpu_index = gpu;
+                m.destination_node_rank = c.node(c.a.rank); m.destination_gpu_index = c.gpu(c.a.rank);
+                m.num_nodes = c.hosts.size(); m.num_gpus_per_node = c.a.gpus_per_node;
+                m.num_experts = c.a.num_experts; m.experts_per_gpu = c.epg();
+                m.first_global_expert = c.a.rank * c.epg(); m.num_tokens = c.a.num_tokens;
+                resize_reserved(m.expert_offsets, c.epg() + 1);
+                resize_reserved(m.expert_token_indices, h->counts[c.gpu(c.a.rank)]);
+                double decode_ms = ms(Clock::now(), before);
+                receive_times[0] += decode_ms; receive_ms += decode_ms;
+                auto* offsets = local.offsets(gpu) + c.gpu(c.a.rank) * (c.epg() + 1);
+                std::copy_n(offsets, m.expert_offsets.size(), m.expert_offsets.data());
+                std::copy_n(local.indices(c, gpu) + cursor, m.expert_token_indices.size(), m.expert_token_indices.data());
+                shm_received += (m.expert_offsets.size() + m.expert_token_indices.size()) * sizeof(int32_t);
+                before = Clock::now();
+                install(c, {source, Expert}, "", installed, receive_times);
+                receive_ms += ms(Clock::now(), before);
+                local_done[gpu] = true; --local_pending;
+            }
+            wait_ms = 0;
+        }
+        if (!pending) continue;
+        int rc = poll(descriptors.data(), descriptors.size(), wait_ms);
         if (rc < 0 && errno == EINTR) continue;
+        if (rc == 0 && wait_ms == 0) continue;
         require(rc > 0, rc == 0 ? "metadata exchange timed out" : "exchange poll failed");
         for (size_t i = 0; i < transfers.size(); ++i) {
             auto& p = descriptors[i]; auto& t = transfers[i];
@@ -734,6 +880,7 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, const Dataset
     receive_times.back() = receive_ms - std::accumulate(receive_times.begin(), receive_times.end() - 1, 0.0);
     Record r; r.rank = c.a.rank;
     r.receive_times = receive_times;
+    r.shm_sent = shm_sent; r.shm_received = shm_received;
     r.times = {ms(finished, started), ms(serialized, started), ms(self_installed, serialized),
                ms(prepared, self_installed), ms(finished, prepared) - receive_ms, receive_ms};
     r.experts = installed.experts.size(); r.nodes = installed.nodes.size();
@@ -791,6 +938,7 @@ void report(const Config& c, const std::vector<std::vector<Record>>& records) {
         ",\"critical_rank_receive_process_ms\":" + receive_summary(critical) +
         ",\"critical_rank_expert_index_bounds_ms\":" + index_bounds_summary(critical) +
         ",\"expert_index_validation_enabled\":" + (c.a.disable_expert_index_validation ? "false" : "true") +
+        ",\"local_shared_memory\":" + (c.a.local_shared_memory ? "true" : "false") +
         ",\"backend\":\"cpp\",\"wire_format\":" + quote(c.a.binary ? "binary" : "text") + ",\"mode\":" + quote(c.a.preserialized ? "preserialized" : "serialize-in-timer");
     std::cout << pretty('{' + common + '}') << std::endl;
     if (!*c.a.output) return;
@@ -819,6 +967,8 @@ int run(const RouterMetadataBenchConfig& raw) {
     Logger::instance().set_level(LogLevel::kError);
     Mesh mesh(c);
     mesh.gather(c, "configuration", c.json());
+    LocalMemory local;
+    local.initialize(c, mesh);
     if (!c.a.rank) std::cout << "Connected " << c.a.world << " C++ CPU proxies; preparing "
                             << c.a.datasets << " routing datasets per rank" << std::endl;
     std::vector<Dataset> datasets;
@@ -844,7 +994,7 @@ int run(const RouterMetadataBenchConfig& raw) {
     for (int iteration = 0; iteration < c.a.warmup + c.a.iterations; ++iteration) {
         int d = iteration % c.a.datasets;
         mesh.gather(c, "start:" + std::to_string(iteration), "");
-        auto result = exchange(c, mesh, datasets[d], iteration, std::move(reusable));
+        auto result = exchange(c, mesh, local, datasets[d], iteration, std::move(reusable));
         if (c.a.verify) {
             for (const auto& [source, metadata] : result.second.experts)
                 require(serialize_router_expert_metadata(metadata) == expected[d].at({source, Expert}), "expert content verification failed");
@@ -864,7 +1014,7 @@ int run(const RouterMetadataBenchConfig& raw) {
 }
 } // namespace
 
-extern "C" uint32_t router_metadata_bench_abi_version() { return 3; }
+extern "C" uint32_t router_metadata_bench_abi_version() { return 4; }
 extern "C" int router_metadata_bench_run(const RouterMetadataBenchConfig* config, char* error, size_t capacity) {
     if (error && capacity) error[0] = '\0';
     try {

@@ -101,7 +101,7 @@ class ProcessTests(unittest.TestCase):
         self.assertIn("TCP operation timed out", result.stderr)
 
     def run_job(self, nodes, per_node, preserialized=False, num_tokens=137,
-                num_experts=16, top_k=4, wire_format="binary", disable_validation=False):
+                num_experts=16, top_k=4, wire_format="binary", disable_validation=False, local_shared_memory=False):
         # Distinct node port ranges emulate hosts without loopback aliases.
         hosts = ["127.0.0.1"] * nodes
         with socket.socket() as probe:
@@ -125,6 +125,8 @@ class ProcessTests(unittest.TestCase):
                            f"--num-tokens={num_tokens}", f"--num-experts={num_experts}", f"--top-k={top_k}",
                            "--datasets=2", "--warmup=1", "--iterations=3", "--timeout=60",
                            f"--output={output}"]
+                    if local_shared_memory:
+                        cmd.append("--local-shared-memory")
                     if preserialized:
                         cmd.append("--preserialized")
                     if disable_validation:
@@ -138,6 +140,7 @@ class ProcessTests(unittest.TestCase):
                     self.assertEqual(code, 0, log.read())
                 report = json.loads(output.read_text())
                 self.assertEqual(report["backend"], "cpp")
+                self.assertEqual(report["configuration"]["local_shared_memory"], local_shared_memory)
                 self.assertEqual(report["expert_index_validation_enabled"], not disable_validation)
                 self.assertEqual(report["configuration"]["expert_index_validation_enabled"], not disable_validation)
                 self.assertEqual(report["wire_format"], wire_format)
@@ -157,7 +160,16 @@ class ProcessTests(unittest.TestCase):
                                        report["critical_rank_ms"]["mean"], places=7)
                 for row in report["iterations"]:
                     self.assertEqual(sum(r["sent_bytes"] for r in row), sum(r["received_bytes"] for r in row))
+                    self.assertEqual(sum(r["shm_sent_bytes"] for r in row),
+                                     sum(r["shm_received_bytes"] for r in row))
+                    if local_shared_memory and per_node > 1:
+                        self.assertGreater(sum(r["shm_sent_bytes"] for r in row), 0)
+                    else:
+                        self.assertEqual(sum(r["shm_sent_bytes"] for r in row), 0)
+                    if local_shared_memory and nodes == 1:
+                        self.assertEqual(sum(r["sent_bytes"] + r["received_bytes"] for r in row), 0)
                     for result in row:
+                        self.assertEqual(result["exchange_ms"], result["tcp_exchange_ms"])
                         self.assertEqual(result["installed_expert_sources"], nodes * per_node)
                         self.assertEqual(result["installed_x3x4_sources"], nodes - 1)
                         self.assertGreater(result["elapsed_ms"], 0)
@@ -189,6 +201,32 @@ class ProcessTests(unittest.TestCase):
                     process.wait()
                 for log in logs:
                     log.close()
+
+    def test_shared_memory_local_only(self):
+        self.run_job(1, 4, local_shared_memory=True)
+
+    def test_shared_memory_hybrid(self):
+        self.run_job(2, 2, local_shared_memory=True)
+
+    def test_shared_memory_preserialized_validation_disabled(self):
+        self.run_job(2, 2, preserialized=True, disable_validation=True, local_shared_memory=True)
+
+    def test_shared_memory_empty_lists(self):
+        self.run_job(2, 2, num_tokens=1, top_k=1, local_shared_memory=True)
+
+    def test_shared_memory_single_proxy_per_node(self):
+        self.run_job(2, 1, local_shared_memory=True)
+
+    def test_shared_memory_default_workload(self):
+        self.run_job(2, 8, num_tokens=20480, num_experts=128, top_k=8, local_shared_memory=True)
+
+    def test_shared_memory_rejects_text(self):
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("benchmark.py")),
+             "--hosts=127.0.0.1", "--local-shared-memory", "--wire-format=text"],
+            capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--local-shared-memory requires --wire-format=binary", result.stderr)
 
     def test_four_local_proxies(self):
         self.run_job(1, 4)

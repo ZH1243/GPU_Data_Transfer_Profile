@@ -87,9 +87,77 @@ not the RDMA device mapping from the main proxy test. For meaningful measurement
 use the intended network interface, an otherwise quiet machine, and consistent
 CPU/NUMA placement. This benchmark does not pin processes automatically.
 
+## Optional within-node shared memory
+
+Rebuild the library and update `benchmark.py` on both nodes (C ABI version 4).
+The default remains all-TCP. To replace local expert-metadata TCP connections
+with shared host memory, pass `--local-shared-memory` on **both nodes**:
+
+```bash
+# Node 0, from this benchmark directory
+RESULT_JSON=results/shared_memory.json bash ./run_node0_torchrun.sh \
+  --local-shared-memory --disable-expert-index-validation
+
+# Node 1
+bash ./run_node1_torchrun.sh \
+  --local-shared-memory --disable-expert-index-validation
+```
+
+This option requires binary mode. Remote expert metadata and x3/x4 still use
+TCP, self metadata still uses the existing local copy, and control collectives
+still use TCP outside timing. For eight proxies per node, each proxy replaces
+seven local expert channels, retaining eight remote expert channels and one
+remote x3/x4 channel. Use matching options on every rank; topology-affecting
+option mismatches can fail during connection setup before configuration checking.
+
+One POSIX shared-memory region is created per logical node. A unique identity
+is distributed through the control mesh; no manual run ID is required. Each
+source owns a cache-line-aligned arena containing packed destination slices,
+counts, and a release/acquire sequence counter. Capacity is bounded by
+`num_tokens * top_k` indices per source across all local destinations, rather
+than reserving that bound per destination. Default shared storage is about
+5 MiB per node. Local workers must share the same POSIX shared-memory namespace
+and permissions; Linux containers need sufficient `/dev/shm` capacity.
+
+Allocation, mapping, and producer-arena prefaulting occur before timing. Each
+iteration copies current dataset arrays into shared memory **inside timing**,
+then publishes them. Receivers copy their slices into reusable CPU records and
+apply the same validation policy as TCP reception. The existing global
+completion collective prevents overwrite until every reader has finished.
+The region is unlinked after all workers map it and unmapped on teardown;
+exception cleanup also unlinks a region owned by that worker. An uncatchable
+termination during initial setup can leave a named object, but a new run uses
+a different identity.
+
+While local arrivals are pending, the proxy scans sequence counters and polls
+remote sockets without blocking. After local reception completes, normal
+blocking socket polling resumes. This intentionally consumes CPU while waiting
+for local producers; keep CPU/NUMA placement consistent in comparisons.
+
+Reports include `local_shared_memory` in configuration. Per-iteration
+`shm_sent_bytes` / `shm_received_bytes` count offsets and indices copied through
+shared memory (excluding publication fields). Existing `sent_bytes` /
+`received_bytes` count only TCP metadata wire bytes. A single-node shared-memory
+run therefore has zero TCP metadata bytes, although control traffic remains.
+
+For compatibility, `tcp_exchange_ms` retains its field name but, with this
+option, measures **the combined TCP/shared-memory exchange stage**, including
+shared payload copies and readiness polling, excluding receive processing.
+Each per-rank record also exposes the same value as `exchange_ms`; these are
+aliases and must not be added together. The five existing stages still sum to
+`elapsed_ms`. Compare `critical_rank_ms` for end-to-end benefit rather than
+interpreting the legacy stage name as isolated TCP time.
+
+For correctness, add `--verify` on both nodes to compare every received table
+against source-specific expected data outside timing. Local subprocess tests
+cover repeated datasets, local-only and hybrid transports, empty lists,
+pre-serialized mode, disabled validation, one proxy per node, and 16 proxies
+with the default workload. These are CPU correctness tests, not Hopper
+performance measurements.
+
 ## Protocol and input fidelity
 
-Every process establishes a full-duplex persistent expert-metadata connection
+By default, every process establishes a full-duplex persistent expert-metadata connection
 with every other process. Matching local ranks on different nodes additionally
 establish a separate x3/x4 connection. Same-node expert messages use IPv4
 loopback; remote messages use `--hosts`. Control synchronization has separate
@@ -322,7 +390,7 @@ RESULT_JSON=results/text.json bash ./run_node0_torchrun.sh --wire-format=text
 ```
 
 Run node 1 with the matching mode for each run. Upgrade/rebuild the library on
-both nodes: the Python/native C ABI is now version 3. Reports identify the wire
+both nodes: the Python/native C ABI is now version 4. Reports identify the wire
 format; timing field names remain stable for comparisons.
 
 For direct binary reception, time inside socket `recv()` calls belongs to
@@ -330,8 +398,8 @@ For direct binary reception, time inside socket `recv()` calls belongs to
 validation belong to the corresponding `*_deserialize_ms` field. The latter now
 sums work before and after the array transfers; it excludes waiting for bytes.
 `configuration.receive_storage` is `direct_reusable_vectors` for binary and
-`payload_buffer` for text. The binary wire format and C ABI are unchanged, but
-rebuild both nodes for comparable timing/schema reports. Native tests check
+`payload_buffer` for text. The binary wire format is unchanged; the current wrapper requires C ABI
+version 4. Rebuild both nodes for comparable timing/schema reports. Native tests check
 that receive-array addresses stay stable across changing routing datasets.
 
 ### Isolated expert index-bounds scan
@@ -380,7 +448,7 @@ still includes identity/configuration checks, so neither parent stage should
 be expected to become zero. If `--verify` is also enabled, exact-content checks
 still run outside the timed interval.
 
-Rebuild on both nodes before using the updated wrapper (C ABI version 3):
+Rebuild on both nodes before using the updated wrapper (C ABI version 4):
 
 ```bash
 cmake --build build -j
