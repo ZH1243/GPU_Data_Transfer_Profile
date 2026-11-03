@@ -135,7 +135,11 @@ class ProcessTests(unittest.TestCase):
                     self.assertEqual(code, 0, log.read())
                 report = json.loads(output.read_text())
                 self.assertEqual(report["backend"], "cpp")
+                self.assertEqual(report["configuration"]["timing_schema"], 2)
                 self.assertEqual(len(report["iterations"]), 3)
+                self.assertAlmostEqual(sum(stats["mean"] for stats in
+                                           report["critical_rank_receive_process_ms"].values()),
+                                       report["critical_rank_stage_ms"]["receive_process_ms"]["mean"], places=7)
                 self.assertAlmostEqual(sum(report["critical_rank_stage_ms"][field]["mean"]
                                            for field in b.STAGE_FIELDS),
                                        report["critical_rank_ms"]["mean"], places=7)
@@ -145,6 +149,17 @@ class ProcessTests(unittest.TestCase):
                         self.assertEqual(result["installed_expert_sources"], nodes * per_node)
                         self.assertEqual(result["installed_x3x4_sources"], nodes - 1)
                         self.assertGreater(result["elapsed_ms"], 0)
+                        breakdown = result["receive_process_breakdown_ms"]
+                        self.assertEqual(len(breakdown), 9)
+                        for value in breakdown.values():
+                            self.assertGreaterEqual(value, 0)
+                        self.assertAlmostEqual(sum(breakdown.values()), result["receive_process_ms"], places=7)
+                        if nodes == 1:
+                            for field in ("x3x4_deserialize_ms", "x3x4_validate_ms",
+                                          "chunk_build_ms", "x3x4_record_install_ms"):
+                                self.assertEqual(breakdown[field], 0)
+                        else:
+                            self.assertGreater(breakdown["chunk_build_ms"], 0)
                         for field in b.STAGE_FIELDS:
                             self.assertGreaterEqual(result[field], 0)
                         self.assertAlmostEqual(sum(result[field] for field in b.STAGE_FIELDS),

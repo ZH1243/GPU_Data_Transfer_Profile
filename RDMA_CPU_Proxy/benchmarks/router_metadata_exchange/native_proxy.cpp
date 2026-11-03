@@ -39,6 +39,11 @@ constexpr int Expert = 0, X3 = 1, Control = 2;
 constexpr size_t FrameBytes = 16;
 const std::array<const char*, 6> Fields = {"elapsed_ms", "serialize_ms", "self_install_ms",
     "communication_prepare_ms", "tcp_exchange_ms", "receive_process_ms"};
+const std::array<const char*, 9> ReceiveFields = {
+    "expert_deserialize_ms", "expert_validate_ms", "expert_record_install_ms",
+    "expert_progress_init_ms", "x3x4_deserialize_ms", "x3x4_validate_ms",
+    "chunk_build_ms", "x3x4_record_install_ms", "overhead_ms"};
+using ReceiveTimes = std::array<double, ReceiveFields.size()>;
 void require(bool value, const std::string& message) {
     if (!value) throw std::runtime_error(message);
 }
@@ -219,7 +224,7 @@ struct Config {
     int epg() const { return a.num_experts / a.world; }
     std::string json() const {
         std::ostringstream out;
-        out << "{\"backend\":\"cpp\",\"wire_format\":\"text\",\"hosts\":[";
+        out << "{\"backend\":\"cpp\",\"timing_schema\":2,\"wire_format\":\"text\",\"hosts\":[";
         for (size_t i = 0; i < hosts.size(); ++i) { if (i) out << ','; out << quote(hosts[i]); }
         out << ']';
 #define FIELD(name) out << ",\"" #name "\":" << a.name
@@ -340,10 +345,17 @@ struct Installed {
     std::map<int, std::vector<ChunkDescriptor>> chunks;
     std::map<int, std::pair<std::vector<int32_t>, std::vector<int32_t>>> progress;
 };
-void install(const Config& c, Key key, const std::string& payload, Installed& installed) {
+void install(const Config& c, Key key, const std::string& payload, Installed& installed, ReceiveTimes& times) {
+    auto previous = Clock::now();
+    auto mark = [&](size_t field) {
+        auto now = Clock::now();
+        times[field] += ms(now, previous);
+        previous = now;
+    };
     int source = key.first;
     if (key.second == Expert) {
         auto m = deserialize_router_expert_metadata(payload, c.a.num_tokens, size_t(c.a.num_tokens) * c.a.top_k);
+        mark(0);
         require(m.source_node_rank == c.node(source) && m.source_gpu_index == c.gpu(source) &&
                 m.destination_node_rank == c.node(c.a.rank) && m.destination_gpu_index == c.gpu(c.a.rank) &&
                 m.num_nodes == int(c.hosts.size()) && m.num_gpus_per_node == c.a.gpus_per_node &&
@@ -353,40 +365,56 @@ void install(const Config& c, Key key, const std::string& payload, Installed& in
         for (int e = 0; e < c.epg(); ++e)
             require(std::is_sorted(m.expert_token_indices.begin() + m.expert_offsets[e],
                                    m.expert_token_indices.begin() + m.expert_offsets[e + 1]), "unsorted expert indices");
+        mark(1);
         require(installed.experts.emplace(source, std::move(m)).second, "duplicate expert source");
+        mark(2);
         installed.progress.emplace(source, std::make_pair(std::vector<int32_t>(c.epg()), std::vector<int32_t>(c.epg())));
+        mark(3);
     } else {
         auto m = deserialize_router_x3_metadata(payload, c.a.num_tokens);
+        mark(4);
         require(m.source_node_rank == c.node(source) && m.destination_node_rank == c.node(c.a.rank) &&
                 m.local_gpu_index == c.gpu(c.a.rank) && c.gpu(source) == c.gpu(c.a.rank) &&
                 m.num_nodes == int(c.hosts.size()) && m.num_gpus_per_node == c.a.gpus_per_node &&
                 m.num_experts == c.a.num_experts && m.top_k == c.a.top_k && m.num_tokens == size_t(c.a.num_tokens) &&
                 m.token_dimension == size_t(c.a.token_dimension) && m.element_bytes == size_t(c.a.element_bytes) &&
                 m.tokens_per_chunk == size_t(c.a.tokens_per_chunk), "x3/x4 identity/dimensions mismatch");
+        mark(5);
         auto chunks = compute_chunks_from_token_indices(m.token_indices, m.token_dimension, m.element_bytes, m.tokens_per_chunk, 1);
+        mark(6);
         require(installed.nodes.emplace(source, std::move(m)).second, "duplicate x3/x4 source");
         installed.chunks.emplace(source, std::move(chunks));
+        mark(7);
     }
 }
 struct Record {
     int rank = 0;
     std::array<double, 6> times{};
+    ReceiveTimes receive_times{};
     uint64_t sent = 0, received = 0, experts = 0, nodes = 0;
     std::string wire() const {
         std::ostringstream out; out << std::setprecision(17) << rank;
         for (double t : times) out << ' ' << t;
+        for (double t : receive_times) out << ' ' << t;
         out << ' ' << sent << ' ' << received << ' ' << experts << ' ' << nodes;
         return out.str();
     }
     static Record parse(const std::string& text) {
         Record r; std::istringstream in(text); in >> r.rank;
         for (double& t : r.times) in >> t;
+        for (double& t : r.receive_times) in >> t;
         require(bool(in >> r.sent >> r.received >> r.experts >> r.nodes), "invalid timing record");
         return r;
     }
     std::string json() const {
         std::ostringstream out; out << std::setprecision(17) << "{\"rank\":" << rank;
         for (size_t i = 0; i < times.size(); ++i) out << ',' << quote(Fields[i]) << ':' << times[i];
+        out << ",\"receive_process_breakdown_ms\":{";
+        for (size_t i = 0; i < receive_times.size(); ++i) {
+            if (i) out << ',';
+            out << quote(ReceiveFields[i]) << ':' << receive_times[i];
+        }
+        out << '}';
         out << ",\"install_ms\":" << times[2] + times[5] << ",\"sent_bytes\":" << sent
             << ",\"received_bytes\":" << received << ",\"installed_expert_sources\":" << experts
             << ",\"installed_x3x4_sources\":" << nodes << '}';
@@ -425,6 +453,7 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, const Dataset
     size_t pending = transfers.size();
     const uint64_t max_payload = 4096 + (uint64_t(c.a.num_tokens) * c.a.top_k + c.epg() + 1) * 32;
     double receive_ms = 0;
+    ReceiveTimes receive_times{};
     auto prepared = Clock::now();
     while (pending) {
         int rc = poll(descriptors.data(), descriptors.size(), remaining(until));
@@ -447,7 +476,7 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, const Dataset
                 } else {
                     t.received += try_recv(p.fd, &t.input[t.received], std::min(size_t(262144), t.input.size() - t.received));
                     if (t.received == t.input.size()) {
-                        auto before = Clock::now(); install(c, t.key, t.input, installed);
+                        auto before = Clock::now(); install(c, t.key, t.input, installed, receive_times);
                         receive_ms += ms(Clock::now(), before); t.done = true;
                     }
                 }
@@ -460,7 +489,11 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, const Dataset
     require(installed.experts.size() == size_t(c.a.world) && installed.nodes.size() == c.hosts.size() - 1,
             "incomplete installed metadata");
     auto finished = Clock::now();
+    // Function entry/exit, temporary destruction, and instrumentation bookkeeping
+    // are retained as a residual so the receive substages sum to the parent.
+    receive_times.back() = receive_ms - std::accumulate(receive_times.begin(), receive_times.end() - 1, 0.0);
     Record r; r.rank = c.a.rank;
+    r.receive_times = receive_times;
     r.times = {ms(finished, started), ms(serialized, started), ms(self_installed, serialized),
                ms(prepared, self_installed), ms(finished, prepared) - receive_ms, receive_ms};
     r.experts = installed.experts.size(); r.nodes = installed.nodes.size();
@@ -478,6 +511,16 @@ std::string summary(std::vector<double> values) {
         << ",\"p99\":" << values[size_t(std::ceil(n * .99)) - 1] << ",\"max\":" << values.back() << '}';
     return out.str();
 }
+std::string receive_summary(const std::vector<Record>& rows) {
+    std::ostringstream out; out << '{';
+    for (size_t field = 0; field < ReceiveFields.size(); ++field) {
+        if (field) out << ',';
+        std::vector<double> values;
+        for (const auto& row : rows) values.push_back(row.receive_times[field]);
+        out << quote(ReceiveFields[field]) << ':' << summary(values);
+    }
+    out << '}'; return out.str();
+}
 std::string stage_summary(const std::vector<Record>& rows, bool full) {
     std::ostringstream out; out << '{';
     for (size_t field = full ? 0 : 1; field < Fields.size(); ++field) {
@@ -488,6 +531,7 @@ std::string stage_summary(const std::vector<Record>& rows, bool full) {
     if (full) {
         std::vector<double> values; for (const auto& row : rows) values.push_back(row.times[2] + row.times[5]);
         out << ",\"install_ms\":" << summary(values);
+        out << ",\"receive_process_breakdown_ms\":" << receive_summary(rows);
     }
     out << '}'; return out.str();
 }
@@ -498,6 +542,7 @@ void report(const Config& c, const std::vector<std::vector<Record>>& records) {
     std::vector<double> totals; for (const auto& row : critical) totals.push_back(row.times[0]);
     std::string common = "\"critical_rank_ms\":" + summary(totals) +
         ",\"critical_rank_stage_ms\":" + stage_summary(critical, false) +
+        ",\"critical_rank_receive_process_ms\":" + receive_summary(critical) +
         ",\"backend\":\"cpp\",\"mode\":" + quote(c.a.preserialized ? "preserialized" : "serialize-in-timer");
     std::cout << pretty('{' + common + '}') << std::endl;
     if (!*c.a.output) return;

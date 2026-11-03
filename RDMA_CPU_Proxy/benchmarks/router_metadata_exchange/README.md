@@ -174,6 +174,34 @@ and percentiles generally do not sum, because each statistic can select differen
 iterations. Network transfer can progress while another rank processes metadata;
 the stage split describes local wall time, not globally exclusive activities.
 
+### Receive-processing breakdown
+
+The console and JSON also report `critical_rank_receive_process_ms`, using the
+same slowest-total-time rank in each iteration. Per-rank summaries and individual
+records contain `receive_process_breakdown_ms`. These nine substages sum to
+`receive_process_ms` for each sample:
+
+| Field | Included work |
+|---|---|
+| `expert_deserialize_ms` | Production expert deserializer: text parsing, vector allocation/filling, and its built-in header/offset/index validation |
+| `expert_validate_ms` | Additional source/destination/topology checks and per-expert index ordering checks |
+| `expert_record_install_ms` | Moving parsed expert vectors into the source-indexed map, including map-node allocation and duplicate-source check |
+| `expert_progress_init_ms` | Allocating/zeroing per-expert head/tail vectors and inserting their source record |
+| `x3x4_deserialize_ms` | Production x3/x4 deserializer: parsing, vector allocation/filling, and built-in validation |
+| `x3x4_validate_ms` | Additional source/destination/topology and tensor/chunk-configuration checks |
+| `chunk_build_ms` | `compute_chunks_from_token_indices()`: descriptor allocation/filling and copies of per-chunk source-token-index lists |
+| `x3x4_record_install_ms` | Moving parsed x3/x4 vectors and chunk descriptors into their source-indexed maps |
+| `overhead_ms` | Remaining time inside the parent receive-processing interval, including function entry/exit, temporary cleanup, and timing bookkeeping |
+
+Deserialization is **not pure text conversion**: validation and allocation are
+interleaved inside the existing production deserializers and remain timed as a
+unit. The explicit `*_validate_ms` fields cover only the additional checks after
+deserialization. Timers do not change the validation policy or wire format.
+Self installation is excluded from this breakdown and remains `self_install_ms`.
+Single-node runs have zero x3/x4 and chunk-build times because no such messages
+are exchanged. Rebuild the shared library on both nodes before rerunning; report
+configuration `timing_schema: 2` identifies this instrumentation version.
+
 The maximum rank-local duration needs no synchronized clocks. It is not an exact
 global makespan: barrier-release and OS scheduling skew can influence it. A send
 finishing only means the local socket accepted its bytes; the corresponding
