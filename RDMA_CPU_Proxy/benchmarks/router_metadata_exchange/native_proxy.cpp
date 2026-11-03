@@ -32,6 +32,7 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <time.h>
 
 namespace {
 using namespace rdma_proxy;
@@ -47,16 +48,21 @@ const std::array<const char*, 9> ReceiveFields = {
     "expert_progress_init_ms", "x3x4_deserialize_ms", "x3x4_validate_ms",
     "chunk_build_ms", "x3x4_record_install_ms", "overhead_ms"};
 // Completion timestamps share the exchange-stage origin and overlap.
-const std::array<const char*, 19> DiagnosticFields = {
+const std::array<const char*, 28> DiagnosticFields = {
     "local_expert_complete_ms", "remote_expert_complete_ms", "remote_x3x4_complete_ms",
     "socket_sends_complete_ms", "poll_ms", "poll_calls", "poll_zero_returns",
     "sendmsg_ms", "sendmsg_calls", "sendmsg_would_block", "sendmsg_interrupted",
     "recv_ms", "recv_calls", "recv_would_block", "recv_interrupted",
-    "shm_publish_ms", "shm_receive_copy_ms", "receive_budget_yields", "exchange_other_ms"};
+    "shm_publish_ms", "shm_receive_copy_ms", "receive_budget_yields", "exchange_other_ms",
+    "shm_scan_ms", "shm_scan_after_socket_ms", "shm_scan_passes", "shm_scan_after_socket_passes",
+    "shm_sequence_checks", "shm_not_ready_checks", "remote_observation_delay_max_ms",
+    "remote_consume_delay_max_ms", "socket_work_complete_ms"};
 enum DiagnosticIndex : size_t {
     SendMs = 7, SendCalls, SendWouldBlock, SendInterrupted,
     RecvMs, RecvCalls, RecvWouldBlock, RecvInterrupted,
-    ShmPublishMs, ShmReceiveCopyMs, ReceiveBudgetYields, ExchangeOtherMs
+    ShmPublishMs, ShmReceiveCopyMs, ReceiveBudgetYields, ExchangeOtherMs,
+    ShmScanMs, ShmScanAfterSocketMs, ShmScanPasses, ShmScanAfterSocketPasses,
+    ShmSequenceChecks, ShmNotReadyChecks, RemoteObserveMaxMs, RemoteConsumeMaxMs, SocketWorkCompleteMs
 };
 using ExchangeDiagnostics = std::array<double, DiagnosticFields.size()>;
 struct ReceiveTimes : std::array<double, ReceiveFields.size()> {
@@ -67,6 +73,15 @@ void require(bool value, const std::string& message) {
     if (!value) throw std::runtime_error(message);
 }
 double ms(Time end, Time begin) { return std::chrono::duration<double, std::milli>(end - begin).count(); }
+// Comparable only between processes on the same host; never subtract across nodes.
+uint64_t monotonic_ns() {
+    timespec now{};
+    require(clock_gettime(CLOCK_MONOTONIC, &now) == 0, "monotonic clock failed");
+    return uint64_t(now.tv_sec) * 1000000000ULL + uint64_t(now.tv_nsec);
+}
+double ns_ms(uint64_t end, uint64_t begin) {
+    return end >= begin ? double(end - begin) / 1e6 : -double(begin - end) / 1e6;
+}
 Time deadline(double seconds) { return Clock::now() + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(seconds)); }
 int remaining(Time until) {
     const double value = ms(until, Clock::now());
@@ -260,7 +275,7 @@ struct Config {
     int epg() const { return a.num_experts / a.world; }
     std::string json() const {
         std::ostringstream out;
-        out << "{\"backend\":\"cpp\",\"timing_schema\":7,\"wire_format\":"
+        out << "{\"backend\":\"cpp\",\"timing_schema\":8,\"wire_format\":"
             << quote(a.binary ? "binary" : "text") << ",\"receive_storage\":"
             << quote(a.same_index_aggregation ? "shared_aggregate_arenas" : (a.binary ? "direct_reusable_vectors" : "payload_buffer")) << ",\"binary_protocol_version\":1,\"hosts\":[";
         for (size_t i = 0; i < hosts.size(); ++i) { if (i) out << ','; out << quote(hosts[i]); }
@@ -369,6 +384,7 @@ struct LocalMemory {
         uint64_t sequence;
         uint64_t counts[8];
         uint64_t x3_count;
+        uint64_t ingress_start_ns, receive_complete_ns, publish_ns;
     };
     std::string name;
     void* base = MAP_FAILED;
@@ -649,11 +665,33 @@ void install(const Config& c, Key key, const std::string& payload, Installed& in
         mark(7);
     }
 }
+struct SharedObservation {
+    int source = -1, ingress_rank = -1;
+    uint64_t ingress_start = 0, received = 0, published = 0, observed = 0, installed = 0;
+    std::string json(uint64_t origin) const {
+        std::ostringstream out; out << std::setprecision(17);
+        out << "{\"source_rank\":" << source << ",\"ingress_rank\":" << ingress_rank
+            << ",\"ingress_exchange_start_ns\":" << ingress_start
+            << ",\"receive_complete_ns\":" << received
+            << ",\"publish_ns\":" << published << ",\"observe_ns\":" << observed
+            << ",\"install_complete_ns\":" << installed
+            << ",\"publish_from_consumer_start_ms\":" << ns_ms(published, origin)
+            << ",\"observe_from_consumer_start_ms\":" << ns_ms(observed, origin)
+            << ",\"install_from_consumer_start_ms\":" << ns_ms(installed, origin)
+            << ",\"observation_delay_ms\":" << ns_ms(observed, published)
+            << ",\"consume_delay_ms\":" << ns_ms(installed, observed);
+        if (received) out << ",\"ingress_receive_complete_ms\":" << ns_ms(received, ingress_start)
+                         << ",\"receive_to_publish_ms\":" << ns_ms(published, received);
+        out << '}'; return out.str();
+    }
+};
 struct Record {
     int rank = 0;
     std::array<double, 6> times{};
     ReceiveTimes receive_times{};
     ExchangeDiagnostics diagnostics{};
+    uint64_t exchange_start_ns = 0;
+    std::vector<SharedObservation> shared_sources;
     uint64_t sent = 0, received = 0, experts = 0, nodes = 0, shm_sent = 0, shm_received = 0;
     std::string wire() const {
         std::ostringstream out; out << std::setprecision(17) << rank;
@@ -662,6 +700,10 @@ struct Record {
         out << ' ' << receive_times.expert_index_bounds_ms;
         for (double value : diagnostics) out << ' ' << value;
         out << ' ' << sent << ' ' << received << ' ' << experts << ' ' << nodes << ' ' << shm_sent << ' ' << shm_received;
+        out << ' ' << exchange_start_ns << ' ' << shared_sources.size();
+        for (const auto& source : shared_sources)
+            out << ' ' << source.source << ' ' << source.ingress_rank << ' ' << source.ingress_start
+                << ' ' << source.received << ' ' << source.published << ' ' << source.observed << ' ' << source.installed;
         return out.str();
     }
     static Record parse(const std::string& text) {
@@ -671,6 +713,12 @@ struct Record {
         in >> r.receive_times.expert_index_bounds_ms;
         for (double& value : r.diagnostics) in >> value;
         require(bool(in >> r.sent >> r.received >> r.experts >> r.nodes >> r.shm_sent >> r.shm_received), "invalid timing record");
+        size_t count = 0;
+        require(bool(in >> r.exchange_start_ns >> count) && count <= text.size(), "invalid shared observation count");
+        r.shared_sources.resize(count);
+        for (auto& source : r.shared_sources)
+            require(bool(in >> source.source >> source.ingress_rank >> source.ingress_start >> source.received
+                            >> source.published >> source.observed >> source.installed), "invalid shared observation");
         return r;
     }
     std::string json() const {
@@ -682,6 +730,12 @@ struct Record {
             out << quote(DiagnosticFields[i]) << ':' << diagnostics[i];
         }
         out << '}';
+        out << ",\"exchange_start_ns\":" << exchange_start_ns << ",\"shared_source_observations\":[";
+        for (size_t i = 0; i < shared_sources.size(); ++i) {
+            if (i) out << ',';
+            out << shared_sources[i].json(exchange_start_ns);
+        }
+        out << ']';
         out << ",\"receive_process_breakdown_ms\":{";
         for (size_t i = 0; i < receive_times.size(); ++i) {
             if (i) out << ',';
@@ -876,7 +930,10 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
     };
     for (const auto& t : transfers) ++incoming_pending[receive_path(t.key)];
     size_t sends_pending = transfers.size();
+    std::vector<SharedObservation> observations;
+    observations.reserve(local_pending);
     auto prepared = Clock::now();
+    const uint64_t exchange_start_ns = monotonic_ns();
     auto received_one = [&](size_t path) {
         require(incoming_pending[path] > 0, "duplicate path completion");
         if (--incoming_pending[path] == 0) diagnostics[path] = ms(Clock::now(), prepared);
@@ -899,6 +956,9 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
             cursor += m.expert_token_indices.size();
             shm_sent += (m.expert_offsets.size() + m.expert_token_indices.size()) * sizeof(int32_t);
         }
+        h->ingress_start_ns = exchange_start_ns;
+        h->receive_complete_ns = 0; // local generation, no incoming aggregate
+        h->publish_ns = monotonic_ns();
         __atomic_store_n(&h->sequence, iteration + 1, __ATOMIC_RELEASE);
         diagnostics[ShmPublishMs] += ms(Clock::now(), publish_started);
     }
@@ -906,15 +966,29 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
         // Never block on sockets while a shared-memory producer may publish.
         int wait_ms = remaining(until);
         if (local_pending) {
+            const bool sockets_done = pending == 0;
+            auto scan_started = Clock::now();
+            double scan_consume_ms = 0;
+            ++diagnostics[ShmScanPasses];
+            if (sockets_done) ++diagnostics[ShmScanAfterSocketPasses];
             for (int source = 0; source < c.a.world; ++source) {
                 if (source == c.a.rank || local_done[source] ||
                     (!c.a.same_index_aggregation && c.node(source) != c.node(c.a.rank))) continue;
                 int gpu = c.gpu(source);
                 int slot = local.slot(c, source);
                 auto* h = local.header(slot);
+                ++diagnostics[ShmSequenceChecks];
                 auto sequence = __atomic_load_n(&h->sequence, __ATOMIC_ACQUIRE);
                 require(sequence <= iteration + 1, "future shared-memory iteration");
-                if (sequence != iteration + 1) continue;
+                if (sequence != iteration + 1) { ++diagnostics[ShmNotReadyChecks]; continue; }
+                auto consume_started = Clock::now();
+                SharedObservation observation;
+                observation.source = source;
+                observation.ingress_rank = c.node(c.a.rank) * c.a.gpus_per_node + gpu;
+                observation.observed = monotonic_ns();
+                observation.ingress_start = h->ingress_start_ns;
+                observation.received = h->receive_complete_ns;
+                observation.published = h->publish_ns;
                 size_t cursor = 0, total = 0;
                 for (int d = 0; d < c.a.gpus_per_node; ++d) {
                     require(h->counts[d] <= size_t(c.a.num_tokens) * c.a.top_k - total, "invalid shared-memory count");
@@ -941,9 +1015,19 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
                 before = Clock::now();
                 install(c, {source, Expert}, "", installed, receive_times);
                 receive_ms += ms(Clock::now(), before);
+                observation.installed = monotonic_ns();
+                observations.push_back(observation);
+                if (c.node(source) != c.node(c.a.rank)) {
+                    diagnostics[RemoteObserveMaxMs] = std::max(diagnostics[RemoteObserveMaxMs], ns_ms(observation.observed, observation.published));
+                    diagnostics[RemoteConsumeMaxMs] = std::max(diagnostics[RemoteConsumeMaxMs], ns_ms(observation.installed, observation.observed));
+                }
+                scan_consume_ms += ms(Clock::now(), consume_started);
                 local_done[source] = true; --local_pending;
                 received_one(c.node(source) == c.node(c.a.rank) ? 0 : 1);
             }
+            double scan_ms = std::max(0.0, ms(Clock::now(), scan_started) - scan_consume_ms);
+            diagnostics[ShmScanMs] += scan_ms;
+            if (sockets_done) diagnostics[ShmScanAfterSocketMs] += scan_ms;
             wait_ms = 0;
         }
         if (!pending) continue;
@@ -1007,9 +1091,12 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
                         if (t.key.second == Aggregate) {
                             int slot = local.slot(c, t.key.first);
                             auto* h = local.header(slot);
+                            h->receive_complete_ns = monotonic_ns();
+                            h->ingress_start_ns = exchange_start_ns;
                             size_t count = 0;
                             for (int gpu = 0; gpu < c.a.gpus_per_node; ++gpu) count += h->counts[gpu];
                             shm_sent += (size_t(c.a.gpus_per_node) * (c.epg() + 1) + count) * 4;
+                            h->publish_ns = monotonic_ns();
                             __atomic_store_n(&h->sequence, iteration + 1, __ATOMIC_RELEASE);
                             auto before = Clock::now();
                             auto& x = installed.nodes.at(t.key.first);
@@ -1048,7 +1135,10 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
             }
             if (t.done && !was_done) received_one(receive_path(t.key));
             p.events = static_cast<short>((t.done ? 0 : POLLIN) | (t.sent == t.output_bytes ? 0 : POLLOUT));
-            if (!p.events) { p.fd = -1; --pending; }
+            if (!p.events) {
+                p.fd = -1;
+                if (--pending == 0) diagnostics[SocketWorkCompleteMs] = ms(Clock::now(), prepared);
+            }
             else require(!(p.revents & POLLHUP), "peer disconnected during metadata exchange");
         }
     }
@@ -1061,6 +1151,8 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
     receive_times.back() = std::max(0.0, receive_ms - std::accumulate(receive_times.begin(), receive_times.end() - 1, 0.0));
     Record r; r.rank = c.a.rank;
     r.receive_times = receive_times;
+    r.exchange_start_ns = exchange_start_ns;
+    r.shared_sources = std::move(observations);
     diagnostics[ExchangeOtherMs] = ms(finished, prepared) - receive_ms - diagnostics[4]
         - diagnostics[SendMs] - diagnostics[RecvMs] - diagnostics[ShmPublishMs] - diagnostics[ShmReceiveCopyMs];
     r.diagnostics = diagnostics;

@@ -303,7 +303,7 @@ deserialization. Timers do not change the validation policy or wire format.
 Self installation is excluded from this breakdown and remains `self_install_ms`.
 Single-node runs have zero x3/x4 and chunk-build times because no such messages
 are exchanged. Rebuild the shared library on both nodes before rerunning; report
-configuration `timing_schema: 7` identifies the current instrumentation version.
+configuration `timing_schema: 8` identifies the current instrumentation version.
 
 The maximum rank-local duration needs no synchronized clocks. It is not an exact
 global makespan: barrier-release and OS scheduling skew can influence it. A send
@@ -646,3 +646,67 @@ ingress proxies, the aggregate exchange scans shared sequence counters and uses
 nonblocking socket polls. This avoids sleeping through a shared-memory-only
 publication but can increase CPU use while remote arrivals are pending. Keep CPU
 placement consistent when evaluating the latency change.
+
+### Publication, observation, and readiness scans (timing schema 8)
+
+Rebuild on both nodes and run the same commands; these diagnostics are always
+collected. The C ABI remains 6. Upgrade all workers together because the shared
+arena layout and internal timing-record format have changed.
+
+Each per-rank iteration record now contains `exchange_start_ns` and a
+`shared_source_observations` array, with one entry per consumed shared expert
+slice. Each entry identifies `source_rank` and `ingress_rank` and includes:
+
+| Field | Meaning |
+|---|---|
+| `ingress_exchange_start_ns` | Ingress proxy's exchange-stage start |
+| `receive_complete_ns` | Ingress detects that the entire aggregate body has arrived; zero for locally generated metadata |
+| `publish_ns` | Timestamp immediately before the release-store publishing the slice |
+| `observe_ns` | Consumer's first successful acquire observation of this iteration |
+| `install_complete_ns` | Consumer has copied, validated, and installed the expert slice |
+| `ingress_receive_complete_ms` | Aggregate arrival relative to the ingress proxy's exchange start; remote sources only |
+| `receive_to_publish_ms` | Time from aggregate arrival detection to publication timestamp; remote sources only |
+| `publish_from_consumer_start_ms`, `observe_from_consumer_start_ms`, `install_from_consumer_start_ms` | Each event relative to the consuming proxy's exchange start |
+| `observation_delay_ms` | Observation minus publication timestamp |
+| `consume_delay_ms` | Installation completion minus observation |
+
+These timestamps use **CLOCK_MONOTONIC on the receiving host**. No sender clock
+is used, and timestamps from different physical nodes must not be subtracted.
+The publication time relative to a consumer's start can be negative when another
+local process publishes before that consumer starts its exchange. Raw nanosecond
+values are integer timestamps, not durations. The sequence release/acquire makes
+the accompanying timestamp fields visible with the payload; the completion
+barrier protects them from overwrite.
+
+The publication timestamp precedes the release-store, so observation delay also
+includes any preemption between timestamp capture and that store. It should not
+be interpreted as a pure cache-coherence latency. Similarly, receive completion
+is the ingress thread's detection of completion, not a NIC arrival timestamp.
+
+Additional fields appear in `critical_rank_exchange_diagnostics`, per-rank
+summaries, and individual records:
+
+| Field | Meaning |
+|---|---|
+| `shm_scan_ms` | Total readiness-scan wall time, excluding intervals consuming ready slices |
+| `shm_scan_after_socket_ms` | Subset of scan time after this proxy has completed all its own sends and incoming socket installations |
+| `shm_scan_passes`, `shm_scan_after_socket_passes` | Total scan passes and the subset after socket work finishes |
+| `shm_sequence_checks`, `shm_not_ready_checks` | Acquire checks and checks that did not see this iteration |
+| `remote_observation_delay_max_ms` | Largest publication-to-observation delay among remote-source slices consumed in this iteration |
+| `remote_consume_delay_max_ms` | Largest observation-to-installation delay among remote-source slices consumed in this iteration |
+| `socket_work_complete_ms` | Completion of all local socket transfers and incoming socket installation, relative to exchange-stage start; zero if there are no socket channels |
+
+Scan time includes scanning completed/ineligible source entries and bookkeeping,
+but excludes ready-slice copying, validation, installation, and per-source
+observation recording. It is a **subset of `exchange_other_ms`**, not an additional
+stage. After-socket scan time is a subset of total scan time. Maximum-delay fields
+are zero if no remote slices are distributed through shared memory. They can
+refer to different source ranks; consult the per-source records for attribution.
+
+To diagnose the last-finishing remote source, select the entry with the largest
+`install_from_consumer_start_ms` among remote sources in the critical-rank record.
+Its publish, observe, and install times separate late ingress publication from
+late consumer observation and consumption. Join `ingress_rank` to the same
+iteration's rank record to inspect that ingress proxy's socket timings. Console
+summaries expose the maxima and scan totals; retain the full JSON report for this
+per-source analysis. All timestamp/counter overhead remains included in timings.

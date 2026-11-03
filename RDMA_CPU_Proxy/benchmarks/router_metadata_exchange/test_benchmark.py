@@ -175,7 +175,7 @@ class ProcessTests(unittest.TestCase):
                 self.assertEqual(report["configuration"]["expert_index_validation_enabled"], not disable_validation)
                 self.assertEqual(report["wire_format"], wire_format)
                 self.assertEqual(report["configuration"]["wire_format"], wire_format)
-                self.assertEqual(report["configuration"]["timing_schema"], 7)
+                self.assertEqual(report["configuration"]["timing_schema"], 8)
                 self.assertEqual(report["configuration"]["receive_storage"],
                                  "shared_aggregate_arenas" if aggregate else ("direct_reusable_vectors" if wire_format == "binary" else "payload_buffer"))
                 self.assertEqual(len(report["iterations"]), 3)
@@ -201,18 +201,61 @@ class ProcessTests(unittest.TestCase):
                         self.assertEqual(sum(r["shm_sent_bytes"] for r in row), 0)
                     if local_shared_memory and nodes == 1:
                         self.assertEqual(sum(r["sent_bytes"] + r["received_bytes"] for r in row), 0)
+                    published = {}
                     for result in row:
+                        observations = result["shared_source_observations"]
+                        expected_sources = set(range(nodes * per_node)) - {result["rank"]} if aggregate else (
+                            {source for source in range(nodes * per_node)
+                             if source // per_node == result["rank"] // per_node and source != result["rank"]}
+                            if local_shared_memory else set())
+                        self.assertEqual({o["source_rank"] for o in observations}, expected_sources)
+                        self.assertEqual(len(observations), len(expected_sources))
+                        for o in observations:
+                            source = o["source_rank"]
+                            ingress = result["rank"] // per_node * per_node + source % per_node
+                            self.assertEqual(o["ingress_rank"], ingress)
+                            self.assertEqual(o["ingress_exchange_start_ns"], row[ingress]["exchange_start_ns"])
+                            self.assertLessEqual(o["publish_ns"], o["observe_ns"])
+                            self.assertLessEqual(o["observe_ns"], o["install_complete_ns"])
+                            self.assertAlmostEqual(o["observation_delay_ms"],
+                                (o["observe_ns"] - o["publish_ns"]) / 1e6, places=9)
+                            self.assertAlmostEqual(o["consume_delay_ms"],
+                                (o["install_complete_ns"] - o["observe_ns"]) / 1e6, places=9)
+                            for field, stamp in (("publish", "publish_ns"), ("observe", "observe_ns"), ("install", "install_complete_ns")):
+                                self.assertAlmostEqual(o[field + "_from_consumer_start_ms"],
+                                    (o[stamp] - result["exchange_start_ns"]) / 1e6, places=9)
+                            key = (result["rank"] // per_node, source)
+                            identity = (o["publish_ns"], o["receive_complete_ns"], o["ingress_exchange_start_ns"])
+                            self.assertEqual(published.setdefault(key, identity), identity)
+                            if source // per_node != result["rank"] // per_node:
+                                self.assertLessEqual(o["ingress_exchange_start_ns"], o["receive_complete_ns"])
+                                self.assertLessEqual(o["receive_complete_ns"], o["publish_ns"])
+                                self.assertAlmostEqual(o["receive_to_publish_ms"],
+                                    (o["publish_ns"] - o["receive_complete_ns"]) / 1e6, places=9)
+                            else:
+                                self.assertEqual(o["receive_complete_ns"], 0)
                         self.assertEqual(result["exchange_ms"], result["tcp_exchange_ms"])
                         self.assertEqual(result["installed_expert_sources"], nodes * per_node)
                         self.assertEqual(result["installed_x3x4_sources"], nodes - 1)
                         self.assertGreater(result["elapsed_ms"], 0)
                         diagnostics = result["exchange_diagnostics"]
-                        self.assertEqual(len(diagnostics), 19)
+                        self.assertEqual(len(diagnostics), 28)
                         exchange_span = result["exchange_ms"] + result["receive_process_ms"]
                         for name, value in diagnostics.items():
                             self.assertGreaterEqual(value, 0)
-                            if name.endswith("_ms"):
+                            if name.endswith("_ms") and name != "remote_observation_delay_max_ms":
                                 self.assertLessEqual(value, exchange_span + 1e-9)
+                        self.assertLessEqual(diagnostics["shm_scan_after_socket_ms"], diagnostics["shm_scan_ms"] + 1e-9)
+                        self.assertLessEqual(diagnostics["shm_scan_ms"], diagnostics["exchange_other_ms"] + 1e-8)
+                        self.assertLessEqual(diagnostics["shm_scan_after_socket_passes"], diagnostics["shm_scan_passes"])
+                        self.assertLessEqual(diagnostics["shm_not_ready_checks"], diagnostics["shm_sequence_checks"])
+                        remote = [o for o in observations if o["source_rank"] // per_node != result["rank"] // per_node]
+                        self.assertAlmostEqual(diagnostics["remote_observation_delay_max_ms"],
+                            max((o["observation_delay_ms"] for o in remote), default=0), places=9)
+                        self.assertAlmostEqual(diagnostics["remote_consume_delay_max_ms"],
+                            max((o["consume_delay_ms"] for o in remote), default=0), places=9)
+                        if not local_shared_memory:
+                            self.assertEqual(diagnostics["shm_scan_passes"], 0)
                         accounted = ("poll_ms", "sendmsg_ms", "recv_ms", "shm_publish_ms",
                                      "shm_receive_copy_ms", "exchange_other_ms")
                         self.assertAlmostEqual(sum(diagnostics[name] for name in accounted),
