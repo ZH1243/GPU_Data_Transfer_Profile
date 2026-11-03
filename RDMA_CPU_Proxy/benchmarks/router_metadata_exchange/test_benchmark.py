@@ -120,12 +120,21 @@ class ProcessTests(unittest.TestCase):
                     self.assertEqual(code, 0, log.read())
                 report = json.loads(output.read_text())
                 self.assertEqual(len(report["iterations"]), 3)
+                self.assertAlmostEqual(sum(report["critical_rank_stage_ms"][field]["mean"]
+                                           for field in b.STAGE_FIELDS),
+                                       report["critical_rank_ms"]["mean"], places=7)
                 for row in report["iterations"]:
                     self.assertEqual(sum(r["sent_bytes"] for r in row), sum(r["received_bytes"] for r in row))
                     for result in row:
                         self.assertEqual(result["installed_expert_sources"], nodes * per_node)
                         self.assertEqual(result["installed_x3x4_sources"], nodes - 1)
                         self.assertGreater(result["elapsed_ms"], 0)
+                        for field in b.STAGE_FIELDS:
+                            self.assertGreaterEqual(result[field], 0)
+                        self.assertAlmostEqual(sum(result[field] for field in b.STAGE_FIELDS),
+                                               result["elapsed_ms"], places=7)
+                        self.assertAlmostEqual(result["install_ms"],
+                                               result["self_install_ms"] + result["receive_process_ms"], places=7)
             finally:
                 for process in processes:
                     if process.poll() is None:

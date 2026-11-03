@@ -112,11 +112,35 @@ The report contains all measured per-rank/per-iteration records and:
 
 - `critical_rank_ms`: statistics of the **maximum rank-local elapsed time** for
   each iteration (minimum, mean, median, nearest-rank p95/p99, maximum).
-- `rank_summaries`: per-rank elapsed, serialization, and decode/validation/
-  installation statistics. `install_ms` also includes the local self-table copy.
+- `critical_rank_stage_ms`: stage statistics from the same slowest-total-time
+  rank selected in each iteration, printed to the console as well as saved.
+  These are not independently selected stage maxima from different ranks.
+- `rank_summaries`: per-rank elapsed and stage statistics.
 - `sent_bytes` / `received_bytes`: wire bytes, including the 16-byte benchmark
   envelopes but excluding handshakes and control traffic.
 - Installed expert and x3/x4 source counts for each rank.
+
+Every per-rank record contains five non-overlapping local wall-time stages:
+
+| Field | Included work |
+|---|---|
+| `serialize_ms` | Outgoing text serialization, or cached-payload selection in pre-serialized mode |
+| `self_install_ms` | Local expert-table copy and construction of its CPU record |
+| `communication_prepare_ms` | Frame buffers, receive state, selector creation/registration, deadline setup |
+| `tcp_exchange_ms` | Exchange-loop elapsed time excluding receive processing: socket waits, sends/receives, buffering, envelope checks, selector bookkeeping/cleanup, and final completeness check |
+| `receive_process_ms` | Sum of incoming-message text parsing, validation, CPU installation, and receive-chunk construction |
+
+The five stages sum to `elapsed_ms` for each sample. For compatibility,
+`install_ms` remains the sum of `self_install_ms` and `receive_process_ms`;
+do not add it again. `tcp_exchange_ms` is computed as the exchange-loop interval
+minus the accumulated receive processing intervals; it includes Python/OS
+overhead and waiting for remote CPU work, not just network transfer latency.
+Instrumentation overhead is included in the measured stages.
+
+Stage means for the critical-rank records sum to the mean total. Their medians
+and percentiles generally do not sum, because each statistic can select different
+iterations. Network transfer can progress while another rank processes metadata;
+the stage split describes local wall time, not globally exclusive activities.
 
 The maximum rank-local duration needs no synchronized clocks. It is not an exact
 global makespan: barrier-release and OS scheduling skew can influence it. A send

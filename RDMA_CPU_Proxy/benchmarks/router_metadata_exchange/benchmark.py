@@ -16,6 +16,8 @@ from pathlib import Path
 U64 = struct.Struct("!Q")
 FRAME = struct.Struct("!QQ")  # payload bytes, iteration (benchmark envelope)
 MASK64 = (1 << 64) - 1
+STAGE_FIELDS = ("serialize_ms", "self_install_ms", "communication_prepare_ms",
+                "tcp_exchange_ms", "receive_process_ms")
 
 
 def require(condition, message):
@@ -249,8 +251,9 @@ def exchange(a, channels, metadata, cached, iteration):
     epg = a.num_experts // a.world
     installed = {(a.rank, "expert"): {"offsets": own[2], "indices": own[3],
                                       "heads": [0] * epg, "tails": [0] * epg}}
+    self_installed = time.perf_counter()
     states = {}
-    install_seconds = time.perf_counter() - serialized
+    receive_seconds = 0.0
     max_payload = 4096 + (a.num_tokens * a.top_k + epg + 1) * 32
     with selectors.DefaultSelector() as selector:
         for key, sock in channels.items():
@@ -260,6 +263,7 @@ def exchange(a, channels, metadata, cached, iteration):
             states[key] = state
             selector.register(sock, selectors.EVENT_READ | selectors.EVENT_WRITE, state)
         deadline = time.monotonic() + a.timeout
+        prepared = time.perf_counter()
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -293,7 +297,7 @@ def exchange(a, channels, metadata, cached, iteration):
                     if state["length"] is not None and len(state["body"]) == state["length"]:
                         before = time.perf_counter()
                         install(a, *state["key"], state["body"], installed)
-                        install_seconds += time.perf_counter() - before
+                        receive_seconds += time.perf_counter() - before
                         state["done"] = True
                 mask = (0 if state["done"] else selectors.EVENT_READ)
                 if state["sent"] < len(state["output"]):
@@ -303,10 +307,19 @@ def exchange(a, channels, metadata, cached, iteration):
                 else:
                     selector.unregister(sock)
     require(len(installed) == 1 + len(channels), "missing installed metadata")
-    elapsed = time.perf_counter() - started
+    finished = time.perf_counter()
+    elapsed = finished - started
+    self_seconds = self_installed - serialized
+    # Non-overlapping local wall-time accounting. Socket progress can overlap
+    # remote CPU work; this residual is not pure network latency.
+    tcp_seconds = finished - prepared - receive_seconds
     return dict(rank=a.rank, elapsed_ms=elapsed * 1000,
                 serialize_ms=(serialized - started) * 1000,
-                install_ms=install_seconds * 1000,
+                self_install_ms=self_seconds * 1000,
+                communication_prepare_ms=(prepared - self_installed) * 1000,
+                tcp_exchange_ms=tcp_seconds * 1000,
+                receive_process_ms=receive_seconds * 1000,
+                install_ms=(self_seconds + receive_seconds) * 1000,
                 installed_expert_sources=sum(kind == "expert" for _, kind in installed),
                 installed_x3x4_sources=sum(kind == "x3x4" for _, kind in installed),
                 sent_bytes=sum(len(p) + FRAME.size for p in payloads.values()),
@@ -382,12 +395,16 @@ def main():
             if iteration >= a.warmup:
                 records.append(results)
         if a.rank == 0:
-            maxima = [max(r["elapsed_ms"] for r in rows) for rows in records]
+            critical_records = [max(rows, key=lambda r: r["elapsed_ms"]) for rows in records]
+            maxima = [r["elapsed_ms"] for r in critical_records]
             report = dict(configuration=signature, critical_rank_ms=summarize(maxima),
+                          critical_rank_stage_ms={field: summarize([r[field] for r in critical_records])
+                                                  for field in STAGE_FIELDS},
                           rank_summaries=[dict(rank=rank, **{field: summarize([row[rank][field] for row in records])
-                                          for field in ("elapsed_ms", "serialize_ms", "install_ms")})
+                                          for field in ("elapsed_ms", "install_ms") + STAGE_FIELDS})
                                           for rank in range(a.world)], iterations=records)
             print(json.dumps({"critical_rank_ms": report["critical_rank_ms"],
+                              "critical_rank_stage_ms": report["critical_rank_stage_ms"],
                               "mode": "preserialized" if a.preserialized else "serialize-in-timer"}, indent=2), flush=True)
             if a.output:
                 a.output.parent.mkdir(parents=True, exist_ok=True)
