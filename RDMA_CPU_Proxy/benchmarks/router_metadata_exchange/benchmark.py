@@ -10,7 +10,7 @@ import threading
 
 INT_FIELDS = ("rank", "world", "gpus_per_node", "port_base", "node_port_stride",
               "num_tokens", "num_experts", "top_k", "token_dimension", "element_bytes",
-              "tokens_per_chunk", "datasets", "warmup", "iterations", "preserialized", "verify", "binary", "disable_expert_index_validation", "local_shared_memory")
+              "tokens_per_chunk", "datasets", "warmup", "iterations", "preserialized", "verify", "binary", "disable_expert_index_validation", "local_shared_memory", "receive_drain", "receive_drain_max_steps")
 
 
 class NativeConfig(ctypes.Structure):
@@ -53,6 +53,10 @@ def arguments():
     p.add_argument("--preserialized", action="store_true")
     p.add_argument("--disable-expert-index-validation", action="store_true",
                    help="binary mode: skip expert index bounds and sorted-order scans; retain structural checks")
+    p.add_argument("--receive-drain-max-steps", type=int, default=16,
+                   help="maximum receive steps per ready socket when draining (1..1024)")
+    p.add_argument("--receive-drain", action="store_true",
+                   help="advance readable sockets until blocked, complete, or the receive-step budget is reached")
     p.add_argument("--local-shared-memory", action="store_true",
                    help="binary mode: exchange same-node expert metadata through shared host memory")
     p.add_argument("--wire-format", choices=("binary", "text"), default="binary",
@@ -63,6 +67,7 @@ def arguments():
     p.add_argument("--verify", action="store_true",
                    help="check received content against regenerated source metadata outside timing")
     a = p.parse_args()
+    require(1 <= a.receive_drain_max_steps <= 1024, "--receive-drain-max-steps must be in 1..1024")
     a.binary = a.wire_format == "binary"
     require(not a.disable_expert_index_validation or a.binary,
             "--disable-expert-index-validation requires --wire-format=binary; text uses the unchanged production deserializer")
@@ -94,7 +99,7 @@ def main():
             "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j")
     library = ctypes.CDLL(str(a.library.resolve()))
     library.router_metadata_bench_abi_version.restype = ctypes.c_uint32
-    require(library.router_metadata_bench_abi_version() == 4, "native benchmark ABI mismatch; rebuild the shared library")
+    require(library.router_metadata_bench_abi_version() == 5, "native benchmark ABI mismatch; rebuild the shared library")
     library.router_metadata_bench_run.argtypes = [ctypes.POINTER(NativeConfig),
                                                  ctypes.POINTER(ctypes.c_char), ctypes.c_size_t]
     library.router_metadata_bench_run.restype = ctypes.c_int

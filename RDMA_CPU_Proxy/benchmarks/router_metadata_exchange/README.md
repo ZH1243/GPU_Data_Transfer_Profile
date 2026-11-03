@@ -89,7 +89,7 @@ CPU/NUMA placement. This benchmark does not pin processes automatically.
 
 ## Optional within-node shared memory
 
-Rebuild the library and update `benchmark.py` on both nodes (C ABI version 4).
+Rebuild the library and update `benchmark.py` on both nodes (C ABI version 5).
 The default remains all-TCP. To replace local expert-metadata TCP connections
 with shared host memory, pass `--local-shared-memory` on **both nodes**:
 
@@ -303,7 +303,7 @@ deserialization. Timers do not change the validation policy or wire format.
 Self installation is excluded from this breakdown and remains `self_install_ms`.
 Single-node runs have zero x3/x4 and chunk-build times because no such messages
 are exchanged. Rebuild the shared library on both nodes before rerunning; report
-configuration `timing_schema: 5` identifies the current instrumentation version.
+configuration `timing_schema: 6` identifies the current instrumentation version.
 
 The maximum rank-local duration needs no synchronized clocks. It is not an exact
 global makespan: barrier-release and OS scheduling skew can influence it. A send
@@ -390,7 +390,7 @@ RESULT_JSON=results/text.json bash ./run_node0_torchrun.sh --wire-format=text
 ```
 
 Run node 1 with the matching mode for each run. Upgrade/rebuild the library on
-both nodes: the Python/native C ABI is now version 4. Reports identify the wire
+both nodes: the Python/native C ABI is now version 5. Reports identify the wire
 format; timing field names remain stable for comparisons.
 
 For direct binary reception, time inside socket `recv()` calls belongs to
@@ -399,7 +399,7 @@ validation belong to the corresponding `*_deserialize_ms` field. The latter now
 sums work before and after the array transfers; it excludes waiting for bytes.
 `configuration.receive_storage` is `direct_reusable_vectors` for binary and
 `payload_buffer` for text. The binary wire format is unchanged; the current wrapper requires C ABI
-version 4. Rebuild both nodes for comparable timing/schema reports. Native tests check
+version 5. Rebuild both nodes for comparable timing/schema reports. Native tests check
 that receive-array addresses stay stable across changing routing datasets.
 
 ### Isolated expert index-bounds scan
@@ -422,7 +422,7 @@ For the mean on the selected critical ranks, divide
 fraction attributable to this scan. Text mode reports zero for the isolated
 field because its checks remain interleaved with parsing in the unchanged
 production deserializer; zero there means **not separately measured**.
-Rebuild on both nodes. `timing_schema: 4` identifies the new nested timing.
+Rebuild on both nodes. the nested timing is also included in current `timing_schema: 6` reports.
 
 ### Disable the two expert-index scans
 
@@ -448,7 +448,7 @@ still includes identity/configuration checks, so neither parent stage should
 be expected to become zero. If `--verify` is also enabled, exact-content checks
 still run outside the timed interval.
 
-Rebuild on both nodes before using the updated wrapper (C ABI version 4):
+Rebuild on both nodes before using the updated wrapper (C ABI version 5):
 
 ```bash
 cmake --build build -j
@@ -459,8 +459,8 @@ and metadata exchange are unchanged.
 
 ### Exchange completion and polling diagnostics (timing schema 5)
 
-Rebuild the native library on both nodes; the C ABI remains version 4 and no
-additional command-line flag is needed. The console and JSON now include
+Rebuild the native library on both nodes; update the wrapper as well (current C ABI version 5). No additional
+command-line flag is needed to collect diagnostics. The console and JSON now include
 `critical_rank_exchange_diagnostics`. Each iteration's diagnostics come from
 that iteration's slowest-total-time rank, just like the existing stage report.
 The JSON also contains `exchange_diagnostics` in individual records and in
@@ -491,3 +491,66 @@ counters exclude connection setup and control collectives. A shared-memory-only
 exchange has zero socket polling, even if it spends time checking local sequence
 counters. Additional timestamps/counters add some measured overhead, so rebuild
 and rerun both transport modes for an instrumentation-matched comparison.
+
+
+### Socket I/O diagnostics and optional receive draining (timing schema 6)
+
+Update `benchmark.py` and rebuild the native library on **both nodes** (ABI 5).
+The new diagnostics are always collected, including in the unchanged default
+one-receive-step-per-socket mode. Enable the alternative with `--receive-drain`
+on both nodes; it supports binary and text modes, with or without local shared
+memory. Each readable socket advances through envelope, protocol header, and
+array/body reception until completion, a would-block/interrupted receive, or its
+step budget. The default budget is 16; `--receive-drain-max-steps=N` accepts
+1..1024. Each step performs at most one receive call and body/array calls remain
+capped at 256 KiB. After exhausting the budget, the loop services other sockets
+and returns to polling. Socket sends retain their existing progression.
+
+For an A/B comparison, rebuild once and run both modes with separate reports:
+
+```bash
+# Node 0: baseline, followed by draining in a separate two-node run
+RESULT_JSON=results/io_baseline.json bash ./run_node0_torchrun.sh \
+  --local-shared-memory --disable-expert-index-validation
+RESULT_JSON=results/io_drain.json bash ./run_node0_torchrun.sh \
+  --local-shared-memory --disable-expert-index-validation --receive-drain
+
+# Node 1: use the matching command for each run
+bash ./run_node1_torchrun.sh --local-shared-memory --disable-expert-index-validation
+bash ./run_node1_torchrun.sh --local-shared-memory --disable-expert-index-validation --receive-drain
+```
+
+The console/JSON `critical_rank_exchange_diagnostics` and corresponding per-rank
+records/summaries now also contain:
+
+| Fields | Meaning |
+|---|---|
+| `sendmsg_ms`, `recv_ms` | Accumulated wall time around the actual metadata socket system calls, including unsuccessful attempts; excludes segment construction, parsing, and validation |
+| `sendmsg_calls`, `recv_calls` | Number of metadata socket calls |
+| `sendmsg_would_block`, `recv_would_block` | Calls returning EAGAIN or EWOULDBLOCK |
+| `sendmsg_interrupted`, `recv_interrupted` | Calls returning EINTR, counted separately from would-block |
+| `shm_publish_ms` | Writing all local destination slices and counts, producer bookkeeping, and release publication; includes the shared-memory payload copies |
+| `shm_receive_copy_ms` | Copies of shared offsets/indices into receiver vectors; excludes resizing, validation, and installation |
+| `receive_budget_yields` | Draining visits that exhaust their step budget with an incomplete message and no would-block/interruption on the last step; zero with draining disabled |
+| `exchange_other_ms` | Residual exchange time after subtracting poll, socket calls, shared publication, and shared receive copies |
+
+For every record, these **non-overlapping durations** sum to `exchange_ms`
+(the legacy `tcp_exchange_ms` alias):
+
+```text
+poll_ms + sendmsg_ms + recv_ms + shm_publish_ms
+        + shm_receive_copy_ms + exchange_other_ms
+```
+
+Receive processing remains a separate stage. The residual includes readiness
+scans, framing checks, iovec construction, loop work, instrumentation bookkeeping,
+and scheduling delays outside the measured calls. System-call durations are wall
+time, not pure CPU cost or network latency. All diagnostic overhead is measured;
+compare baseline and draining using the same build. The existing completion
+milestones still overlap these durations and must not be added to them.
+
+Configuration records `receive_drain` and `receive_max_steps_per_socket`
+(effective budget, 1 when disabled). The ABI change rejects older native libraries
+in the Python wrapper. Tests exercise both receive modes, small budgets, empty
+arrays, text/binary messages, local-only/hybrid exchanges, the default 16-proxy
+workload, and nonblocking partial-I/O/backpressure counters.

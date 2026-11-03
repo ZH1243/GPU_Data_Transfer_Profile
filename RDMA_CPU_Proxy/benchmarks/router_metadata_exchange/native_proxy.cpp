@@ -47,9 +47,17 @@ const std::array<const char*, 9> ReceiveFields = {
     "expert_progress_init_ms", "x3x4_deserialize_ms", "x3x4_validate_ms",
     "chunk_build_ms", "x3x4_record_install_ms", "overhead_ms"};
 // Completion timestamps share the exchange-stage origin and overlap.
-const std::array<const char*, 7> DiagnosticFields = {
+const std::array<const char*, 19> DiagnosticFields = {
     "local_expert_complete_ms", "remote_expert_complete_ms", "remote_x3x4_complete_ms",
-    "socket_sends_complete_ms", "poll_ms", "poll_calls", "poll_zero_returns"};
+    "socket_sends_complete_ms", "poll_ms", "poll_calls", "poll_zero_returns",
+    "sendmsg_ms", "sendmsg_calls", "sendmsg_would_block", "sendmsg_interrupted",
+    "recv_ms", "recv_calls", "recv_would_block", "recv_interrupted",
+    "shm_publish_ms", "shm_receive_copy_ms", "receive_budget_yields", "exchange_other_ms"};
+enum DiagnosticIndex : size_t {
+    SendMs = 7, SendCalls, SendWouldBlock, SendInterrupted,
+    RecvMs, RecvCalls, RecvWouldBlock, RecvInterrupted,
+    ShmPublishMs, ShmReceiveCopyMs, ReceiveBudgetYields, ExchangeOtherMs
+};
 using ExchangeDiagnostics = std::array<double, DiagnosticFields.size()>;
 struct ReceiveTimes : std::array<double, ReceiveFields.size()> {
     // Nested measurement, already included in expert_deserialize_ms.
@@ -119,8 +127,17 @@ ssize_t try_send(int fd, const char* data, size_t size) {
     require(n > 0, "socket send failed/peer disconnected");
     return n;
 }
-ssize_t try_recv(int fd, char* data, size_t size) {
+ssize_t try_recv(int fd, char* data, size_t size, ExchangeDiagnostics* diagnostics = nullptr) {
+    auto before = diagnostics ? Clock::now() : Time{};
     ssize_t n = ::recv(fd, data, size, 0);
+    const int saved_errno = errno;
+    if (diagnostics) {
+        (*diagnostics)[RecvMs] += ms(Clock::now(), before);
+        ++(*diagnostics)[RecvCalls];
+        if (n < 0 && (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK)) ++(*diagnostics)[RecvWouldBlock];
+        if (n < 0 && saved_errno == EINTR) ++(*diagnostics)[RecvInterrupted];
+    }
+    errno = saved_errno;
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
     require(n > 0, "socket receive failed/peer disconnected");
     return n;
@@ -214,6 +231,7 @@ struct Config {
         require(!a.disable_expert_index_validation || a.binary,
                 "disabling expert index validation requires binary mode");
         require(!a.local_shared_memory || a.binary, "shared memory requires binary mode");
+        require(a.receive_drain_max_steps >= 1 && a.receive_drain_max_steps <= 1024, "invalid receive drain step budget");
         const uint32_t endian_probe = 1;
         require(!a.binary || (sizeof(size_t) == 8 && *reinterpret_cast<const uint8_t*>(&endian_probe) == 1),
                 "binary mode requires 64-bit size_t and little-endian hosts");
@@ -241,7 +259,7 @@ struct Config {
     int epg() const { return a.num_experts / a.world; }
     std::string json() const {
         std::ostringstream out;
-        out << "{\"backend\":\"cpp\",\"timing_schema\":5,\"wire_format\":"
+        out << "{\"backend\":\"cpp\",\"timing_schema\":6,\"wire_format\":"
             << quote(a.binary ? "binary" : "text") << ",\"receive_storage\":"
             << quote(a.binary ? "direct_reusable_vectors" : "payload_buffer") << ",\"binary_protocol_version\":1,\"hosts\":[";
         for (size_t i = 0; i < hosts.size(); ++i) { if (i) out << ','; out << quote(hosts[i]); }
@@ -251,6 +269,8 @@ struct Config {
         FIELD(num_tokens); FIELD(num_experts); FIELD(top_k); FIELD(token_dimension);
         FIELD(element_bytes); FIELD(tokens_per_chunk); FIELD(datasets); FIELD(warmup);
         FIELD(iterations); FIELD(seed); FIELD(timeout);
+        out << ",\"receive_drain\":" << (a.receive_drain ? "true" : "false")
+            << ",\"receive_max_steps_per_socket\":" << (a.receive_drain ? a.receive_drain_max_steps : 1);
         out << ",\"local_shared_memory\":" << (a.local_shared_memory ? "true" : "false");
 #undef FIELD
         out << ",\"expert_index_validation_enabled\":" << (a.disable_expert_index_validation ? "false" : "true");
@@ -662,7 +682,7 @@ struct Transfer {
     bool done = false;
 };
 // sendmsg references the existing arrays; no packed copy or decimal conversion.
-size_t send_segments(int fd, const Transfer& t) {
+size_t send_segments(int fd, const Transfer& t, ExchangeDiagnostics* diagnostics = nullptr) {
     std::array<iovec, 3> remaining_segments{};
     size_t skip = t.sent, count = 0;
     for (auto segment : t.segments) {
@@ -678,7 +698,16 @@ size_t send_segments(int fd, const Transfer& t) {
 #else
     constexpr int flags = 0;
 #endif
+    auto before = diagnostics ? Clock::now() : Time{};
     auto n = ::sendmsg(fd, &message, flags);
+    const int saved_errno = errno;
+    if (diagnostics) {
+        (*diagnostics)[SendMs] += ms(Clock::now(), before);
+        ++(*diagnostics)[SendCalls];
+        if (n < 0 && (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK)) ++(*diagnostics)[SendWouldBlock];
+        if (n < 0 && saved_errno == EINTR) ++(*diagnostics)[SendInterrupted];
+    }
+    errno = saved_errno;
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
     require(n > 0, "sendmsg failed/peer disconnected");
     return size_t(n);
@@ -787,6 +816,7 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
         if (--incoming_pending[path] == 0) diagnostics[path] = ms(Clock::now(), prepared);
     };
     if (c.a.local_shared_memory) {
+        auto publish_started = Clock::now();
         int gpu = c.gpu(c.a.rank);
         auto* h = local.header(gpu);
         size_t cursor = 0;
@@ -804,6 +834,7 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
             shm_sent += (m.expert_offsets.size() + m.expert_token_indices.size()) * sizeof(int32_t);
         }
         __atomic_store_n(&h->sequence, iteration + 1, __ATOMIC_RELEASE);
+        diagnostics[ShmPublishMs] += ms(Clock::now(), publish_started);
     }
     while (pending || local_pending) {
         // Never block on sockets while a shared-memory producer may publish.
@@ -834,8 +865,10 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
                 double decode_ms = ms(Clock::now(), before);
                 receive_times[0] += decode_ms; receive_ms += decode_ms;
                 auto* offsets = local.offsets(gpu) + c.gpu(c.a.rank) * (c.epg() + 1);
+                auto copy_started = Clock::now();
                 std::copy_n(offsets, m.expert_offsets.size(), m.expert_offsets.data());
                 std::copy_n(local.indices(c, gpu) + cursor, m.expert_token_indices.size(), m.expert_token_indices.data());
+                diagnostics[ShmReceiveCopyMs] += ms(Clock::now(), copy_started);
                 shm_received += (m.expert_offsets.size() + m.expert_token_indices.size()) * sizeof(int32_t);
                 before = Clock::now();
                 install(c, {source, Expert}, "", installed, receive_times);
@@ -861,14 +894,22 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
             if (p.fd < 0 || !p.revents) continue;
             require(!(p.revents & (POLLERR | POLLNVAL)), "metadata socket error");
             if (p.revents & POLLOUT) {
-                t.sent += send_segments(p.fd, t);
+                t.sent += send_segments(p.fd, t, &diagnostics);
                 if (t.sent == t.output_bytes && --sends_pending == 0)
                     diagnostics[3] = ms(Clock::now(), prepared);
             }
             const bool was_done = t.done;
-            if ((p.revents & (POLLIN | POLLHUP)) && !t.done) {
+            const int receive_steps = c.a.receive_drain ? c.a.receive_drain_max_steps : 1;
+            for (int step = 0; step < receive_steps &&
+                 (p.revents & (POLLIN | POLLHUP)) && !t.done; ++step) {
+                bool no_progress = false;
+                auto receive = [&](int fd, char* destination, size_t bytes) {
+                    auto count = try_recv(fd, destination, bytes, &diagnostics);
+                    no_progress = count == 0; // would-block or EINTR: return to polling
+                    return count;
+                };
                 if (t.header_received < FrameBytes) {
-                    t.header_received += try_recv(p.fd, t.header.data() + t.header_received, FrameBytes - t.header_received);
+                    t.header_received += receive(p.fd, t.header.data() + t.header_received, FrameBytes - t.header_received);
                     if (t.header_received == FrameBytes) {
                         uint64_t size = read64(t.header.data());
                         require(read64(t.header.data() + 8) == iteration, "stale/mixed iteration");
@@ -879,7 +920,7 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
                     }
                 } else if (c.a.binary) {
                     if (!t.arrays_ready) {
-                        t.received += try_recv(p.fd, &t.input[t.received], t.input.size() - t.received);
+                        t.received += receive(p.fd, &t.input[t.received], t.input.size() - t.received);
                         if (t.received == t.input.size()) {
                             auto before = Clock::now();
                             prepare_direct_receive(c, t, installed);
@@ -889,7 +930,7 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
                         }
                     } else if (!direct_arrays_complete(t)) {
                         auto& array = t.receive_arrays[t.array_index];
-                        t.array_offset += try_recv(p.fd, static_cast<char*>(array.iov_base) + t.array_offset,
+                        t.array_offset += receive(p.fd, static_cast<char*>(array.iov_base) + t.array_offset,
                             std::min(size_t(262144), array.iov_len - t.array_offset));
                     }
                     if (t.arrays_ready && direct_arrays_complete(t)) {
@@ -897,12 +938,15 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
                         receive_ms += ms(Clock::now(), before); t.done = true;
                     }
                 } else {
-                    t.received += try_recv(p.fd, &t.input[t.received], std::min(size_t(262144), t.input.size() - t.received));
+                    t.received += receive(p.fd, &t.input[t.received], std::min(size_t(262144), t.input.size() - t.received));
                     if (t.received == t.input.size()) {
                         auto before = Clock::now(); install(c, t.key, t.input, installed, receive_times);
                         receive_ms += ms(Clock::now(), before); t.done = true;
                     }
                 }
+                if (no_progress) break;
+                if (c.a.receive_drain && step + 1 == receive_steps && !t.done)
+                    ++diagnostics[ReceiveBudgetYields];
             }
             if (t.done && !was_done) received_one(receive_path(t.key));
             p.events = static_cast<short>((t.done ? 0 : POLLIN) | (t.sent == t.output_bytes ? 0 : POLLOUT));
@@ -918,6 +962,8 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
     receive_times.back() = receive_ms - std::accumulate(receive_times.begin(), receive_times.end() - 1, 0.0);
     Record r; r.rank = c.a.rank;
     r.receive_times = receive_times;
+    diagnostics[ExchangeOtherMs] = ms(finished, prepared) - receive_ms - diagnostics[4]
+        - diagnostics[SendMs] - diagnostics[RecvMs] - diagnostics[ShmPublishMs] - diagnostics[ShmReceiveCopyMs];
     r.diagnostics = diagnostics;
     r.shm_sent = shm_sent; r.shm_received = shm_received;
     r.times = {ms(finished, started), ms(serialized, started), ms(self_installed, serialized),
@@ -989,6 +1035,7 @@ void report(const Config& c, const std::vector<std::vector<Record>>& records) {
         ",\"critical_rank_receive_process_ms\":" + receive_summary(critical) +
         ",\"critical_rank_expert_index_bounds_ms\":" + index_bounds_summary(critical) +
         ",\"expert_index_validation_enabled\":" + (c.a.disable_expert_index_validation ? "false" : "true") +
+        ",\"receive_drain\":" + (c.a.receive_drain ? "true" : "false") +
         ",\"local_shared_memory\":" + (c.a.local_shared_memory ? "true" : "false") +
         ",\"backend\":\"cpp\",\"wire_format\":" + quote(c.a.binary ? "binary" : "text") + ",\"mode\":" + quote(c.a.preserialized ? "preserialized" : "serialize-in-timer");
     std::cout << pretty('{' + common + '}') << std::endl;
@@ -1065,7 +1112,7 @@ int run(const RouterMetadataBenchConfig& raw) {
 }
 } // namespace
 
-extern "C" uint32_t router_metadata_bench_abi_version() { return 4; }
+extern "C" uint32_t router_metadata_bench_abi_version() { return 5; }
 extern "C" int router_metadata_bench_run(const RouterMetadataBenchConfig* config, char* error, size_t capacity) {
     if (error && capacity) error[0] = '\0';
     try {
@@ -1083,6 +1130,7 @@ extern "C" int router_metadata_bench_run(const RouterMetadataBenchConfig* config
 int main() {
     try {
         RouterMetadataBenchConfig raw{};
+        raw.receive_drain_max_steps = 16;
         raw.rank = 0; raw.world = 4; raw.gpus_per_node = 2;
         raw.port_base = 20515; raw.num_tokens = 137; raw.num_experts = 16; raw.top_k = 4;
         raw.token_dimension = 4096; raw.element_bytes = 2; raw.tokens_per_chunk = 7;
@@ -1190,15 +1238,21 @@ int main() {
         Transfer t;
         t.segments = {{a.data(), a.size()}, {nullptr, 0}, {b.data(), b.size()}};
         t.output_bytes = a.size() + b.size();
+        ExchangeDiagnostics io{};
+        char probe;
+        require(try_recv(receiver.fd, &probe, 1, &io) == 0 && io[RecvWouldBlock] == 1,
+                "empty nonblocking receive was not counted");
         auto until = deadline(5);
         while (received.size() < t.output_bytes) {
             remaining(until);
-            if (t.sent < t.output_bytes) t.sent += send_segments(sender.fd, t);
+            if (t.sent < t.output_bytes) t.sent += send_segments(sender.fd, t, &io);
             char buffer[113];
-            auto n = try_recv(receiver.fd, buffer, sizeof(buffer));
+            auto n = try_recv(receiver.fd, buffer, sizeof(buffer), &io);
             received.append(buffer, size_t(n));
         }
         require(t.sent == t.output_bytes && received == a + b, "partial sendmsg corrupted array bytes");
+        require(io[SendCalls] > 1 && io[RecvCalls] > 1 && io[SendWouldBlock] > 0,
+                "partial I/O instrumentation did not count calls/backpressure");
         std::cout << "Binary codec and partial-send tests passed\n";
         return 0;
     } catch (const std::exception& e) {

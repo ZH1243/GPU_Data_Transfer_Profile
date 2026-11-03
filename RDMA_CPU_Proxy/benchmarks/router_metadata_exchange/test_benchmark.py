@@ -101,7 +101,7 @@ class ProcessTests(unittest.TestCase):
         self.assertIn("TCP operation timed out", result.stderr)
 
     def run_job(self, nodes, per_node, preserialized=False, num_tokens=137,
-                num_experts=16, top_k=4, wire_format="binary", disable_validation=False, local_shared_memory=False):
+                num_experts=16, top_k=4, wire_format="binary", disable_validation=False, local_shared_memory=False, receive_drain=False, drain_steps=16):
         # Distinct node port ranges emulate hosts without loopback aliases.
         hosts = ["127.0.0.1"] * nodes
         with socket.socket() as probe:
@@ -125,6 +125,8 @@ class ProcessTests(unittest.TestCase):
                            f"--num-tokens={num_tokens}", f"--num-experts={num_experts}", f"--top-k={top_k}",
                            "--datasets=2", "--warmup=1", "--iterations=3", "--timeout=60",
                            f"--output={output}"]
+                    if receive_drain:
+                        cmd.extend(["--receive-drain", f"--receive-drain-max-steps={drain_steps}"])
                     if local_shared_memory:
                         cmd.append("--local-shared-memory")
                     if preserialized:
@@ -140,12 +142,14 @@ class ProcessTests(unittest.TestCase):
                     self.assertEqual(code, 0, log.read())
                 report = json.loads(output.read_text())
                 self.assertEqual(report["backend"], "cpp")
+                self.assertEqual(report["receive_drain"], receive_drain)
+                self.assertEqual(report["configuration"]["receive_max_steps_per_socket"], drain_steps if receive_drain else 1)
                 self.assertEqual(report["configuration"]["local_shared_memory"], local_shared_memory)
                 self.assertEqual(report["expert_index_validation_enabled"], not disable_validation)
                 self.assertEqual(report["configuration"]["expert_index_validation_enabled"], not disable_validation)
                 self.assertEqual(report["wire_format"], wire_format)
                 self.assertEqual(report["configuration"]["wire_format"], wire_format)
-                self.assertEqual(report["configuration"]["timing_schema"], 5)
+                self.assertEqual(report["configuration"]["timing_schema"], 6)
                 self.assertEqual(report["configuration"]["receive_storage"],
                                  "direct_reusable_vectors" if wire_format == "binary" else "payload_buffer")
                 self.assertEqual(len(report["iterations"]), 3)
@@ -177,12 +181,29 @@ class ProcessTests(unittest.TestCase):
                         self.assertEqual(result["installed_x3x4_sources"], nodes - 1)
                         self.assertGreater(result["elapsed_ms"], 0)
                         diagnostics = result["exchange_diagnostics"]
-                        self.assertEqual(len(diagnostics), 7)
+                        self.assertEqual(len(diagnostics), 19)
                         exchange_span = result["exchange_ms"] + result["receive_process_ms"]
                         for name, value in diagnostics.items():
                             self.assertGreaterEqual(value, 0)
                             if name.endswith("_ms"):
                                 self.assertLessEqual(value, exchange_span + 1e-9)
+                        accounted = ("poll_ms", "sendmsg_ms", "recv_ms", "shm_publish_ms",
+                                     "shm_receive_copy_ms", "exchange_other_ms")
+                        self.assertAlmostEqual(sum(diagnostics[name] for name in accounted),
+                                               result["exchange_ms"], places=7)
+                        for op in ("sendmsg", "recv"):
+                            self.assertLessEqual(diagnostics[op + "_would_block"] + diagnostics[op + "_interrupted"],
+                                                 diagnostics[op + "_calls"])
+                        if not receive_drain:
+                            self.assertEqual(diagnostics["receive_budget_yields"], 0)
+                        if not local_shared_memory:
+                            self.assertEqual(diagnostics["shm_publish_ms"], 0)
+                            self.assertEqual(diagnostics["shm_receive_copy_ms"], 0)
+                        if local_shared_memory and nodes == 1:
+                            self.assertEqual(diagnostics["recv_calls"], 0)
+                            self.assertEqual(diagnostics["sendmsg_calls"], 0)
+                        if receive_drain and drain_steps == 2 and nodes > 1:
+                            self.assertGreater(diagnostics["receive_budget_yields"], 0)
                         self.assertLessEqual(diagnostics["poll_ms"], result["exchange_ms"] + 1e-9)
                         self.assertLessEqual(diagnostics["poll_zero_returns"], diagnostics["poll_calls"])
                         for name in ("poll_calls", "poll_zero_returns"):
@@ -227,6 +248,36 @@ class ProcessTests(unittest.TestCase):
                     process.wait()
                 for log in logs:
                     log.close()
+
+    def test_receive_drain_hybrid(self):
+        self.run_job(2, 2, local_shared_memory=True, receive_drain=True)
+
+    def test_receive_drain_tcp_small_budget(self):
+        self.run_job(2, 2, receive_drain=True, drain_steps=2)
+
+    def test_receive_drain_empty_lists(self):
+        self.run_job(2, 2, num_tokens=1, top_k=1, local_shared_memory=True, receive_drain=True)
+
+    def test_receive_drain_text(self):
+        self.run_job(2, 2, wire_format="text", receive_drain=True)
+
+    def test_receive_drain_preserialized(self):
+        self.run_job(2, 2, preserialized=True, disable_validation=True, local_shared_memory=True, receive_drain=True)
+
+    def test_receive_drain_local_only(self):
+        self.run_job(1, 4, local_shared_memory=True, receive_drain=True)
+
+    def test_receive_drain_default_workload(self):
+        self.run_job(2, 8, num_tokens=20480, num_experts=128, top_k=8, local_shared_memory=True, receive_drain=True)
+
+    def test_receive_drain_invalid_budget(self):
+        for budget in (0, 1025):
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).with_name("benchmark.py")),
+                 "--hosts=127.0.0.1", f"--receive-drain-max-steps={budget}"],
+                capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("--receive-drain-max-steps must be in 1..1024", result.stderr)
 
     def test_shared_memory_local_only(self):
         self.run_job(1, 4, local_shared_memory=True)
