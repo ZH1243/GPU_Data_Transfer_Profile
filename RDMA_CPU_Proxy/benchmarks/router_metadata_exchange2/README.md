@@ -141,7 +141,7 @@ immediately before they record the start event and launch the metadata graph.
 The launch barrier requires native launch; invalid option combinations fail early.
 Both flags are off by default, preserving the existing Python launch path.
 
-Update the Python files and **rebuild the library (ABI 4)**:
+Update the Python files and **rebuild the library (ABI 5)**:
 
 ```bash
 cmake --build build -j
@@ -193,7 +193,7 @@ arrival slot. The C++ callers acquire-poll all eight arrivals, checking timeout/
 then enqueue their exchange kernels. Slots carry monotonically increasing epochs;
 the existing consumption barrier prevents reuse while peers still consume metadata.
 
-Update Python and rebuild the library together (native **ABI 4**):
+Update Python and rebuild the library together (native **ABI 5**):
 
 ```bash
 cmake --build build -j
@@ -224,7 +224,7 @@ exchange stage into the metadata barrier. The flag can also combine with
 
 Pass `--per-source-readback` to remove the all-sources gate before readback.
 The default remains unchanged. **Rebuild the shared library and update Python
-together**: the native interface is now ABI 4; Python rejects older libraries.
+together**: the native interface is now ABI 5; Python rejects older libraries.
 
 ```bash
 cmake --build build -j
@@ -291,7 +291,7 @@ rank with the longest end-to-end duration on each iteration and using that same
 rank's measurements for every row. These distributions are stored as
 `critical_rank_metrics`, with selected ranks in `critical_rank_per_iteration`.
 `all_rank_metrics` retains distributions over all rank/iteration samples. JSON
-timing fields remain in **milliseconds** (schema version 5).
+timing fields remain in **milliseconds** (schema version 6).
 
 | Field | Meaning |
 |---|---|
@@ -302,6 +302,11 @@ timing fields remain in **milliseconds** (schema version 5).
 | `peer_completion_wait_ms` | Wait after local publication for all peer publications |
 | `headers_d2h_ms` | Wall time for header submission and completion |
 | `payload_d2h_ms` | Header checks, exact payload submissions, and completion |
+| `payload_checks_ms` | Sum of CPU header checks and source/destination address and length preparation |
+| `payload_submit_ms` | Sum of wall durations of nonempty `cudaMemcpyAsync` calls, including CUDA API overhead |
+| `payload_event_record_ms` | CPU wall time recording payload completion events |
+| `payload_completion_ms` | Batched mode: polling/yielding until the completion event is observed; per-source mode: summed intervals from event recording to observed completion, including other source work between polls |
+| `payload_other_ms` | Parent payload time minus the four measured subintervals: bookkeeping, loop and timestamp-boundary overhead |
 | `install_ms` | CPU validation, view installation, and progress reset |
 | `native_ms` | Native submit through worker installation, before return to Python |
 | `host_outside_native_ms` | End-to-end minus native duration: host submission before the native timer and wakeup/return overhead after it; not isolated Python CPU time |
@@ -309,7 +314,16 @@ timing fields remain in **milliseconds** (schema version 5).
 | `peer_received_index_bytes` | Received peer index bytes, excluding self and headers |
 | `header_bytes` | Header D2H bytes (576 per rank per iteration) |
 
-These timings overlap and **must not be added together**. Reported bytes are logical
+The five `payload_*` subrows partition `payload_d2h_ms` per sample. Their **means**
+add to the parent mean, up to rounding; medians and p95 values need not add. Do not
+add the subrows to the parent again. Timing is always enabled, so rebuild the native
+library and update Python together to obtain this breakdown. Extra clock reads can
+increase measured latency slightly, particularly for very small copies/checks.
+Copies may execute while subsequent CUDA API calls are being submitted; the final
+completion wait measures only residual CPU-observed latency, not total DMA time.
+Per-source mode retains overlapping latency sums, not additive wall stages.
+
+The other timings overlap and **must not be added together**. Reported bytes are logical
 payload bytes, not hardware link transaction counters. The all-senders completion
 wait, header round trip, and eight small payload submissions may dominate latency;
 the experiment makes these costs visible. Optional per-source progress is described

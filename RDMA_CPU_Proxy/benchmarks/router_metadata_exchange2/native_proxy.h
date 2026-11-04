@@ -3,7 +3,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI 4; Linux CUDA only. All functions except destroy/error return 0 on success.
+/* ABI 5; Linux CUDA only. All functions except destroy/error return 0 on success.
  * create/connect/submit/wait/view must be called serially by one host thread.
  * submit queues work; the owned native thread handles readback and installation.
  * Pointers returned by view are borrowed until the next submit or destroy.
@@ -19,6 +19,11 @@ typedef struct {
     double peer_completion_wait_ms;
     double headers_d2h_ms;
     double payload_d2h_ms;
+    double payload_checks_ms;
+    double payload_submit_ms;
+    double payload_event_record_ms;
+    double payload_completion_ms;
+    double payload_other_ms;
     double install_ms;
     double native_ms;
     uint64_t received_index_bytes;

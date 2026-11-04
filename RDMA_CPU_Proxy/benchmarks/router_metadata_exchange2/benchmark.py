@@ -32,6 +32,11 @@ def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False):
         ("peer_completion_wait_ms", "Proxy wait for peer completions"),
         ("headers_d2h_ms", "Header D2H + completion (wall)"),
         ("payload_d2h_ms", "Payload checks + D2H + completion (wall)"),
+        ("payload_checks_ms", "  Payload: header checks + addresses"),
+        ("payload_submit_ms", "  Payload: cudaMemcpyAsync calls"),
+        ("payload_event_record_ms", "  Payload: completion event recording"),
+        ("payload_completion_ms", "  Payload: completion wait / detection"),
+        ("payload_other_ms", "  Payload: bookkeeping / timer overhead"),
         ("install_ms", "CPU validation + install + reset"),
         ("native_ms", "Native submit through installation (wall)"),
         ("host_outside_native_ms", "Host time outside native interval (wall)"),
@@ -54,6 +59,9 @@ def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False):
         print(f"{label:45s} {values['median'] * 1000:10.3f} "
               f"{values['mean'] * 1000:10.3f} {values['p95'] * 1000:10.3f}")
     print("GPU and CPU intervals overlap: do not sum these rows.")
+    print("Payload subrows partition the payload total per sample (means add; medians/p95 need not).")
+    print("Completion wait is residual CPU-observed latency, not pure DMA time; transfers can")
+    print("already run during cudaMemcpyAsync submissions. Extra timestamps add measurement overhead.")
     if per_source_readback:
         print("Per-source mode: readiness spans overlap readback/installation; D2H rows")
         print("sum eight overlapping source latencies, not elapsed readback wall time.")
@@ -270,7 +278,7 @@ def main():
             metrics = {key: summary([r[key] for report in reports for r in report["records"]])
                        for key in records[0] if key.endswith("_ms")}
             critical_metrics = {key: summary([r[key] for r in critical_records]) for key in metrics}
-            report = dict(schema_version=5, backend="cpp-thread-cuda-ipc", topology=dict(
+            report = dict(schema_version=6, backend="cpp-thread-cuda-ipc", topology=dict(
                 nodes=1, gpus=8, experts=128, experts_per_gpu=16, top_k=8),
                 configuration=config, versions=dict(torch=torch.__version__, cuda=torch.version.cuda),
                 critical_rank_end_to_end_ms=summary(critical), all_rank_metrics=metrics,

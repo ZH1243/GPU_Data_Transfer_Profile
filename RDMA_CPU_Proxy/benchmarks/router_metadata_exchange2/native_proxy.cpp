@@ -145,7 +145,7 @@ struct Rme2Proxy {
     }
     void process_per_source() {
         std::array<rme2::ReadbackStage, rme2::gpus> stages{};
-        std::array<Clock::time_point, rme2::gpus> header_start{}, payload_start{};
+        std::array<Clock::time_point, rme2::gpus> header_start{}, payload_start{}, payload_wait_start{};
         const auto started = Clock::now();
         bool published = false;
         int observed = 0, installed_count = 0;
@@ -175,19 +175,33 @@ struct Rme2Proxy {
                 [&](size_t s) {
                     stats.headers_d2h_ms += ms(header_start[s]);
                     payload_start[s] = Clock::now();
+                    const auto checks_start = Clock::now();
                     const int32_t* header = pinned + s * rme2::header_words;
                     const int count = rme2::check_header(header, capacity);
                     const size_t bytes = size_t(count) * sizeof(int32_t);
                     const int32_t* src = int(s) == rank ? local_values + header[0] : payload(inbox, s);
-                    if (bytes) check(cudaMemcpyAsync(payload(pinned, s), src, bytes,
-                                                    cudaMemcpyDeviceToHost, source_streams[s]), "copy ready source payload");
+                    auto* dst = payload(pinned, s);
+                    stats.payload_checks_ms += ms(checks_start);
+                    if (bytes) {
+                        const auto submit_start = Clock::now();
+                        check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost,
+                                              source_streams[s]), "copy ready source payload");
+                        stats.payload_submit_ms += ms(submit_start);
+                    }
                     // Even empty payloads use an event, keeping lifetime and
                     // completion semantics identical without a zero-byte copy.
+                    const auto event_start = Clock::now();
                     check(cudaEventRecord(source_events[s], source_streams[s]), "record source payload completion");
+                    stats.payload_event_record_ms += ms(event_start);
+                    payload_wait_start[s] = Clock::now();
                     stats.received_index_bytes += bytes;
                     if (int(s) != rank) stats.peer_received_index_bytes += bytes;
                 },
-                [&](size_t s) { return event_ready(source_events[s]); },
+                [&](size_t s) {
+                    if (!event_ready(source_events[s])) return false;
+                    stats.payload_completion_ms += ms(payload_wait_start[s]);
+                    return true;
+                },
                 [&](size_t s) {
                     stats.payload_d2h_ms += ms(payload_start[s]);
                     const auto install_start = Clock::now();
@@ -201,7 +215,14 @@ struct Rme2Proxy {
         float elapsed = 0;
         check(cudaEventElapsedTime(&elapsed, begin, end), "exchange event timing");
         stats.exchange_gpu_ms = elapsed;
+        finish_payload_breakdown();
         stats.native_ms = ms(submitted);
+    }
+    void finish_payload_breakdown() {
+        // Uninstrumented loop/accounting work and timer boundary overhead. In
+        // progressive mode the parent and completion fields sum source spans.
+        stats.payload_other_ms = stats.payload_d2h_ms - stats.payload_checks_ms
+            - stats.payload_submit_ms - stats.payload_event_record_ms - stats.payload_completion_ms;
     }
     void process() {
         if (per_source_readback) { process_per_source(); return; }
@@ -231,18 +252,30 @@ struct Rme2Proxy {
         stats.headers_d2h_ms = ms(start);
         start = Clock::now();
         for (int source = 0; source < rme2::gpus; ++source) {
+            const auto checks_start = Clock::now();
             const int32_t* header = pinned + source * rme2::header_words;
             int count = rme2::check_header(header, capacity);
             auto bytes = size_t(count) * sizeof(int32_t);
             const int32_t* src = source == rank ? local_values + header[0] : payload(inbox, source);
-            if (bytes) check(cudaMemcpyAsync(payload(pinned, source), src, bytes,
-                                            cudaMemcpyDeviceToHost, read_stream), "copy exact metadata payload");
+            auto* dst = payload(pinned, source);
+            stats.payload_checks_ms += ms(checks_start);
+            if (bytes) {
+                const auto submit_start = Clock::now();
+                check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost,
+                                      read_stream), "copy exact metadata payload");
+                stats.payload_submit_ms += ms(submit_start);
+            }
             stats.received_index_bytes += bytes;
             if (source != rank) stats.peer_received_index_bytes += bytes;
         }
+        auto part_start = Clock::now();
         check(cudaEventRecord(read_done, read_stream), "record payload readback");
+        stats.payload_event_record_ms = ms(part_start);
+        part_start = Clock::now();
         wait_event(read_done);
+        stats.payload_completion_ms = ms(part_start);
         stats.payload_d2h_ms = ms(start);
+        finish_payload_breakdown();
         start = Clock::now();
         for (int source = 0; source < rme2::gpus; ++source)
             rme2::install(installed[source], pinned + source * rme2::header_words,
@@ -364,7 +397,7 @@ struct Rme2Proxy {
     }
 };
 
-extern "C" int rme2_abi_version() { return 4; }
+extern "C" int rme2_abi_version() { return 5; }
 extern "C" const char* rme2_error() { return last_error.c_str(); }
 extern "C" int rme2_create(int rank, int device, int tokens, const char* name,
                            double timeout, int validate, int core, int per_source_readback, int metadata_barrier, Rme2Proxy** out) {
