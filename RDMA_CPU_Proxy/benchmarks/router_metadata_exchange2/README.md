@@ -132,11 +132,48 @@ Payload capacity is conservative; transfer size is exact. The design avoids send
 D2H, sender packing buffers, self peer payload copies, and receiver CPU payload copies.
 It is not zero-copy: peer payloads still move GPU-to-GPU and then GPU-to-CPU.
 
+### Optional barrier after metadata processing
+
+`--metadata-barrier` (default off) synchronizes after **GPU metadata completion**,
+before exchange submission. It runs inside the native submission call made by each
+Python caller, not on the proxy worker. An event queued on the metadata stream must
+complete before the caller release-publishes its iteration in a separate shared-memory
+arrival slot. The C++ callers acquire-poll all eight arrivals, checking timeout/abort,
+then enqueue their exchange kernels. Slots carry monotonically increasing epochs;
+the existing consumption barrier prevents reuse while peers still consume metadata.
+
+Update Python and rebuild the library together (native **ABI 3**):
+
+```bash
+cmake --build build -j
+bash ./run_single_node_torchrun.sh --metadata-barrier \
+  --tokens 257 --warmup 1 --iterations 6 --route-pattern cycle --verify all
+
+RESULT_JSON=results/metadata_barrier.json bash ./run_single_node_torchrun.sh \
+  --metadata-barrier --skip-index-validation --warmup 20 --iterations 200
+```
+
+The extra waits remain inside `native_ms` and `end_to_end_ms`, with separate rows:
+
+- `metadata_completion_wait_ms`: recording and polling the metadata completion event
+  in the C++ caller. It measures remaining metadata execution and CPU detection delay,
+  not the full seven-kernel duration (which remains `metadata_gpu_ms`).
+- `metadata_barrier_wait_ms`: publishing this GPU's metadata-ready arrival and waiting
+  for all other GPUs' arrivals. This exposes readiness skew after metadata processing.
+
+Both fields are zero when disabled. In default batched readback, the subsequent
+`sender_completion_wait_ms` now waits for exchange completion only, since metadata
+has completed; `peer_completion_wait_ms` still waits for peer exchange publications.
+Neither CPU barrier release nor CPU completion detection guarantees simultaneous GPU
+starts. Compare end-to-end time as well as the waits: waiting may move from the peer
+exchange stage into the metadata barrier. The flag can also combine with
+`--per-source-readback`, whose overlapping timing semantics below still apply.
+
 ### Optional per-source readback
 
 Pass `--per-source-readback` to remove the all-sources gate before readback.
 The default remains unchanged. **Rebuild the shared library and update Python
-together**: the native create signature is now ABI 2; Python rejects older libraries.
+together**: the native create signature is now ABI 3; Python rejects older libraries.
 
 ```bash
 cmake --build build -j
@@ -203,7 +240,7 @@ rank with the longest end-to-end duration on each iteration and using that same
 rank's measurements for every row. These distributions are stored as
 `critical_rank_metrics`, with selected ranks in `critical_rank_per_iteration`.
 `all_rank_metrics` retains distributions over all rank/iteration samples. JSON
-timing fields remain in **milliseconds** (schema version 3).
+timing fields remain in **milliseconds** (schema version 4).
 
 | Field | Meaning |
 |---|---|

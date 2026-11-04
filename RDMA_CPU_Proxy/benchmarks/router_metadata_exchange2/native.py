@@ -4,6 +4,7 @@ import ctypes as C
 
 class Stats(C.Structure):
     _fields_ = [(name, C.c_double) for name in (
+        "metadata_completion_wait_ms", "metadata_barrier_wait_ms",
         "exchange_gpu_ms", "sender_completion_wait_ms", "peer_completion_wait_ms",
         "headers_d2h_ms", "payload_d2h_ms", "install_ms", "native_ms")]
     _fields_ += [(name, C.c_uint64) for name in (
@@ -15,14 +16,14 @@ class Stats(C.Structure):
 
 class Proxy:
     def __init__(self, library, rank, device, tokens, shm_name, timeout, validate, core,
-                 per_source_readback=False):
+                 per_source_readback=False, metadata_barrier=False):
         self.lib = C.CDLL(str(library))  # CDLL releases the GIL in native calls.
         self.handle = C.c_void_p()
         signatures = {
             "rme2_abi_version": ([], C.c_int),
             "rme2_error": ([], C.c_char_p),
             "rme2_create": ([C.c_int, C.c_int, C.c_int, C.c_char_p, C.c_double,
-                              C.c_int, C.c_int, C.c_int, C.POINTER(C.c_void_p)], C.c_int),
+                              C.c_int, C.c_int, C.c_int, C.c_int, C.POINTER(C.c_void_p)], C.c_int),
             "rme2_export": ([C.c_void_p, C.c_void_p], C.c_int),
             "rme2_connect": ([C.c_void_p, C.c_void_p], C.c_int),
             "rme2_unlink": ([C.c_void_p], C.c_int),
@@ -36,10 +37,10 @@ class Proxy:
         for name, (args, result) in signatures.items():
             fn = getattr(self.lib, name)
             fn.argtypes, fn.restype = args, result
-        if self.lib.rme2_abi_version() != 2:
+        if self.lib.rme2_abi_version() != 3:
             raise RuntimeError("native ABI mismatch; rebuild the library")
         self.check(self.lib.rme2_create(rank, device, tokens, shm_name.encode(), timeout,
-                                       int(validate), core, int(per_source_readback), C.byref(self.handle)))
+                                       int(validate), core, int(per_source_readback), int(metadata_barrier), C.byref(self.handle)))
 
     def check(self, status):
         if status:

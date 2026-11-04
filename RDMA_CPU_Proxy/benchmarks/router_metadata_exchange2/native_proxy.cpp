@@ -2,6 +2,7 @@
 #include "exchange.cuh"
 #include "metadata_view.hpp"
 #include "readback_progress.hpp"
+#include "epoch_barrier.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -39,7 +40,7 @@ template<class F> int api(F&& f) {
 // Linux process-shared, lock-free aligned atomic counters. Only CPU threads
 // touch these; GPU readiness comes from a completed CUDA event first.
 struct alignas(64) Slot { uint64_t complete; char padding[56]; };
-struct Shared { Slot slots[rme2::gpus]; Slot aborted; };
+struct Shared { Slot slots[rme2::gpus]; Slot metadata_arrivals[rme2::gpus]; Slot aborted; };
 static_assert(__atomic_always_lock_free(sizeof(uint64_t), nullptr), "64-bit atomics required");
 uint64_t acquire(const uint64_t* p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
 void release(uint64_t* p, uint64_t value) { __atomic_store_n(p, value, __ATOMIC_RELEASE); }
@@ -48,7 +49,7 @@ void release(uint64_t* p, uint64_t value) { __atomic_store_n(p, value, __ATOMIC_
 struct Rme2Proxy {
     int rank, device, tokens, capacity, core;
     double timeout;
-    bool validate, per_source_readback, owner = false, connected = false, pending = false, done = false;
+    bool validate, per_source_readback, metadata_barrier, owner = false, connected = false, pending = false, done = false;
     std::string name, failure;
     Shared* shared = nullptr;
     int32_t* inbox = nullptr;
@@ -56,7 +57,7 @@ struct Rme2Proxy {
     PeerArenas peers{};
     std::array<bool, rme2::gpus> opened{};
     cudaStream_t read_stream = nullptr;
-    cudaEvent_t begin = nullptr, end = nullptr, read_done = nullptr;
+    cudaEvent_t begin = nullptr, end = nullptr, read_done = nullptr, metadata_done = nullptr;
     std::array<cudaStream_t, rme2::gpus> source_streams{};
     std::array<cudaEvent_t, rme2::gpus> source_events{};
     std::array<rme2::Installed, rme2::gpus> installed{};
@@ -69,9 +70,9 @@ struct Rme2Proxy {
     Clock::time_point submitted;
     Rme2Stats stats{};
 
-    Rme2Proxy(int r, int d, int t, const char* n, double seconds, bool v, int c, bool progressive)
+    Rme2Proxy(int r, int d, int t, const char* n, double seconds, bool v, int c, bool progressive, bool barrier)
         : rank(r), device(d), tokens(t), capacity(t * 8), core(c), timeout(seconds),
-          validate(v), per_source_readback(progressive), name(n) {}
+          validate(v), per_source_readback(progressive), metadata_barrier(barrier), name(n) {}
 
     size_t words() const { return size_t(rme2::gpus) * (rme2::header_words + size_t(capacity)); }
     int32_t* payload(int32_t* arena, int source) const {
@@ -88,6 +89,8 @@ struct Rme2Proxy {
         check(cudaEventCreate(&begin), "create exchange start event");
         check(cudaEventCreate(&end), "create exchange end event");
         check(cudaEventCreateWithFlags(&read_done, cudaEventDisableTiming), "create readback event");
+        if (metadata_barrier)
+            check(cudaEventCreateWithFlags(&metadata_done, cudaEventDisableTiming), "create metadata completion event");
         if (per_source_readback) {
             for (int s = 0; s < rme2::gpus; ++s) {
                 check(cudaStreamCreateWithFlags(&source_streams[s], cudaStreamNonBlocking),
@@ -136,7 +139,6 @@ struct Rme2Proxy {
         return true;
     }
     void process_per_source() {
-        stats = {};
         std::array<rme2::ReadbackStage, rme2::gpus> stages{};
         std::array<Clock::time_point, rme2::gpus> header_start{}, payload_start{};
         const auto started = Clock::now();
@@ -198,7 +200,6 @@ struct Rme2Proxy {
     }
     void process() {
         if (per_source_readback) { process_per_source(); return; }
-        stats = {};
         auto start = Clock::now();
         wait_event(end);
         stats.sender_completion_wait_ms = ms(start);
@@ -290,6 +291,7 @@ struct Rme2Proxy {
         if (begin) cudaEventDestroy(begin);
         if (end) cudaEventDestroy(end);
         if (read_done) cudaEventDestroy(read_done);
+        if (metadata_done) cudaEventDestroy(metadata_done);
         for (auto event : source_events) if (event) cudaEventDestroy(event);
         for (auto stream : source_streams) if (stream) cudaStreamDestroy(stream);
         if (inbox) cudaFree(inbox);
@@ -299,10 +301,10 @@ struct Rme2Proxy {
     }
 };
 
-extern "C" int rme2_abi_version() { return 2; }
+extern "C" int rme2_abi_version() { return 3; }
 extern "C" const char* rme2_error() { return last_error.c_str(); }
 extern "C" int rme2_create(int rank, int device, int tokens, const char* name,
-                           double timeout, int validate, int core, int per_source_readback, Rme2Proxy** out) {
+                           double timeout, int validate, int core, int per_source_readback, int metadata_barrier, Rme2Proxy** out) {
     return api([&] {
         require(out != nullptr, "null output"); *out = nullptr;
         require(rank >= 0 && rank < 8 && device >= 0 && tokens > 0 && tokens <= 10000000 &&
@@ -310,7 +312,8 @@ extern "C" int rme2_create(int rank, int device, int tokens, const char* name,
         require(name && name[0] == '/' && std::strlen(name) < 200 &&
                 std::strchr(name + 1, '/') == nullptr, "invalid shared memory name");
         require(per_source_readback == 0 || per_source_readback == 1, "invalid readback mode");
-        auto* p = new Rme2Proxy(rank, device, tokens, name, timeout, validate != 0, core, per_source_readback != 0);
+        require(metadata_barrier == 0 || metadata_barrier == 1, "invalid metadata barrier mode");
+        auto* p = new Rme2Proxy(rank, device, tokens, name, timeout, validate != 0, core, per_source_readback != 0, metadata_barrier != 0);
         try { p->initialize(); } catch (...) { delete p; throw; }
         *out = p;
     });
@@ -377,7 +380,30 @@ extern "C" int rme2_submit(Rme2Proxy* p, uint64_t iteration, const int32_t* offs
                 "submit requires prior wait and consecutive iterations starting at 1");
         check(cudaSetDevice(p->device), "select submit GPU");
         p->submitted = Clock::now();
+        p->stats = {};
         auto s = static_cast<cudaStream_t>(stream);
+        if (p->metadata_barrier) {
+            try {
+                // The caller has already queued metadata on this stream. Only
+                // this event's completion permits arrival at the CPU barrier.
+                auto started = Clock::now();
+                check(cudaEventRecord(p->metadata_done, s), "record metadata completion");
+                p->wait_event(p->metadata_done);
+                p->stats.metadata_completion_wait_ms = ms(started);
+                started = Clock::now();
+                release(&p->shared->metadata_arrivals[p->rank].complete, iteration);
+                rme2::wait_epoch_all(rme2::gpus, iteration,
+                    [&](int peer) { return acquire(&p->shared->metadata_arrivals[peer].complete); },
+                    [&] {
+                        p->check_deadline(started);
+                        std::this_thread::yield();
+                    });
+                p->stats.metadata_barrier_wait_ms = ms(started);
+            } catch (...) {
+                release(&p->shared->aborted.complete, 1);
+                throw;
+            }
+        }
         check(cudaEventRecord(p->begin, s), "record exchange start");
         launch_exchange(p->peers, p->rank, p->capacity, offsets, indices, s);
         check(cudaGetLastError(), "launch metadata exchange");

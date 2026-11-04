@@ -20,10 +20,12 @@ def summary(values):
                 p95=ordered[int(0.95 * (len(ordered) - 1))], max=ordered[-1])
 
 
-def print_breakdown(metrics, per_source_readback=False):
+def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False):
     labels = (
         ("end_to_end_ms", "End to end (wall)"),
         ("metadata_gpu_ms", "Seven metadata kernels (GPU)"),
+        ("metadata_completion_wait_ms", "CPU wait for local metadata completion"),
+        ("metadata_barrier_wait_ms", "Shared-memory metadata barrier wait"),
         ("exchange_gpu_ms", "GPU-to-GPU exchange (GPU)"),
         ("sender_completion_wait_ms", "Proxy wait for local GPU completion"),
         ("peer_completion_wait_ms", "Proxy wait for peer completions"),
@@ -38,6 +40,8 @@ def print_breakdown(metrics, per_source_readback=False):
     print("all rows use that same rank's sample, not separate per-stage maxima.")
     print(f"{'Measurement':45s} {'median':>10s} {'mean':>10s} {'p95':>10s}")
     for key, label in labels:
+        if metadata_barrier and not per_source_readback and key == "sender_completion_wait_ms":
+            label = "Proxy wait for local exchange completion"
         if per_source_readback:
             label = {
                 "sender_completion_wait_ms": "Local completion observation span (wall)",
@@ -71,6 +75,8 @@ def options():
                         default="affine", help="cycle stresses empty lists and changing lengths")
     parser.add_argument("--skip-index-validation", action="store_true",
                         help="omit timed per-index scans; structural header checks always remain")
+    parser.add_argument("--metadata-barrier", action="store_true",
+                        help="wait for all GPUs to finish metadata before submitting exchange (timed)")
     parser.add_argument("--per-source-readback", action="store_true",
                         help="start each source's readback when ready, overlapping late sources")
     parser.add_argument("--cpu-core-map", default="",
@@ -155,7 +161,7 @@ def main():
         dist.broadcast_object_list(identity, src=0)
         def create_proxy():
             return Proxy(args.library.resolve(), rank, local, args.tokens, identity[0],
-                         args.timeout, not args.skip_index_validation, args.cores[rank], args.per_source_readback)
+                         args.timeout, not args.skip_index_validation, args.cores[rank], args.per_source_readback, args.metadata_barrier)
         if rank == 0:
             proxy = create_proxy()
         dist.barrier()  # creator finished initializing shared control
@@ -204,7 +210,7 @@ def main():
         if rank == 0:
             print(f"Single node: 8 GPUs, 128 experts, top-8, 16 experts/GPU; {properties.name}", flush=True)
             print(f"mode={args.mode}; tokens/source={args.tokens}; verify={args.verify}; "
-                  f"per_source_readback={args.per_source_readback}; native proxy threads active", flush=True)
+                  f"per_source_readback={args.per_source_readback}; metadata_barrier={args.metadata_barrier}; native proxy threads active", flush=True)
         records = []
         total = args.warmup + args.iterations
         for iteration in range(1, total + 1):
@@ -243,7 +249,7 @@ def main():
             metrics = {key: summary([r[key] for report in reports for r in report["records"]])
                        for key in records[0] if key.endswith("_ms")}
             critical_metrics = {key: summary([r[key] for r in critical_records]) for key in metrics}
-            report = dict(schema_version=3, backend="cpp-thread-cuda-ipc", topology=dict(
+            report = dict(schema_version=4, backend="cpp-thread-cuda-ipc", topology=dict(
                 nodes=1, gpus=8, experts=128, experts_per_gpu=16, top_k=8),
                 configuration=config, versions=dict(torch=torch.__version__, cuda=torch.version.cuda),
                 critical_rank_end_to_end_ms=summary(critical), all_rank_metrics=metrics,
@@ -257,7 +263,7 @@ def main():
             args.output.write_text(json.dumps(report, indent=2) + "\n")
             print(json.dumps(dict(critical_rank_end_to_end_ms=summary(critical),
                                   output=str(args.output), verification=args.verify), indent=2), flush=True)
-            print_breakdown(critical_metrics, args.per_source_readback)
+            print_breakdown(critical_metrics, args.per_source_readback, args.metadata_barrier)
         dist.barrier()
         proxy.disconnect()
         dist.barrier()  # close every IPC import before any owning GPU allocation is freed

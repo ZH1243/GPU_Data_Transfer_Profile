@@ -3,13 +3,15 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI 2; Linux CUDA only. All functions except destroy/error return 0 on success.
+/* ABI 3; Linux CUDA only. All functions except destroy/error return 0 on success.
  * create/connect/submit/wait/view must be called serially by one host thread.
  * submit queues work; the owned native thread handles readback and installation.
  * Pointers returned by view are borrowed until the next submit or destroy.
  */
 typedef struct Rme2Proxy Rme2Proxy;
 typedef struct {
+    double metadata_completion_wait_ms;
+    double metadata_barrier_wait_ms;
     double exchange_gpu_ms;
     double sender_completion_wait_ms;
     double peer_completion_wait_ms;
@@ -25,7 +27,7 @@ int rme2_abi_version(void);
 const char* rme2_error(void);
 int rme2_create(int rank, int device, int tokens, const char* shm_name,
                 double timeout_seconds, int validate_indices, int cpu_core,
-                int per_source_readback, Rme2Proxy** out);
+                int per_source_readback, int metadata_barrier, Rme2Proxy** out);
 int rme2_export(Rme2Proxy*, void* handle64);
 int rme2_connect(Rme2Proxy*, const void* handles_8_by_64);
 int rme2_unlink(Rme2Proxy*);
