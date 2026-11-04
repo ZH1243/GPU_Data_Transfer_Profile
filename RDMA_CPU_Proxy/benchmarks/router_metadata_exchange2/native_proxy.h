@@ -3,7 +3,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI 1; Linux CUDA only. All functions except destroy/error return 0 on success.
+/* ABI 2; Linux CUDA only. All functions except destroy/error return 0 on success.
  * create/connect/submit/wait/view must be called serially by one host thread.
  * submit queues work; the owned native thread handles readback and installation.
  * Pointers returned by view are borrowed until the next submit or destroy.
@@ -24,7 +24,8 @@ typedef struct {
 int rme2_abi_version(void);
 const char* rme2_error(void);
 int rme2_create(int rank, int device, int tokens, const char* shm_name,
-                double timeout_seconds, int validate_indices, int cpu_core, Rme2Proxy** out);
+                double timeout_seconds, int validate_indices, int cpu_core,
+                int per_source_readback, Rme2Proxy** out);
 int rme2_export(Rme2Proxy*, void* handle64);
 int rme2_connect(Rme2Proxy*, const void* handles_8_by_64);
 int rme2_unlink(Rme2Proxy*);

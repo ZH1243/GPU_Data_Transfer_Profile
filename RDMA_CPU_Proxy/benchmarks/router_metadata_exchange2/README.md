@@ -104,7 +104,7 @@ is necessary. A slot's header contains the source slice's absolute begin followe
 the valid prefix is transferred. At default T, each receiver has approximately 5 MiB
 of GPU inbox space and 5 MiB of pinned storage, excluding CuTe scratch.
 
-For every iteration:
+For every iteration in the default batched-readback mode:
 
 1. Generate R, finish generation, and align ranks with a CPU collective outside timing.
 2. Start the Python wall timer. Launch the seven metadata kernels (eager or graph).
@@ -132,6 +132,57 @@ Payload capacity is conservative; transfer size is exact. The design avoids send
 D2H, sender packing buffers, self peer payload copies, and receiver CPU payload copies.
 It is not zero-copy: peer payloads still move GPU-to-GPU and then GPU-to-CPU.
 
+### Optional per-source readback
+
+Pass `--per-source-readback` to remove the all-sources gate before readback.
+The default remains unchanged. **Rebuild the shared library and update Python
+together**: the native create signature is now ABI 2; Python rejects older libraries.
+
+```bash
+cmake --build build -j
+# Verify changed lengths, empty payloads, and both eager/graph execution:
+bash ./run_gpu_checks.sh --per-source-readback
+
+# Performance comparison with the same validation/warmup/iteration settings:
+RESULT_JSON=results/per_source.json bash ./run_single_node_torchrun.sh \
+  --per-source-readback --skip-index-validation --warmup 20 --iterations 200
+RESULT_JSON=results/batched.json bash ./run_single_node_torchrun.sh \
+  --skip-index-validation --warmup 20 --iterations 200
+```
+
+The native worker runs a nonblocking sweep over source states:
+`waiting for publication -> header in flight -> payload in flight -> installed`.
+It also polls and publishes its own GPU completion while progressing other sources;
+it does not first block on its own GPU. As soon as a source's iteration counter is
+observed, its header is copied. Header completion permits structural validation and
+exact-length payload submission. Payload completion permits installing that source's
+pinned-memory view. Each source has a reusable nonblocking CUDA stream and event,
+so a delayed source cannot impose a host-side wait on other sources. Physical copy
+engines may still serialize transfers. Self payload retains the direct CuTe-buffer
+path; empty payloads skip the copy but record completion normally.
+
+The worker returns only after all sources are installed. The existing consumption
+barrier, iteration counters, timeout/abort checks, and collective IPC teardown remain
+in force. The completion publication still means a source finished writing **all**
+destinations; this feature does not introduce finer per-destination GPU signals.
+
+Per-source mode changes the interpretation of these existing timing fields (the
+terminal labels and JSON `readback_timing_semantics` identify the distinction):
+
+- `sender_completion_wait_ms`: elapsed worker time until local completion is observed,
+  including any overlapping peer readback work, rather than an isolated wait.
+- `peer_completion_wait_ms`: elapsed worker time until all source publications are
+  observed, overlapping earlier readbacks/installations, rather than blocked time.
+- `headers_d2h_ms` and `payload_d2h_ms`: sums of eight per-source submission-to-observed-
+  completion latencies, including CPU scheduling/query delays. These intervals overlap
+  and can exceed native/end-to-end wall time. Payload latency includes header checking.
+- `install_ms`: summed CPU validation/installation/reset time across all eight sources.
+
+Use `end_to_end_ms` and `native_ms` for performance comparison; do not subtract the
+overlapping per-source stages from native time to derive an overhead residual. The
+extra small header copies, event queries and streams can offset overlap benefits;
+speedup must be measured on the remote machine.
+
 Pinned views are owned by the native proxy and valid until its next submission or
 destruction. Only the native worker installs them. The Python API exposes snapshots
 solely for out-of-band checking. There is only one in-flight iteration. Setup unlinks
@@ -152,7 +203,7 @@ rank with the longest end-to-end duration on each iteration and using that same
 rank's measurements for every row. These distributions are stored as
 `critical_rank_metrics`, with selected ranks in `critical_rank_per_iteration`.
 `all_rank_metrics` retains distributions over all rank/iteration samples. JSON
-timing fields remain in **milliseconds** (schema version 2).
+timing fields remain in **milliseconds** (schema version 3).
 
 | Field | Meaning |
 |---|---|
@@ -173,8 +224,9 @@ timing fields remain in **milliseconds** (schema version 2).
 These timings overlap and **must not be added together**. Reported bytes are logical
 payload bytes, not hardware link transaction counters. The all-senders completion
 wait, header round trip, and eight small payload submissions may dominate latency;
-the experiment makes these costs visible. Per-source progress/pipelining and GPU-only
-readiness are possible future optimizations, not implemented here.
+the experiment makes these costs visible. Optional per-source progress is described
+above; GPU-only readiness is not implemented here. The table describes default-mode
+timings; per-source mode uses the explicitly documented overlapping measurements.
 
 Full timed index validation is enabled by default. `--skip-index-validation` omits
 index scans but retains structural header bounds/order checks. `--verify boundaries`
