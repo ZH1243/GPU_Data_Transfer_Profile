@@ -1,4 +1,5 @@
 import subprocess
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +30,18 @@ class LaunchDispatchTests(unittest.TestCase):
             result = subprocess.run([sys.executable, program, *flags], text=True, capture_output=True)
             self.assertEqual(result.returncode, 2)
             self.assertIn('requires', result.stderr)
+
+    def test_two_node_options_fail_before_cuda_import(self):
+        program = str(Path(__file__).with_name('benchmark.py'))
+        env = dict(os.environ, WORLD_SIZE='16', RANK='8', LOCAL_RANK='0', LOCAL_WORLD_SIZE='8')
+        for flag in ('--per-source-readback', '--batch-payload-copy'):
+            result = subprocess.run([sys.executable, program, flag], env=env, text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('two-node mode requires default all-senders', result.stderr)
+        result = subprocess.run([sys.executable, program, '--rdma-device-map', ''],
+                                env=env, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('one or eight NIC names', result.stderr)
 
 
 if __name__ == '__main__':

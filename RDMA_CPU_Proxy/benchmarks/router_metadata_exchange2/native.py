@@ -7,9 +7,10 @@ class Stats(C.Structure):
         "metadata_launch_barrier_ms", "metadata_gpu_ms", "metadata_completion_wait_ms", "metadata_barrier_wait_ms",
         "exchange_gpu_ms", "sender_completion_wait_ms", "peer_completion_wait_ms",
         "headers_d2h_ms", "payload_d2h_ms", "payload_checks_ms", "payload_submit_ms",
-        "payload_event_record_ms", "payload_completion_ms", "payload_other_ms", "install_ms", "native_ms")]
+        "payload_event_record_ms", "payload_completion_ms", "payload_other_ms", "install_ms", "native_ms",
+        "rdma_post_ms", "rdma_poll_ms", "rdma_post_recv_ms", "rdma_work_complete_ms")]
     _fields_ += [(name, C.c_uint64) for name in (
-        "received_index_bytes", "peer_received_index_bytes", "header_bytes")]
+        "received_index_bytes", "peer_received_index_bytes", "header_bytes", "rdma_sent_bytes", "rdma_received_bytes")]
 
     def as_dict(self):
         return {name: getattr(self, name) for name, _ in self._fields_}
@@ -17,17 +18,21 @@ class Stats(C.Structure):
 
 class Proxy:
     def __init__(self, library, rank, device, tokens, shm_name, timeout, validate, core,
-                 per_source_readback=False, metadata_barrier=False, batch_payload_copy=False):
+                 per_source_readback=False, metadata_barrier=False, batch_payload_copy=False,
+                 nodes=1, node=0):
+        self.experts_per_gpu = 128 // (nodes * 8)
         self.lib = C.CDLL(str(library))  # CDLL releases the GIL in native calls.
         self.handle = C.c_void_p()
         self.lib.rme2_abi_version.restype = C.c_int
-        if self.lib.rme2_abi_version() != 6:
+        if self.lib.rme2_abi_version() != 7:
             raise RuntimeError("native ABI mismatch; rebuild the library")
         signatures = {
             "rme2_abi_version": ([], C.c_int),
             "rme2_error": ([], C.c_char_p),
             "rme2_create": ([C.c_int, C.c_int, C.c_int, C.c_char_p, C.c_double,
-                              C.c_int, C.c_int, C.c_int, C.c_int, C.POINTER(C.c_void_p)], C.c_int),
+                              C.c_int, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int, C.POINTER(C.c_void_p)], C.c_int),
+            "rme2_rdma_init": ([C.c_void_p, C.c_char_p, C.c_int, C.c_int, C.c_void_p, C.c_int], C.c_int),
+            "rme2_rdma_connect": ([C.c_void_p, C.c_char_p], C.c_int),
             "rme2_set_batch_payload_copy": ([C.c_void_p, C.c_int], C.c_int),
             "rme2_export": ([C.c_void_p, C.c_void_p], C.c_int),
             "rme2_connect": ([C.c_void_p, C.c_void_p], C.c_int),
@@ -44,10 +49,11 @@ class Proxy:
         for name, (args, result) in signatures.items():
             fn = getattr(self.lib, name)
             fn.argtypes, fn.restype = args, result
-        if self.lib.rme2_abi_version() != 6:
+        if self.lib.rme2_abi_version() != 7:
             raise RuntimeError("native ABI mismatch; rebuild the library")
         self.check(self.lib.rme2_create(rank, device, tokens, shm_name.encode(), timeout,
-                                       int(validate), core, int(per_source_readback), int(metadata_barrier), C.byref(self.handle)))
+                                       int(validate), core, int(per_source_readback), int(metadata_barrier),
+                                       nodes, node, C.byref(self.handle)))
         try:
             self.check(self.lib.rme2_set_batch_payload_copy(self.handle, int(batch_payload_copy)))
         except Exception:
@@ -62,6 +68,14 @@ class Proxy:
         handle = C.create_string_buffer(64)
         self.check(self.lib.rme2_export(self.handle, handle))
         return handle.raw
+
+    def rdma_init(self, device, port, gid):
+        descriptor = C.create_string_buffer(4096)
+        self.check(self.lib.rme2_rdma_init(self.handle, device.encode(), port, gid, descriptor, len(descriptor)))
+        return descriptor.value
+
+    def rdma_connect(self, descriptor):
+        self.check(self.lib.rme2_rdma_connect(self.handle, descriptor))
 
     def connect(self, handles):
         if len(handles) != 8 or any(len(h) != 64 for h in handles):
@@ -93,7 +107,7 @@ class Proxy:
         offsets, indices, count = C.POINTER(C.c_int32)(), C.POINTER(C.c_int32)(), C.c_int()
         self.check(self.lib.rme2_view(self.handle, source, C.byref(offsets),
                                      C.byref(indices), C.byref(count)))
-        return list(offsets[:17]), list(indices[:count.value])
+        return list(offsets[:self.experts_per_gpu + 1]), list(indices[:count.value])
 
     def disconnect(self):
         self.check(self.lib.rme2_disconnect(self.handle))

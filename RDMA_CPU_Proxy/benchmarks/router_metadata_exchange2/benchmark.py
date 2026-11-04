@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-node GPU routing metadata -> NVLink IPC -> pinned C++ proxy benchmark."""
+"""GPU routing metadata -> intra-node IPC -> local D2H / remote HBM-to-DRAM RDMA."""
 import argparse
 from datetime import timedelta
 import json
@@ -7,11 +7,13 @@ import os
 from pathlib import Path
 import socket
 import statistics
+import sys
 import time
 import uuid
 
 from native import Proxy
-from reference import make_routes, metadata, destination_slice, sample_seed, sample_pattern
+from reference import make_routes, metadata, destination_slice, sample_seed, sample_pattern, metadata_two
+from topology import rank_topology, validate_hosts, rdma_device
 
 
 def summary(values):
@@ -38,6 +40,10 @@ def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False, 
         ("payload_completion_ms", "  Payload: completion wait / detection"),
         ("payload_other_ms", "  Payload: bookkeeping / timer overhead"),
         ("install_ms", "CPU validation + install + reset"),
+        ("rdma_post_ms", "RDMA record checks + write submissions"),
+        ("rdma_poll_ms", "RDMA CQ polling CPU time"),
+        ("rdma_post_recv_ms", "RDMA receive credit reposting"),
+        ("rdma_work_complete_ms", "RDMA submission through all completions"),
         ("native_ms", "Native submit through installation (wall)"),
         ("host_outside_native_ms", "Host time outside native interval (wall)"),
     )
@@ -88,6 +94,11 @@ def options():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--library", type=Path,
                         default=Path(__file__).resolve().parent / "build/librouter_metadata_exchange2.so")
+    parser.add_argument("--rdma-device-map", default=os.environ.get("RDMA_DEVICE_MAP", ""),
+                        help="two-node mode: one or eight verbs NIC names, indexed by local GPU")
+    parser.add_argument("--rdma-port", type=int, default=1)
+    parser.add_argument("--rdma-gid-index", type=int, default=3,
+                        help="RoCE GID index; -1 selects InfiniBand LID routing")
     parser.add_argument("--tokens", type=int, default=20480)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=50)
@@ -114,6 +125,8 @@ def options():
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--output", type=Path, default=Path("results/metadata_exchange2.json"))
     args = parser.parse_args()
+    if not 1 <= args.rdma_port <= 255 or not -1 <= args.rdma_gid_index <= 255:
+        parser.error("invalid RDMA port/GID index")
     if args.batch_payload_copy and args.per_source_readback:
         parser.error("--batch-payload-copy requires --per-source-readback to be disabled")
     if args.native_metadata_launch and args.mode != "graph":
@@ -133,24 +146,28 @@ def options():
     return args
 
 
-def verify(args, iteration, rank, plan, proxy):
+def verify(args, iteration, rank, plan, proxy, nodes=1):
     import torch
     pattern = sample_pattern(args.route_pattern, iteration)
-    for source in range(8):
-        routes = make_routes(args.tokens, sample_seed(args.seed, source, iteration), pattern)
-        offsets, values, x3, x4 = metadata(routes, source)
-        expected = destination_slice(offsets, values, rank)
+    for source in range(8 * nodes):
+        routes = make_routes(args.tokens, sample_seed(args.seed, source, iteration, nodes), pattern)
+        if nodes == 2:
+            offsets, values, x3, x4, node_offsets = metadata_two(routes, source % 8)
+        else:
+            offsets, values, x3, x4 = metadata(routes, source)
+            node_offsets = [0, args.tokens]
+        expected = destination_slice(offsets, values, rank, nodes)
         if proxy.snapshot(source) != expected:
             raise AssertionError(f"rank={rank} source={source} iteration={iteration}: installed metadata mismatch")
         if source == rank:
             if plan.r.cpu().tolist() != routes:
                 raise AssertionError("GPU route generator mismatch")
             actual = (plan.expert_offsets.cpu().tolist(), plan.expert_token_indices.cpu().tolist(),
-                      plan.x3.cpu().tolist(), plan.x4.cpu().tolist())
+                      plan.x3[:len(x3)].cpu().tolist(), plan.x4[:len(x4)].cpu().tolist())
             if actual != (offsets, values, x3, x4):
-                raise AssertionError("single-node CuTe metadata mismatch")
-            if plan.node_offsets.cpu().tolist() != [0, args.tokens]:
-                raise AssertionError("single-node offsets mismatch")
+                raise AssertionError("CuTe metadata mismatch")
+            if plan.node_offsets.cpu().tolist() != node_offsets:
+                raise AssertionError("CuTe node offsets mismatch")
             counts = plan.buffers[2].cpu().to(dtype=torch.int64)
             prefixes = counts.cumsum(dim=0)
             if (not torch.equal(plan.buffers[3].cpu().to(torch.int64), prefixes - counts)
@@ -160,21 +177,24 @@ def verify(args, iteration, rank, plan, proxy):
 
 def main():
     args = options()
+    world, rank, local, nodes, node = rank_topology(os.environ)
+    if nodes == 2 and (args.per_source_readback or args.batch_payload_copy):
+        raise ValueError("two-node mode requires default all-senders readback; disable per-source and batch-copy options")
+    nic = rdma_device(args.rdma_device_map, local) if nodes == 2 else None
     import torch
     import torch.distributed as dist
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
-    from metadata_cute_single import MetadataPlan, RouteGenerator
+    if nodes == 2:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "get_expert_token_idx_list_gpu"))
+        from metadata_cute import MetadataPlan, RouteGenerator
+    else:
+        from metadata_cute_single import MetadataPlan, RouteGenerator
 
-    rank = int(os.environ.get("RANK", "-1"))
-    local = int(os.environ.get("LOCAL_RANK", "-1"))
-    if (int(os.environ.get("WORLD_SIZE", "0")) != 8
-            or int(os.environ.get("LOCAL_WORLD_SIZE", "0")) != 8 or rank != local):
-        raise RuntimeError("launch with torchrun --standalone --nnodes=1 --nproc_per_node=8")
     if not torch.cuda.is_available() or torch.cuda.device_count() < 8:
-        raise RuntimeError("requires eight visible peer-accessible CUDA GPUs on one Linux node")
+        raise RuntimeError("requires eight visible peer-accessible CUDA GPUs on each Linux node")
     torch.cuda.set_device(local)
     device = torch.device("cuda", local)
     if torch.cuda.get_device_capability(local)[0] < 9:
@@ -188,32 +208,39 @@ def main():
     proxy = None
     clean = False
     try:
-        configs = [None] * 8
+        configs = [None] * world
         config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
         dist.all_gather_object(configs, (socket.gethostname(), config))
-        if any(c != configs[0] for c in configs):
-            raise RuntimeError("all ranks must be on the same host with identical options")
+        validate_hosts(configs, nodes)
         identity = ["/rme2_" + uuid.uuid4().hex if rank == 0 else None]
         dist.broadcast_object_list(identity, src=0)
+        shm_name = identity[0] + "_node" + str(node)
         def create_proxy():
-            return Proxy(args.library.resolve(), rank, local, args.tokens, identity[0],
-                         args.timeout, not args.skip_index_validation, args.cores[rank], args.per_source_readback, args.metadata_barrier, args.batch_payload_copy)
-        if rank == 0:
+            return Proxy(args.library.resolve(), local, local, args.tokens, shm_name,
+                         args.timeout, not args.skip_index_validation, args.cores[local],
+                         args.per_source_readback, args.metadata_barrier, args.batch_payload_copy, nodes, node)
+        if local == 0:
             proxy = create_proxy()
         dist.barrier()  # creator finished initializing shared control
-        if rank != 0:
+        if local != 0:
             proxy = create_proxy()
-        handles = [None] * 8
+        if nodes == 2:
+            descriptor = proxy.rdma_init(nic, args.rdma_port, args.rdma_gid_index)
+            descriptors = [None] * world
+            dist.all_gather_object(descriptors, descriptor)
+            proxy.rdma_connect(descriptors[(1 - node) * 8 + local])
+        handles = [None] * world
         dist.all_gather_object(handles, proxy.export())
-        proxy.connect(handles)
+        proxy.connect(handles[node * 8:node * 8 + 8])
         dist.barrier()  # all mappings exist before unlink / GPU writes
-        if rank == 0:
+        if local == 0:
             proxy.unlink()
 
         stream = torch.cuda.Stream(device=device)
         with torch.cuda.stream(stream):
-            r = torch.empty((args.tokens, 8), dtype=torch.int32, device=device)
-            plan = MetadataPlan(r, rank)
+            # The two-node plan validates its initial R during construction.
+            r = torch.arange(8, dtype=torch.int32, device=device).expand(args.tokens, 8).clone()
+            plan = MetadataPlan(r, local)
             r_argument = from_dlpack(r)
             stream_argument = cuda.CUstream(stream.cuda_stream)
             generator = cute.compile(RouteGenerator(), r_argument, cutlass.Uint64(args.seed), stream_argument)
@@ -224,7 +251,7 @@ def main():
             pattern = sample_pattern(args.route_pattern, iteration)
             with torch.cuda.stream(stream):
                 if pattern == "affine":
-                    generator(r_argument, cutlass.Uint64(sample_seed(args.seed, rank, iteration)), stream_argument)
+                    generator(r_argument, cutlass.Uint64(sample_seed(args.seed, rank, iteration, nodes)), stream_argument)
                 else:
                     r.copy_(hot_low if pattern == "hot-low" else hot_high)
 
@@ -246,7 +273,7 @@ def main():
         begin.record(stream); end.record(stream); end.synchronize()
         properties = torch.cuda.get_device_properties(local)
         if rank == 0:
-            print(f"Single node: 8 GPUs, 128 experts, top-8, 16 experts/GPU; {properties.name}", flush=True)
+            print(f"{nodes} node(s), {world} GPUs, 128 experts, top-8, {128 // world} experts/GPU; {properties.name}", flush=True)
             print(f"mode={args.mode}; tokens/source={args.tokens}; verify={args.verify}; "
                   f"native_metadata_launch={args.native_metadata_launch}; metadata_launch_barrier={args.metadata_launch_barrier}; "
                   f"batch_payload_copy={args.batch_payload_copy}; per_source_readback={args.per_source_readback}; metadata_barrier={args.metadata_barrier}; native proxy threads active", flush=True)
@@ -269,13 +296,13 @@ def main():
             if iteration > args.warmup:
                 records.append(record)
             if args.verify == "all" or (args.verify == "boundaries" and iteration in (1, total)):
-                verify(args, iteration, rank, plan, proxy)
+                verify(args, iteration, rank, plan, proxy, nodes)
             # No producer may regenerate R/metadata or overwrite an inbox until
             # ALL consumers finished D2H and any out-of-band verification.
             dist.barrier()
-        reports = [None] * 8
+        reports = [None] * world
         dist.all_gather_object(reports, dict(rank=rank, device_name=properties.name,
-                                           cpu_core=args.cores[rank], records=records))
+                                           node=node, local_rank=local, rdma_device=nic, cpu_core=args.cores[local], records=records))
         if rank == 0:
             critical_reports = [max(reports, key=lambda report: report["records"][i]["end_to_end_ms"])
                                 for i in range(args.iterations)]
@@ -284,14 +311,16 @@ def main():
             metrics = {key: summary([r[key] for report in reports for r in report["records"]])
                        for key in records[0] if key.endswith("_ms")}
             critical_metrics = {key: summary([r[key] for r in critical_records]) for key in metrics}
-            report = dict(schema_version=7, backend="cpp-thread-cuda-ipc", topology=dict(
-                nodes=1, gpus=8, experts=128, experts_per_gpu=16, top_k=8),
+            report = dict(schema_version=8, backend=("cpp-thread-cuda-ipc-gpudirect-rdma" if nodes == 2 else "cpp-thread-cuda-ipc"), topology=dict(
+                nodes=nodes, gpus=world, gpus_per_node=8, experts=128, experts_per_gpu=128 // world, top_k=8),
+                completion_endpoint=f"{world} source expert tables installed; outgoing RDMA sends drained",
                 configuration=config, versions=dict(torch=torch.__version__, cuda=torch.version.cuda),
                 critical_rank_end_to_end_ms=summary(critical), all_rank_metrics=metrics,
                 critical_rank_metrics=critical_metrics,
                 critical_rank_per_iteration=[r["rank"] for r in critical_reports],
                 readback_timing_semantics=("per-source D2H latency sums; readiness observation spans overlap readback"
-                                          if args.per_source_readback else "batched D2H wall stages after all-source wait"),
+                                          if args.per_source_readback else ("local D2H overlaps RDMA; payload completion includes CPU progress delays"
+                                          if nodes == 2 else "batched D2H wall stages after all-source wait")),
                 timing_note="Overlapping GPU/CPU spans are not additive. Generation, setup, outer Gloo barriers and exact verification excluded; enabled native barriers included.",
                 ranks=reports)
             args.output.parent.mkdir(parents=True, exist_ok=True)

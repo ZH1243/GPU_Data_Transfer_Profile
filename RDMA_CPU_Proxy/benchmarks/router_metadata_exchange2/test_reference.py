@@ -5,10 +5,43 @@ import subprocess
 import sys
 import unittest
 
-from reference import make_routes, metadata, destination_slice, sample_seed, sample_pattern
+from reference import make_routes, metadata, metadata_two, destination_slice, sample_seed, sample_pattern
 
 
 class ReferenceTests(unittest.TestCase):
+    def test_two_node_empty_slices_and_seed(self):
+        self.assertEqual(sample_seed((1 << 64) - 2, 15, 2, 2), 29)
+        for source in range(8):
+            for pattern, target in (("hot-low", 0), ("hot-high", 15)):
+                offsets, values, x3, x4, nodes = metadata_two(make_routes(33, 0, pattern), source)
+                self.assertEqual(nodes, [0, 33, 33] if target == 0 else [0, 0, 33])
+                self.assertEqual(x3, list(range(33)))
+                self.assertEqual(x4, [1 << ((source - target % 8) % 8)] * 33)
+                for dest in range(16):
+                    off, val = destination_slice(offsets, values, dest, 2)
+                    self.assertEqual(len(off), 9)
+                    self.assertEqual(len(val), 264 if dest == target else 0)
+
+    def test_remote_same_index_uses_direct_positions(self):
+        # Both destination nodes retain gaps for source-local GPU 0; GPU 1
+        # uses compact positions. Relaying through GPU 1 must not reindex.
+        routes = [list(range(e, e + 8)) for e in (0, 8, 64, 72, 0, 64)]
+        offsets, values, _, _, nodes = metadata_two(routes, 0)
+        self.assertEqual(nodes, [0, 3, 6])
+        for expert in (0, 64):
+            self.assertEqual(values[offsets[expert]:offsets[expert + 1]], [1, 2])
+        for expert in (8, 72):
+            self.assertEqual(values[offsets[expert]:offsets[expert + 1]], [0])
+
+    @unittest.skipUnless(os.environ.get("RME2_REFERENCE_BIN"), "run through CTest for production C++ comparison")
+    def test_two_node_matches_production(self):
+        for tokens in (1, 33, 257):
+            for source in range(16):
+                seed = sample_seed((1 << 64) - 2, source, 2, 2)
+                expected = json.loads(subprocess.check_output(
+                    [os.environ["RME2_REFERENCE_BIN"], "--dump", str(tokens), str(seed), str(source), "2"], text=True))
+                self.assertEqual(list(metadata_two(make_routes(tokens, seed), source % 8)), expected)
+
     def test_generator_matches_existing_generator(self):
         root = Path(__file__).resolve().parents[3]
         sys.path.insert(0, str(root / "get_expert_token_idx_list_gpu"))

@@ -3,7 +3,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI 6; Linux CUDA only. All functions except destroy/error return 0 on success.
+/* ABI 7; Linux CUDA only. All functions except destroy/error return 0 on success.
  * create/connect/submit/wait/view must be called serially by one host thread.
  * submit queues work; the owned native thread handles readback and installation.
  * Pointers returned by view are borrowed until the next submit or destroy.
@@ -26,16 +26,27 @@ typedef struct {
     double payload_other_ms;
     double install_ms;
     double native_ms;
+    double rdma_post_ms;
+    double rdma_poll_ms;
+    double rdma_post_recv_ms;
+    double rdma_work_complete_ms;
     uint64_t received_index_bytes;
     uint64_t peer_received_index_bytes;
     uint64_t header_bytes;
+    uint64_t rdma_sent_bytes;
+    uint64_t rdma_received_bytes;
 } Rme2Stats;
 int rme2_abi_version(void);
 int rme2_set_batch_payload_copy(Rme2Proxy*, int enabled);
 const char* rme2_error(void);
 int rme2_create(int rank, int device, int tokens, const char* shm_name,
                 double timeout_seconds, int validate_indices, int cpu_core,
-                int per_source_readback, int metadata_barrier, Rme2Proxy** out);
+                int per_source_readback, int metadata_barrier, int nodes, int node, Rme2Proxy** out);
+/* Two-node setup only, before connect/capture/submit. Descriptor is NUL-terminated.
+ * init registers relay-owned HBM and final pinned host records once. */
+int rme2_rdma_init(Rme2Proxy*, const char* device, int port, int gid,
+                   char* descriptor, int descriptor_capacity);
+int rme2_rdma_connect(Rme2Proxy*, const char* descriptor);
 int rme2_export(Rme2Proxy*, void* handle64);
 int rme2_connect(Rme2Proxy*, const void* handles_8_by_64);
 int rme2_unlink(Rme2Proxy*);

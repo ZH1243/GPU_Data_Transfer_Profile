@@ -13,10 +13,10 @@ template<class F> void rejects(F f) {
     try { f(); } catch (const std::runtime_error&) { threw = true; }
     check(threw, "invalid metadata was accepted");
 }
-rdma_proxy::ProxyConfig config(int tokens, uint64_t seed, int source) {
+rdma_proxy::ProxyConfig config(int tokens, uint64_t seed, int source, int nodes = 1) {
     rdma_proxy::ProxyConfig c;
-    c.num_nodes = 1; c.num_gpus_per_node = 8; c.num_tokens = tokens;
-    c.local_gpu_index = source; c.router_routing_enabled = true;
+    c.num_nodes = nodes; c.num_gpus_per_node = 8; c.num_tokens = tokens;
+    c.node_rank = source / 8; c.local_gpu_index = source % 8; c.router_routing_enabled = true;
     c.router_num_experts = 128; c.router_top_k = 8; c.router_seed = seed; c.mock_mode = true;
     return c;
 }
@@ -29,19 +29,31 @@ template<class T> void array(const T& values) {
 int main(int argc, char** argv) {
     try {
         rdma_proxy::Logger::instance().set_level(rdma_proxy::LogLevel::kError);
-        if (argc == 5 && std::string(argv[1]) == "--dump") {
-            rdma_proxy::RouterRouting routing(config(std::stoi(argv[2]), std::stoull(argv[3]), std::stoi(argv[4])));
+        if ((argc == 5 || argc == 6) && std::string(argv[1]) == "--dump") {
+            const int nodes = argc == 6 ? std::stoi(argv[5]) : 1;
+            check(nodes == 1 || nodes == 2, "invalid node count");
+            rdma_proxy::RouterRouting routing(config(std::stoi(argv[2]), std::stoull(argv[3]), std::stoi(argv[4]), nodes));
             routing.initialize();
             std::vector<int32_t> offsets{0}, values;
-            for (int dest = 0; dest < 8; ++dest) {
-                const auto& m = routing.expert_metadata_for_gpu(0, dest);
+            for (int dest = 0; dest < 8 * nodes; ++dest) {
+                const auto& m = routing.expert_metadata_for_gpu(dest / 8, dest % 8);
                 int base = values.size();
-                for (int e = 1; e <= 16; ++e) offsets.push_back(base + m.expert_offsets[e]);
+                for (int e = 1; e <= 16 / nodes; ++e) offsets.push_back(base + m.expert_offsets[e]);
                 values.insert(values.end(), m.expert_token_indices.begin(), m.expert_token_indices.end());
             }
             std::cout << '['; array(offsets); std::cout << ','; array(values); std::cout << ',';
-            array(routing.token_indices_for_node(0)); std::cout << ',';
-            array(routing.token_masks_for_node(0)); std::cout << "]\n";
+            std::vector<std::size_t> x3, node_offsets{0};
+            std::vector<uint8_t> x4;
+            for (int n = 0; n < nodes; ++n) {
+                const auto& indices = routing.token_indices_for_node(n);
+                const auto& masks = routing.token_masks_for_node(n);
+                x3.insert(x3.end(), indices.begin(), indices.end());
+                x4.insert(x4.end(), masks.begin(), masks.end());
+                node_offsets.push_back(x3.size());
+            }
+            array(x3); std::cout << ','; array(x4);
+            if (nodes == 2) { std::cout << ','; array(node_offsets); }
+            std::cout << "]\n";
             return 0;
         }
         for (int source = 0; source < 8; ++source) {

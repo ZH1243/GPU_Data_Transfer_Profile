@@ -1,6 +1,6 @@
-# GPU router metadata exchange, single node
+# GPU router metadata exchange, one or two nodes
 
-This experiment runs **eight torchrun Python processes on one Linux Hopper node**.
+The default single-node mode runs **eight torchrun Python processes on one Linux Hopper node**.
 Each process owns one GPU and loads `librouter_metadata_exchange2.so`. That library
 owns a C++ proxy thread. Python generates fresh routes and launches seven CuTe DSL
 metadata kernels; a CUDA C++ kernel writes destination-specific metadata directly
@@ -16,6 +16,157 @@ the new reference and installed views against the actual production `RouterRouti
 CPU implementation. It does not measure token payload dispatch, GEMMs, RDMA,
 GPU `A_idx`/scheduler construction, local `x3/x4` CPU installation, or combine.
 The completion endpoint is **all eight source expert tables installed at the CPU proxy**.
+
+## Two-node exchange (ABI 7)
+
+The benchmark also supports **two Linux Hopper nodes, eight GPUs each**, keeping
+128 experts and top-8, hence **eight experts per GPU**. It reuses the existing
+seven-kernel `get_expert_token_idx_list_gpu/metadata_cute.py` implementation.
+Both nodes generate fresh, independently seeded routes every iteration. Source
+identity is global rank; mask ordering and the direct-input exception use the
+original source's local GPU index. Seeds are
+`(seed + global_rank + 16*(iteration-1)) mod 2^64`.
+
+Build on **both remote machines**, from this benchmark directory:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=90 -DRME2_REQUIRE_RDMA=ON
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
+
+Use the same Python files and rebuilt shared library on both nodes. Requirements
+in addition to the single-node CUDA/CuTe environment: libibverbs/rdma-core headers
+and library, a working GPU-memory registration path (the `ibv_reg_mr` CUDA pointer
+path, typically `nvidia-peermem`), a compatible NIC/GPU PCIe topology, and enough
+locked-memory allowance for the registered arenas. There is no CPU staging or TCP
+payload fallback and no DMA-BUF registration backend in this implementation.
+`RME2_REQUIRE_RDMA=ON` fails configuration without verbs; otherwise a CUDA build
+can still run single-node mode and rejects two-node use without verbs support.
+
+For an initial full-content check, run the corresponding command on each node:
+
+```bash
+# Node 0
+bash ./run_node0_torchrun.sh --tokens 257 --warmup 1 --iterations 6 \
+  --route-pattern cycle --verify all
+# Node 1
+bash ./run_node1_torchrun.sh --tokens 257 --warmup 1 --iterations 6 \
+  --route-pattern cycle --verify all
+```
+
+The scripts default to rendezvous `28.59.80.49:29520`. Set `MASTER_ADDR` and
+`MASTER_PORT` consistently if needed. The default NIC map matches the production
+scripts: `mlx5_bond_1,mlx5_bond_4,mlx5_bond_3,mlx5_bond_2,mlx5_bond_7,mlx5_bond_6,mlx5_bond_8,mlx5_bond_5`.
+Override `RDMA_DEVICE_MAP` or `--rdma-device-map` with eight names indexed by local
+CUDA ordinal, or one NIC name for all proxies. `--rdma-port` defaults to 1 and
+`--rdma-gid-index` to 3; use -1 for InfiniBand LID routing. The RC connection uses
+MTU 4096 and the production path's RoCE hop-limit/retry settings. Check these
+against the target fabric. CPU core maps and NIC maps may differ between nodes;
+workload and protocol options must match. Keep all eight GPUs visible to every
+local worker, as in single-node mode. Only global rank 0 writes the result JSON.
+
+After correctness checks, omit the small-workload arguments for the default
+20,480-token run. Eager, graph, `--native-metadata-launch`, and the two optional
+node-local metadata barriers work in two-node mode. For example, pass on both nodes:
+
+```bash
+--native-metadata-launch --metadata-launch-barrier \
+  --skip-index-validation --warmup 20 --iterations 200
+```
+
+This first two-node path uses the all-local-senders readiness gate. It explicitly
+rejects `--per-source-readback` and `--batch-payload-copy`; those optimizations
+remain available in single-node mode.
+
+### Two-node data path and lifetime
+
+1. Each receiver/relay owns a dedicated CUDA IPC arena and a persistent pinned
+   host arena. Both are registered once with verbs. The HBM arena has two banks
+   of eight source slots: one bank per destination node. Each record contains a
+   64-byte header followed by capacity for `T*8` int32 indices. A separate 1,024-byte
+   directory duplicates the headers for one small D2H transfer. At T=20,480, each
+   proxy reserves approximately 10 MiB each of HBM and pinned host records.
+2. After the seven metadata kernels, 16 CTAs (one per global destination) write
+   both destination-node slices into the appropriate local relay GPU. All payloads,
+   including relay-self slices, enter the registered arena. Records preserve original
+   source identity, destination, full 64-bit iteration, and nine normalized offsets.
+   Every writer system-fences its writes before its completion event.
+3. CPU proxies publish producer event completion through **node-local** shared
+   counters. Each relay waits for all eight local producers. GPU registration enables
+   `CU_POINTER_ATTRIBUTE_SYNC_MEMOPS`; NIC reads are posted only after producer
+   completion and directory readback. The relay's own event alone is insufficient.
+4. Each relay validates the directory, queues eight exact-size local D2H payload
+   copies, and posts eight signaled RDMA Writes With Immediate on one same-index
+   RC connection. Each RDMA source is the relay's HBM record and each destination
+   is the remote proxy's final pinned record. There is no sender CPU payload copy,
+   extra GPU packing pass, or receiver CPU payload copy. Empty lists still transfer
+   a header and produce a receive completion.
+5. The worker polls CUDA and RDMA completions together. Local D2H completion
+   permits installation of the eight local-source views. Each successful RDMA
+   receive completion permits identity/epoch/length validation and installation
+   of that original remote source's view. Receive WQEs are preposted; credits are
+   replenished during timing. CQ polling uses a fixed-size stack buffer.
+6. `wait()` returns after **all 16 source expert tables are installed and all eight
+   outgoing sends complete**. The outer all-16-rank consumption barrier protects
+   record reuse, including verification. There is one iteration in flight. Setup,
+   generation, graph compilation, verification, and outer barriers remain outside
+   end-to-end timing. Optional native barriers synchronize only the eight workers
+   on each node and remain timed.
+
+The global rank mapping is `node * 8 + local_gpu`. Gloo exchanges IPC handles and
+QP/MR descriptors during setup, then provides iteration boundaries and reporting;
+no expert metadata payload uses Gloo. IPC mappings and shared-memory counters stay
+local to each node. Normal shutdown stops workers, closes every IPC import,
+collectively waits, destroys QPs/deregisters MRs, and frees their arenas. A local
+worker failure publishes node-local abort; cross-node failures surface through
+CQ errors, bounded native/Gloo waits, and torchrun termination. There is no recovery
+of an in-flight failed iteration.
+
+The endpoint remains **expert tables installed at CPU proxies**. `x3/x4` is computed
+and checked but is not exchanged or installed for token dispatch. GPU `A_idx`,
+scheduler reconstruction, actual token movement, GEMM, and combine remain excluded.
+This does not change the production proxy or its initialization-only metadata API.
+
+### Two-node timing and remote validation
+
+JSON schema 8 adds `rdma_post_ms` (record checks and write submissions),
+`rdma_poll_ms` (time inside CQ polling), `rdma_post_recv_ms` (credit reposting), and
+`rdma_work_complete_ms` (span from starting submissions until all send/receive
+completions are processed). `rdma_sent_bytes` and `rdma_received_bytes` include
+record headers. `received_index_bytes` includes all 16 installed payloads;
+`peer_received_index_bytes` excludes only this process's original source record.
+`header_bytes` is the 1,024-byte directory D2H. RDMA fields are zero in single-node
+mode. Per-rank reports include node/local rank and selected NIC; critical-rank
+statistics select among all 16 ranks.
+
+Local payload copies overlap RDMA work. `payload_completion_ms` includes CPU
+observation delay while submitting/progressing RDMA; it is not pure DMA time.
+`rdma_work_complete_ms` overlaps D2H and includes receiver validation/installation
+and progress scheduling. Do not add overlapping stage times. Compare the overall
+`end_to_end_ms` distribution. Source payload volume remains `T*8` indices across
+all 16 destinations, rather than doubling the one-node index volume.
+
+Run extended correctness checks on both nodes (same optional flags):
+
+```bash
+# Node 0 / node 1 respectively
+bash ./run_two_node_gpu_checks.sh 0
+bash ./run_two_node_gpu_checks.sh 1
+# Repeat with --native-metadata-launch --metadata-launch-barrier --metadata-barrier
+```
+
+These cover eager/graph execution, partial chunks and scan carry, seed wraparound,
+empty local/remote receives, changing lengths, and every installed source table.
+The host suite compares both topology references with production CPU routing and
+checks record identity, length bounds, borrowed installation, and launch topology.
+Host checks cannot establish CUDA compilation, peer-write/NIC visibility, or RDMA
+correctness/performance; those checks require the two remote Hopper nodes.
+
+## Single-node mode
+
+The sections below describe the preserved single-node path and its options.
 
 ## Build and run on the remote machine
 
@@ -137,7 +288,7 @@ It is not zero-copy: peer payloads still move GPU-to-GPU and then GPU-to-CPU.
 `--batch-payload-copy` replaces the receiver's nonempty payload copy loop with one
 `cudaMemcpyBatchAsync`. It is off by default and requires `--per-source-readback`
 to be disabled. It works with Python or native metadata launch and either barrier.
-Update Python and rebuild the shared library together (**ABI 6**), using the remote
+Update Python and rebuild the shared library together (**ABI 7**), using the remote
 CUDA 12.9 toolkit:
 
 ```bash
@@ -181,7 +332,7 @@ immediately before they record the start event and launch the metadata graph.
 The launch barrier requires native launch; invalid option combinations fail early.
 Both flags are off by default, preserving the existing Python launch path.
 
-Update the Python files and **rebuild the library (ABI 6)**:
+Update the Python files and **rebuild the library (ABI 7)**:
 
 ```bash
 cmake --build build -j
@@ -233,7 +384,7 @@ arrival slot. The C++ callers acquire-poll all eight arrivals, checking timeout/
 then enqueue their exchange kernels. Slots carry monotonically increasing epochs;
 the existing consumption barrier prevents reuse while peers still consume metadata.
 
-Update Python and rebuild the library together (native **ABI 6**):
+Update Python and rebuild the library together (native **ABI 7**):
 
 ```bash
 cmake --build build -j
@@ -264,7 +415,7 @@ exchange stage into the metadata barrier. The flag can also combine with
 
 Pass `--per-source-readback` to remove the all-sources gate before readback.
 The default remains unchanged. **Rebuild the shared library and update Python
-together**: the native interface is now ABI 6; Python rejects older libraries.
+together**: the native interface is now ABI 7; Python rejects older libraries.
 
 ```bash
 cmake --build build -j
@@ -331,7 +482,7 @@ rank with the longest end-to-end duration on each iteration and using that same
 rank's measurements for every row. These distributions are stored as
 `critical_rank_metrics`, with selected ranks in `critical_rank_per_iteration`.
 `all_rank_metrics` retains distributions over all rank/iteration samples. JSON
-timing fields remain in **milliseconds** (schema version 7).
+timing fields remain in **milliseconds** (schema version 8).
 
 | Field | Meaning |
 |---|---|

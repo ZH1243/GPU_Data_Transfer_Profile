@@ -9,8 +9,8 @@ def splitmix64(value):
     return value ^ (value >> 31)
 
 
-def sample_seed(base, source, iteration):
-    return (base + source + (iteration - 1) * 8) & MASK64
+def sample_seed(base, source, iteration, nodes=1):
+    return (base + source + (iteration - 1) * 8 * nodes) & MASK64
 
 
 def sample_pattern(pattern, iteration):
@@ -59,7 +59,47 @@ def metadata(routes, source):
     return offsets, values, order, [masks[t] for t in order]
 
 
-def destination_slice(offsets, values, destination):
-    first = destination * 16
-    base, end = offsets[first], offsets[first + 16]
-    return [x - base for x in offsets[first:first + 17]], values[base:end]
+def destination_slice(offsets, values, destination, nodes=1):
+    epg = 128 // (nodes * 8)
+    first = destination * epg
+    base, end = offsets[first], offsets[first + epg]
+    return [x - base for x in offsets[first:first + epg + 1]], values[base:end]
+
+
+def metadata_two(routes, source):
+    """Two destination-node orders; source is the original local GPU index.
+
+    Return only meaningful x3/x4 entries (GPU allocations have a 2*T tail).
+    """
+    if not 0 <= source < 8:
+        raise ValueError("source GPU must be 0..7")
+    entries = [[], []]
+    for token, row in enumerate(routes):
+        if len(row) != 8 or len(set(row)) != 8 or any(e < 0 or e >= 128 for e in row):
+            raise ValueError("routes require eight distinct experts in [0,128)")
+        masks = [0, 0]
+        for e in row:
+            masks[e // 64] |= 1 << ((source - (e // 8) % 8) % 8)
+        for node, mask in enumerate(masks):
+            if mask:
+                entries[node].append((token, mask))
+    lists = [[] for _ in range(128)]
+    x3, x4, node_offsets = [], [], [0]
+    for node in range(2):
+        positions = [0] * 8
+        for position, (token, mask) in enumerate(sorted(entries[node], key=lambda x: -x[1])):
+            x3.append(token)
+            x4.append(mask)
+            for e in routes[token]:
+                if e // 64 == node:
+                    gpu = (e // 8) % 8
+                    lists[e].append(position if gpu == source else positions[gpu])
+            for gpu in range(8):
+                if mask & (1 << ((source - gpu) % 8)):
+                    positions[gpu] += 1
+        node_offsets.append(len(x3))
+    offsets, values = [0], []
+    for indices in lists:
+        values.extend(indices)
+        offsets.append(len(values))
+    return offsets, values, x3, x4, node_offsets
