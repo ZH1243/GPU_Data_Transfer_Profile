@@ -147,6 +147,13 @@ and the distribution of **maximum per-rank end-to-end duration** for each iterat
 This maximum uses aligned starts and local durations, not a cross-device timestamp
 subtraction. CUDA event clocks are never compared across GPUs.
 
+The terminal also prints median/mean/p95 timings in **microseconds**, selecting the
+rank with the longest end-to-end duration on each iteration and using that same
+rank's measurements for every row. These distributions are stored as
+`critical_rank_metrics`, with selected ranks in `critical_rank_per_iteration`.
+`all_rank_metrics` retains distributions over all rank/iteration samples. JSON
+timing fields remain in **milliseconds** (schema version 2).
+
 | Field | Meaning |
 |---|---|
 | `end_to_end_ms` | Python wall time from metadata submission through native installation/wait return |
@@ -158,6 +165,7 @@ subtraction. CUDA event clocks are never compared across GPUs.
 | `payload_d2h_ms` | Header checks, exact payload submissions, and completion |
 | `install_ms` | CPU validation, view installation, and progress reset |
 | `native_ms` | Native submit through worker installation, before return to Python |
+| `host_outside_native_ms` | End-to-end minus native duration: host submission before the native timer and wakeup/return overhead after it; not isolated Python CPU time |
 | `received_index_bytes` | All D2H index payload bytes, including self |
 | `peer_received_index_bytes` | Received peer index bytes, excluding self and headers |
 | `header_bytes` | Header D2H bytes (576 per rank per iteration) |

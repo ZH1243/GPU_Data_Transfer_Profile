@@ -20,6 +20,32 @@ def summary(values):
                 p95=ordered[int(0.95 * (len(ordered) - 1))], max=ordered[-1])
 
 
+def print_breakdown(metrics):
+    labels = (
+        ("end_to_end_ms", "End to end (wall)"),
+        ("metadata_gpu_ms", "Seven metadata kernels (GPU)"),
+        ("exchange_gpu_ms", "GPU-to-GPU exchange (GPU)"),
+        ("sender_completion_wait_ms", "Proxy wait for local GPU completion"),
+        ("peer_completion_wait_ms", "Proxy wait for peer completions"),
+        ("headers_d2h_ms", "Header D2H + completion (wall)"),
+        ("payload_d2h_ms", "Payload checks + D2H + completion (wall)"),
+        ("install_ms", "CPU validation + install + reset"),
+        ("native_ms", "Native submit through installation (wall)"),
+        ("host_outside_native_ms", "Host time outside native interval (wall)"),
+    )
+    print("\nTiming breakdown in microseconds (us).")
+    print("Each iteration uses the rank with the longest end-to-end time;")
+    print("all rows use that same rank's sample, not separate per-stage maxima.")
+    print(f"{'Measurement':45s} {'median':>10s} {'mean':>10s} {'p95':>10s}")
+    for key, label in labels:
+        values = metrics[key]
+        print(f"{label:45s} {values['median'] * 1000:10.3f} "
+              f"{values['mean'] * 1000:10.3f} {values['p95'] * 1000:10.3f}")
+    print("GPU and CPU intervals overlap: do not sum these rows.")
+    print("Host time outside native includes metadata submission and wait-return overhead;")
+    print("it is end_to_end - native, not an isolated Python execution measurement.", flush=True)
+
+
 def options():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--library", type=Path,
@@ -183,6 +209,7 @@ def main():
                 proxy.submit(iteration, plan, stream)
             record = proxy.wait()
             record["end_to_end_ms"] = (time.perf_counter_ns() - started) / 1e6
+            record["host_outside_native_ms"] = record["end_to_end_ms"] - record["native_ms"]
             record["metadata_gpu_ms"] = begin.elapsed_time(end)
             record["iteration"] = iteration
             if iteration > args.warmup:
@@ -196,20 +223,26 @@ def main():
         dist.all_gather_object(reports, dict(rank=rank, device_name=properties.name,
                                            cpu_core=args.cores[rank], records=records))
         if rank == 0:
-            critical = [max(report["records"][i]["end_to_end_ms"] for report in reports)
-                        for i in range(args.iterations)]
+            critical_reports = [max(reports, key=lambda report: report["records"][i]["end_to_end_ms"])
+                                for i in range(args.iterations)]
+            critical_records = [report["records"][i] for i, report in enumerate(critical_reports)]
+            critical = [r["end_to_end_ms"] for r in critical_records]
             metrics = {key: summary([r[key] for report in reports for r in report["records"]])
                        for key in records[0] if key.endswith("_ms")}
-            report = dict(schema_version=1, backend="cpp-thread-cuda-ipc", topology=dict(
+            critical_metrics = {key: summary([r[key] for r in critical_records]) for key in metrics}
+            report = dict(schema_version=2, backend="cpp-thread-cuda-ipc", topology=dict(
                 nodes=1, gpus=8, experts=128, experts_per_gpu=16, top_k=8),
                 configuration=config, versions=dict(torch=torch.__version__, cuda=torch.version.cuda),
                 critical_rank_end_to_end_ms=summary(critical), all_rank_metrics=metrics,
+                critical_rank_metrics=critical_metrics,
+                critical_rank_per_iteration=[r["rank"] for r in critical_reports],
                 timing_note="Overlapping GPU/CPU spans are not additive. Generation, setup, barriers and exact verification excluded.",
                 ranks=reports)
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(report, indent=2) + "\n")
             print(json.dumps(dict(critical_rank_end_to_end_ms=summary(critical),
                                   output=str(args.output), verification=args.verify), indent=2), flush=True)
+            print_breakdown(critical_metrics)
         dist.barrier()
         proxy.disconnect()
         dist.barrier()  # close every IPC import before any owning GPU allocation is freed
