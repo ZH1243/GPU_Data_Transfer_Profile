@@ -4,7 +4,7 @@ import ctypes as C
 
 class Stats(C.Structure):
     _fields_ = [(name, C.c_double) for name in (
-        "metadata_completion_wait_ms", "metadata_barrier_wait_ms",
+        "metadata_launch_barrier_ms", "metadata_gpu_ms", "metadata_completion_wait_ms", "metadata_barrier_wait_ms",
         "exchange_gpu_ms", "sender_completion_wait_ms", "peer_completion_wait_ms",
         "headers_d2h_ms", "payload_d2h_ms", "install_ms", "native_ms")]
     _fields_ += [(name, C.c_uint64) for name in (
@@ -19,6 +19,9 @@ class Proxy:
                  per_source_readback=False, metadata_barrier=False):
         self.lib = C.CDLL(str(library))  # CDLL releases the GIL in native calls.
         self.handle = C.c_void_p()
+        self.lib.rme2_abi_version.restype = C.c_int
+        if self.lib.rme2_abi_version() != 4:
+            raise RuntimeError("native ABI mismatch; rebuild the library")
         signatures = {
             "rme2_abi_version": ([], C.c_int),
             "rme2_error": ([], C.c_char_p),
@@ -28,6 +31,8 @@ class Proxy:
             "rme2_connect": ([C.c_void_p, C.c_void_p], C.c_int),
             "rme2_unlink": ([C.c_void_p], C.c_int),
             "rme2_disconnect": ([C.c_void_p], C.c_int),
+            "rme2_capture_begin": ([C.c_void_p, C.c_void_p], C.c_int),
+            "rme2_capture_end": ([C.c_void_p, C.c_int], C.c_int),
             "rme2_submit": ([C.c_void_p, C.c_uint64, C.c_void_p, C.c_void_p, C.c_void_p], C.c_int),
             "rme2_wait": ([C.c_void_p, C.POINTER(Stats)], C.c_int),
             "rme2_view": ([C.c_void_p, C.c_int, C.POINTER(C.POINTER(C.c_int32)),
@@ -37,7 +42,7 @@ class Proxy:
         for name, (args, result) in signatures.items():
             fn = getattr(self.lib, name)
             fn.argtypes, fn.restype = args, result
-        if self.lib.rme2_abi_version() != 3:
+        if self.lib.rme2_abi_version() != 4:
             raise RuntimeError("native ABI mismatch; rebuild the library")
         self.check(self.lib.rme2_create(rank, device, tokens, shm_name.encode(), timeout,
                                        int(validate), core, int(per_source_readback), int(metadata_barrier), C.byref(self.handle)))
@@ -59,6 +64,13 @@ class Proxy:
 
     def unlink(self):
         self.check(self.lib.rme2_unlink(self.handle))
+
+    def capture_metadata(self, plan, stream, launch_barrier=False):
+        # Native owns graph executable; retain explicit owners of captured pointers.
+        self._metadata_plan, self._metadata_stream = plan, stream
+        self.check(self.lib.rme2_capture_begin(self.handle, stream.cuda_stream))
+        plan.launch(stream)
+        self.check(self.lib.rme2_capture_end(self.handle, int(launch_barrier)))
 
     def submit(self, iteration, plan, stream):
         self.check(self.lib.rme2_submit(self.handle, iteration, plan.expert_offsets.data_ptr(),

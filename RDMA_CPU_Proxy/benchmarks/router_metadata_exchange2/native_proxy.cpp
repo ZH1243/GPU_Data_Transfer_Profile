@@ -40,7 +40,7 @@ template<class F> int api(F&& f) {
 // Linux process-shared, lock-free aligned atomic counters. Only CPU threads
 // touch these; GPU readiness comes from a completed CUDA event first.
 struct alignas(64) Slot { uint64_t complete; char padding[56]; };
-struct Shared { Slot slots[rme2::gpus]; Slot metadata_arrivals[rme2::gpus]; Slot aborted; };
+struct Shared { Slot slots[rme2::gpus]; Slot metadata_arrivals[rme2::gpus]; Slot launch_arrivals[rme2::gpus]; Slot aborted; };
 static_assert(__atomic_always_lock_free(sizeof(uint64_t), nullptr), "64-bit atomics required");
 uint64_t acquire(const uint64_t* p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
 void release(uint64_t* p, uint64_t value) { __atomic_store_n(p, value, __ATOMIC_RELEASE); }
@@ -60,6 +60,11 @@ struct Rme2Proxy {
     cudaEvent_t begin = nullptr, end = nullptr, read_done = nullptr, metadata_done = nullptr;
     std::array<cudaStream_t, rme2::gpus> source_streams{};
     std::array<cudaEvent_t, rme2::gpus> source_events{};
+    cudaGraphExec_t metadata_graph = nullptr;
+    cudaStream_t capture_stream = nullptr, work_stream = nullptr;
+    bool capturing = false, launch_barrier = false;
+    cudaEvent_t metadata_begin = nullptr, metadata_end = nullptr;
+    const int32_t* local_offsets = nullptr;
     std::array<rme2::Installed, rme2::gpus> installed{};
     std::thread worker;
     std::mutex mutex;
@@ -245,6 +250,48 @@ struct Rme2Proxy {
         stats.install_ms = ms(start);
         stats.native_ms = ms(submitted);
     }
+    void submit_exchange(cudaStream_t s) {
+        if (metadata_barrier) {
+            try {
+                // Metadata has already been queued on this stream. Only
+                // this event's completion permits arrival at the CPU barrier.
+                auto started = Clock::now();
+                check(cudaEventRecord(metadata_done, s), "record metadata completion");
+                wait_event(metadata_done);
+                stats.metadata_completion_wait_ms = ms(started);
+                started = Clock::now();
+                release(&shared->metadata_arrivals[rank].complete, sequence);
+                rme2::wait_epoch_all(rme2::gpus, sequence,
+                    [&](int peer) { return acquire(&shared->metadata_arrivals[peer].complete); },
+                    [&] {
+                        check_deadline(started);
+                        std::this_thread::yield();
+                    });
+                stats.metadata_barrier_wait_ms = ms(started);
+            } catch (...) {
+                release(&shared->aborted.complete, 1);
+                throw;
+            }
+        }
+        check(cudaEventRecord(begin, s), "record exchange start");
+        launch_exchange(peers, rank, capacity, local_offsets, local_values, s);
+        check(cudaGetLastError(), "launch metadata exchange");
+        check(cudaEventRecord(end, s), "record exchange end");
+    }
+    void launch_metadata() {
+        if (launch_barrier) {
+            const auto start = Clock::now();
+            release(&shared->launch_arrivals[rank].complete, sequence);
+            rme2::wait_epoch_all(rme2::gpus, sequence,
+                [&](int peer) { return acquire(&shared->launch_arrivals[peer].complete); },
+                [&] { check_deadline(start); std::this_thread::yield(); });
+            stats.metadata_launch_barrier_ms = ms(start);
+        }
+        check(cudaEventRecord(metadata_begin, work_stream), "record native metadata start");
+        check(cudaGraphLaunch(metadata_graph, work_stream), "launch native metadata graph");
+        check(cudaEventRecord(metadata_end, work_stream), "record native metadata end");
+        submit_exchange(work_stream);
+    }
     void run() noexcept {
         try {
             check(cudaSetDevice(device), "select proxy thread GPU");
@@ -260,7 +307,14 @@ struct Rme2Proxy {
                     changed.wait(lock, [&] { return stopping.load() || pending; });
                     if (stopping.load()) return;
                 }
+                if (metadata_graph) launch_metadata();
                 process();
+                if (metadata_graph) {
+                    float elapsed = 0;
+                    check(cudaEventElapsedTime(&elapsed, metadata_begin, metadata_end), "native metadata timing");
+                    stats.metadata_gpu_ms = elapsed;
+                    stats.native_ms = ms(submitted);
+                }
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     pending = false; done = true;
@@ -282,6 +336,12 @@ struct Rme2Proxy {
         if (worker.joinable()) worker.join();
         cudaSetDevice(device);
         // Caller must collectively finish before destroying IPC allocations.
+        if (capturing) {
+            cudaGraph_t discarded = nullptr;
+            cudaStreamEndCapture(capture_stream, &discarded);
+            if (discarded) cudaGraphDestroy(discarded);
+        }
+        if (metadata_graph && work_stream) cudaStreamSynchronize(work_stream);
         if (read_stream) cudaStreamSynchronize(read_stream);
         for (auto stream : source_streams) if (stream) cudaStreamSynchronize(stream);
         if (end) cudaEventSynchronize(end);
@@ -294,6 +354,9 @@ struct Rme2Proxy {
         if (metadata_done) cudaEventDestroy(metadata_done);
         for (auto event : source_events) if (event) cudaEventDestroy(event);
         for (auto stream : source_streams) if (stream) cudaStreamDestroy(stream);
+        if (metadata_graph) cudaGraphExecDestroy(metadata_graph);
+        if (metadata_begin) cudaEventDestroy(metadata_begin);
+        if (metadata_end) cudaEventDestroy(metadata_end);
         if (inbox) cudaFree(inbox);
         if (pinned) cudaFreeHost(pinned);
         if (shared) munmap(shared, sizeof(Shared));
@@ -301,7 +364,7 @@ struct Rme2Proxy {
     }
 };
 
-extern "C" int rme2_abi_version() { return 3; }
+extern "C" int rme2_abi_version() { return 4; }
 extern "C" const char* rme2_error() { return last_error.c_str(); }
 extern "C" int rme2_create(int rank, int device, int tokens, const char* name,
                            double timeout, int validate, int core, int per_source_readback, int metadata_barrier, Rme2Proxy** out) {
@@ -370,45 +433,57 @@ extern "C" int rme2_disconnect(Rme2Proxy* p) {
         p->connected = false;
     });
 }
+extern "C" int rme2_capture_begin(Rme2Proxy* p, void* stream) {
+    return api([&] {
+        require(p && p->connected, "capture requires connected proxy");
+        std::lock_guard<std::mutex> lock(p->mutex);
+        require(!p->pending && !p->done && !p->capturing && !p->metadata_graph && p->sequence == 0,
+                "capture must precede all submissions and occur only once");
+        require(p->failure.empty(), p->failure.c_str());
+        check(cudaSetDevice(p->device), "select capture GPU");
+        check(cudaEventCreate(&p->metadata_begin), "create native metadata start");
+        check(cudaEventCreate(&p->metadata_end), "create native metadata end");
+        p->capture_stream = static_cast<cudaStream_t>(stream);
+        check(cudaStreamBeginCapture(p->capture_stream, cudaStreamCaptureModeThreadLocal), "begin metadata capture");
+        p->capturing = true;
+    });
+}
+extern "C" int rme2_capture_end(Rme2Proxy* p, int launch_barrier) {
+    return api([&] {
+        require(p && p->capturing, "no active metadata capture");
+        std::lock_guard<std::mutex> lock(p->mutex);
+        require(launch_barrier == 0 || launch_barrier == 1, "invalid launch barrier mode");
+        check(cudaSetDevice(p->device), "select capture end GPU");
+        cudaGraph_t graph = nullptr;
+        auto status = cudaStreamEndCapture(p->capture_stream, &graph);
+        p->capturing = false;
+        check(status, "end metadata capture");
+        try {
+            check(cudaGraphInstantiate(&p->metadata_graph, graph, nullptr, nullptr, 0), "instantiate native metadata graph");
+            // Move upload/first launch costs outside measured iterations.
+            check(cudaGraphUpload(p->metadata_graph, p->capture_stream), "upload native metadata graph");
+            check(cudaStreamSynchronize(p->capture_stream), "complete native graph upload");
+        } catch (...) { if (graph) cudaGraphDestroy(graph); throw; }
+        check(cudaGraphDestroy(graph), "release captured graph definition");
+        p->launch_barrier = launch_barrier != 0;
+    });
+}
 extern "C" int rme2_submit(Rme2Proxy* p, uint64_t iteration, const int32_t* offsets,
                            const int32_t* indices, void* stream) {
     return api([&] {
         require(p && offsets && indices && p->connected, "invalid submit arguments");
         std::lock_guard<std::mutex> lock(p->mutex);
         require(p->failure.empty(), p->failure.c_str());
-        require(!p->pending && !p->done && iteration == p->sequence + 1 && iteration != 0,
+        require(!p->pending && !p->done && !p->capturing && iteration == p->sequence + 1 && iteration != 0,
                 "submit requires prior wait and consecutive iterations starting at 1");
         check(cudaSetDevice(p->device), "select submit GPU");
         p->submitted = Clock::now();
         p->stats = {};
         auto s = static_cast<cudaStream_t>(stream);
-        if (p->metadata_barrier) {
-            try {
-                // The caller has already queued metadata on this stream. Only
-                // this event's completion permits arrival at the CPU barrier.
-                auto started = Clock::now();
-                check(cudaEventRecord(p->metadata_done, s), "record metadata completion");
-                p->wait_event(p->metadata_done);
-                p->stats.metadata_completion_wait_ms = ms(started);
-                started = Clock::now();
-                release(&p->shared->metadata_arrivals[p->rank].complete, iteration);
-                rme2::wait_epoch_all(rme2::gpus, iteration,
-                    [&](int peer) { return acquire(&p->shared->metadata_arrivals[peer].complete); },
-                    [&] {
-                        p->check_deadline(started);
-                        std::this_thread::yield();
-                    });
-                p->stats.metadata_barrier_wait_ms = ms(started);
-            } catch (...) {
-                release(&p->shared->aborted.complete, 1);
-                throw;
-            }
-        }
-        check(cudaEventRecord(p->begin, s), "record exchange start");
-        launch_exchange(p->peers, p->rank, p->capacity, offsets, indices, s);
-        check(cudaGetLastError(), "launch metadata exchange");
-        check(cudaEventRecord(p->end, s), "record exchange end");
-        p->local_values = indices; p->sequence = iteration; p->pending = true;
+        p->local_values = indices; p->local_offsets = offsets;
+        p->work_stream = s; p->sequence = iteration;
+        if (!p->metadata_graph) p->submit_exchange(s);
+        p->pending = true;
         p->changed.notify_all();
     });
 }

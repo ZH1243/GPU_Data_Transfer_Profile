@@ -3,13 +3,15 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI 3; Linux CUDA only. All functions except destroy/error return 0 on success.
+/* ABI 4; Linux CUDA only. All functions except destroy/error return 0 on success.
  * create/connect/submit/wait/view must be called serially by one host thread.
  * submit queues work; the owned native thread handles readback and installation.
  * Pointers returned by view are borrowed until the next submit or destroy.
  */
 typedef struct Rme2Proxy Rme2Proxy;
 typedef struct {
+    double metadata_launch_barrier_ms;
+    double metadata_gpu_ms;
     double metadata_completion_wait_ms;
     double metadata_barrier_wait_ms;
     double exchange_gpu_ms;
@@ -34,6 +36,13 @@ int rme2_unlink(Rme2Proxy*);
 /* Collectively disconnect, barrier, then destroy: imported mappings must close
  * before any owner frees its IPC arena. */
 int rme2_disconnect(Rme2Proxy*);
+/* Setup-only capture on a nondefault stream. The proxy owns the executable;
+ * caller owns all captured tensors and must keep them and submission streams
+ * alive through final wait/disconnect/destroy. Capture must contain only metadata.
+ * After capture, submit schedules metadata AND exchange on the native worker.
+ */
+int rme2_capture_begin(Rme2Proxy*, void* cuda_stream);
+int rme2_capture_end(Rme2Proxy*, int launch_barrier);
 int rme2_submit(Rme2Proxy*, uint64_t iteration, const int32_t* offsets,
                 const int32_t* indices, void* cuda_stream);
 int rme2_wait(Rme2Proxy*, Rme2Stats*);

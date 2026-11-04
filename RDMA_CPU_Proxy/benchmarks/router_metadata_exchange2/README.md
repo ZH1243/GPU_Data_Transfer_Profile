@@ -132,17 +132,68 @@ Payload capacity is conservative; transfer size is exact. The design avoids send
 D2H, sender packing buffers, self peer payload copies, and receiver CPU payload copies.
 It is not zero-copy: peer payloads still move GPU-to-GPU and then GPU-to-CPU.
 
+### Native worker metadata launch and pre-launch barrier
+
+`--native-metadata-launch` moves metadata graph replay and exchange submission onto
+the native proxy worker. It requires `--mode graph` (the default). Add
+`--metadata-launch-barrier` to synchronize those workers through shared CPU memory
+immediately before they record the start event and launch the metadata graph.
+The launch barrier requires native launch; invalid option combinations fail early.
+Both flags are off by default, preserving the existing Python launch path.
+
+Update the Python files and **rebuild the library (ABI 4)**:
+
+```bash
+cmake --build build -j
+# Correctness with native launch, pre-launch alignment, fresh inputs and empty lists:
+bash ./run_gpu_checks.sh --native-metadata-launch --metadata-launch-barrier
+
+RESULT_JSON=results/native_launch_barrier.json bash ./run_single_node_torchrun.sh \
+  --native-metadata-launch --metadata-launch-barrier \
+  --skip-index-validation --warmup 20 --iterations 200
+```
+
+For comparison, run native launch without `--metadata-launch-barrier`, and the
+original mode without either flag. To measure residual skew after metadata finishes,
+also add the independent `--metadata-barrier` described below. All combinations
+support `--per-source-readback`. The GPU check script selects only graph mode when
+native launch is requested; run it with the additional options to check combinations.
+
+Python still generates R, compiles CuTe and warms its kernels during setup. The C API
+begins stream capture, Python queues the seven compiled kernels once, and C++ ends
+capture, instantiates and uploads its own CUDA graph executable. This does not depend
+on PyTorch exposing raw graph handles. Capture/JIT/upload are outside timing. The
+Python wrapper retains the plan and stream, keeping captured tensor addresses alive;
+the native proxy destroys its executable only after worker shutdown and stream
+completion. The original graph definition is destroyed after instantiation.
+
+Each iteration completes R generation outside timing, then Python queues a native
+command and waits. The worker selects its GPU, optionally waits for the pre-launch
+barrier, replays the metadata graph and submits exchange on the same stream. Python
+does not replay metadata or record metadata timing events in this path. The native
+worker's CUDA events supply `metadata_gpu_ms`. There is no Python scheduling step
+between barrier release and graph submission. CPU scheduling and CUDA launch latency
+can still produce GPU start skew.
+
+`metadata_launch_barrier_ms` is the timed worker arrival/publication/wait interval
+before metadata launch (zero when disabled). It is included in `native_ms` and
+`end_to_end_ms`, together with command handoff and worker scheduling. Consequently,
+waiting can move into this barrier; compare end-to-end latency rather than just peer
+wait. The metadata-launch and post-metadata barriers use separate cache-line-aligned,
+epoch-tagged arrival arrays and the existing abort/timeout protocol.
+
 ### Optional barrier after metadata processing
 
 `--metadata-barrier` (default off) synchronizes after **GPU metadata completion**,
-before exchange submission. It runs inside the native submission call made by each
-Python caller, not on the proxy worker. An event queued on the metadata stream must
+before exchange submission. In the default launch path it runs inside the native
+submission call made by each Python caller. With `--native-metadata-launch`, it runs
+on the proxy worker after graph submission. An event queued on the metadata stream must
 complete before the caller release-publishes its iteration in a separate shared-memory
 arrival slot. The C++ callers acquire-poll all eight arrivals, checking timeout/abort,
 then enqueue their exchange kernels. Slots carry monotonically increasing epochs;
 the existing consumption barrier prevents reuse while peers still consume metadata.
 
-Update Python and rebuild the library together (native **ABI 3**):
+Update Python and rebuild the library together (native **ABI 4**):
 
 ```bash
 cmake --build build -j
@@ -173,7 +224,7 @@ exchange stage into the metadata barrier. The flag can also combine with
 
 Pass `--per-source-readback` to remove the all-sources gate before readback.
 The default remains unchanged. **Rebuild the shared library and update Python
-together**: the native create signature is now ABI 3; Python rejects older libraries.
+together**: the native interface is now ABI 4; Python rejects older libraries.
 
 ```bash
 cmake --build build -j
@@ -240,7 +291,7 @@ rank with the longest end-to-end duration on each iteration and using that same
 rank's measurements for every row. These distributions are stored as
 `critical_rank_metrics`, with selected ranks in `critical_rank_per_iteration`.
 `all_rank_metrics` retains distributions over all rank/iteration samples. JSON
-timing fields remain in **milliseconds** (schema version 4).
+timing fields remain in **milliseconds** (schema version 5).
 
 | Field | Meaning |
 |---|---|

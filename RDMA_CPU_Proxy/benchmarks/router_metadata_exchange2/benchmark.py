@@ -23,6 +23,7 @@ def summary(values):
 def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False):
     labels = (
         ("end_to_end_ms", "End to end (wall)"),
+        ("metadata_launch_barrier_ms", "Native metadata launch barrier wait"),
         ("metadata_gpu_ms", "Seven metadata kernels (GPU)"),
         ("metadata_completion_wait_ms", "CPU wait for local metadata completion"),
         ("metadata_barrier_wait_ms", "Shared-memory metadata barrier wait"),
@@ -56,8 +57,21 @@ def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False):
     if per_source_readback:
         print("Per-source mode: readiness spans overlap readback/installation; D2H rows")
         print("sum eight overlapping source latencies, not elapsed readback wall time.")
-    print("Host time outside native includes metadata submission and wait-return overhead;")
+    print("Host time outside native includes caller submission and wait-return overhead;")
     print("it is end_to_end - native, not an isolated Python execution measurement.", flush=True)
+
+
+def enqueue_iteration(proxy, iteration, plan, stream, graph, begin, end, native_launch):
+    if not native_launch:
+        begin.record(stream)
+        if graph is None:
+            plan.launch(stream)
+        else:
+            graph.replay()
+        end.record(stream)
+    # In native mode this only queues a command; the C++ worker launches both
+    # metadata and exchange. Caller already completed R generation outside timing.
+    proxy.submit(iteration, plan, stream)
 
 
 def options():
@@ -75,6 +89,10 @@ def options():
                         default="affine", help="cycle stresses empty lists and changing lengths")
     parser.add_argument("--skip-index-validation", action="store_true",
                         help="omit timed per-index scans; structural header checks always remain")
+    parser.add_argument("--native-metadata-launch", action="store_true",
+                        help="native proxy worker launches captured CuTe graph; requires --mode graph")
+    parser.add_argument("--metadata-launch-barrier", action="store_true",
+                        help="shared-memory barrier in native workers immediately before metadata launch")
     parser.add_argument("--metadata-barrier", action="store_true",
                         help="wait for all GPUs to finish metadata before submitting exchange (timed)")
     parser.add_argument("--per-source-readback", action="store_true",
@@ -84,6 +102,10 @@ def options():
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--output", type=Path, default=Path("results/metadata_exchange2.json"))
     args = parser.parse_args()
+    if args.native_metadata_launch and args.mode != "graph":
+        parser.error("--native-metadata-launch requires --mode graph")
+    if args.metadata_launch_barrier and not args.native_metadata_launch:
+        parser.error("--metadata-launch-barrier requires --native-metadata-launch")
     if not 1 <= args.tokens <= 10000000 or args.warmup < 1 or args.iterations < 1:
         parser.error("require tokens=1..10000000, warmup>=1, iterations>=1")
     if not 0 <= args.seed < 2**64 or not 0 < args.timeout < 86400:
@@ -197,7 +219,9 @@ def main():
         plan.launch(stream)
         stream.synchronize()
         graph = None
-        if args.mode == "graph":
+        if args.native_metadata_launch:
+            proxy.capture_metadata(plan, stream, args.metadata_launch_barrier)
+        elif args.mode == "graph":
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
                 plan.launch(stream)
@@ -210,6 +234,7 @@ def main():
         if rank == 0:
             print(f"Single node: 8 GPUs, 128 experts, top-8, 16 experts/GPU; {properties.name}", flush=True)
             print(f"mode={args.mode}; tokens/source={args.tokens}; verify={args.verify}; "
+                  f"native_metadata_launch={args.native_metadata_launch}; metadata_launch_barrier={args.metadata_launch_barrier}; "
                   f"per_source_readback={args.per_source_readback}; metadata_barrier={args.metadata_barrier}; native proxy threads active", flush=True)
         records = []
         total = args.warmup + args.iterations
@@ -219,17 +244,13 @@ def main():
             dist.barrier()         # align start; previous iteration also has a consumption barrier
             started = time.perf_counter_ns()
             with torch.cuda.stream(stream):
-                begin.record(stream)
-                if graph is None:
-                    plan.launch(stream)
-                else:
-                    graph.replay()
-                end.record(stream)
-                proxy.submit(iteration, plan, stream)
+                enqueue_iteration(proxy, iteration, plan, stream, graph, begin, end,
+                                  args.native_metadata_launch)
             record = proxy.wait()
             record["end_to_end_ms"] = (time.perf_counter_ns() - started) / 1e6
             record["host_outside_native_ms"] = record["end_to_end_ms"] - record["native_ms"]
-            record["metadata_gpu_ms"] = begin.elapsed_time(end)
+            if not args.native_metadata_launch:
+                record["metadata_gpu_ms"] = begin.elapsed_time(end)
             record["iteration"] = iteration
             if iteration > args.warmup:
                 records.append(record)
@@ -249,7 +270,7 @@ def main():
             metrics = {key: summary([r[key] for report in reports for r in report["records"]])
                        for key in records[0] if key.endswith("_ms")}
             critical_metrics = {key: summary([r[key] for r in critical_records]) for key in metrics}
-            report = dict(schema_version=4, backend="cpp-thread-cuda-ipc", topology=dict(
+            report = dict(schema_version=5, backend="cpp-thread-cuda-ipc", topology=dict(
                 nodes=1, gpus=8, experts=128, experts_per_gpu=16, top_k=8),
                 configuration=config, versions=dict(torch=torch.__version__, cuda=torch.version.cuda),
                 critical_rank_end_to_end_ms=summary(critical), all_rank_metrics=metrics,
