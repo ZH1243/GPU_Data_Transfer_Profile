@@ -24,7 +24,8 @@ class LaunchDispatchTests(unittest.TestCase):
 
     def test_invalid_modes_fail_before_cuda_import(self):
         program = str(Path(__file__).with_name('benchmark.py'))
-        for flags in (['--metadata-launch-barrier'], ['--native-metadata-launch', '--mode', 'eager']):
+        for flags in (['--metadata-launch-barrier'], ['--native-metadata-launch', '--mode', 'eager'],
+                      ['--batch-payload-copy', '--per-source-readback']):
             result = subprocess.run([sys.executable, program, *flags], text=True, capture_output=True)
             self.assertEqual(result.returncode, 2)
             self.assertIn('requires', result.stderr)

@@ -20,7 +20,7 @@ def summary(values):
                 p95=ordered[int(0.95 * (len(ordered) - 1))], max=ordered[-1])
 
 
-def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False):
+def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False, batch_payload_copy=False):
     labels = (
         ("end_to_end_ms", "End to end (wall)"),
         ("metadata_launch_barrier_ms", "Native metadata launch barrier wait"),
@@ -46,6 +46,8 @@ def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False):
     print("all rows use that same rank's sample, not separate per-stage maxima.")
     print(f"{'Measurement':45s} {'median':>10s} {'mean':>10s} {'p95':>10s}")
     for key, label in labels:
+        if batch_payload_copy and key == "payload_submit_ms":
+            label = "  Payload: cudaMemcpyBatchAsync call"
         if metadata_barrier and not per_source_readback and key == "sender_completion_wait_ms":
             label = "Proxy wait for local exchange completion"
         if per_source_readback:
@@ -103,6 +105,8 @@ def options():
                         help="shared-memory barrier in native workers immediately before metadata launch")
     parser.add_argument("--metadata-barrier", action="store_true",
                         help="wait for all GPUs to finish metadata before submitting exchange (timed)")
+    parser.add_argument("--batch-payload-copy", action="store_true",
+                        help="one cudaMemcpyBatchAsync for nonempty payloads; incompatible with per-source readback")
     parser.add_argument("--per-source-readback", action="store_true",
                         help="start each source's readback when ready, overlapping late sources")
     parser.add_argument("--cpu-core-map", default="",
@@ -110,6 +114,8 @@ def options():
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--output", type=Path, default=Path("results/metadata_exchange2.json"))
     args = parser.parse_args()
+    if args.batch_payload_copy and args.per_source_readback:
+        parser.error("--batch-payload-copy requires --per-source-readback to be disabled")
     if args.native_metadata_launch and args.mode != "graph":
         parser.error("--native-metadata-launch requires --mode graph")
     if args.metadata_launch_barrier and not args.native_metadata_launch:
@@ -191,7 +197,7 @@ def main():
         dist.broadcast_object_list(identity, src=0)
         def create_proxy():
             return Proxy(args.library.resolve(), rank, local, args.tokens, identity[0],
-                         args.timeout, not args.skip_index_validation, args.cores[rank], args.per_source_readback, args.metadata_barrier)
+                         args.timeout, not args.skip_index_validation, args.cores[rank], args.per_source_readback, args.metadata_barrier, args.batch_payload_copy)
         if rank == 0:
             proxy = create_proxy()
         dist.barrier()  # creator finished initializing shared control
@@ -243,7 +249,7 @@ def main():
             print(f"Single node: 8 GPUs, 128 experts, top-8, 16 experts/GPU; {properties.name}", flush=True)
             print(f"mode={args.mode}; tokens/source={args.tokens}; verify={args.verify}; "
                   f"native_metadata_launch={args.native_metadata_launch}; metadata_launch_barrier={args.metadata_launch_barrier}; "
-                  f"per_source_readback={args.per_source_readback}; metadata_barrier={args.metadata_barrier}; native proxy threads active", flush=True)
+                  f"batch_payload_copy={args.batch_payload_copy}; per_source_readback={args.per_source_readback}; metadata_barrier={args.metadata_barrier}; native proxy threads active", flush=True)
         records = []
         total = args.warmup + args.iterations
         for iteration in range(1, total + 1):
@@ -278,7 +284,7 @@ def main():
             metrics = {key: summary([r[key] for report in reports for r in report["records"]])
                        for key in records[0] if key.endswith("_ms")}
             critical_metrics = {key: summary([r[key] for r in critical_records]) for key in metrics}
-            report = dict(schema_version=6, backend="cpp-thread-cuda-ipc", topology=dict(
+            report = dict(schema_version=7, backend="cpp-thread-cuda-ipc", topology=dict(
                 nodes=1, gpus=8, experts=128, experts_per_gpu=16, top_k=8),
                 configuration=config, versions=dict(torch=torch.__version__, cuda=torch.version.cuda),
                 critical_rank_end_to_end_ms=summary(critical), all_rank_metrics=metrics,
@@ -286,13 +292,13 @@ def main():
                 critical_rank_per_iteration=[r["rank"] for r in critical_reports],
                 readback_timing_semantics=("per-source D2H latency sums; readiness observation spans overlap readback"
                                           if args.per_source_readback else "batched D2H wall stages after all-source wait"),
-                timing_note="Overlapping GPU/CPU spans are not additive. Generation, setup, barriers and exact verification excluded.",
+                timing_note="Overlapping GPU/CPU spans are not additive. Generation, setup, outer Gloo barriers and exact verification excluded; enabled native barriers included.",
                 ranks=reports)
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(report, indent=2) + "\n")
             print(json.dumps(dict(critical_rank_end_to_end_ms=summary(critical),
                                   output=str(args.output), verification=args.verify), indent=2), flush=True)
-            print_breakdown(critical_metrics, args.per_source_readback, args.metadata_barrier)
+            print_breakdown(critical_metrics, args.per_source_readback, args.metadata_barrier, args.batch_payload_copy)
         dist.barrier()
         proxy.disconnect()
         dist.barrier()  # close every IPC import before any owning GPU allocation is freed

@@ -3,6 +3,7 @@
 #include "metadata_view.hpp"
 #include "readback_progress.hpp"
 #include "epoch_barrier.hpp"
+#include "payload_batch.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -74,6 +75,8 @@ struct Rme2Proxy {
     const int32_t* local_values = nullptr;
     Clock::time_point submitted;
     Rme2Stats stats{};
+    bool batch_payload_copy = false;
+    rme2::PayloadBatch payload_batch;
 
     Rme2Proxy(int r, int d, int t, const char* n, double seconds, bool v, int c, bool progressive, bool barrier)
         : rank(r), device(d), tokens(t), capacity(t * 8), core(c), timeout(seconds),
@@ -251,6 +254,7 @@ struct Rme2Proxy {
         wait_event(read_done);
         stats.headers_d2h_ms = ms(start);
         start = Clock::now();
+        if (batch_payload_copy) payload_batch.reset();
         for (int source = 0; source < rme2::gpus; ++source) {
             const auto checks_start = Clock::now();
             const int32_t* header = pinned + source * rme2::header_words;
@@ -258,8 +262,9 @@ struct Rme2Proxy {
             auto bytes = size_t(count) * sizeof(int32_t);
             const int32_t* src = source == rank ? local_values + header[0] : payload(inbox, source);
             auto* dst = payload(pinned, source);
+            if (batch_payload_copy) payload_batch.append(dst, src, bytes, source);
             stats.payload_checks_ms += ms(checks_start);
-            if (bytes) {
+            if (bytes && !batch_payload_copy) {
                 const auto submit_start = Clock::now();
                 check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost,
                                       read_stream), "copy exact metadata payload");
@@ -267,6 +272,28 @@ struct Rme2Proxy {
             }
             stats.received_index_bytes += bytes;
             if (source != rank) stats.peer_received_index_bytes += bytes;
+        }
+        if (batch_payload_copy && payload_batch.count) {
+#if CUDART_VERSION >= 12080
+            cudaMemcpyAttributes attrs{};
+            attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+            size_t attribute_index = 0;
+            size_t failed_index = SIZE_MAX;
+            const auto submit_start = Clock::now();
+            const auto status = cudaMemcpyBatchAsync(
+                payload_batch.destinations.data(), payload_batch.sources.data(),
+                payload_batch.sizes.data(), payload_batch.count, &attrs,
+                &attribute_index, 1, &failed_index, read_stream);
+            stats.payload_submit_ms += ms(submit_start);
+            if (status != cudaSuccess) {
+                const std::string detail = failed_index < payload_batch.count
+                    ? " at source " + std::to_string(payload_batch.source_ranks[failed_index])
+                    : " (no specific batch entry)";
+                throw std::runtime_error(std::string("cudaMemcpyBatchAsync payload") + detail + ": " + cudaGetErrorString(status));
+            }
+#else
+            throw std::runtime_error("batch payload copy requires a CUDA 12.8+ build");
+#endif
         }
         auto part_start = Clock::now();
         check(cudaEventRecord(read_done, read_stream), "record payload readback");
@@ -397,7 +424,19 @@ struct Rme2Proxy {
     }
 };
 
-extern "C" int rme2_abi_version() { return 5; }
+extern "C" int rme2_abi_version() { return 6; }
+extern "C" int rme2_set_batch_payload_copy(Rme2Proxy* p, int enabled) {
+    return api([&] {
+        require(p && (enabled == 0 || enabled == 1), "invalid batch payload option");
+        std::lock_guard<std::mutex> lock(p->mutex);
+        require(p->sequence == 0 && !p->pending && !p->done, "configure payload copy before iterations");
+        require(!enabled || !p->per_source_readback, "batch payload copy cannot combine with per-source readback");
+#if CUDART_VERSION < 12080
+        require(!enabled, "batch payload copy requires a CUDA 12.8+ build (use CUDA 12.9 on Hopper)");
+#endif
+        p->batch_payload_copy = enabled != 0;
+    });
+}
 extern "C" const char* rme2_error() { return last_error.c_str(); }
 extern "C" int rme2_create(int rank, int device, int tokens, const char* name,
                            double timeout, int validate, int core, int per_source_readback, int metadata_barrier, Rme2Proxy** out) {

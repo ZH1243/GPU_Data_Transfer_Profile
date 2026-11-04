@@ -132,6 +132,46 @@ Payload capacity is conservative; transfer size is exact. The design avoids send
 D2H, sender packing buffers, self peer payload copies, and receiver CPU payload copies.
 It is not zero-copy: peer payloads still move GPU-to-GPU and then GPU-to-CPU.
 
+### Optional batch payload copy (CUDA 12.9)
+
+`--batch-payload-copy` replaces the receiver's nonempty payload copy loop with one
+`cudaMemcpyBatchAsync`. It is off by default and requires `--per-source-readback`
+to be disabled. It works with Python or native metadata launch and either barrier.
+Update Python and rebuild the shared library together (**ABI 6**), using the remote
+CUDA 12.9 toolkit:
+
+```bash
+cmake --build build -j
+bash ./run_gpu_checks.sh --batch-payload-copy --native-metadata-launch --metadata-launch-barrier
+
+RESULT_JSON=results/batch_payload.json bash ./run_single_node_torchrun.sh \
+  --native-metadata-launch --metadata-launch-barrier \
+  --batch-payload-copy --skip-index-validation --warmup 20 --iterations 200
+```
+
+Repeat without `--batch-payload-copy` for a matched baseline. Build-time guards keep
+older CUDA builds usable for the default path, but explicitly reject enabling this
+feature without CUDA 12.8+ headers/runtime. There is no silent fallback if the batch
+API fails. Ensure CMake selected the CUDA 12.9 toolkit, not an older cached installation.
+
+After the unchanged header D2H and structural checks, persistent fixed-size arrays
+hold each nonempty copy's source, destination and exact byte length. Self metadata
+still reads directly from CuTe output. The batch uses stream-ordered source access,
+with one attribute group covering all entries. Payloads are independent and their
+pinned destinations are disjoint, so no intra-batch ordering is required. The same
+single completion event gates CPU installation and the iteration reuse barrier.
+Empty destinations submit no copy; an entirely empty payload set skips the batch
+call but still records completion. No payload packing or extra payload copy occurs.
+
+`payload_submit_ms` now measures the single batch API call, labelled accordingly in
+terminal output. Descriptor preparation is included in `payload_checks_ms`; tiny
+attribute setup remains in `payload_other_ms`. The total and all other subrows retain
+their meanings. JSON configuration records the selected mode. Errors identify the
+source corresponding to CUDA's failed batch index when available.
+
+The API reduces host submissions; it does not guarantee one contiguous DMA transfer
+or improved end-to-end latency. See the [CUDA 12.9 batch-copy API documentation](https://docs.nvidia.com/cuda/archive/12.9.1/cuda-runtime-api/group__CUDART__MEMORY.html).
+
 ### Native worker metadata launch and pre-launch barrier
 
 `--native-metadata-launch` moves metadata graph replay and exchange submission onto
@@ -141,7 +181,7 @@ immediately before they record the start event and launch the metadata graph.
 The launch barrier requires native launch; invalid option combinations fail early.
 Both flags are off by default, preserving the existing Python launch path.
 
-Update the Python files and **rebuild the library (ABI 5)**:
+Update the Python files and **rebuild the library (ABI 6)**:
 
 ```bash
 cmake --build build -j
@@ -193,7 +233,7 @@ arrival slot. The C++ callers acquire-poll all eight arrivals, checking timeout/
 then enqueue their exchange kernels. Slots carry monotonically increasing epochs;
 the existing consumption barrier prevents reuse while peers still consume metadata.
 
-Update Python and rebuild the library together (native **ABI 5**):
+Update Python and rebuild the library together (native **ABI 6**):
 
 ```bash
 cmake --build build -j
@@ -224,7 +264,7 @@ exchange stage into the metadata barrier. The flag can also combine with
 
 Pass `--per-source-readback` to remove the all-sources gate before readback.
 The default remains unchanged. **Rebuild the shared library and update Python
-together**: the native interface is now ABI 5; Python rejects older libraries.
+together**: the native interface is now ABI 6; Python rejects older libraries.
 
 ```bash
 cmake --build build -j
@@ -291,7 +331,7 @@ rank with the longest end-to-end duration on each iteration and using that same
 rank's measurements for every row. These distributions are stored as
 `critical_rank_metrics`, with selected ranks in `critical_rank_per_iteration`.
 `all_rank_metrics` retains distributions over all rank/iteration samples. JSON
-timing fields remain in **milliseconds** (schema version 6).
+timing fields remain in **milliseconds** (schema version 7).
 
 | Field | Meaning |
 |---|---|
@@ -303,7 +343,7 @@ timing fields remain in **milliseconds** (schema version 6).
 | `headers_d2h_ms` | Wall time for header submission and completion |
 | `payload_d2h_ms` | Header checks, exact payload submissions, and completion |
 | `payload_checks_ms` | Sum of CPU header checks and source/destination address and length preparation |
-| `payload_submit_ms` | Sum of wall durations of nonempty `cudaMemcpyAsync` calls, including CUDA API overhead |
+| `payload_submit_ms` | Sum of wall durations of nonempty `cudaMemcpyAsync` calls, or the single batch call when enabled, including CUDA API overhead |
 | `payload_event_record_ms` | CPU wall time recording payload completion events |
 | `payload_completion_ms` | Batched mode: polling/yielding until the completion event is observed; per-source mode: summed intervals from event recording to observed completion, including other source work between polls |
 | `payload_other_ms` | Parent payload time minus the four measured subintervals: bookkeeping, loop and timestamp-boundary overhead |

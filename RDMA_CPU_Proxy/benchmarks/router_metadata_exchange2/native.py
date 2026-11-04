@@ -17,17 +17,18 @@ class Stats(C.Structure):
 
 class Proxy:
     def __init__(self, library, rank, device, tokens, shm_name, timeout, validate, core,
-                 per_source_readback=False, metadata_barrier=False):
+                 per_source_readback=False, metadata_barrier=False, batch_payload_copy=False):
         self.lib = C.CDLL(str(library))  # CDLL releases the GIL in native calls.
         self.handle = C.c_void_p()
         self.lib.rme2_abi_version.restype = C.c_int
-        if self.lib.rme2_abi_version() != 5:
+        if self.lib.rme2_abi_version() != 6:
             raise RuntimeError("native ABI mismatch; rebuild the library")
         signatures = {
             "rme2_abi_version": ([], C.c_int),
             "rme2_error": ([], C.c_char_p),
             "rme2_create": ([C.c_int, C.c_int, C.c_int, C.c_char_p, C.c_double,
                               C.c_int, C.c_int, C.c_int, C.c_int, C.POINTER(C.c_void_p)], C.c_int),
+            "rme2_set_batch_payload_copy": ([C.c_void_p, C.c_int], C.c_int),
             "rme2_export": ([C.c_void_p, C.c_void_p], C.c_int),
             "rme2_connect": ([C.c_void_p, C.c_void_p], C.c_int),
             "rme2_unlink": ([C.c_void_p], C.c_int),
@@ -43,10 +44,15 @@ class Proxy:
         for name, (args, result) in signatures.items():
             fn = getattr(self.lib, name)
             fn.argtypes, fn.restype = args, result
-        if self.lib.rme2_abi_version() != 5:
+        if self.lib.rme2_abi_version() != 6:
             raise RuntimeError("native ABI mismatch; rebuild the library")
         self.check(self.lib.rme2_create(rank, device, tokens, shm_name.encode(), timeout,
                                        int(validate), core, int(per_source_readback), int(metadata_barrier), C.byref(self.handle)))
+        try:
+            self.check(self.lib.rme2_set_batch_payload_copy(self.handle, int(batch_payload_copy)))
+        except Exception:
+            self.close()
+            raise
 
     def check(self, status):
         if status:
