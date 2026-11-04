@@ -25,8 +25,15 @@ class TopologyTests(unittest.TestCase):
         wrong[8] = ("host1", dict(configs[8][1], tokens=258))
         with self.assertRaises(ValueError):
             validate_hosts(wrong, 2)
+
+    def test_two_nodes_may_report_the_same_hostname(self):
+        configs = [("container", dict(tokens=257, rdma_device_map=f"nic{r // 8}"))
+                   for r in range(16)]
+        validate_hosts(configs, 2)
+        # Shared hostname must not bypass the workload consistency checks.
+        configs[8] = ("container", dict(tokens=258, rdma_device_map="nic1"))
         with self.assertRaises(ValueError):
-            validate_hosts([("same", c) for _, c in configs], 2)
+            validate_hosts(configs, 2)
 
     def test_nic_mapping(self):
         self.assertEqual(rdma_device("mlx5_0", 7), "mlx5_0")

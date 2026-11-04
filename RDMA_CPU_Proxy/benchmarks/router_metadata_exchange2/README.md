@@ -115,7 +115,9 @@ remain available in single-node mode.
    end-to-end timing. Optional native barriers synchronize only the eight workers
    on each node and remain timed.
 
-The global rank mapping is `node * 8 + local_gpu`. Gloo exchanges IPC handles and
+The global rank mapping is `node * 8 + local_gpu`; torchrun rank groups determine
+node identity, so the two machines may report the same container hostname.
+Gloo exchanges IPC handles and
 QP/MR descriptors during setup, then provides iteration boundaries and reporting;
 no expert metadata payload uses Gloo. IPC mappings and shared-memory counters stay
 local to each node. Normal shutdown stops workers, closes every IPC import,

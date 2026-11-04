@@ -15,8 +15,8 @@ def validate_hosts(configs, nodes):
     for node in range(nodes):
         if len({configs[node * 8 + g][0] for g in range(8)}) != 1:
             raise ValueError("each eight-rank node group must share a host")
-    if nodes == 2 and configs[0][0] == configs[8][0]:
-        raise ValueError("two-node mode requires two distinct hosts")
+    # Torchrun's rank groups define node identity. Hostnames need not be unique
+    # across machines, especially when both nodes use the same container image.
     # Device/core maps, library locations and output paths may differ by node.
     local_options = {"rdma_device_map", "cpu_core_map", "cores", "library", "output"}
     comparable = [{k: v for k, v in config.items() if k not in local_options}
