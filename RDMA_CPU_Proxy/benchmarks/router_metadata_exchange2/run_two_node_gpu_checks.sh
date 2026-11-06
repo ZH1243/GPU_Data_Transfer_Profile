@@ -14,4 +14,14 @@ for mode in "${modes[@]}"; do
       --seed 18446744073709551614 \
       --output "${script_dir}/results/check_two_${mode}_${tokens}.json" "$@"
   done
+  # Byte-copy fallback and partial vectorized rows; cycle also checks empty
+  # local gathers, changing lengths, untouched tails and fresh input payloads.
+  for width in 7 8; do
+    bash "${script_dir}/run_two_node_torchrun.sh" "${node_rank}" --mode "${mode}" --tokens 33 \
+      --token-dimension "${width}" --warmup 1 --iterations 6 --route-pattern cycle --verify all \
+      --output "${script_dir}/results/check_two_${mode}_staging_d${width}.json" "$@"
+  done
+  bash "${script_dir}/run_two_node_torchrun.sh" "${node_rank}" --mode "${mode}" --tokens 33 \
+    --skip-local-staging --warmup 1 --iterations 3 --route-pattern cycle --verify all \
+    --output "${script_dir}/results/check_two_${mode}_no_staging.json" "$@"
 done

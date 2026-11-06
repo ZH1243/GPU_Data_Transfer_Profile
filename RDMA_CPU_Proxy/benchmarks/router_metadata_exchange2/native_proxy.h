@@ -3,7 +3,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI 8; Linux CUDA only. All functions except destroy/error return 0 on success.
+/* ABI 9; Linux CUDA only. All functions except destroy/error return 0 on success.
  * create/connect/submit/wait/view must be called serially by one host thread.
  * submit queues work; the owned native thread handles readback and installation.
  * Pointers returned by view are borrowed until the next submit or destroy.
@@ -30,6 +30,8 @@ typedef struct {
     double rdma_poll_ms;
     double rdma_post_recv_ms;
     double rdma_work_complete_ms;
+    double local_staging_gpu_ms;
+    double local_staging_wait_ms;
     uint64_t received_index_bytes;
     uint64_t peer_received_index_bytes;
     uint64_t header_bytes;
@@ -59,10 +61,18 @@ int rme2_disconnect(Rme2Proxy*);
 /* Setup-only capture on a nondefault stream. The proxy owns the executable;
  * caller owns all captured tensors and must keep them and submission streams
  * alive through final wait/disconnect/destroy. Capture must contain only metadata.
- * After capture, submit schedules metadata AND exchange on the native worker.
+ * After capture, submit schedules metadata, exchange and optional staging on
+ * the native worker.
  */
 int rme2_capture_begin(Rme2Proxy*, void* cuda_stream);
 int rme2_capture_end(Rme2Proxy*, int launch_barrier);
+/* Optional setup-only capture of the local token-row gather, separate from
+ * metadata capture. Works with Python eager/graph and native metadata launch.
+ * submit enqueues this graph AFTER the exchange completion event on the same
+ * stream. CPU readback/RDMA waits only for exchange; wait also drains staging.
+ * Caller keeps captured tensors alive through disconnect/destroy. */
+int rme2_staging_capture_begin(Rme2Proxy*, void* cuda_stream);
+int rme2_staging_capture_end(Rme2Proxy*);
 /* Two-node submissions require node_offsets/x3/x4; single-node ignores them.
  * All input buffers must remain alive and unchanged until wait completes. */
 int rme2_submit(Rme2Proxy*, uint64_t iteration, const int32_t* offsets,

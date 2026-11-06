@@ -6,6 +6,8 @@ owns a C++ proxy thread. Python generates fresh routes and launches seven CuTe D
 metadata kernels; a CUDA C++ kernel writes destination-specific metadata directly
 into CUDA-IPC-mapped peer GPU buffers. Each receiver proxy reads the results into
 persistent pinned memory and installs pointer/count views of that memory.
+After the GPU exchange kernel, a CuTe gather rebuilds the local token staging
+buffer each iteration, overlapping CPU metadata readback/communication when possible.
 
 This is an isolated **benchmark-specific proxy**, not the production `Proxy` class
 or `librdma_cpu_proxy.so`. The production class currently generates/exchanges
@@ -13,12 +15,73 @@ metadata internally during initialization, owns vector-backed records, and rejec
 reinstallation. This experiment implements the proposed replacement data path and
 production routing/index conventions without changing those APIs. Host tests compare
 the new reference and installed views against the actual production `RouterRouting`
-CPU implementation. It does not measure token payload dispatch, GEMMs, RDMA,
+CPU implementation. It does not measure inter-GPU token payload dispatch, GEMMs,
 GPU `A_idx`/scheduler construction, local `x3/x4` CPU installation, or combine.
 In single-node mode the completion endpoint is **all eight source expert tables
-installed at the CPU proxy**. Two-node mode also exchanges remote `x3/x4`, as below.
+installed at the CPU proxy and local token staging complete**. Two-node mode also
+exchanges remote `x3/x4`, as below.
 
-## Two-node exchange (ABI 8)
+## Local token staging (default)
+
+Both one- and two-node modes now include the existing CuTe `LocalStagingPlan`
+from `get_expert_token_idx_list_gpu/metadata_cute.py`. Each process owns reusable
+source/destination BF16 tensors `[tokens, token_dimension]`; `--token-dimension`
+defaults to 4096. At T=20,480 these add 160 MiB each (320 MiB total per GPU),
+outside the registered metadata arenas. The vectorized 128-bit gather is used
+for aligned rows; odd widths such as 7 select its existing byte-copy fallback.
+
+The gather reads the current local-node slice directly on the GPU:
+
+```text
+begin = node_offsets[node]
+rows  = node_offsets[node + 1] - begin
+staging[row, :] = input_tokens[x3[begin + row], :],  0 <= row < rows
+```
+
+No row count is copied to the host before the gather. The slice can grow, shrink
+or become empty between iterations; the unused destination tail is untouched.
+Synthetic activation bit patterns change with rank, row, column and iteration.
+Activation refresh, allocations, compilation, graph capture/upload and verification
+are outside timing, just like route generation. The gather itself is timed.
+
+The stream/progress ordering is:
+
+```text
+GPU work stream: seven metadata kernels -> exchange -> exchange-ready event
+                                                        -> local gather -> staging-done event
+CPU worker:                    wait for exchange-ready -> publish/wait local producers
+                                                        -> header D2H -> local payload D2H + RDMA
+                                                        -> install metadata / drain sends
+                                                        -> wait for remaining staging tail -> return
+```
+
+Exchange readiness is recorded **before** the gather, so CPU publication,
+readback on separate CUDA streams, and RDMA do not wait for staging completion.
+The gather uses separate activation buffers and reads this source's local `x3`;
+it needs no incoming remote metadata. There is no device-wide synchronization
+inside timing. Hardware overlap is permitted, not guaranteed: gather traffic may
+contend with D2H/RDMA for GPU memory bandwidth. The consumption barrier protects
+both metadata and staging inputs/outputs from premature reuse.
+
+The gather is captured as a **separate single-kernel CUDA graph**, launched by
+native code after exchange in every mode. `--mode eager/graph` continues to
+select how the seven metadata kernels are submitted; `--native-metadata-launch`
+moves their graph launch to the native worker. The staging graph is never included
+inside the metadata graph or inside the exchange GPU timer.
+
+`local_staging_gpu_ms` measures the gather's CUDA event span.
+`local_staging_wait_ms` measures only the residual CPU wait after metadata work
+finishes (including completion-query overhead). `native_ms` and `end_to_end_ms`
+now require **both metadata completion and staging completion**. Do not add the
+gather GPU duration to the D2H/RDMA spans. JSON schema 10 records the selected
+staging workload and expanded completion endpoint.
+
+Use `--skip-local-staging` on all ranks for the metadata-only baseline; this omits
+activation allocations/refresh and the gather, and reports both staging timings
+as zero. Existing commands enable staging automatically. Update Python files and
+rebuild the native library on both nodes for **ABI 9** before running.
+
+## Two-node exchange (ABI 9)
 
 The benchmark also supports **two Linux Hopper nodes, eight GPUs each**, keeping
 128 experts and top-8, hence **eight experts per GPU**. It reuses the existing
@@ -32,9 +95,10 @@ Two-node mode exchanges **expert tables plus the same-index remote source's
 `x3/x4` slice every iteration**, enabled by default with no additional flag.
 This matches the production test's `x3/x4` source/destination convention while
 using GPU-to-host RDMA instead of its initialization-time TCP exchange. Update
-Python and rebuild the library on **both nodes**: ABI 8 / wire format 2 is not
+Python and rebuild the library on **both nodes**: ABI 9 / wire format 2 is not
 compatible with older benchmark binaries. Existing benchmark commands still work,
-but their end-to-end timings now include `x3/x4` packing, transfer and installation.
+but their end-to-end timings now include `x3/x4` packing, transfer and installation
+and, by default, local token staging completion.
 
 Build on **both remote machines**, from this benchmark directory:
 
@@ -108,7 +172,9 @@ remain available in single-node mode.
    `x3/x4`. For source node `n`, the slice is
    `[node_offsets[1-n], node_offsets[2-n])`. The packed record contains its header,
    then the valid int32 `x3` entries, then the valid uint8 `x4` masks. No additional
-   kernel is launched. Every writer system-fences its writes before its completion event.
+   packing kernel is launched. Every writer system-fences its writes before its
+   exchange-completion event. The local staging gather follows that event on the
+   same GPU stream and can overlap the subsequent CPU/D2H/RDMA work.
 3. CPU proxies publish producer event completion through **node-local** shared
    counters. Each relay waits for all eight local producers. GPU registration enables
    `CU_POINTER_ATTRIBUTE_SYNC_MEMOPS`; NIC reads are posted only after producer
@@ -128,11 +194,12 @@ remain available in single-node mode.
    final pinned token IDs/masks and their count. Nine receive WQEs are preposted;
    credits are replenished during timing. CQ polling uses a fixed-size stack buffer.
 6. `wait()` returns after **all 16 source expert tables and the remote same-index
-   `x3/x4` slice are installed, and all nine outgoing sends complete**.
+   `x3/x4` slice are installed, all nine outgoing sends complete, and local token
+   staging finishes** (unless `--skip-local-staging`).
    Empty `x3/x4` slices still send a header and require a completion.
    The outer all-16-rank consumption barrier protects
    record reuse, including verification. There is one iteration in flight. Setup,
-   generation, graph compilation, verification, and outer barriers remain outside
+   route/activation generation, graph compilation, verification, and outer barriers remain outside
    end-to-end timing. Optional native barriers synchronize only the eight workers
    on each node and remain timed.
 
@@ -148,14 +215,14 @@ CQ errors, bounded native/Gloo waits, and torchrun termination. There is no reco
 of an in-flight failed iteration.
 
 The endpoint is **expert tables and remote `x3/x4` installed at benchmark CPU
-proxies**. The received `x3/x4` view is not wired into production token dispatch.
-Local `x3/x4` CPU installation, GPU `A_idx`, scheduler reconstruction, actual token
-movement, GEMM, and combine remain excluded.
+proxies, plus local staging completion**. The received `x3/x4` view is not wired
+into production token dispatch. Local `x3/x4` CPU installation, GPU `A_idx`,
+scheduler reconstruction, inter-GPU token movement, GEMM, and combine remain excluded.
 This does not change the production proxy or its initialization-only metadata API.
 
 ### Two-node timing and remote validation
 
-JSON schema 9 reports `rdma_post_ms` (record checks and write submissions),
+JSON schema 10 reports `rdma_post_ms` (record checks and write submissions),
 `rdma_poll_ms` (time inside CQ polling), `rdma_post_recv_ms` (credit reposting), and
 `rdma_work_complete_ms` (span from starting submissions until all send/receive
 completions are processed). `rdma_sent_bytes` and `rdma_received_bytes` include
@@ -193,7 +260,10 @@ These cover eager/graph execution, partial chunks and scan carry, seed wraparoun
 empty local/remote receives, changing lengths, every installed source table, and
 the exact remote `x3/x4` token IDs/masks. `cycle` alternates affine/hot-low/hot-high,
 so each direction exercises empty, full and changing `x3/x4` lengths in reused
-allocations. Exact verification also checks all reported byte counters.
+allocations. Exact verification also checks all reported byte counters and every
+staged activation bit against the independent CPU-reference local `x3` slice,
+plus untouched-tail sentinels. The GPU scripts also exercise staging dimensions
+7 and 8 (fallback and partial vectorized rows) and `--skip-local-staging`.
 The host suite compares both topology references with production CPU routing and
 checks record identity, length bounds, borrowed installation, and launch topology.
 Host checks cannot establish CUDA compilation, peer-write/NIC visibility, or RDMA
@@ -227,7 +297,7 @@ bash ./run_single_node_torchrun.sh \
 # Default workload: 20,480 tokens/source, 5 warmups, 50 measured iterations.
 bash ./run_single_node_torchrun.sh
 
-# Paired modes; both use the same seeds. Graph captures only the seven metadata kernels.
+# Paired metadata modes; staging always uses a separate native graph.
 RESULT_JSON=results/eager.json bash ./run_single_node_torchrun.sh --mode eager
 RESULT_JSON=results/graph.json bash ./run_single_node_torchrun.sh --mode graph
 
@@ -292,11 +362,13 @@ of GPU inbox space and 5 MiB of pinned storage, excluding CuTe scratch.
 
 For every iteration in the default batched-readback mode:
 
-1. Generate R, finish generation, and align ranks with a CPU collective outside timing.
+1. Generate R, refresh input activations, finish generation, and align ranks with
+   a CPU collective outside timing.
 2. Start the Python wall timer. Launch the seven metadata kernels (eager or graph).
 3. Queue the exchange kernel on the **same CUDA stream**. One CTA per destination
    reads source offsets and directly writes the destination header and index slice.
    Every writer executes a system fence. The self CTA writes only a header.
+   Record exchange completion, then queue the local staging graph on this stream.
 4. The native thread polls its source exchange completion event, then release-publishes
    the iteration number in a cache-line-separated POSIX shared-memory CPU counter.
    Receivers acquire-poll all eight source counters. This is a conservative all-senders
@@ -309,7 +381,8 @@ For every iteration in the default batched-readback mode:
 6. After D2H completion, install borrowed views and reset per-expert heads/tails.
    There is no pinned-to-vector copy, serialization, or per-iteration allocation in
    the native data path. Optional full index bounds/sorted-order checks are timed.
-7. Return to Python and stop the wall timer. Optional exact verification runs outside
+7. Wait for any remaining local staging work, return to Python and stop the wall
+   timer. Optional exact verification runs outside
    timing. A consumption barrier then prevents ANY producer from reusing its output
    or inbox while another proxy still reads it.
 
@@ -323,7 +396,7 @@ It is not zero-copy: peer payloads still move GPU-to-GPU and then GPU-to-CPU.
 `--batch-payload-copy` replaces the receiver's nonempty payload copy loop with one
 `cudaMemcpyBatchAsync`. It is off by default and requires `--per-source-readback`
 to be disabled. It works with Python or native metadata launch and either barrier.
-Update Python and rebuild the shared library together (**ABI 8**), using the remote
+Update Python and rebuild the shared library together (**ABI 9**), using the remote
 CUDA 12.9 toolkit:
 
 ```bash
@@ -367,7 +440,7 @@ immediately before they record the start event and launch the metadata graph.
 The launch barrier requires native launch; invalid option combinations fail early.
 Both flags are off by default, preserving the existing Python launch path.
 
-Update the Python files and **rebuild the library (ABI 8)**:
+Update the Python files and **rebuild the library (ABI 9)**:
 
 ```bash
 cmake --build build -j
@@ -419,7 +492,7 @@ arrival slot. The C++ callers acquire-poll all eight arrivals, checking timeout/
 then enqueue their exchange kernels. Slots carry monotonically increasing epochs;
 the existing consumption barrier prevents reuse while peers still consume metadata.
 
-Update Python and rebuild the library together (native **ABI 8**):
+Update Python and rebuild the library together (native **ABI 9**):
 
 ```bash
 cmake --build build -j
@@ -450,7 +523,7 @@ exchange stage into the metadata barrier. The flag can also combine with
 
 Pass `--per-source-readback` to remove the all-sources gate before readback.
 The default remains unchanged. **Rebuild the shared library and update Python
-together**: the native interface is now ABI 8; Python rejects older libraries.
+together**: the native interface is now ABI 9; Python rejects older libraries.
 
 ```bash
 cmake --build build -j
@@ -517,13 +590,15 @@ rank with the longest end-to-end duration on each iteration and using that same
 rank's measurements for every row. These distributions are stored as
 `critical_rank_metrics`, with selected ranks in `critical_rank_per_iteration`.
 `all_rank_metrics` retains distributions over all rank/iteration samples. JSON
-timing fields remain in **milliseconds** (schema version 9).
+timing fields remain in **milliseconds** (schema version 10).
 
 | Field | Meaning |
 |---|---|
-| `end_to_end_ms` | Python wall time from metadata submission through native installation/wait return |
+| `end_to_end_ms` | Python wall time from metadata submission through installation, send completion, staging completion and wait return |
 | `metadata_gpu_ms` | CUDA event span around the seven kernels, including submission gaps |
 | `exchange_gpu_ms` | CUDA event span around the direct-write kernel |
+| `local_staging_gpu_ms` | CUDA event span around local token-row gather; zero when skipped |
+| `local_staging_wait_ms` | Residual CPU wait for gather completion after metadata exchange/installation; includes query overhead |
 | `sender_completion_wait_ms` | Native worker wait for local stream completion, possibly including unfinished metadata |
 | `peer_completion_wait_ms` | Wait after local publication for all peer publications |
 | `headers_d2h_ms` | Wall time for header submission and completion |
@@ -534,7 +609,7 @@ timing fields remain in **milliseconds** (schema version 9).
 | `payload_completion_ms` | Batched mode: polling/yielding until the completion event is observed; per-source mode: summed intervals from event recording to observed completion, including other source work between polls |
 | `payload_other_ms` | Parent payload time minus the four measured subintervals: bookkeeping, loop and timestamp-boundary overhead |
 | `install_ms` | CPU validation, view installation, and progress reset |
-| `native_ms` | Native submit through worker installation, before return to Python |
+| `native_ms` | Native submit through metadata installation, outgoing sends and staging completion, before return to Python |
 | `host_outside_native_ms` | End-to-end minus native duration: host submission before the native timer and wakeup/return overhead after it; not isolated Python CPU time |
 | `received_index_bytes` | All received expert-index payload bytes, including self; excludes x3/x4 |
 | `peer_received_index_bytes` | Received peer index bytes, excluding self and headers |
@@ -563,7 +638,9 @@ record identity, epoch and length checks. `--verify boundaries`
 (default) checks the first warmup and final measured result against the independent
 CPU reference, including every received source table, GPU generator, all meaningful
 CuTe outputs, input scan scratch, received remote x3/x4 in two-node mode, and byte
-counters. Use `--verify all` for every invocation or
+counters. With staging enabled, it also checks every valid gathered row and the
+untouched tail. Input activations change each iteration even for fixed hot routes.
+Use `--verify all` for every invocation or
 `--verify none` only after remote correctness has been established.
 
 Local host-only checks (including on macOS):
@@ -576,6 +653,6 @@ ctest --test-dir /tmp/rme2-host-build --output-on-failure
 
 These test the actual production CPU routing compatibility, generator equivalence,
 index conventions, zero-length lists, borrowed-view installation, progress reset,
-seed wraparound, and malformed metadata. They do **not** compile or execute the
+seed wraparound, malformed metadata and C/ctypes stats layout. They do **not** compile or execute the
 CUDA/CuTe kernels or validate NVLink performance. The native CUDA build and
 `run_gpu_checks.sh` must be run on the remote eight-GPU machine.

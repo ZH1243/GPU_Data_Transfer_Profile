@@ -66,9 +66,11 @@ struct Rme2Proxy {
     std::array<cudaStream_t, rme2::gpus> source_streams{};
     std::array<cudaEvent_t, rme2::gpus> source_events{};
     cudaGraphExec_t metadata_graph = nullptr;
+    cudaGraphExec_t staging_graph = nullptr;
     cudaStream_t capture_stream = nullptr, work_stream = nullptr;
-    bool capturing = false, launch_barrier = false;
+    bool capturing = false, capturing_staging = false, launch_barrier = false;
     cudaEvent_t metadata_begin = nullptr, metadata_end = nullptr;
+    cudaEvent_t staging_begin = nullptr, staging_end = nullptr;
     const int32_t* local_offsets = nullptr;
     const int32_t* local_node_offsets = nullptr;
     const int32_t* local_x3 = nullptr;
@@ -477,7 +479,14 @@ struct Rme2Proxy {
         else
             launch_exchange(peers, rank, capacity, local_offsets, local_values, s);
         check(cudaGetLastError(), "launch metadata exchange");
+        // Publish readiness at the exchange boundary, BEFORE the gather. The
+        // receiver can read metadata while this stream gathers activation rows.
         check(cudaEventRecord(end, s), "record exchange end");
+        if (staging_graph) {
+            check(cudaEventRecord(staging_begin, s), "record local staging start");
+            check(cudaGraphLaunch(staging_graph, s), "launch local staging graph");
+            check(cudaEventRecord(staging_end, s), "record local staging end");
+        }
     }
     void launch_metadata() {
         if (launch_barrier) {
@@ -510,12 +519,22 @@ struct Rme2Proxy {
                 }
                 if (metadata_graph) launch_metadata();
                 process();
+                // All metadata work is complete. Only the unhidden gather tail
+                // remains; never delay producer publication or RDMA on this event.
+                if (staging_graph) {
+                    const auto started = Clock::now();
+                    wait_event(staging_end);
+                    stats.local_staging_wait_ms = ms(started);
+                    float elapsed = 0;
+                    check(cudaEventElapsedTime(&elapsed, staging_begin, staging_end), "local staging timing");
+                    stats.local_staging_gpu_ms = elapsed;
+                }
                 if (metadata_graph) {
                     float elapsed = 0;
                     check(cudaEventElapsedTime(&elapsed, metadata_begin, metadata_end), "native metadata timing");
                     stats.metadata_gpu_ms = elapsed;
-                    stats.native_ms = ms(submitted);
                 }
+                stats.native_ms = ms(submitted);
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     pending = false; done = true;
@@ -542,7 +561,7 @@ struct Rme2Proxy {
             cudaStreamEndCapture(capture_stream, &discarded);
             if (discarded) cudaGraphDestroy(discarded);
         }
-        if (metadata_graph && work_stream) cudaStreamSynchronize(work_stream);
+        if ((metadata_graph || staging_graph) && work_stream) cudaStreamSynchronize(work_stream);
         if (read_stream) cudaStreamSynchronize(read_stream);
         for (auto stream : source_streams) if (stream) cudaStreamSynchronize(stream);
         if (end) cudaEventSynchronize(end);
@@ -558,6 +577,9 @@ struct Rme2Proxy {
         if (metadata_graph) cudaGraphExecDestroy(metadata_graph);
         if (metadata_begin) cudaEventDestroy(metadata_begin);
         if (metadata_end) cudaEventDestroy(metadata_end);
+        if (staging_graph) cudaGraphExecDestroy(staging_graph);
+        if (staging_begin) cudaEventDestroy(staging_begin);
+        if (staging_end) cudaEventDestroy(staging_end);
         rdma.reset();
         if (inbox) cudaFree(inbox);
         if (pinned) cudaFreeHost(pinned);
@@ -566,7 +588,7 @@ struct Rme2Proxy {
     }
 };
 
-extern "C" int rme2_abi_version() { return 8; }
+extern "C" int rme2_abi_version() { return 9; }
 extern "C" int rme2_set_batch_payload_copy(Rme2Proxy* p, int enabled) {
     return api([&] {
         require(p && (enabled == 0 || enabled == 1), "invalid batch payload option");
@@ -679,41 +701,50 @@ extern "C" int rme2_disconnect(Rme2Proxy* p) {
         p->connected = false;
     });
 }
-extern "C" int rme2_capture_begin(Rme2Proxy* p, void* stream) {
+namespace {
+int capture_begin(Rme2Proxy* p, void* stream, bool staging) {
     return api([&] {
         require(p && p->connected, "capture requires connected proxy");
         std::lock_guard<std::mutex> lock(p->mutex);
-        require(!p->pending && !p->done && !p->capturing && !p->metadata_graph && p->sequence == 0,
-                "capture must precede all submissions and occur only once");
+        require(!p->pending && !p->done && !p->capturing &&
+                !(staging ? p->staging_graph : p->metadata_graph) && p->sequence == 0,
+                "each capture must precede all submissions and occur only once");
         require(p->failure.empty(), p->failure.c_str());
         check(cudaSetDevice(p->device), "select capture GPU");
-        check(cudaEventCreate(&p->metadata_begin), "create native metadata start");
-        check(cudaEventCreate(&p->metadata_end), "create native metadata end");
+        check(cudaEventCreate(staging ? &p->staging_begin : &p->metadata_begin), "create graph start event");
+        check(cudaEventCreate(staging ? &p->staging_end : &p->metadata_end), "create graph end event");
         p->capture_stream = static_cast<cudaStream_t>(stream);
-        check(cudaStreamBeginCapture(p->capture_stream, cudaStreamCaptureModeThreadLocal), "begin metadata capture");
+        check(cudaStreamBeginCapture(p->capture_stream, cudaStreamCaptureModeThreadLocal), "begin graph capture");
         p->capturing = true;
+        p->capturing_staging = staging;
     });
 }
-extern "C" int rme2_capture_end(Rme2Proxy* p, int launch_barrier) {
+int capture_end(Rme2Proxy* p, int launch_barrier, bool staging) {
     return api([&] {
-        require(p && p->capturing, "no active metadata capture");
+        require(p && p->capturing && p->capturing_staging == staging, "no matching active graph capture");
         std::lock_guard<std::mutex> lock(p->mutex);
         require(launch_barrier == 0 || launch_barrier == 1, "invalid launch barrier mode");
         check(cudaSetDevice(p->device), "select capture end GPU");
+        auto* executable = staging ? &p->staging_graph : &p->metadata_graph;
         cudaGraph_t graph = nullptr;
         auto status = cudaStreamEndCapture(p->capture_stream, &graph);
         p->capturing = false;
-        check(status, "end metadata capture");
+        check(status, "end graph capture");
         try {
-            check(cudaGraphInstantiate(&p->metadata_graph, graph, nullptr, nullptr, 0), "instantiate native metadata graph");
+            check(cudaGraphInstantiate(executable, graph, nullptr, nullptr, 0), "instantiate native graph");
             // Move upload/first launch costs outside measured iterations.
-            check(cudaGraphUpload(p->metadata_graph, p->capture_stream), "upload native metadata graph");
+            check(cudaGraphUpload(*executable, p->capture_stream), "upload native graph");
             check(cudaStreamSynchronize(p->capture_stream), "complete native graph upload");
         } catch (...) { if (graph) cudaGraphDestroy(graph); throw; }
         check(cudaGraphDestroy(graph), "release captured graph definition");
-        p->launch_barrier = launch_barrier != 0;
+        if (!staging) p->launch_barrier = launch_barrier != 0;
     });
 }
+} // namespace
+extern "C" int rme2_capture_begin(Rme2Proxy* p, void* stream) { return capture_begin(p, stream, false); }
+extern "C" int rme2_capture_end(Rme2Proxy* p, int launch_barrier) { return capture_end(p, launch_barrier, false); }
+extern "C" int rme2_staging_capture_begin(Rme2Proxy* p, void* stream) { return capture_begin(p, stream, true); }
+extern "C" int rme2_staging_capture_end(Rme2Proxy* p) { return capture_end(p, 0, true); }
 extern "C" int rme2_submit(Rme2Proxy* p, uint64_t iteration, const int32_t* offsets,
                            const int32_t* indices, const int32_t* node_offsets,
                            const int32_t* x3, const uint8_t* x4, void* stream) {

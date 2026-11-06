@@ -30,6 +30,11 @@ if(BUILD_TESTING)
   add_test(NAME metadata_view COMMAND test_metadata_view)
   find_package(Python3 COMPONENTS Interpreter)
   if(Python3_Interpreter_FOUND)
+    add_executable(test_native_abi test_native_abi.cpp)
+    target_compile_options(test_native_abi PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME native_abi COMMAND ${CMAKE_COMMAND} -E env
+      RME2_ABI_BIN=$<TARGET_FILE:test_native_abi> PYTHONDONTWRITEBYTECODE=1
+      ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_native_abi.py)
     add_test(NAME topology COMMAND ${CMAKE_COMMAND} -E env PYTHONDONTWRITEBYTECODE=1
       ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_topology.py)
     add_test(NAME launch_dispatch COMMAND ${CMAKE_COMMAND} -E env PYTHONDONTWRITEBYTECODE=1

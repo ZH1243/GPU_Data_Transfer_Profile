@@ -14,6 +14,7 @@ import uuid
 from native import Proxy
 from reference import make_routes, metadata, destination_slice, sample_seed, sample_pattern, metadata_two
 from topology import rank_topology, validate_hosts, rdma_device
+from local_staging import StagingWorkload
 
 
 def summary(values):
@@ -30,6 +31,7 @@ def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False, 
         ("metadata_completion_wait_ms", "CPU wait for local metadata completion"),
         ("metadata_barrier_wait_ms", "Shared-memory metadata barrier wait"),
         ("exchange_gpu_ms", "GPU exchange / x3/x4 packing (GPU)"),
+        ("local_staging_gpu_ms", "Local staging gather (GPU)"),
         ("sender_completion_wait_ms", "Proxy wait for local GPU completion"),
         ("peer_completion_wait_ms", "Proxy wait for peer completions"),
         ("headers_d2h_ms", "Header D2H + completion (wall)"),
@@ -44,7 +46,8 @@ def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False, 
         ("rdma_poll_ms", "RDMA CQ polling CPU time"),
         ("rdma_post_recv_ms", "RDMA receive credit reposting"),
         ("rdma_work_complete_ms", "RDMA submission through all completions"),
-        ("native_ms", "Native submit through installation (wall)"),
+        ("local_staging_wait_ms", "Residual staging wait after metadata exchange"),
+        ("native_ms", "Native submit through all work (wall)"),
         ("host_outside_native_ms", "Host time outside native interval (wall)"),
     )
     print("\nTiming breakdown in microseconds (us).")
@@ -67,6 +70,8 @@ def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False, 
         print(f"{label:45s} {values['median'] * 1000:10.3f} "
               f"{values['mean'] * 1000:10.3f} {values['p95'] * 1000:10.3f}")
     print("GPU and CPU intervals overlap: do not sum these rows.")
+    print("Local staging runs after GPU exchange and may overlap D2H/RDMA; its residual wait")
+    print("is measured after metadata installation/send completion, not added GPU execution time.")
     print("Payload subrows partition the payload total per sample (means add; medians/p95 need not).")
     print("Completion wait is residual CPU-observed latency, not pure DMA time; transfers can")
     print("already run during cudaMemcpyAsync submissions. Extra timestamps add measurement overhead.")
@@ -85,8 +90,8 @@ def enqueue_iteration(proxy, iteration, plan, stream, graph, begin, end, native_
         else:
             graph.replay()
         end.record(stream)
-    # In native mode this only queues a command; the C++ worker launches both
-    # metadata and exchange. Caller already completed R generation outside timing.
+    # In native mode this only queues a command; the C++ worker launches metadata,
+    # exchange and optional staging. Route/activation generation is already complete.
     proxy.submit(iteration, plan, stream)
 
 
@@ -100,6 +105,10 @@ def options():
     parser.add_argument("--rdma-gid-index", type=int, default=3,
                         help="RoCE GID index; -1 selects InfiniBand LID routing")
     parser.add_argument("--tokens", type=int, default=20480)
+    parser.add_argument("--token-dimension", type=int, default=4096,
+                        help="BF16 elements per local staging row (default: 4096)")
+    parser.add_argument("--skip-local-staging", action="store_true",
+                        help="metadata-only baseline; omit activation buffers and local gather")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--seed", type=int, default=1234)
@@ -135,6 +144,8 @@ def options():
         parser.error("--metadata-launch-barrier requires --native-metadata-launch")
     if not 1 <= args.tokens <= 10000000 or args.warmup < 1 or args.iterations < 1:
         parser.error("require tokens=1..10000000, warmup>=1, iterations>=1")
+    if args.token_dimension < 1:
+        parser.error("local staging requires --token-dimension >= 1")
     if not 0 <= args.seed < 2**64 or not 0 < args.timeout < 86400:
         parser.error("require uint64 seed and finite timeout between 0 and 86400 seconds")
     try:
@@ -146,7 +157,7 @@ def options():
     return args
 
 
-def verify(args, iteration, rank, plan, proxy, nodes=1, stats=None):
+def verify(args, iteration, rank, plan, proxy, nodes=1, stats=None, staging=None):
     import torch
     pattern = sample_pattern(args.route_pattern, iteration)
     expected_bytes = dict(received_index_bytes=0, peer_received_index_bytes=0,
@@ -177,6 +188,9 @@ def verify(args, iteration, rank, plan, proxy, nodes=1, stats=None):
             expected_bytes["x3_x4_received_bytes"] = (last - first) * 5
             expected_bytes["rdma_received_bytes"] += 64 + (last - first) * 5
         if source == rank:
+            if staging is not None:
+                first, last = node_offsets[rank // 8:rank // 8 + 2]
+                staging.verify(x3[first:last])
             if nodes == 2:
                 remote = 1 - rank // 8
                 route_bytes = (node_offsets[remote + 1] - node_offsets[remote]) * 5
@@ -218,8 +232,8 @@ def main():
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "get_expert_token_idx_list_gpu"))
     if nodes == 2:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "get_expert_token_idx_list_gpu"))
         from metadata_cute import MetadataPlan, RouteGenerator
     else:
         from metadata_cute_single import MetadataPlan, RouteGenerator
@@ -277,18 +291,24 @@ def main():
             generator = cute.compile(RouteGenerator(), r_argument, cutlass.Uint64(args.seed), stream_argument)
             hot_low = torch.arange(8, dtype=torch.int32, device=device).expand(args.tokens, 8)
             hot_high = torch.arange(120, 128, dtype=torch.int32, device=device).expand(args.tokens, 8)
+            staging = (None if args.skip_local_staging else
+                       StagingWorkload(plan, node, rank, args.token_dimension))
 
-        def generate(iteration):
+        def generate(iteration, check_staging=False):
             pattern = sample_pattern(args.route_pattern, iteration)
             with torch.cuda.stream(stream):
                 if pattern == "affine":
                     generator(r_argument, cutlass.Uint64(sample_seed(args.seed, rank, iteration, nodes)), stream_argument)
                 else:
                     r.copy_(hot_low if pattern == "hot-low" else hot_high)
+                if staging is not None:
+                    staging.prepare(iteration, check_staging)
 
         # Prime every kernel before graph capture and before measured work.
-        generate(1)
+        generate(1, check_staging=True)
         plan.launch(stream)
+        if staging is not None:
+            staging.plan.launch(stream)
         stream.synchronize()
         graph = None
         if args.native_metadata_launch:
@@ -298,6 +318,10 @@ def main():
             with torch.cuda.graph(graph, stream=stream):
                 plan.launch(stream)
             stream.synchronize()
+        if staging is not None:
+            # Always a separate single-kernel graph, including eager metadata
+            # mode, so native can enqueue it immediately after exchange readiness.
+            proxy.capture_staging(staging.plan, stream)
         begin = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         # Force lazy event creation outside measurements.
@@ -310,11 +334,14 @@ def main():
                   f"batch_payload_copy={args.batch_payload_copy}; per_source_readback={args.per_source_readback}; metadata_barrier={args.metadata_barrier}; native proxy threads active", flush=True)
             if nodes == 2:
                 print("x3/x4 exchange enabled: same-index remote slice; nine RDMA records per proxy/iteration", flush=True)
+            print(f"local_staging={staging is not None}; token_dimension={args.token_dimension}; "
+                  f"dtype=BF16; gather={staging.plan.implementation if staging else 'disabled'}", flush=True)
         records = []
         total = args.warmup + args.iterations
         for iteration in range(1, total + 1):
-            generate(iteration)
-            stream.synchronize()  # input generation excluded from wall/GPU timings
+            verify_iteration = args.verify == "all" or (args.verify == "boundaries" and iteration in (1, total))
+            generate(iteration, check_staging=verify_iteration)
+            stream.synchronize()  # route/activation generation and poisoning excluded
             dist.barrier()         # align start; previous iteration also has a consumption barrier
             started = time.perf_counter_ns()
             with torch.cuda.stream(stream):
@@ -328,8 +355,8 @@ def main():
             record["iteration"] = iteration
             if iteration > args.warmup:
                 records.append(record)
-            if args.verify == "all" or (args.verify == "boundaries" and iteration in (1, total)):
-                verify(args, iteration, rank, plan, proxy, nodes, record)
+            if verify_iteration:
+                verify(args, iteration, rank, plan, proxy, nodes, record, staging)
             # No producer may regenerate R/metadata or overwrite an inbox until
             # ALL consumers finished D2H and any out-of-band verification.
             dist.barrier()
@@ -344,11 +371,15 @@ def main():
             metrics = {key: summary([r[key] for report in reports for r in report["records"]])
                        for key in records[0] if key.endswith("_ms")}
             critical_metrics = {key: summary([r[key] for r in critical_records]) for key in metrics}
-            report = dict(schema_version=9, backend=("cpp-thread-cuda-ipc-gpudirect-rdma" if nodes == 2 else "cpp-thread-cuda-ipc"), topology=dict(
+            report = dict(schema_version=10, backend=("cpp-thread-cuda-ipc-gpudirect-rdma" if nodes == 2 else "cpp-thread-cuda-ipc"), topology=dict(
                 nodes=nodes, gpus=world, gpus_per_node=8, experts=128, experts_per_gpu=128 // world, top_k=8),
                 completion_endpoint=("16 source expert tables and remote same-index x3/x4 installed; nine outgoing RDMA sends drained"
-                                     if nodes == 2 else "8 source expert tables installed"),
+                                     if nodes == 2 else "8 source expert tables installed")
+                                    + ("; local token staging complete" if staging is not None else ""),
                 x3_x4_exchange=nodes == 2,
+                local_staging=dict(enabled=staging is not None, dtype="bfloat16", token_dimension=args.token_dimension,
+                                   implementation=staging.plan.implementation if staging else None,
+                                   launch="separate native CUDA graph after exchange" if staging else None),
                 configuration=config, versions=dict(torch=torch.__version__, cuda=torch.version.cuda),
                 critical_rank_end_to_end_ms=summary(critical), all_rank_metrics=metrics,
                 critical_rank_metrics=critical_metrics,
@@ -356,7 +387,7 @@ def main():
                 readback_timing_semantics=("per-source D2H latency sums; readiness observation spans overlap readback"
                                           if args.per_source_readback else ("local D2H overlaps RDMA; payload completion includes CPU progress delays"
                                           if nodes == 2 else "batched D2H wall stages after all-source wait")),
-                timing_note="Overlapping GPU/CPU spans are not additive. Generation, setup, outer Gloo barriers and exact verification excluded; enabled native barriers included.",
+                timing_note="Overlapping GPU/CPU spans are not additive. Local staging overlaps metadata readback/RDMA and is included in native/end-to-end completion. Route/activation generation, setup, outer Gloo barriers and exact verification excluded; enabled native barriers included.",
                 ranks=reports)
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(report, indent=2) + "\n")

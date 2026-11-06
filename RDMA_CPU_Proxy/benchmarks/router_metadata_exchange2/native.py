@@ -8,7 +8,8 @@ class Stats(C.Structure):
         "exchange_gpu_ms", "sender_completion_wait_ms", "peer_completion_wait_ms",
         "headers_d2h_ms", "payload_d2h_ms", "payload_checks_ms", "payload_submit_ms",
         "payload_event_record_ms", "payload_completion_ms", "payload_other_ms", "install_ms", "native_ms",
-        "rdma_post_ms", "rdma_poll_ms", "rdma_post_recv_ms", "rdma_work_complete_ms")]
+        "rdma_post_ms", "rdma_poll_ms", "rdma_post_recv_ms", "rdma_work_complete_ms",
+        "local_staging_gpu_ms", "local_staging_wait_ms")]
     _fields_ += [(name, C.c_uint64) for name in (
         "received_index_bytes", "peer_received_index_bytes", "header_bytes", "rdma_sent_bytes", "rdma_received_bytes",
         "x3_x4_sent_bytes", "x3_x4_received_bytes")]
@@ -26,7 +27,7 @@ class Proxy:
         self.lib = C.CDLL(str(library))  # CDLL releases the GIL in native calls.
         self.handle = C.c_void_p()
         self.lib.rme2_abi_version.restype = C.c_int
-        if self.lib.rme2_abi_version() != 8:
+        if self.lib.rme2_abi_version() != 9:
             raise RuntimeError("native ABI mismatch; rebuild the library")
         signatures = {
             "rme2_abi_version": ([], C.c_int),
@@ -42,6 +43,8 @@ class Proxy:
             "rme2_disconnect": ([C.c_void_p], C.c_int),
             "rme2_capture_begin": ([C.c_void_p, C.c_void_p], C.c_int),
             "rme2_capture_end": ([C.c_void_p, C.c_int], C.c_int),
+            "rme2_staging_capture_begin": ([C.c_void_p, C.c_void_p], C.c_int),
+            "rme2_staging_capture_end": ([C.c_void_p], C.c_int),
             "rme2_submit": ([C.c_void_p, C.c_uint64] + [C.c_void_p] * 6, C.c_int),
             "rme2_wait": ([C.c_void_p, C.POINTER(Stats)], C.c_int),
             "rme2_view": ([C.c_void_p, C.c_int, C.POINTER(C.POINTER(C.c_int32)),
@@ -53,7 +56,7 @@ class Proxy:
         for name, (args, result) in signatures.items():
             fn = getattr(self.lib, name)
             fn.argtypes, fn.restype = args, result
-        if self.lib.rme2_abi_version() != 8:
+        if self.lib.rme2_abi_version() != 9:
             raise RuntimeError("native ABI mismatch; rebuild the library")
         self.check(self.lib.rme2_create(rank, device, tokens, shm_name.encode(), timeout,
                                        int(validate), core, int(per_source_readback), int(metadata_barrier),
@@ -96,6 +99,14 @@ class Proxy:
         self.check(self.lib.rme2_capture_begin(self.handle, stream.cuda_stream))
         plan.launch(stream)
         self.check(self.lib.rme2_capture_end(self.handle, int(launch_barrier)))
+
+    def capture_staging(self, plan, stream):
+        # Separate graph: native records exchange readiness before launching it.
+        # Keep the plan (and hence its source/destination tensors) alive.
+        self._staging_plan, self._staging_stream = plan, stream
+        self.check(self.lib.rme2_staging_capture_begin(self.handle, stream.cuda_stream))
+        plan.launch(stream)
+        self.check(self.lib.rme2_staging_capture_end(self.handle))
 
     def submit(self, iteration, plan, stream):
         route_pointers = ((plan.node_offsets.data_ptr(), plan.x3.data_ptr(), plan.x4.data_ptr())
