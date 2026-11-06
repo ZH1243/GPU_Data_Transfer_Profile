@@ -3,7 +3,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI 7; Linux CUDA only. All functions except destroy/error return 0 on success.
+/* ABI 8; Linux CUDA only. All functions except destroy/error return 0 on success.
  * create/connect/submit/wait/view must be called serially by one host thread.
  * submit queues work; the owned native thread handles readback and installation.
  * Pointers returned by view are borrowed until the next submit or destroy.
@@ -35,6 +35,9 @@ typedef struct {
     uint64_t header_bytes;
     uint64_t rdma_sent_bytes;
     uint64_t rdma_received_bytes;
+    /* x3/x4 payload only (5 bytes/token); RDMA totals above include its header. */
+    uint64_t x3_x4_sent_bytes;
+    uint64_t x3_x4_received_bytes;
 } Rme2Stats;
 int rme2_abi_version(void);
 int rme2_set_batch_payload_copy(Rme2Proxy*, int enabled);
@@ -60,11 +63,17 @@ int rme2_disconnect(Rme2Proxy*);
  */
 int rme2_capture_begin(Rme2Proxy*, void* cuda_stream);
 int rme2_capture_end(Rme2Proxy*, int launch_barrier);
+/* Two-node submissions require node_offsets/x3/x4; single-node ignores them.
+ * All input buffers must remain alive and unchanged until wait completes. */
 int rme2_submit(Rme2Proxy*, uint64_t iteration, const int32_t* offsets,
-                const int32_t* indices, void* cuda_stream);
+                const int32_t* indices, const int32_t* node_offsets,
+                const int32_t* x3, const uint8_t* x4, void* cuda_stream);
 int rme2_wait(Rme2Proxy*, Rme2Stats*);
 int rme2_view(Rme2Proxy*, int source, const int32_t** offsets,
               const int32_t** indices, int* count);
+/* Two-node only: remote same-index source's slice for this node, borrowed
+ * through the next submit/destroy, available only after successful wait. */
+int rme2_x3_x4_view(Rme2Proxy*, const int32_t** x3, const uint8_t** x4, int* count);
 void rme2_destroy(Rme2Proxy*);
 #ifdef __cplusplus
 }

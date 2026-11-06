@@ -15,9 +15,10 @@ production routing/index conventions without changing those APIs. Host tests com
 the new reference and installed views against the actual production `RouterRouting`
 CPU implementation. It does not measure token payload dispatch, GEMMs, RDMA,
 GPU `A_idx`/scheduler construction, local `x3/x4` CPU installation, or combine.
-The completion endpoint is **all eight source expert tables installed at the CPU proxy**.
+In single-node mode the completion endpoint is **all eight source expert tables
+installed at the CPU proxy**. Two-node mode also exchanges remote `x3/x4`, as below.
 
-## Two-node exchange (ABI 7)
+## Two-node exchange (ABI 8)
 
 The benchmark also supports **two Linux Hopper nodes, eight GPUs each**, keeping
 128 experts and top-8, hence **eight experts per GPU**. It reuses the existing
@@ -26,6 +27,14 @@ Both nodes generate fresh, independently seeded routes every iteration. Source
 identity is global rank; mask ordering and the direct-input exception use the
 original source's local GPU index. Seeds are
 `(seed + global_rank + 16*(iteration-1)) mod 2^64`.
+
+Two-node mode exchanges **expert tables plus the same-index remote source's
+`x3/x4` slice every iteration**, enabled by default with no additional flag.
+This matches the production test's `x3/x4` source/destination convention while
+using GPU-to-host RDMA instead of its initialization-time TCP exchange. Update
+Python and rebuild the library on **both nodes**: ABI 8 / wire format 2 is not
+compatible with older benchmark binaries. Existing benchmark commands still work,
+but their end-to-end timings now include `x3/x4` packing, transfer and installation.
 
 Build on **both remote machines**, from this benchmark directory:
 
@@ -85,31 +94,43 @@ remain available in single-node mode.
 1. Each receiver/relay owns a dedicated CUDA IPC arena and a persistent pinned
    host arena. Both are registered once with verbs. The HBM arena has two banks
    of eight source slots: one bank per destination node. Each record contains a
-   64-byte header followed by capacity for `T*8` int32 indices. A separate 1,024-byte
-   directory duplicates the headers for one small D2H transfer. At T=20,480, each
-   proxy reserves approximately 10 MiB each of HBM and pinned host records.
+   64-byte header followed by capacity for `T*8` int32 indices. An additional
+   `x3/x4` record holds a 64-byte header and capacity for `T` int32 token IDs plus
+   `T` uint8 masks. A separate 1,088-byte directory duplicates all 17 headers for
+   one small D2H transfer. At T=20,480, each proxy reserves approximately 10.1 MiB
+   each of HBM and pinned host records.
 2. After the seven metadata kernels, 16 CTAs (one per global destination) write
    both destination-node slices into the appropriate local relay GPU. All payloads,
    including relay-self slices, enter the registered arena. Records preserve original
    source identity, destination, full 64-bit iteration, and nine normalized offsets.
-   Every writer system-fences its writes before its completion event.
+   The same-index remote CTA also packs its own source's remote-node `x3/x4`
+   slice into its registered local arena; it does not collect other sources'
+   `x3/x4`. For source node `n`, the slice is
+   `[node_offsets[1-n], node_offsets[2-n])`. The packed record contains its header,
+   then the valid int32 `x3` entries, then the valid uint8 `x4` masks. No additional
+   kernel is launched. Every writer system-fences its writes before its completion event.
 3. CPU proxies publish producer event completion through **node-local** shared
    counters. Each relay waits for all eight local producers. GPU registration enables
    `CU_POINTER_ATTRIBUTE_SYNC_MEMOPS`; NIC reads are posted only after producer
    completion and directory readback. The relay's own event alone is insufficient.
 4. Each relay validates the directory, queues eight exact-size local D2H payload
-   copies, and posts eight signaled RDMA Writes With Immediate on one same-index
-   RC connection. Each RDMA source is the relay's HBM record and each destination
+   copies, and posts nine signaled RDMA Writes With Immediate on one same-index
+   RC connection: eight expert records and one `x3/x4` record. Each RDMA source is
+   the relay's HBM record and each destination
    is the remote proxy's final pinned record. There is no sender CPU payload copy,
    extra GPU packing pass, or receiver CPU payload copy. Empty lists still transfer
    a header and produce a receive completion.
 5. The worker polls CUDA and RDMA completions together. Local D2H completion
    permits installation of the eight local-source views. Each successful RDMA
    receive completion permits identity/epoch/length validation and installation
-   of that original remote source's view. Receive WQEs are preposted; credits are
-   replenished during timing. CQ polling uses a fixed-size stack buffer.
-6. `wait()` returns after **all 16 source expert tables are installed and all eight
-   outgoing sends complete**. The outer all-16-rank consumption barrier protects
+   of that original remote source's view. Immediate tags 0..7 identify expert
+   sources; tag 8 identifies `x3/x4`. Its receive installs borrowed pointers to the
+   final pinned token IDs/masks and their count. Nine receive WQEs are preposted;
+   credits are replenished during timing. CQ polling uses a fixed-size stack buffer.
+6. `wait()` returns after **all 16 source expert tables and the remote same-index
+   `x3/x4` slice are installed, and all nine outgoing sends complete**.
+   Empty `x3/x4` slices still send a header and require a completion.
+   The outer all-16-rank consumption barrier protects
    record reuse, including verification. There is one iteration in flight. Setup,
    generation, graph compilation, verification, and outer barriers remain outside
    end-to-end timing. Optional native barriers synchronize only the eight workers
@@ -119,27 +140,32 @@ The global rank mapping is `node * 8 + local_gpu`; torchrun rank groups determin
 node identity, so the two machines may report the same container hostname.
 Gloo exchanges IPC handles and
 QP/MR descriptors during setup, then provides iteration boundaries and reporting;
-no expert metadata payload uses Gloo. IPC mappings and shared-memory counters stay
+no expert or `x3/x4` payload uses Gloo. IPC mappings and shared-memory counters stay
 local to each node. Normal shutdown stops workers, closes every IPC import,
 collectively waits, destroys QPs/deregisters MRs, and frees their arenas. A local
 worker failure publishes node-local abort; cross-node failures surface through
 CQ errors, bounded native/Gloo waits, and torchrun termination. There is no recovery
 of an in-flight failed iteration.
 
-The endpoint remains **expert tables installed at CPU proxies**. `x3/x4` is computed
-and checked but is not exchanged or installed for token dispatch. GPU `A_idx`,
-scheduler reconstruction, actual token movement, GEMM, and combine remain excluded.
+The endpoint is **expert tables and remote `x3/x4` installed at benchmark CPU
+proxies**. The received `x3/x4` view is not wired into production token dispatch.
+Local `x3/x4` CPU installation, GPU `A_idx`, scheduler reconstruction, actual token
+movement, GEMM, and combine remain excluded.
 This does not change the production proxy or its initialization-only metadata API.
 
 ### Two-node timing and remote validation
 
-JSON schema 8 adds `rdma_post_ms` (record checks and write submissions),
+JSON schema 9 reports `rdma_post_ms` (record checks and write submissions),
 `rdma_poll_ms` (time inside CQ polling), `rdma_post_recv_ms` (credit reposting), and
 `rdma_work_complete_ms` (span from starting submissions until all send/receive
 completions are processed). `rdma_sent_bytes` and `rdma_received_bytes` include
-record headers. `received_index_bytes` includes all 16 installed payloads;
+all nine record headers and both expert and `x3/x4` payloads.
+`x3_x4_sent_bytes` and `x3_x4_received_bytes` separately count only the `x3/x4`
+payload (five bytes per routed token, excluding its header). The outgoing and
+incoming lengths may differ. `received_index_bytes` includes all 16 installed
+expert-index payloads, excluding `x3/x4`;
 `peer_received_index_bytes` excludes only this process's original source record.
-`header_bytes` is the 1,024-byte directory D2H. RDMA fields are zero in single-node
+`header_bytes` is the 1,088-byte directory D2H. RDMA and `x3_x4_*` byte fields are zero in single-node
 mode. Per-rank reports include node/local rank and selected NIC; critical-rank
 statistics select among all 16 ranks.
 
@@ -148,7 +174,11 @@ observation delay while submitting/progressing RDMA; it is not pure DMA time.
 `rdma_work_complete_ms` overlaps D2H and includes receiver validation/installation
 and progress scheduling. Do not add overlapping stage times. Compare the overall
 `end_to_end_ms` distribution. Source payload volume remains `T*8` indices across
-all 16 destinations, rather than doubling the one-node index volume.
+all 16 destinations, plus up to `5*T` bytes of outgoing `x3/x4` per source
+(100 KiB at T=20,480). `exchange_gpu_ms` includes packing this record;
+`install_ms` includes its receiver validation/view installation. These costs are
+also included in `end_to_end_ms`. `x3_x4_exchange` in JSON identifies the expanded
+two-node workload; older expert-only measurements have a different endpoint.
 
 Run extended correctness checks on both nodes (same optional flags):
 
@@ -160,7 +190,10 @@ bash ./run_two_node_gpu_checks.sh 1
 ```
 
 These cover eager/graph execution, partial chunks and scan carry, seed wraparound,
-empty local/remote receives, changing lengths, and every installed source table.
+empty local/remote receives, changing lengths, every installed source table, and
+the exact remote `x3/x4` token IDs/masks. `cycle` alternates affine/hot-low/hot-high,
+so each direction exercises empty, full and changing `x3/x4` lengths in reused
+allocations. Exact verification also checks all reported byte counters.
 The host suite compares both topology references with production CPU routing and
 checks record identity, length bounds, borrowed installation, and launch topology.
 Host checks cannot establish CUDA compilation, peer-write/NIC visibility, or RDMA
@@ -236,8 +269,8 @@ Routes are distinct expert IDs in `[0,128)`. For source `s` and destination `d`,
 the mask bit is `(s-d) mod 8`. The source's own expert lists index the full reordered
 node input; other destinations' lists index their compacted input. List order and
 duplicates across different expert lists are preserved. Destination offsets are
-normalized to zero. `x3/x4` are computed and verified but not exchanged: there is
-no inter-node `x3/x4` path in this experiment.
+normalized to zero. In single-node mode `x3/x4` are computed and verified but not
+exchanged. Two-node mode exchanges the remote-node slice as described above.
 
 The default GPU generator matches the existing SplitMix64/start/odd-stride generator.
 Iteration `i` (starting at 1), source `s`, uses `(seed + s + 8*(i-1)) mod 2^64`.
@@ -290,7 +323,7 @@ It is not zero-copy: peer payloads still move GPU-to-GPU and then GPU-to-CPU.
 `--batch-payload-copy` replaces the receiver's nonempty payload copy loop with one
 `cudaMemcpyBatchAsync`. It is off by default and requires `--per-source-readback`
 to be disabled. It works with Python or native metadata launch and either barrier.
-Update Python and rebuild the shared library together (**ABI 7**), using the remote
+Update Python and rebuild the shared library together (**ABI 8**), using the remote
 CUDA 12.9 toolkit:
 
 ```bash
@@ -334,7 +367,7 @@ immediately before they record the start event and launch the metadata graph.
 The launch barrier requires native launch; invalid option combinations fail early.
 Both flags are off by default, preserving the existing Python launch path.
 
-Update the Python files and **rebuild the library (ABI 7)**:
+Update the Python files and **rebuild the library (ABI 8)**:
 
 ```bash
 cmake --build build -j
@@ -386,7 +419,7 @@ arrival slot. The C++ callers acquire-poll all eight arrivals, checking timeout/
 then enqueue their exchange kernels. Slots carry monotonically increasing epochs;
 the existing consumption barrier prevents reuse while peers still consume metadata.
 
-Update Python and rebuild the library together (native **ABI 7**):
+Update Python and rebuild the library together (native **ABI 8**):
 
 ```bash
 cmake --build build -j
@@ -417,7 +450,7 @@ exchange stage into the metadata barrier. The flag can also combine with
 
 Pass `--per-source-readback` to remove the all-sources gate before readback.
 The default remains unchanged. **Rebuild the shared library and update Python
-together**: the native interface is now ABI 7; Python rejects older libraries.
+together**: the native interface is now ABI 8; Python rejects older libraries.
 
 ```bash
 cmake --build build -j
@@ -484,7 +517,7 @@ rank with the longest end-to-end duration on each iteration and using that same
 rank's measurements for every row. These distributions are stored as
 `critical_rank_metrics`, with selected ranks in `critical_rank_per_iteration`.
 `all_rank_metrics` retains distributions over all rank/iteration samples. JSON
-timing fields remain in **milliseconds** (schema version 8).
+timing fields remain in **milliseconds** (schema version 9).
 
 | Field | Meaning |
 |---|---|
@@ -503,9 +536,10 @@ timing fields remain in **milliseconds** (schema version 8).
 | `install_ms` | CPU validation, view installation, and progress reset |
 | `native_ms` | Native submit through worker installation, before return to Python |
 | `host_outside_native_ms` | End-to-end minus native duration: host submission before the native timer and wakeup/return overhead after it; not isolated Python CPU time |
-| `received_index_bytes` | All D2H index payload bytes, including self |
+| `received_index_bytes` | All received expert-index payload bytes, including self; excludes x3/x4 |
 | `peer_received_index_bytes` | Received peer index bytes, excluding self and headers |
-| `header_bytes` | Header D2H bytes (576 per rank per iteration) |
+| `header_bytes` | Header D2H bytes (576 single-node; 1,088 two-node, per rank per iteration) |
+| `x3_x4_sent_bytes`, `x3_x4_received_bytes` | Two-node x3/x4 payload bytes, excluding headers; zero single-node |
 
 The five `payload_*` subrows partition `payload_d2h_ms` per sample. Their **means**
 add to the parent mean, up to rounding; medians and p95 values need not add. Do not
@@ -524,10 +558,12 @@ above; GPU-only readiness is not implemented here. The table describes default-m
 timings; per-source mode uses the explicitly documented overlapping measurements.
 
 Full timed index validation is enabled by default. `--skip-index-validation` omits
-index scans but retains structural header bounds/order checks. `--verify boundaries`
+expert-index and x3/x4 token/mask scans but retains structural header bounds/order,
+record identity, epoch and length checks. `--verify boundaries`
 (default) checks the first warmup and final measured result against the independent
 CPU reference, including every received source table, GPU generator, all meaningful
-CuTe outputs, and input scan scratch. Use `--verify all` for every invocation or
+CuTe outputs, input scan scratch, received remote x3/x4 in two-node mode, and byte
+counters. Use `--verify all` for every invocation or
 `--verify none` only after remote correctness has been established.
 
 Local host-only checks (including on macOS):

@@ -29,7 +29,7 @@ def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False, 
         ("metadata_gpu_ms", "Seven metadata kernels (GPU)"),
         ("metadata_completion_wait_ms", "CPU wait for local metadata completion"),
         ("metadata_barrier_wait_ms", "Shared-memory metadata barrier wait"),
-        ("exchange_gpu_ms", "GPU-to-GPU exchange (GPU)"),
+        ("exchange_gpu_ms", "GPU exchange / x3/x4 packing (GPU)"),
         ("sender_completion_wait_ms", "Proxy wait for local GPU completion"),
         ("peer_completion_wait_ms", "Proxy wait for peer completions"),
         ("headers_d2h_ms", "Header D2H + completion (wall)"),
@@ -109,7 +109,7 @@ def options():
     parser.add_argument("--route-pattern", choices=("affine", "hot-low", "hot-high", "cycle"),
                         default="affine", help="cycle stresses empty lists and changing lengths")
     parser.add_argument("--skip-index-validation", action="store_true",
-                        help="omit timed per-index scans; structural header checks always remain")
+                        help="omit timed expert-index and x3/x4 scans; structural header checks always remain")
     parser.add_argument("--native-metadata-launch", action="store_true",
                         help="native proxy worker launches captured CuTe graph; requires --mode graph")
     parser.add_argument("--metadata-launch-barrier", action="store_true",
@@ -146,9 +146,13 @@ def options():
     return args
 
 
-def verify(args, iteration, rank, plan, proxy, nodes=1):
+def verify(args, iteration, rank, plan, proxy, nodes=1, stats=None):
     import torch
     pattern = sample_pattern(args.route_pattern, iteration)
+    expected_bytes = dict(received_index_bytes=0, peer_received_index_bytes=0,
+                          rdma_sent_bytes=0, rdma_received_bytes=0,
+                          x3_x4_sent_bytes=0, x3_x4_received_bytes=0,
+                          header_bytes=1088 if nodes == 2 else 576)
     for source in range(8 * nodes):
         routes = make_routes(args.tokens, sample_seed(args.seed, source, iteration, nodes), pattern)
         if nodes == 2:
@@ -157,9 +161,29 @@ def verify(args, iteration, rank, plan, proxy, nodes=1):
             offsets, values, x3, x4 = metadata(routes, source)
             node_offsets = [0, args.tokens]
         expected = destination_slice(offsets, values, rank, nodes)
+        payload_bytes = len(expected[1]) * 4
+        expected_bytes["received_index_bytes"] += payload_bytes
+        if source != rank:
+            expected_bytes["peer_received_index_bytes"] += payload_bytes
+        if nodes == 2 and source // 8 != rank // 8:
+            expected_bytes["rdma_received_bytes"] += 64 + payload_bytes
         if proxy.snapshot(source) != expected:
             raise AssertionError(f"rank={rank} source={source} iteration={iteration}: installed metadata mismatch")
+        if nodes == 2 and source == (rank ^ 8):
+            node = rank // 8
+            first, last = node_offsets[node:node + 2]
+            if proxy.snapshot_x3_x4() != (x3[first:last], x4[first:last]):
+                raise AssertionError(f"rank={rank} source={source} iteration={iteration}: received x3/x4 mismatch")
+            expected_bytes["x3_x4_received_bytes"] = (last - first) * 5
+            expected_bytes["rdma_received_bytes"] += 64 + (last - first) * 5
         if source == rank:
+            if nodes == 2:
+                remote = 1 - rank // 8
+                route_bytes = (node_offsets[remote + 1] - node_offsets[remote]) * 5
+                expected_bytes["x3_x4_sent_bytes"] = route_bytes
+                # Expert sends belong to the relay, aggregating all local sources;
+                # their expected volume is accumulated below for every local source.
+                expected_bytes["rdma_sent_bytes"] += 64 + route_bytes
             if plan.r.cpu().tolist() != routes:
                 raise AssertionError("GPU route generator mismatch")
             actual = (plan.expert_offsets.cpu().tolist(), plan.expert_token_indices.cpu().tolist(),
@@ -173,6 +197,13 @@ def verify(args, iteration, rank, plan, proxy, nodes=1):
             if (not torch.equal(plan.buffers[3].cpu().to(torch.int64), prefixes - counts)
                     or not torch.equal(plan.buffers[13].cpu().to(torch.int64), prefixes[-1])):
                 raise AssertionError("CuTe input scan scratch mismatch")
+        if nodes == 2 and source // 8 == rank // 8:
+            remote_experts = destination_slice(offsets, values, rank ^ 8, nodes)
+            expected_bytes["rdma_sent_bytes"] += 64 + len(remote_experts[1]) * 4
+    if stats is not None:
+        for key, expected in expected_bytes.items():
+            if stats[key] != expected:
+                raise AssertionError(f"rank={rank} iteration={iteration}: {key}={stats[key]}, expected {expected}")
 
 
 def main():
@@ -277,6 +308,8 @@ def main():
             print(f"mode={args.mode}; tokens/source={args.tokens}; verify={args.verify}; "
                   f"native_metadata_launch={args.native_metadata_launch}; metadata_launch_barrier={args.metadata_launch_barrier}; "
                   f"batch_payload_copy={args.batch_payload_copy}; per_source_readback={args.per_source_readback}; metadata_barrier={args.metadata_barrier}; native proxy threads active", flush=True)
+            if nodes == 2:
+                print("x3/x4 exchange enabled: same-index remote slice; nine RDMA records per proxy/iteration", flush=True)
         records = []
         total = args.warmup + args.iterations
         for iteration in range(1, total + 1):
@@ -296,7 +329,7 @@ def main():
             if iteration > args.warmup:
                 records.append(record)
             if args.verify == "all" or (args.verify == "boundaries" and iteration in (1, total)):
-                verify(args, iteration, rank, plan, proxy, nodes)
+                verify(args, iteration, rank, plan, proxy, nodes, record)
             # No producer may regenerate R/metadata or overwrite an inbox until
             # ALL consumers finished D2H and any out-of-band verification.
             dist.barrier()
@@ -311,9 +344,11 @@ def main():
             metrics = {key: summary([r[key] for report in reports for r in report["records"]])
                        for key in records[0] if key.endswith("_ms")}
             critical_metrics = {key: summary([r[key] for r in critical_records]) for key in metrics}
-            report = dict(schema_version=8, backend=("cpp-thread-cuda-ipc-gpudirect-rdma" if nodes == 2 else "cpp-thread-cuda-ipc"), topology=dict(
+            report = dict(schema_version=9, backend=("cpp-thread-cuda-ipc-gpudirect-rdma" if nodes == 2 else "cpp-thread-cuda-ipc"), topology=dict(
                 nodes=nodes, gpus=world, gpus_per_node=8, experts=128, experts_per_gpu=128 // world, top_k=8),
-                completion_endpoint=f"{world} source expert tables installed; outgoing RDMA sends drained",
+                completion_endpoint=("16 source expert tables and remote same-index x3/x4 installed; nine outgoing RDMA sends drained"
+                                     if nodes == 2 else "8 source expert tables installed"),
+                x3_x4_exchange=nodes == 2,
                 configuration=config, versions=dict(torch=torch.__version__, cuda=torch.version.cuda),
                 critical_rank_end_to_end_ms=summary(critical), all_rank_metrics=metrics,
                 critical_rank_metrics=critical_metrics,

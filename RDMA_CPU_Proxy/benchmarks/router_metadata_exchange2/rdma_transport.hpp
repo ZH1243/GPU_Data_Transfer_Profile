@@ -42,7 +42,7 @@ struct MetadataRdma {
             throw std::runtime_error("RDMA peer topology/arena mismatch");
         remote = info.recv_buffer;
         qp->connect(info.qps.front());
-        for (int s = 0; s < 8; ++s) qp->post_receive(1);
+        for (int s = 0; s < two::messages; ++s) qp->post_receive(1);
         connected = true;
     }
     void post(uint64_t iteration, int source, int count) {
@@ -50,6 +50,12 @@ struct MetadataRdma {
         const size_t to = two::record_offset(node * 8 + source, capacity) * 4;
         qp->post(two::send_id(iteration, source), send_mr.addr + from,
             send_mr.lkey, remote.addr + to, remote.rkey, uint32_t(two::record_bytes(count)), uint32_t(source));
+    }
+    void post_x3_x4(uint64_t iteration, int count) {
+        const size_t offset = two::x3_x4_offset(capacity) * sizeof(int32_t);
+        qp->post(two::send_id(iteration, two::x3_x4_tag), send_mr.addr + offset,
+            send_mr.lkey, remote.addr + offset, remote.rkey,
+            uint32_t(two::x3_x4_bytes(count)), two::x3_x4_tag);
     }
     // Destroy QP before deregistering its memory; caller destroys transport
     // before freeing either CUDA allocation, including on failure.

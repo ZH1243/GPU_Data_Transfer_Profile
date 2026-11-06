@@ -10,7 +10,8 @@ class Stats(C.Structure):
         "payload_event_record_ms", "payload_completion_ms", "payload_other_ms", "install_ms", "native_ms",
         "rdma_post_ms", "rdma_poll_ms", "rdma_post_recv_ms", "rdma_work_complete_ms")]
     _fields_ += [(name, C.c_uint64) for name in (
-        "received_index_bytes", "peer_received_index_bytes", "header_bytes", "rdma_sent_bytes", "rdma_received_bytes")]
+        "received_index_bytes", "peer_received_index_bytes", "header_bytes", "rdma_sent_bytes", "rdma_received_bytes",
+        "x3_x4_sent_bytes", "x3_x4_received_bytes")]
 
     def as_dict(self):
         return {name: getattr(self, name) for name, _ in self._fields_}
@@ -21,10 +22,11 @@ class Proxy:
                  per_source_readback=False, metadata_barrier=False, batch_payload_copy=False,
                  nodes=1, node=0):
         self.experts_per_gpu = 128 // (nodes * 8)
+        self.nodes = nodes
         self.lib = C.CDLL(str(library))  # CDLL releases the GIL in native calls.
         self.handle = C.c_void_p()
         self.lib.rme2_abi_version.restype = C.c_int
-        if self.lib.rme2_abi_version() != 7:
+        if self.lib.rme2_abi_version() != 8:
             raise RuntimeError("native ABI mismatch; rebuild the library")
         signatures = {
             "rme2_abi_version": ([], C.c_int),
@@ -40,16 +42,18 @@ class Proxy:
             "rme2_disconnect": ([C.c_void_p], C.c_int),
             "rme2_capture_begin": ([C.c_void_p, C.c_void_p], C.c_int),
             "rme2_capture_end": ([C.c_void_p, C.c_int], C.c_int),
-            "rme2_submit": ([C.c_void_p, C.c_uint64, C.c_void_p, C.c_void_p, C.c_void_p], C.c_int),
+            "rme2_submit": ([C.c_void_p, C.c_uint64] + [C.c_void_p] * 6, C.c_int),
             "rme2_wait": ([C.c_void_p, C.POINTER(Stats)], C.c_int),
             "rme2_view": ([C.c_void_p, C.c_int, C.POINTER(C.POINTER(C.c_int32)),
                             C.POINTER(C.POINTER(C.c_int32)), C.POINTER(C.c_int)], C.c_int),
+            "rme2_x3_x4_view": ([C.c_void_p, C.POINTER(C.POINTER(C.c_int32)),
+                                 C.POINTER(C.POINTER(C.c_uint8)), C.POINTER(C.c_int)], C.c_int),
             "rme2_destroy": ([C.c_void_p], None),
         }
         for name, (args, result) in signatures.items():
             fn = getattr(self.lib, name)
             fn.argtypes, fn.restype = args, result
-        if self.lib.rme2_abi_version() != 7:
+        if self.lib.rme2_abi_version() != 8:
             raise RuntimeError("native ABI mismatch; rebuild the library")
         self.check(self.lib.rme2_create(rank, device, tokens, shm_name.encode(), timeout,
                                        int(validate), core, int(per_source_readback), int(metadata_barrier),
@@ -94,8 +98,10 @@ class Proxy:
         self.check(self.lib.rme2_capture_end(self.handle, int(launch_barrier)))
 
     def submit(self, iteration, plan, stream):
+        route_pointers = ((plan.node_offsets.data_ptr(), plan.x3.data_ptr(), plan.x4.data_ptr())
+                          if self.nodes == 2 else (None,) * 3)
         self.check(self.lib.rme2_submit(self.handle, iteration, plan.expert_offsets.data_ptr(),
-                                       plan.expert_token_indices.data_ptr(), stream.cuda_stream))
+                                       plan.expert_token_indices.data_ptr(), *route_pointers, stream.cuda_stream))
 
     def wait(self):
         stats = Stats()
@@ -108,6 +114,12 @@ class Proxy:
         self.check(self.lib.rme2_view(self.handle, source, C.byref(offsets),
                                      C.byref(indices), C.byref(count)))
         return list(offsets[:self.experts_per_gpu + 1]), list(indices[:count.value])
+
+    def snapshot_x3_x4(self):
+        # Remote same-index source's slice for this node; outside timing only.
+        x3, x4, count = C.POINTER(C.c_int32)(), C.POINTER(C.c_uint8)(), C.c_int()
+        self.check(self.lib.rme2_x3_x4_view(self.handle, C.byref(x3), C.byref(x4), C.byref(count)))
+        return list(x3[:count.value]), list(x4[:count.value])
 
     def disconnect(self):
         self.check(self.lib.rme2_disconnect(self.handle))

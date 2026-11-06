@@ -70,7 +70,11 @@ struct Rme2Proxy {
     bool capturing = false, launch_barrier = false;
     cudaEvent_t metadata_begin = nullptr, metadata_end = nullptr;
     const int32_t* local_offsets = nullptr;
+    const int32_t* local_node_offsets = nullptr;
+    const int32_t* local_x3 = nullptr;
+    const uint8_t* local_x4 = nullptr;
     std::array<rme2::Installed, 16> installed{};
+    rme2::two::InstalledX3X4 installed_x3_x4{};
     std::thread worker;
     std::mutex mutex;
     std::condition_variable changed;
@@ -292,6 +296,16 @@ struct Rme2Proxy {
             stats.rdma_sent_bytes += two::record_bytes(count);
             stats.rdma_post_ms += ms(before);
         }
+        {
+            const auto before = Clock::now();
+            const int32_t* h = pinned + two::sources * two::header_words;
+            const int count = two::check_x3_x4_header(h, tokens, sequence,
+                                                      node * 8 + rank, (1 - node) * 8 + rank);
+            rdma->post_x3_x4(sequence, count);
+            stats.x3_x4_sent_bytes = size_t(count) * 5;
+            stats.rdma_sent_bytes += two::x3_x4_bytes(count);
+            stats.rdma_post_ms += ms(before);
+        }
         two::CompletionProgress progress(sequence);
         bool local_installed = false;
         while (!local_installed || !progress.complete()) {
@@ -319,15 +333,23 @@ struct Rme2Proxy {
                     progress.complete_send(completion.wr_id);
                 } else {
                     const int s = progress.receive_source(completion.wr_id, completion.imm_data);
-                    const int slot = (1 - node) * 8 + s;
                     const auto before = Clock::now();
-                    const int32_t* h = pinned + two::record_offset(slot, capacity);
-                    two::check_received(h, capacity, sequence, slot, node * 8 + rank, completion.byte_len);
-                    rme2::install(installed[slot], h + 6, h + two::header_words,
-                                  tokens, sequence, validate, two::epg);
+                    if (s == two::x3_x4_tag) {
+                        const int32_t* h = pinned + two::x3_x4_offset(capacity);
+                        two::install_x3_x4(installed_x3_x4, h, tokens, sequence,
+                                          (1 - node) * 8 + rank, node * 8 + rank,
+                                          completion.byte_len, validate);
+                        stats.x3_x4_received_bytes = size_t(installed_x3_x4.count) * 5;
+                    } else {
+                        const int slot = (1 - node) * 8 + s;
+                        const int32_t* h = pinned + two::record_offset(slot, capacity);
+                        two::check_received(h, capacity, sequence, slot, node * 8 + rank, completion.byte_len);
+                        rme2::install(installed[slot], h + 6, h + two::header_words,
+                                      tokens, sequence, validate, two::epg);
+                        stats.received_index_bytes += size_t(installed[slot].count) * 4;
+                        stats.peer_received_index_bytes += size_t(installed[slot].count) * 4;
+                    }
                     stats.install_ms += ms(before);
-                    stats.received_index_bytes += size_t(installed[slot].count) * 4;
-                    stats.peer_received_index_bytes += size_t(installed[slot].count) * 4;
                     stats.rdma_received_bytes += completion.byte_len;
                     progress.installed(s);
                     const auto repost_start = Clock::now();
@@ -450,7 +472,8 @@ struct Rme2Proxy {
         }
         check(cudaEventRecord(begin, s), "record exchange start");
         if (nodes == 2)
-            launch_exchange_two(peers, rank, node, capacity, sequence, local_offsets, local_values, s);
+            launch_exchange_two(peers, rank, node, capacity, sequence, local_offsets, local_values,
+                                local_node_offsets, local_x3, local_x4, s);
         else
             launch_exchange(peers, rank, capacity, local_offsets, local_values, s);
         check(cudaGetLastError(), "launch metadata exchange");
@@ -543,7 +566,7 @@ struct Rme2Proxy {
     }
 };
 
-extern "C" int rme2_abi_version() { return 7; }
+extern "C" int rme2_abi_version() { return 8; }
 extern "C" int rme2_set_batch_payload_copy(Rme2Proxy* p, int enabled) {
     return api([&] {
         require(p && (enabled == 0 || enabled == 1), "invalid batch payload option");
@@ -692,9 +715,11 @@ extern "C" int rme2_capture_end(Rme2Proxy* p, int launch_barrier) {
     });
 }
 extern "C" int rme2_submit(Rme2Proxy* p, uint64_t iteration, const int32_t* offsets,
-                           const int32_t* indices, void* stream) {
+                           const int32_t* indices, const int32_t* node_offsets,
+                           const int32_t* x3, const uint8_t* x4, void* stream) {
     return api([&] {
         require(p && offsets && indices && p->connected, "invalid submit arguments");
+        require(p->nodes == 1 || (node_offsets && x3 && x4), "two-node submit requires x3/x4 metadata");
         require(p->nodes == 1 || (p->rdma && p->rdma->connected), "RDMA setup is incomplete");
         if (p->nodes == 2) rme2::two::send_id(iteration, 0);
         std::lock_guard<std::mutex> lock(p->mutex);
@@ -706,6 +731,7 @@ extern "C" int rme2_submit(Rme2Proxy* p, uint64_t iteration, const int32_t* offs
         p->stats = {};
         auto s = static_cast<cudaStream_t>(stream);
         p->local_values = indices; p->local_offsets = offsets;
+        p->local_node_offsets = node_offsets; p->local_x3 = x3; p->local_x4 = x4;
         p->work_stream = s; p->sequence = iteration;
         if (!p->metadata_graph) p->submit_exchange(s);
         p->pending = true;
@@ -731,6 +757,15 @@ extern "C" int rme2_view(Rme2Proxy* p, int source, const int32_t** offsets,
                 "view requires successful wait");
         const auto& view = p->installed[source];
         *offsets = view.offsets; *indices = view.indices; *count = view.count;
+    });
+}
+extern "C" int rme2_x3_x4_view(Rme2Proxy* p, const int32_t** x3, const uint8_t** x4, int* count) {
+    return api([&] {
+        require(p && p->nodes == 2 && x3 && x4 && count, "invalid x3/x4 view arguments");
+        std::lock_guard<std::mutex> lock(p->mutex);
+        require(!p->pending && !p->done && p->failure.empty() && p->sequence > 0 &&
+                p->installed_x3_x4.iteration == p->sequence, "x3/x4 view requires successful wait");
+        *x3 = p->installed_x3_x4.x3; *x4 = p->installed_x3_x4.x4; *count = p->installed_x3_x4.count;
     });
 }
 extern "C" void rme2_destroy(Rme2Proxy* p) { delete p; }
