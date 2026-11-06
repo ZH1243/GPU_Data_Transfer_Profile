@@ -56,7 +56,8 @@ CPU worker:                    wait for exchange-ready -> publish/wait local pro
 ```
 
 Exchange readiness is recorded **before** the gather, so CPU publication,
-readback on separate CUDA streams, and RDMA do not wait for staging completion.
+readback on separate CUDA streams, and RDMA do not wait for staging completion
+by default.
 The gather uses separate activation buffers and reads this source's local `x3`;
 it needs no incoming remote metadata. There is no device-wide synchronization
 inside timing. Hardware overlap is permitted, not guaranteed: gather traffic may
@@ -73,15 +74,50 @@ inside the metadata graph or inside the exchange GPU timer.
 `local_staging_wait_ms` measures only the residual CPU wait after metadata work
 finishes (including completion-query overhead). `native_ms` and `end_to_end_ms`
 now require **both metadata completion and staging completion**. Do not add the
-gather GPU duration to the D2H/RDMA spans. JSON schema 10 records the selected
+gather GPU duration to the D2H/RDMA spans. JSON schema 11 records the selected
 staging workload and expanded completion endpoint.
 
 Use `--skip-local-staging` on all ranks for the metadata-only baseline; this omits
-activation allocations/refresh and the gather, and reports both staging timings
+activation allocations/refresh and the gather, and reports all staging timings
 as zero. Existing commands enable staging automatically. Update Python files and
-rebuild the native library on both nodes for **ABI 9** before running.
+rebuild the native library on both nodes for **ABI 10** before running.
 
-## Two-node exchange (ABI 9)
+To serialize gather and D2H, add **`--d2h-after-local-staging` on all ranks**.
+The worker publishes exchange completion as usual, waits for all local producers,
+then waits for **its own GPU's staging-done event** before submitting header D2H.
+Payload D2H follows header readback as usual. This is not an all-GPU staging
+barrier. No header/payload D2H on that GPU overlaps its gather; other GPUs may
+still be gathering. Outgoing RDMA is also delayed because record lengths come
+from the header readback; incoming RDMA into pinned host memory is not gated.
+
+The additional `staging_before_d2h_wait_ms` metric (terminal row **Local staging
+wait before D2H (wall)**) excludes the preceding producer wait and is outside
+both D2H timers, but inside native/end-to-end time. It may be near zero if gather
+finishes during the producer wait. The existing residual staging wait still
+measures the final completion query. Without the flag, the new metric is zero
+and the existing overlap behavior is preserved. Combining the flag with
+`--skip-local-staging` is rejected.
+
+For a matched two-node comparison, run your existing command on both nodes with
+and without this flag; keep the launch barrier, token dimension, validation,
+warmup and iteration settings identical. For example, on node 0:
+
+```bash
+bash ./run_node0_torchrun.sh \
+  --tokens 20480 --warmup 20 --iterations 200 \
+  --route-pattern affine --verify boundaries \
+  --native-metadata-launch --skip-index-validation \
+  --d2h-after-local-staging
+```
+
+On node 1 use `run_node1_torchrun.sh` with the same arguments. Rebuild the library
+on both nodes for ABI 10. JSON schema 11 records the option and new timing field.
+The option also works with Python eager/graph launch and single-node readback.
+In single-node per-source mode the gate starts when the first producer is ready;
+publication continues while waiting, and the all-source readiness observation
+span includes this gate.
+
+## Two-node exchange (ABI 10)
 
 The benchmark also supports **two Linux Hopper nodes, eight GPUs each**, keeping
 128 experts and top-8, hence **eight experts per GPU**. It reuses the existing
@@ -95,7 +131,7 @@ Two-node mode exchanges **expert tables plus the same-index remote source's
 `x3/x4` slice every iteration**, enabled by default with no additional flag.
 This matches the production test's `x3/x4` source/destination convention while
 using GPU-to-host RDMA instead of its initialization-time TCP exchange. Update
-Python and rebuild the library on **both nodes**: ABI 9 / wire format 2 is not
+Python and rebuild the library on **both nodes**: ABI 10 / wire format 2 is not
 compatible with older benchmark binaries. Existing benchmark commands still work,
 but their end-to-end timings now include `x3/x4` packing, transfer and installation
 and, by default, local token staging completion.
@@ -222,7 +258,7 @@ This does not change the production proxy or its initialization-only metadata AP
 
 ### Two-node timing and remote validation
 
-JSON schema 10 reports `rdma_post_ms` (record checks and write submissions),
+JSON schema 11 reports `rdma_post_ms` (record checks and write submissions),
 `rdma_poll_ms` (time inside CQ polling), `rdma_post_recv_ms` (credit reposting), and
 `rdma_work_complete_ms` (span from starting submissions until all send/receive
 completions are processed). `rdma_sent_bytes` and `rdma_received_bytes` include
@@ -263,7 +299,9 @@ so each direction exercises empty, full and changing `x3/x4` lengths in reused
 allocations. Exact verification also checks all reported byte counters and every
 staged activation bit against the independent CPU-reference local `x3` slice,
 plus untouched-tail sentinels. The GPU scripts also exercise staging dimensions
-7 and 8 (fallback and partial vectorized rows) and `--skip-local-staging`.
+7 and 8 (fallback and partial vectorized rows), `--skip-local-staging`, and a
+serialized `--d2h-after-local-staging` case. Passing the serialization flag to
+the scripts applies it throughout and omits the incompatible no-staging case.
 The host suite compares both topology references with production CPU routing and
 checks record identity, length bounds, borrowed installation, and launch topology.
 Host checks cannot establish CUDA compilation, peer-write/NIC visibility, or RDMA
@@ -396,7 +434,7 @@ It is not zero-copy: peer payloads still move GPU-to-GPU and then GPU-to-CPU.
 `--batch-payload-copy` replaces the receiver's nonempty payload copy loop with one
 `cudaMemcpyBatchAsync`. It is off by default and requires `--per-source-readback`
 to be disabled. It works with Python or native metadata launch and either barrier.
-Update Python and rebuild the shared library together (**ABI 9**), using the remote
+Update Python and rebuild the shared library together (**ABI 10**), using the remote
 CUDA 12.9 toolkit:
 
 ```bash
@@ -440,7 +478,7 @@ immediately before they record the start event and launch the metadata graph.
 The launch barrier requires native launch; invalid option combinations fail early.
 Both flags are off by default, preserving the existing Python launch path.
 
-Update the Python files and **rebuild the library (ABI 9)**:
+Update the Python files and **rebuild the library (ABI 10)**:
 
 ```bash
 cmake --build build -j
@@ -492,7 +530,7 @@ arrival slot. The C++ callers acquire-poll all eight arrivals, checking timeout/
 then enqueue their exchange kernels. Slots carry monotonically increasing epochs;
 the existing consumption barrier prevents reuse while peers still consume metadata.
 
-Update Python and rebuild the library together (native **ABI 9**):
+Update Python and rebuild the library together (native **ABI 10**):
 
 ```bash
 cmake --build build -j
@@ -523,7 +561,7 @@ exchange stage into the metadata barrier. The flag can also combine with
 
 Pass `--per-source-readback` to remove the all-sources gate before readback.
 The default remains unchanged. **Rebuild the shared library and update Python
-together**: the native interface is now ABI 9; Python rejects older libraries.
+together**: the native interface is now ABI 10; Python rejects older libraries.
 
 ```bash
 cmake --build build -j
@@ -560,6 +598,7 @@ terminal labels and JSON `readback_timing_semantics` identify the distinction):
   including any overlapping peer readback work, rather than an isolated wait.
 - `peer_completion_wait_ms`: elapsed worker time until all source publications are
   observed, overlapping earlier readbacks/installations, rather than blocked time.
+  With `--d2h-after-local-staging`, this span also includes the staging gate.
 - `headers_d2h_ms` and `payload_d2h_ms`: sums of eight per-source submission-to-observed-
   completion latencies, including CPU scheduling/query delays. These intervals overlap
   and can exceed native/end-to-end wall time. Payload latency includes header checking.
@@ -598,6 +637,7 @@ timing fields remain in **milliseconds** (schema version 10).
 | `metadata_gpu_ms` | CUDA event span around the seven kernels, including submission gaps |
 | `exchange_gpu_ms` | CUDA event span around the direct-write kernel |
 | `local_staging_gpu_ms` | CUDA event span around local token-row gather; zero when skipped |
+| `staging_before_d2h_wait_ms` | Optional residual local gather wait before any D2H; zero when disabled; outside D2H timers |
 | `local_staging_wait_ms` | Residual CPU wait for gather completion after metadata exchange/installation; includes query overhead |
 | `sender_completion_wait_ms` | Native worker wait for local stream completion, possibly including unfinished metadata |
 | `peer_completion_wait_ms` | Wait after local publication for all peer publications |

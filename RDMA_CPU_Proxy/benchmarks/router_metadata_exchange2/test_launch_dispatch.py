@@ -4,10 +4,18 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from benchmark import enqueue_iteration
+from benchmark import enqueue_iteration, options
+from unittest.mock import patch
 
 
 class LaunchDispatchTests(unittest.TestCase):
+    def test_staging_readback_is_opt_in(self):
+        for flags, enabled in (([], False), (['--d2h-after-local-staging'], True)):
+            with patch.object(sys, 'argv', ['benchmark.py', *flags]):
+                args = options()
+            self.assertEqual(args.d2h_after_local_staging, enabled)
+            self.assertFalse(args.skip_local_staging)
+
     def test_native_never_launches_python_kernels_or_events(self):
         for native, graph_mode, expected in (
             (True, True, ['submit']),
@@ -26,7 +34,8 @@ class LaunchDispatchTests(unittest.TestCase):
     def test_invalid_modes_fail_before_cuda_import(self):
         program = str(Path(__file__).with_name('benchmark.py'))
         for flags in (['--metadata-launch-barrier'], ['--native-metadata-launch', '--mode', 'eager'],
-                      ['--batch-payload-copy', '--per-source-readback'], ['--token-dimension', '0']):
+                      ['--batch-payload-copy', '--per-source-readback'], ['--token-dimension', '0'],
+                      ['--d2h-after-local-staging', '--skip-local-staging']):
             result = subprocess.run([sys.executable, program, *flags], text=True, capture_output=True)
             self.assertEqual(result.returncode, 2)
             self.assertIn('requires', result.stderr)

@@ -9,6 +9,7 @@ int main() {
     FIELD(rdma_work_complete_ms);
     FIELD(local_staging_gpu_ms);
     FIELD(local_staging_wait_ms);
+    FIELD(staging_before_d2h_wait_ms);
     FIELD(received_index_bytes);
     FIELD(x3_x4_received_bytes);
 #undef FIELD

@@ -86,6 +86,9 @@ struct Rme2Proxy {
     Clock::time_point submitted;
     Rme2Stats stats{};
     bool batch_payload_copy = false;
+    bool d2h_after_local_staging = false;
+    bool staging_readback_started = false, staging_readback_ready = false;
+    Clock::time_point staging_readback_start;
     rme2::PayloadBatch payload_batch;
 
     Rme2Proxy(int r, int d, int t, const char* n, double seconds, bool v, int c, bool progressive, bool barrier,
@@ -160,6 +163,25 @@ struct Rme2Proxy {
         check(status, "query progressive readback event");
         return true;
     }
+    bool readback_ready() {
+        // Poll on the CPU before starting D2H timers. A stream wait inside the
+        // copy interval would incorrectly charge gather time to D2H latency.
+        if (!d2h_after_local_staging || staging_readback_ready) return true;
+        if (!staging_readback_started) {
+            staging_readback_start = Clock::now();
+            staging_readback_started = true;
+        }
+        if (!event_ready(staging_end)) return false;
+        stats.staging_before_d2h_wait_ms = ms(staging_readback_start);
+        staging_readback_ready = true;
+        return true;
+    }
+    void wait_for_readback() {
+        while (!readback_ready()) {
+            check_deadline(submitted);
+            std::this_thread::yield();
+        }
+    }
     void process_per_source() {
         std::array<rme2::ReadbackStage, rme2::gpus> stages{};
         std::array<Clock::time_point, rme2::gpus> header_start{}, payload_start{}, payload_wait_start{};
@@ -168,15 +190,17 @@ struct Rme2Proxy {
         int observed = 0, installed_count = 0;
         while (installed_count != rme2::gpus) {
             check_deadline(started);
-            // Never wait for our own GPU before progressing already-ready peers.
-            // Still publish promptly so peers cannot deadlock behind our readback.
+            // Publish promptly even when the optional staging gate delays
+            // readback, so peers cannot deadlock behind our gather/readback.
             if (!published && event_ready(end)) {
                 stats.sender_completion_wait_ms = ms(started);
                 release(&shared->slots[rank].complete, sequence);
                 published = true;
             }
             bool changed = rme2::progress_sources(stages,
-                [&](size_t s) { return acquire(&shared->slots[s].complete) >= sequence; },
+                [&](size_t s) {
+                    return acquire(&shared->slots[s].complete) >= sequence && readback_ready();
+                },
                 [&](size_t s) {
                     if (++observed == rme2::gpus)
                         stats.peer_completion_wait_ms = ms(started);
@@ -257,6 +281,7 @@ struct Rme2Proxy {
             [&](int s) { return acquire(&shared->slots[s].complete); },
             [&] { check_deadline(start); std::this_thread::yield(); });
         stats.peer_completion_wait_ms = ms(start);
+        wait_for_readback();
         start = Clock::now();
         stats.header_bytes = two::directory_words * sizeof(int32_t);
         check(cudaMemcpyAsync(pinned, inbox, stats.header_bytes, cudaMemcpyDeviceToHost, read_stream),
@@ -385,6 +410,7 @@ struct Rme2Proxy {
             }
         }
         stats.peer_completion_wait_ms = ms(start);
+        wait_for_readback();
         start = Clock::now();
         stats.header_bytes = rme2::gpus * rme2::header_words * sizeof(int32_t);
         check(cudaMemcpyAsync(pinned, inbox, stats.header_bytes, cudaMemcpyDeviceToHost,
@@ -519,8 +545,8 @@ struct Rme2Proxy {
                 }
                 if (metadata_graph) launch_metadata();
                 process();
-                // All metadata work is complete. Only the unhidden gather tail
-                // remains; never delay producer publication or RDMA on this event.
+                // Drain any remaining gather tail. In serialized mode readback
+                // already observed this event; publication never waits on it.
                 if (staging_graph) {
                     const auto started = Clock::now();
                     wait_event(staging_end);
@@ -588,7 +614,15 @@ struct Rme2Proxy {
     }
 };
 
-extern "C" int rme2_abi_version() { return 9; }
+extern "C" int rme2_abi_version() { return 10; }
+extern "C" int rme2_set_d2h_after_local_staging(Rme2Proxy* p, int enabled) {
+    return api([&] {
+        require(p && (enabled == 0 || enabled == 1), "invalid staging readback option");
+        std::lock_guard<std::mutex> lock(p->mutex);
+        require(p->sequence == 0 && !p->pending && !p->done, "configure staging readback before iterations");
+        p->d2h_after_local_staging = enabled != 0;
+    });
+}
 extern "C" int rme2_set_batch_payload_copy(Rme2Proxy* p, int enabled) {
     return api([&] {
         require(p && (enabled == 0 || enabled == 1), "invalid batch payload option");
@@ -757,9 +791,12 @@ extern "C" int rme2_submit(Rme2Proxy* p, uint64_t iteration, const int32_t* offs
         require(p->failure.empty(), p->failure.c_str());
         require(!p->pending && !p->done && !p->capturing && iteration == p->sequence + 1 && iteration != 0,
                 "submit requires prior wait and consecutive iterations starting at 1");
+        require(!p->d2h_after_local_staging || p->staging_graph,
+                "D2H after local staging requires a captured staging graph");
         check(cudaSetDevice(p->device), "select submit GPU");
         p->submitted = Clock::now();
         p->stats = {};
+        p->staging_readback_started = p->staging_readback_ready = false;
         auto s = static_cast<cudaStream_t>(stream);
         p->local_values = indices; p->local_offsets = offsets;
         p->local_node_offsets = node_offsets; p->local_x3 = x3; p->local_x4 = x4;

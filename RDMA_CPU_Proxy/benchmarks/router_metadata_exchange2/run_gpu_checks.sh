@@ -4,7 +4,11 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # Warp/chunk/scan carry boundaries; cycle includes empty receive lists and
 # growth/shrinkage using the same allocations. Full content checks every time.
 modes=(eager graph)
+serialized=false
+skip_staging=false
 for arg in "$@"; do
+  if [[ "${arg}" == "--d2h-after-local-staging" ]]; then serialized=true; fi
+  if [[ "${arg}" == "--skip-local-staging" ]]; then skip_staging=true; fi
   if [[ "${arg}" == "--native-metadata-launch" ]]; then modes=(graph); fi
 done
 for mode in "${modes[@]}"; do
@@ -19,7 +23,16 @@ for mode in "${modes[@]}"; do
       --token-dimension "${width}" --warmup 1 --iterations 3 --route-pattern cycle --verify all \
       --output "${script_dir}/results/check_${mode}_staging_d${width}.json" "$@"
   done
-  bash "${script_dir}/run_single_node_torchrun.sh" --mode "${mode}" --tokens 33 \
-    --skip-local-staging --warmup 1 --iterations 3 --route-pattern cycle --verify all \
-    --output "${script_dir}/results/check_${mode}_no_staging.json" "$@"
+  if ! "${serialized}"; then
+    bash "${script_dir}/run_single_node_torchrun.sh" --mode "${mode}" --tokens 33 \
+      --skip-local-staging --warmup 1 --iterations 3 --route-pattern cycle --verify all \
+      --output "${script_dir}/results/check_${mode}_no_staging.json" "$@"
+  fi
+
+  if ! "${skip_staging}" && ! "${serialized}"; then
+    bash "${script_dir}/run_single_node_torchrun.sh" --mode "${mode}" --tokens 33 \
+      --d2h-after-local-staging --warmup 1 --iterations 6 --route-pattern cycle --verify all \
+      --output "${script_dir}/results/check_${mode}_serialized_staging.json" "$@"
+  fi
+
 done
