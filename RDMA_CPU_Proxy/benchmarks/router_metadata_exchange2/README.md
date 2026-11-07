@@ -74,13 +74,13 @@ inside the metadata graph or inside the exchange GPU timer.
 `local_staging_wait_ms` measures only the residual CPU wait after metadata work
 finishes (including completion-query overhead). `native_ms` and `end_to_end_ms`
 now require **both metadata completion and staging completion**. Do not add the
-gather GPU duration to the D2H/RDMA spans. JSON schema 12 records the selected
+gather GPU duration to the D2H/RDMA spans. JSON schema 13 records the selected
 staging workload and expanded completion endpoint.
 
 Use `--skip-local-staging` on all ranks for the metadata-only baseline; this omits
 activation allocations/refresh and the gather, and reports all staging timings
 as zero. Existing commands enable staging automatically. Update Python files and
-rebuild the native library on both nodes for **ABI 11** before running.
+rebuild the native library on both nodes for **ABI 12** before running.
 
 To serialize gather and D2H, add **`--d2h-after-local-staging` on all ranks**.
 The worker publishes exchange completion as usual, waits for all local producers,
@@ -111,7 +111,7 @@ bash ./run_node0_torchrun.sh \
 ```
 
 On node 1 use `run_node1_torchrun.sh` with the same arguments. Rebuild the library
-on both nodes for ABI 11. JSON schema 12 records the option and new timing field.
+on both nodes for ABI 12. JSON schema 13 records the option and new timing field.
 The option also works with Python eager/graph launch and single-node readback.
 In single-node per-source mode the gate starts when the first producer is ready;
 publication continues while waiting, and the all-source readiness observation
@@ -146,9 +146,76 @@ both require local staging enabled. With neither flag, overlap remains the defau
 
 For the reverse-order experiment, replace `--d2h-after-local-staging` in your
 command with `--local-staging-after-d2h`, keeping all other settings identical.
-Update Python and rebuild the library on both nodes for ABI 11.
+Update Python and rebuild the library on both nodes for ABI 12.
 
-## Two-node exchange (ABI 11)
+## Direct x3/x4 output for RDMA
+
+Add **`--direct-x3-x4-output` on both nodes** to write the outgoing remote-node
+x3/x4 payload in metadata kernel 4 (`build_node_indices`). The default retains
+the exchange-kernel packing path for comparison. This option is two-node only,
+works with eager, graph, and native metadata launch, and is independent of the
+local staging ordering options (including `--skip-local-staging`).
+
+The producer uses node offsets from kernel 3 to store token IDs and masks in the
+proxy's own registered GPU arena:
+
+```text
+[64-byte header, written later by exchange][N int32 token IDs][N uint8 masks]
+```
+
+The token/mask values are stored while already available in kernel 4. Canonical
+x3/x4 arrays are still populated for kernels 5/7, local gather and verification.
+Thus this removes the later payload reread/copy, but still writes a second copy
+of the remote slice. The exchange kernel skips only the x3/x4 payload loop;
+expert metadata exchange, record/directory header generation and completion
+publication remain. There are still seven processing kernels, one exchange
+kernel, and nine RDMA records on the same connection. Wire format and byte counts
+are unchanged; empty slices send only a header.
+
+The borrowed pointer is configured once before capture, and each captured launch
+uses the same allocation. The masks start at `payload + 4*N`, calculated on GPU
+each iteration; no CPU length readback is added. Each producing thread uses a
+[system-scope fence](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_api/cute_arch.html#cutlass.cute.arch.fence_acq_rel_sys)
+after its direct stores. Existing stream ordering, producer completion, RDMA
+completion and iteration barriers protect visibility and buffer reuse.
+
+The extra producer stores/fence are included in **Seven metadata kernels (GPU)**.
+The exchange row is renamed **GPU exchange / x3/x4 header (GPU)** in this mode.
+Compare their combined per-sample duration and end-to-end time; a reduction in
+exchange time alone is not a net speedup. JSON schema 13 records the producer
+choice and CLI flag. Rebuild on both nodes for **ABI 12**, and also update
+`get_expert_token_idx_list_gpu/metadata_cute.py`.
+
+For your D2H-before-gather experiment, on node 0:
+
+```bash
+bash ./run_node0_torchrun.sh \
+  --tokens 20480 --warmup 20 --iterations 200 \
+  --route-pattern affine --verify boundaries \
+  --native-metadata-launch --skip-index-validation \
+  --metadata-launch-barrier --local-staging-after-d2h \
+  --direct-x3-x4-output
+```
+
+Use `run_node1_torchrun.sh` with identical arguments on node 1. Omit only the
+new flag for the matched baseline.
+
+Remote validation:
+
+```bash
+# One GPU on either Hopper node: checks direct output BEFORE exchange can copy.
+python check_direct_x3_x4_gpu.py
+# Run concurrently on the two nodes with ranks 0 and 1 respectively:
+bash run_two_node_gpu_checks.sh 0 --native-metadata-launch --direct-x3-x4-output
+bash run_two_node_gpu_checks.sh 1 --native-metadata-launch --direct-x3-x4-output
+```
+
+The isolated producer check validates both node slices, partial chunks, changing
+mask addresses, empty/full payloads, canonical outputs, and byte guards under
+eager and graph launch. The distributed checks validate received records against
+the CPU reference; their default suite also includes a direct-output case.
+
+## Two-node exchange (ABI 12)
 
 The benchmark also supports **two Linux Hopper nodes, eight GPUs each**, keeping
 128 experts and top-8, hence **eight experts per GPU**. It reuses the existing
@@ -162,7 +229,7 @@ Two-node mode exchanges **expert tables plus the same-index remote source's
 `x3/x4` slice every iteration**, enabled by default with no additional flag.
 This matches the production test's `x3/x4` source/destination convention while
 using GPU-to-host RDMA instead of its initialization-time TCP exchange. Update
-Python and rebuild the library on **both nodes**: ABI 11 / wire format 2 is not
+Python and rebuild the library on **both nodes**: ABI 12 / wire format 2 is not
 compatible with older benchmark binaries. Existing benchmark commands still work,
 but their end-to-end timings now include `x3/x4` packing, transfer and installation
 and, by default, local token staging completion.
@@ -239,7 +306,8 @@ remain available in single-node mode.
    `x3/x4`. For source node `n`, the slice is
    `[node_offsets[1-n], node_offsets[2-n])`. The packed record contains its header,
    then the valid int32 `x3` entries, then the valid uint8 `x4` masks. No additional
-   packing kernel is launched. Every writer system-fences its writes before its
+   packing kernel is launched. With `--direct-x3-x4-output`, kernel 4 writes the
+   payload instead and this CTA only writes its headers. Every writer system-fences its writes before its
    exchange-completion event. The local staging gather follows that event on the
    same GPU stream and can overlap the subsequent CPU/D2H/RDMA work.
 3. CPU proxies publish producer event completion through **node-local** shared
@@ -289,7 +357,7 @@ This does not change the production proxy or its initialization-only metadata AP
 
 ### Two-node timing and remote validation
 
-JSON schema 12 reports `rdma_post_ms` (record checks and write submissions),
+JSON schema 13 reports `rdma_post_ms` (record checks and write submissions),
 `rdma_poll_ms` (time inside CQ polling), `rdma_post_recv_ms` (credit reposting), and
 `rdma_work_complete_ms` (span from starting submissions until all send/receive
 completions are processed). `rdma_sent_bytes` and `rdma_received_bytes` include
@@ -466,7 +534,7 @@ It is not zero-copy: peer payloads still move GPU-to-GPU and then GPU-to-CPU.
 `--batch-payload-copy` replaces the receiver's nonempty payload copy loop with one
 `cudaMemcpyBatchAsync`. It is off by default and requires `--per-source-readback`
 to be disabled. It works with Python or native metadata launch and either barrier.
-Update Python and rebuild the shared library together (**ABI 11**), using the remote
+Update Python and rebuild the shared library together (**ABI 12**), using the remote
 CUDA 12.9 toolkit:
 
 ```bash
@@ -510,7 +578,7 @@ immediately before they record the start event and launch the metadata graph.
 The launch barrier requires native launch; invalid option combinations fail early.
 Both flags are off by default, preserving the existing Python launch path.
 
-Update the Python files and **rebuild the library (ABI 11)**:
+Update the Python files and **rebuild the library (ABI 12)**:
 
 ```bash
 cmake --build build -j
@@ -562,7 +630,7 @@ arrival slot. The C++ callers acquire-poll all eight arrivals, checking timeout/
 then enqueue their exchange kernels. Slots carry monotonically increasing epochs;
 the existing consumption barrier prevents reuse while peers still consume metadata.
 
-Update Python and rebuild the library together (native **ABI 11**):
+Update Python and rebuild the library together (native **ABI 12**):
 
 ```bash
 cmake --build build -j
@@ -593,7 +661,7 @@ exchange stage into the metadata barrier. The flag can also combine with
 
 Pass `--per-source-readback` to remove the all-sources gate before readback.
 The default remains unchanged. **Rebuild the shared library and update Python
-together**: the native interface is now ABI 11; Python rejects older libraries.
+together**: the native interface is now ABI 12; Python rejects older libraries.
 
 ```bash
 cmake --build build -j

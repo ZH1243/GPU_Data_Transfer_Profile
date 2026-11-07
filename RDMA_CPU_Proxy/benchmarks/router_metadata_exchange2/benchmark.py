@@ -23,7 +23,8 @@ def summary(values):
                 p95=ordered[int(0.95 * (len(ordered) - 1))], max=ordered[-1])
 
 
-def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False, batch_payload_copy=False):
+def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False, batch_payload_copy=False,
+                    direct_x3_x4_output=False):
     labels = (
         ("end_to_end_ms", "End to end (wall)"),
         ("metadata_launch_barrier_ms", "Native metadata launch barrier wait"),
@@ -56,6 +57,8 @@ def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False, 
     print("all rows use that same rank's sample, not separate per-stage maxima.")
     print(f"{'Measurement':45s} {'median':>10s} {'mean':>10s} {'p95':>10s}")
     for key, label in labels:
+        if direct_x3_x4_output and key == "exchange_gpu_ms":
+            label = "GPU exchange / x3/x4 header (GPU)"
         if batch_payload_copy and key == "payload_submit_ms":
             label = "  Payload: cudaMemcpyBatchAsync call"
         if metadata_barrier and not per_source_readback and key == "sender_completion_wait_ms":
@@ -126,6 +129,8 @@ def options():
                         default="affine", help="cycle stresses empty lists and changing lengths")
     parser.add_argument("--skip-index-validation", action="store_true",
                         help="omit timed expert-index and x3/x4 scans; structural header checks always remain")
+    parser.add_argument("--direct-x3-x4-output", action="store_true",
+                        help="two-node only: metadata kernel 4 also writes remote x3/x4 directly into the RDMA buffer")
     parser.add_argument("--native-metadata-launch", action="store_true",
                         help="native proxy worker launches captured CuTe graph; requires --mode graph")
     parser.add_argument("--metadata-launch-barrier", action="store_true",
@@ -238,6 +243,8 @@ def main():
     world, rank, local, nodes, node = rank_topology(os.environ)
     if nodes == 2 and (args.per_source_readback or args.batch_payload_copy):
         raise ValueError("two-node mode requires default all-senders readback; disable per-source and batch-copy options")
+    if args.direct_x3_x4_output and nodes != 2:
+        raise ValueError("--direct-x3-x4-output requires two-node mode")
     nic = rdma_device(args.rdma_device_map, local) if nodes == 2 else None
     import torch
     import torch.distributed as dist
@@ -300,7 +307,14 @@ def main():
         with torch.cuda.stream(stream):
             # The two-node plan validates its initial R during construction.
             r = torch.arange(8, dtype=torch.int32, device=device).expand(args.tokens, 8).clone()
-            plan = MetadataPlan(r, local)
+            plan_options = {}
+            if args.direct_x3_x4_output:
+                plan_options = dict(rdma_x3_x4_payload=proxy.enable_direct_x3_x4(),
+                                    remote_output_node=1 - node)
+            plan = MetadataPlan(r, local, **plan_options)
+            if args.direct_x3_x4_output:
+                # Borrowed native allocation must outlive every captured launch.
+                plan._rdma_output_owner = proxy
             r_argument = from_dlpack(r)
             stream_argument = cuda.CUstream(stream.cuda_stream)
             generator = cute.compile(RouteGenerator(), r_argument, cutlass.Uint64(args.seed), stream_argument)
@@ -348,7 +362,8 @@ def main():
                   f"native_metadata_launch={args.native_metadata_launch}; metadata_launch_barrier={args.metadata_launch_barrier}; "
                   f"batch_payload_copy={args.batch_payload_copy}; per_source_readback={args.per_source_readback}; metadata_barrier={args.metadata_barrier}; native proxy threads active", flush=True)
             if nodes == 2:
-                print("x3/x4 exchange enabled: same-index remote slice; nine RDMA records per proxy/iteration", flush=True)
+                print("x3/x4 exchange enabled: same-index remote slice; nine RDMA records per proxy/iteration; "
+                      f"direct_x3_x4_output={args.direct_x3_x4_output}", flush=True)
             print(f"local_staging={staging is not None}; d2h_after_local_staging={args.d2h_after_local_staging}; "
                   f"local_staging_after_d2h={args.local_staging_after_d2h}; token_dimension={args.token_dimension}; "
                   f"dtype=BF16; gather={staging.plan.implementation if staging else 'disabled'}", flush=True)
@@ -387,12 +402,14 @@ def main():
             metrics = {key: summary([r[key] for report in reports for r in report["records"]])
                        for key in records[0] if key.endswith("_ms")}
             critical_metrics = {key: summary([r[key] for r in critical_records]) for key in metrics}
-            report = dict(schema_version=12, backend=("cpp-thread-cuda-ipc-gpudirect-rdma" if nodes == 2 else "cpp-thread-cuda-ipc"), topology=dict(
+            report = dict(schema_version=13, backend=("cpp-thread-cuda-ipc-gpudirect-rdma" if nodes == 2 else "cpp-thread-cuda-ipc"), topology=dict(
                 nodes=nodes, gpus=world, gpus_per_node=8, experts=128, experts_per_gpu=128 // world, top_k=8),
                 completion_endpoint=("16 source expert tables and remote same-index x3/x4 installed; nine outgoing RDMA sends drained"
                                      if nodes == 2 else "8 source expert tables installed")
                                     + ("; local token staging complete" if staging is not None else ""),
                 x3_x4_exchange=nodes == 2,
+                x3_x4_payload_producer=("metadata kernel 4 (direct output)" if args.direct_x3_x4_output
+                                       else "GPU exchange packing" if nodes == 2 else None),
                 local_staging=dict(enabled=staging is not None, dtype="bfloat16", token_dimension=args.token_dimension,
                                    d2h_after_local_staging=args.d2h_after_local_staging,
                                    local_staging_after_d2h=args.local_staging_after_d2h,
@@ -412,7 +429,8 @@ def main():
             args.output.write_text(json.dumps(report, indent=2) + "\n")
             print(json.dumps(dict(critical_rank_end_to_end_ms=summary(critical),
                                   output=str(args.output), verification=args.verify), indent=2), flush=True)
-            print_breakdown(critical_metrics, args.per_source_readback, args.metadata_barrier, args.batch_payload_copy)
+            print_breakdown(critical_metrics, args.per_source_readback, args.metadata_barrier, args.batch_payload_copy,
+                            args.direct_x3_x4_output)
         dist.barrier()
         proxy.disconnect()
         dist.barrier()  # close every IPC import before any owning GPU allocation is freed

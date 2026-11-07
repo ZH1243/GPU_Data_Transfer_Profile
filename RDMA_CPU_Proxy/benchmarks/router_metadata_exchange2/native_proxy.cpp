@@ -88,6 +88,7 @@ struct Rme2Proxy {
     bool batch_payload_copy = false;
     bool d2h_after_local_staging = false;
     bool local_staging_after_d2h = false;
+    bool direct_x3_x4_output = false;
     bool staging_readback_started = false, staging_readback_ready = false;
     Clock::time_point staging_readback_start;
     rme2::PayloadBatch payload_batch;
@@ -508,7 +509,7 @@ struct Rme2Proxy {
         check(cudaEventRecord(begin, s), "record exchange start");
         if (nodes == 2)
             launch_exchange_two(peers, rank, node, capacity, sequence, local_offsets, local_values,
-                                local_node_offsets, local_x3, local_x4, s);
+                                local_node_offsets, local_x3, local_x4, direct_x3_x4_output, s);
         else
             launch_exchange(peers, rank, capacity, local_offsets, local_values, s);
         check(cudaGetLastError(), "launch metadata exchange");
@@ -624,7 +625,20 @@ struct Rme2Proxy {
     }
 };
 
-extern "C" int rme2_abi_version() { return 11; }
+extern "C" int rme2_abi_version() { return 12; }
+extern "C" int rme2_enable_direct_x3_x4(Rme2Proxy* p, void** payload, uint64_t* bytes) {
+    return api([&] {
+        require(p && payload && bytes, "invalid direct x3/x4 output arguments");
+        std::lock_guard<std::mutex> lock(p->mutex);
+        require(p->nodes == 2 && p->connected && p->rdma && p->rdma->connected,
+                "direct x3/x4 output requires connected two-node RDMA");
+        require(p->sequence == 0 && !p->pending && !p->done && !p->capturing &&
+                !p->metadata_graph && !p->staging_graph, "configure direct output before capture/iterations");
+        *payload = p->inbox + rme2::two::x3_x4_offset(p->capacity) + rme2::two::header_words;
+        *bytes = uint64_t(p->tokens) * 5;
+        p->direct_x3_x4_output = true;
+    });
+}
 extern "C" int rme2_set_local_staging_after_d2h(Rme2Proxy* p, int enabled) {
     return api([&] {
         require(p && (enabled == 0 || enabled == 1), "invalid deferred staging option");

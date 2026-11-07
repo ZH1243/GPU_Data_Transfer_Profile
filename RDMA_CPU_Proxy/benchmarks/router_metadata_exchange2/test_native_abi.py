@@ -15,6 +15,23 @@ class NativeAbiTests(unittest.TestCase):
         for field, offset in layout.items():
             self.assertEqual(int(offset), getattr(Stats, field).offset, field)
 
+    def test_direct_output_borrows_pointer_and_checks_capacity(self):
+        proxy = Proxy.__new__(Proxy)
+        proxy.handle, proxy.tokens = 123, 33
+        for address, size, valid in ((4096, 165, True), (0, 165, False),
+                                     (4097, 165, False), (4096, 164, False)):
+            def enable(handle, payload, capacity):
+                self.assertEqual(handle, 123)
+                ctypes.cast(payload, ctypes.POINTER(ctypes.c_void_p))[0] = address
+                ctypes.cast(capacity, ctypes.POINTER(ctypes.c_uint64))[0] = size
+                return 0
+            proxy.lib = SimpleNamespace(rme2_enable_direct_x3_x4=enable)
+            if valid:
+                self.assertEqual(proxy.enable_direct_x3_x4(), address)
+            else:
+                with self.assertRaisesRegex(RuntimeError, 'invalid native'):
+                    proxy.enable_direct_x3_x4()
+
     def test_staging_capture_retains_tensor_owners_and_uses_separate_api(self):
         calls = []
         proxy = Proxy.__new__(Proxy)

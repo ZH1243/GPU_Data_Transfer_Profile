@@ -95,13 +95,15 @@ def _bitmap_rank(bits: cute.Tensor, group: cutlass.Int32, thread: cutlass.Int32)
 
 
 class MetadataKernels:
-    def __init__(self, tokens, local_gpu_id):
+    def __init__(self, tokens, local_gpu_id, remote_output_node=-1):
         self.tokens = tokens
         self.chunks = (tokens + 255) // 256
         self.local_gpu_id = local_gpu_id
+        self.remote_output_node = remote_output_node
 
     @cute.jit
-    def __call__(self, r: cute.Tensor, b: tuple, stream: cuda.CUstream):
+    def __call__(self, r: cute.Tensor, b: tuple, rdma_payload: cutlass.Uint64,
+                 stream: cuda.CUstream):
         (masks, bits, counts, prefixes, mask_offsets, expert_offsets,
          x3, x4, node_offsets, reordered_bits, reordered_counts,
          reordered_prefixes, values, input_totals) = b
@@ -111,7 +113,8 @@ class MetadataKernels:
             grid=(80, 1, 1), block=(256, 1, 1), stream=stream)
         self.build_input_offsets(input_totals, mask_offsets, expert_offsets, node_offsets).launch(
             grid=(1, 1, 1), block=(256, 1, 1), stream=stream)
-        self.build_node_indices(masks, bits, prefixes, mask_offsets, x3, x4).launch(
+        self.build_node_indices(masks, bits, prefixes, mask_offsets, x3, x4,
+                                node_offsets, rdma_payload).launch(
             grid=(self.chunks, 1, 1), block=(256, 1, 1), stream=stream)
         self.count_reordered(r, x3, x4, node_offsets, reordered_bits, reordered_counts).launch(
             grid=(self.chunks, 2, 1), block=(256, 1, 1), stream=stream)
@@ -220,7 +223,8 @@ class MetadataKernels:
     @cute.kernel
     def build_node_indices(self, masks: cute.Tensor, bits: cute.Tensor,
                            prefixes: cute.Tensor, mask_offsets: cute.Tensor,
-                           x3: cute.Tensor, x4: cute.Tensor):
+                           x3: cute.Tensor, x4: cute.Tensor,
+                           node_offsets: cute.Tensor, rdma_payload: cutlass.Uint64):
         thread, _, _ = cute.arch.thread_idx()
         chunk, _, _ = cute.arch.block_idx()
         token = chunk * 256 + thread
@@ -233,6 +237,23 @@ class MetadataKernels:
                     dst = mask_offsets[group] + prefixes[chunk, 128 + group] + rank
                     x3[dst] = token
                     x4[dst] = cutlass.Uint8(mask)
+                    if cutlass.const_expr(node == self.remote_output_node):
+                        # Preserve canonical outputs for kernels 5/7 and gather.
+                        # The registered send payload is compact: int32[N], uint8[N].
+                        first = node_offsets[node]
+                        count = node_offsets[node + 1] - first
+                        out_x3 = cute.make_tensor(
+                            cute.make_ptr(cutlass.Int32, rdma_payload,
+                                          cute.AddressSpace.gmem, assumed_align=4),
+                            cute.make_layout((self.tokens,)))
+                        out_x4 = cute.make_tensor(
+                            cute.make_ptr(cutlass.Uint8, rdma_payload + cutlass.Uint64(count) * 4,
+                                          cute.AddressSpace.gmem, assumed_align=1),
+                            cute.make_layout((self.tokens,)))
+                        out_x3[dst - first] = token
+                        out_x4[dst - first] = cutlass.Uint8(mask)
+                        # Each writer fences its own stores before producer completion.
+                        cute.arch.fence_acq_rel_sys()
 
     @cute.kernel
     def count_reordered(self, r: cute.Tensor, x3: cute.Tensor, x4: cute.Tensor,
@@ -467,9 +488,13 @@ class MetadataPlan:
     not allocate, compile, synchronize, or validate. R may be updated in place
     between launches provided the distinct/in-range route contract is preserved.
     Calls sharing a plan must be ordered on one stream or externally synchronized.
+    Optional rdma_x3_x4_payload is a borrowed, four-byte-aligned GPU address with
+    at least 5*T bytes on R's device, kept alive by the caller through all launches.
+    With remote_output_node=0 or 1, kernel 4 also writes that node's compact slice
+    there; the canonical outputs and seven-kernel sequence are preserved.
     """
 
-    def __init__(self, r, local_gpu_id=0):
+    def __init__(self, r, local_gpu_id=0, *, rdma_x3_x4_payload=0, remote_output_node=-1):
         import torch
 
         if (not r.is_cuda or r.dtype != torch.int32 or r.ndim != 2
@@ -477,6 +502,10 @@ class MetadataPlan:
             raise ValueError("R must be a contiguous CUDA int32 tensor of shape [T,8]")
         if not 1 <= r.shape[0] <= 10_000_000 or not 0 <= local_gpu_id < 8:
             raise ValueError("require 1 <= T <= 10000000 and 0 <= local_gpu_id < 8")
+        if remote_output_node not in (-1, 0, 1) or bool(rdma_x3_x4_payload) != (remote_output_node >= 0):
+            raise ValueError("direct x3/x4 output requires a payload pointer and destination node 0 or 1")
+        if rdma_x3_x4_payload < 0 or rdma_x3_x4_payload >= 2**64 or rdma_x3_x4_payload % 4:
+            raise ValueError("RDMA payload must be a four-byte-aligned uint64 GPU address")
         routes = r.cpu()
         ordered = routes.sort(dim=1).values
         if (ordered[:, 0] < 0).any() or (ordered[:, -1] >= 128).any():
@@ -504,9 +533,10 @@ class MetadataPlan:
         self.expert_token_indices = self.buffers[12]
         self.input_totals = self.buffers[13]
         with torch.cuda.device(r.device):
-            self.arguments = (from_dlpack(r), tuple(from_dlpack(b) for b in self.buffers))
+            self.arguments = (from_dlpack(r), tuple(from_dlpack(b) for b in self.buffers),
+                              cutlass.Uint64(rdma_x3_x4_payload))
             stream = cuda.CUstream(torch.cuda.current_stream(r.device).cuda_stream)
-            self.compiled = cute.compile(MetadataKernels(tokens, local_gpu_id),
+            self.compiled = cute.compile(MetadataKernels(tokens, local_gpu_id, remote_output_node),
                                          *self.arguments, stream)
 
     def launch(self, stream=None):

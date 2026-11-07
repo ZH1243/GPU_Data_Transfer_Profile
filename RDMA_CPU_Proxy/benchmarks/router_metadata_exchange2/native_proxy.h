@@ -3,7 +3,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI 11; Linux CUDA only. All functions except destroy/error return 0 on success.
+/* ABI 12; Linux CUDA only. All functions except destroy/error return 0 on success.
  * create/connect/submit/wait/view must be called serially by one host thread.
  * submit queues work; the owned native thread handles readback and installation.
  * Pointers returned by view are borrowed until the next submit or destroy.
@@ -50,6 +50,13 @@ int rme2_set_d2h_after_local_staging(Rme2Proxy*, int enabled);
 /* Setup-only: defer gather launch until all local payload D2H completes.
  * Mutually exclusive with d2h_after_local_staging; requires a staging graph. */
 int rme2_set_local_staging_after_d2h(Rme2Proxy*, int enabled);
+/* Two-node setup, after connect and before any capture/submit. Enables skipping
+ * x3/x4 payload packing in exchange and returns a borrowed GPU payload pointer
+ * with capacity 5*T bytes (header excluded), valid until destroy. Caller must
+ * write int32[N] followed by uint8[N] each iteration on the metadata stream,
+ * N = remote node slice length, and system-fence stores before completion.
+ * Never overwrite until all consumers/sends from the prior iteration finish. */
+int rme2_enable_direct_x3_x4(Rme2Proxy*, void** payload, uint64_t* bytes);
 const char* rme2_error(void);
 int rme2_create(int rank, int device, int tokens, const char* shm_name,
                 double timeout_seconds, int validate_indices, int cpu_core,

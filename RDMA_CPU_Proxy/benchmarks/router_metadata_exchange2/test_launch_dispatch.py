@@ -19,6 +19,17 @@ class LaunchDispatchTests(unittest.TestCase):
             self.assertEqual(args.local_staging_after_d2h, after)
             self.assertFalse(args.skip_local_staging)
 
+    def test_direct_output_option(self):
+        for flags, enabled in (([], False), (['--direct-x3-x4-output'], True)):
+            with patch.object(sys, 'argv', ['benchmark.py', *flags]):
+                self.assertEqual(options().direct_x3_x4_output, enabled)
+        program = str(Path(__file__).with_name('benchmark.py'))
+        env = dict(os.environ, WORLD_SIZE='8', RANK='0', LOCAL_RANK='0', LOCAL_WORLD_SIZE='8')
+        result = subprocess.run([sys.executable, program, '--direct-x3-x4-output'],
+                                env=env, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('requires two-node mode', result.stderr)
+
     def test_native_never_launches_python_kernels_or_events(self):
         for native, graph_mode, expected in (
             (True, True, ['submit']),
