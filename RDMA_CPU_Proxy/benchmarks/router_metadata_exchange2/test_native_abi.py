@@ -3,11 +3,37 @@ import os
 import subprocess
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from native import Proxy, Stats
 
 
 class NativeAbiTests(unittest.TestCase):
+    def test_receiver_overlap_is_configured_after_receiver_before_connect(self):
+        for overlap in (False, True):
+            lib = MagicMock()
+            lib.rme2_abi_version.return_value = 14
+            def create(*args):
+                ctypes.cast(args[-1], ctypes.POINTER(ctypes.c_void_p))[0] = 123
+                return 0
+            lib.rme2_create.side_effect = create
+            for name in ('batch_payload_copy', 'd2h_after_local_staging', 'local_staging_after_d2h',
+                         'receiver_kernel', 'receiver_overlap_exchange'):
+                getattr(lib, 'rme2_set_' + name).return_value = 0
+            with patch('native.C.CDLL', return_value=lib):
+                proxy = Proxy('unused.so', 0, 0, 33, '/test', 120, True, -1,
+                              nodes=2, receiver_kernel=True, receiver_overlap_exchange=overlap)
+            try:
+                calls = [call[0] for call in lib.method_calls]
+                self.assertLess(calls.index('rme2_set_receiver_kernel'),
+                                calls.index('rme2_set_receiver_overlap_exchange'))
+                lib.rme2_set_receiver_overlap_exchange.assert_called_once_with(proxy.handle, int(overlap))
+                lib.rme2_connect.assert_not_called()
+                self.assertEqual(lib.rme2_set_receiver_overlap_exchange.argtypes,
+                                 [ctypes.c_void_p, ctypes.c_int])
+            finally:
+                proxy.close()
+
     def test_stats_c_layout_matches_ctypes(self):
         result = subprocess.run([os.environ['RME2_ABI_BIN']], check=True, text=True, capture_output=True)
         layout = dict(line.split() for line in result.stdout.splitlines())

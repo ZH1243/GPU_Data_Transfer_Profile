@@ -8,12 +8,14 @@ serialized=false
 skip_staging=false
 direct_output=false
 receiver=false
+receiver_overlap=false
 for arg in "$@"; do
   if [[ "${arg}" == "--d2h-after-local-staging" || "${arg}" == "--local-staging-after-d2h" ]]; then serialized=true; fi
   if [[ "${arg}" == "--skip-local-staging" ]]; then skip_staging=true; fi
   if [[ "${arg}" == "--native-metadata-launch" ]]; then modes=(graph); fi
   if [[ "${arg}" == "--direct-x3-x4-output" ]]; then direct_output=true; fi
   if [[ "${arg}" == "--receiver-kernel" ]]; then receiver=true; fi
+  if [[ "${arg}" == "--receiver-overlap-exchange" ]]; then receiver_overlap=true; fi
 done
 for mode in "${modes[@]}"; do
   for tokens in 1 33 257 8193 16385; do
@@ -53,5 +55,11 @@ for mode in "${modes[@]}"; do
     bash "${script_dir}/run_two_node_torchrun.sh" "${node_rank}" --mode "${mode}" --tokens 257 \
       --direct-x3-x4-output --warmup 1 --iterations 6 --route-pattern cycle --verify all \
       --output "${script_dir}/results/check_two_${mode}_direct_output.json" "$@"
+  fi
+  if "${receiver}" && ! "${receiver_overlap}"; then
+    # Receiver baseline runs also exercise the alternate GPU event dependency.
+    bash "${script_dir}/run_two_node_torchrun.sh" "${node_rank}" --mode "${mode}" --tokens 257 \
+      --receiver-overlap-exchange --warmup 1 --iterations 6 --route-pattern cycle --verify all \
+      --output "${script_dir}/results/check_two_${mode}_receiver_overlap.json" "$@"
   fi
 done

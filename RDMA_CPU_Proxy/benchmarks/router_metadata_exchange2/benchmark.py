@@ -24,7 +24,7 @@ def summary(values):
 
 
 def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False, batch_payload_copy=False,
-                    direct_x3_x4_output=False, receiver_kernel=False):
+                    direct_x3_x4_output=False, receiver_kernel=False, receiver_overlap_exchange=False):
     labels = (
         ("end_to_end_ms", "End to end (wall)"),
         ("metadata_launch_barrier_ms", "Native metadata launch barrier wait"),
@@ -81,8 +81,13 @@ def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False, 
               f"{values['mean'] * 1000:10.3f} {values['p95'] * 1000:10.3f}")
     print("GPU and CPU intervals overlap: do not sum these rows.")
     if receiver_kernel:
-        print("Receiver starts after this GPU's outbound exchange; it can overlap other GPUs' exchanges,")
-        print("local staging, directory/self D2H and RDMA. Its GPU span includes waiting for peer records.")
+        if receiver_overlap_exchange:
+            print("Receiver is eligible at this GPU's exchange start; same-GPU overlap is permitted, not guaranteed.")
+            print("Its event interval can overlap the local exchange: do not add exchange and receiver times.")
+        else:
+            print("Receiver starts after this GPU's outbound exchange; it can overlap other GPUs' exchanges.")
+        print("Receiver can also overlap local staging, directory/self D2H and RDMA.")
+        print("Its GPU event span includes scheduling and waiting for peer records, not just host stores.")
     print("Local staging runs after GPU exchange; --d2h-after-local-staging gates readback on it.")
     print("--local-staging-after-d2h launches gather after local D2H; remaining RDMA may overlap.")
     print("By default staging may overlap D2H/RDMA. Its residual wait")
@@ -140,6 +145,8 @@ def options():
                         help="omit timed expert-index and x3/x4 scans; structural header checks always remain")
     parser.add_argument("--receiver-kernel", action="store_true",
                         help="two-node only: copy peer records to mapped host memory as GPU readiness flags arrive")
+    parser.add_argument("--receiver-overlap-exchange", action="store_true",
+                        help="requires --receiver-kernel: permit receiver and local exchange to run concurrently")
     parser.add_argument("--direct-x3-x4-output", action="store_true",
                         help="two-node only: metadata kernel 4 also writes remote x3/x4 directly into the RDMA buffer")
     parser.add_argument("--native-metadata-launch", action="store_true",
@@ -157,6 +164,8 @@ def options():
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--output", type=Path, default=Path("results/metadata_exchange2.json"))
     args = parser.parse_args()
+    if args.receiver_overlap_exchange and not args.receiver_kernel:
+        parser.error("--receiver-overlap-exchange requires --receiver-kernel")
     if args.receiver_kernel and args.d2h_after_local_staging:
         parser.error("--receiver-kernel requires --d2h-after-local-staging to be disabled")
     if args.local_staging_after_d2h and args.d2h_after_local_staging:
@@ -307,7 +316,8 @@ def main():
                          args.per_source_readback, args.metadata_barrier, args.batch_payload_copy, nodes, node,
                          d2h_after_local_staging=args.d2h_after_local_staging,
                          local_staging_after_d2h=args.local_staging_after_d2h,
-                         receiver_kernel=args.receiver_kernel)
+                         receiver_kernel=args.receiver_kernel,
+                         receiver_overlap_exchange=args.receiver_overlap_exchange)
         if local == 0:
             proxy = create_proxy()
         dist.barrier()  # creator finished initializing shared control
@@ -387,6 +397,7 @@ def main():
                 print("x3/x4 exchange enabled: same-index remote slice; nine RDMA records per proxy/iteration; "
                       f"direct_x3_x4_output={args.direct_x3_x4_output}", flush=True)
                 print(f"receiver_kernel={args.receiver_kernel}; "
+                      f"receiver_overlap_exchange={args.receiver_overlap_exchange}; "
                       "directory D2H retained; peer payload D2H uses SM stores when enabled", flush=True)
             print(f"local_staging={staging is not None}; d2h_after_local_staging={args.d2h_after_local_staging}; "
                   f"local_staging_after_d2h={args.local_staging_after_d2h}; token_dimension={args.token_dimension}; "
@@ -426,14 +437,17 @@ def main():
             metrics = {key: summary([r[key] for report in reports for r in report["records"]])
                        for key in records[0] if key.endswith("_ms")}
             critical_metrics = {key: summary([r[key] for r in critical_records]) for key in metrics}
-            report = dict(schema_version=14, backend=("cpp-thread-cuda-ipc-gpudirect-rdma" if nodes == 2 else "cpp-thread-cuda-ipc"), topology=dict(
+            report = dict(schema_version=15, backend=("cpp-thread-cuda-ipc-gpudirect-rdma" if nodes == 2 else "cpp-thread-cuda-ipc"), topology=dict(
                 nodes=nodes, gpus=world, gpus_per_node=8, experts=128, experts_per_gpu=128 // world, top_k=8),
                 completion_endpoint=("16 source expert tables and remote same-index x3/x4 installed; nine outgoing RDMA sends drained"
                                      if nodes == 2 else "8 source expert tables installed")
                                     + ("; local token staging complete" if staging is not None else ""),
                 x3_x4_exchange=nodes == 2,
                 receiver_kernel=args.receiver_kernel,
-                receiver_timing_note="Receiver GPU span includes peer readiness polling and mapped-host stores; it starts after local outbound exchange and overlaps late peer exchange/staging/readback/RDMA. Local payload completion waits for both self DMA and receiver. receiver_copy_bytes includes peer headers; payload_copy_bytes counts API-submitted two-node index bytes. Directory D2H is unchanged.",
+                receiver_overlap_exchange=args.receiver_overlap_exchange,
+                receiver_start_gate=("exchange_start" if args.receiver_overlap_exchange else "exchange_end")
+                                    if args.receiver_kernel else None,
+                receiver_timing_note="Receiver event span starts after receiver_start_gate, includes scheduling, peer readiness polling and mapped-host stores, and can overlap exchange/staging/readback/RDMA. Same-GPU exchange overlap is permitted only with receiver_overlap_exchange; actual concurrency is not guaranteed. Exchange and receiver durations are not additive. Local payload completion waits for both self DMA and receiver. receiver_copy_bytes includes peer headers; payload_copy_bytes counts API-submitted two-node index bytes. Directory D2H is unchanged.",
                 x3_x4_payload_producer=("metadata kernel 4 (direct output)" if args.direct_x3_x4_output
                                        else "GPU exchange packing" if nodes == 2 else None),
                 local_staging=dict(enabled=staging is not None, dtype="bfloat16", token_dimension=args.token_dimension,
@@ -456,7 +470,7 @@ def main():
             print(json.dumps(dict(critical_rank_end_to_end_ms=summary(critical),
                                   output=str(args.output), verification=args.verify), indent=2), flush=True)
             print_breakdown(critical_metrics, args.per_source_readback, args.metadata_barrier, args.batch_payload_copy,
-                            args.direct_x3_x4_output, args.receiver_kernel)
+                            args.direct_x3_x4_output, args.receiver_kernel, args.receiver_overlap_exchange)
         dist.barrier()
         proxy.disconnect()
         dist.barrier()  # close every IPC import before any owning GPU allocation is freed

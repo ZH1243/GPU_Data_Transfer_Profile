@@ -23,14 +23,14 @@ class Proxy:
     def __init__(self, library, rank, device, tokens, shm_name, timeout, validate, core,
                  per_source_readback=False, metadata_barrier=False, batch_payload_copy=False,
                  nodes=1, node=0, d2h_after_local_staging=False, local_staging_after_d2h=False,
-                 receiver_kernel=False):
+                 receiver_kernel=False, receiver_overlap_exchange=False):
         self.experts_per_gpu = 128 // (nodes * 8)
         self.nodes = nodes
         self.tokens = tokens
         self.lib = C.CDLL(str(library))  # CDLL releases the GIL in native calls.
         self.handle = C.c_void_p()
         self.lib.rme2_abi_version.restype = C.c_int
-        if self.lib.rme2_abi_version() != 13:
+        if self.lib.rme2_abi_version() != 14:
             raise RuntimeError("native ABI mismatch; rebuild the library")
         signatures = {
             "rme2_abi_version": ([], C.c_int),
@@ -41,6 +41,7 @@ class Proxy:
             "rme2_rdma_connect": ([C.c_void_p, C.c_char_p], C.c_int),
             "rme2_set_batch_payload_copy": ([C.c_void_p, C.c_int], C.c_int),
             "rme2_set_receiver_kernel": ([C.c_void_p, C.c_int], C.c_int),
+            "rme2_set_receiver_overlap_exchange": ([C.c_void_p, C.c_int], C.c_int),
             "rme2_set_d2h_after_local_staging": ([C.c_void_p, C.c_int], C.c_int),
             "rme2_set_local_staging_after_d2h": ([C.c_void_p, C.c_int], C.c_int),
             "rme2_enable_direct_x3_x4": ([C.c_void_p, C.POINTER(C.c_void_p), C.POINTER(C.c_uint64)], C.c_int),
@@ -63,7 +64,7 @@ class Proxy:
         for name, (args, result) in signatures.items():
             fn = getattr(self.lib, name)
             fn.argtypes, fn.restype = args, result
-        if self.lib.rme2_abi_version() != 13:
+        if self.lib.rme2_abi_version() != 14:
             raise RuntimeError("native ABI mismatch; rebuild the library")
         self.check(self.lib.rme2_create(rank, device, tokens, shm_name.encode(), timeout,
                                        int(validate), core, int(per_source_readback), int(metadata_barrier),
@@ -73,6 +74,7 @@ class Proxy:
             self.check(self.lib.rme2_set_d2h_after_local_staging(self.handle, int(d2h_after_local_staging)))
             self.check(self.lib.rme2_set_local_staging_after_d2h(self.handle, int(local_staging_after_d2h)))
             self.check(self.lib.rme2_set_receiver_kernel(self.handle, int(receiver_kernel)))
+            self.check(self.lib.rme2_set_receiver_overlap_exchange(self.handle, int(receiver_overlap_exchange)))
         except Exception:
             self.close()
             raise

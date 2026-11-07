@@ -21,13 +21,13 @@ struct Device {
     int32_t *arena{}, *host{}, *mapped{}, *offsets{}, *values{}, *nodes{};
     rme2::receiver::Result *results{}, *mapped_results{};
     cudaStream_t send{}, receive{};
-    cudaEvent_t sent{}, received{};
+    cudaEvent_t exchange_start{}, sent{}, received{};
     uint64_t cycles_per_ms{};
     std::vector<int32_t> offsets_cpu, values_cpu;
 };
 constexpr int sentinel = -777777;
 
-void run(int tokens) {
+void run(int tokens, bool overlap_exchange) {
     using namespace rme2;
     const int capacity = tokens * 8;
     const size_t words = two::words(capacity);
@@ -52,6 +52,7 @@ void run(int tokens) {
         check(cudaMemset(d.nodes, 0, 3 * 4)); // x3/x4 slices empty in this transport test
         check(cudaStreamCreateWithFlags(&d.send, cudaStreamNonBlocking));
         check(cudaStreamCreateWithFlags(&d.receive, cudaStreamNonBlocking));
+        check(cudaEventCreateWithFlags(&d.exchange_start, cudaEventDisableTiming));
         check(cudaEventCreateWithFlags(&d.sent, cudaEventDisableTiming));
         check(cudaEventCreateWithFlags(&d.received, cudaEventDisableTiming));
         check(cudaDeviceSynchronize());
@@ -86,12 +87,16 @@ void run(int tokens) {
             for (int source = 0; source < 8; ++source) {
                 check(cudaSetDevice(source));
                 auto& d = gpu[source];
+                // In overlap mode, GPU 7's receiver may proceed while its own
+                // outbound work is delayed; all incoming records still need
+                // this iteration's peer publications. No global start barrier.
+                check(cudaEventRecord(d.exchange_start, d.send));
                 if (source == 7) delay<<<1, 1, 0, d.send>>>(d.cycles_per_ms * 5);
                 launch_exchange_two(peers, source, node, capacity, epoch, d.offsets, d.values,
                                     d.nodes, nullptr, nullptr, false, true, d.send);
                 check(cudaGetLastError());
                 check(cudaEventRecord(d.sent, d.send));
-                check(cudaStreamWaitEvent(d.receive, d.sent, 0));
+                check(cudaStreamWaitEvent(d.receive, overlap_exchange ? d.exchange_start : d.sent, 0));
                 launch_receiver(d.arena, d.mapped, source, node, capacity, epoch,
                                 d.cycles_per_ms * 10000, d.mapped_results, d.receive);
                 check(cudaGetLastError());
@@ -101,6 +106,9 @@ void run(int tokens) {
                 check(cudaSetDevice(dest));
                 auto& d = gpu[dest];
                 check(cudaEventSynchronize(d.received));
+                // A receiver can now finish before its local exchange. Both
+                // streams must drain before inputs/arenas are reused or freed.
+                check(cudaEventSynchronize(d.sent));
                 std::vector<int32_t> expected(words, sentinel);
                 for (int source = 0; source < 8; ++source) if (source != dest) {
                     require(d.results[source].epoch == epoch && !d.results[source].error,
@@ -148,6 +156,7 @@ void run(int tokens) {
         auto& item = gpu[g];
         check(cudaStreamDestroy(item.send)); check(cudaStreamDestroy(item.receive));
         check(cudaEventDestroy(item.sent)); check(cudaEventDestroy(item.received));
+        check(cudaEventDestroy(item.exchange_start));
         check(cudaFree(item.arena)); check(cudaFree(item.offsets));
         check(cudaFree(item.values)); check(cudaFree(item.nodes));
         check(cudaFreeHost(item.host)); check(cudaFreeHost(item.results));
@@ -162,7 +171,7 @@ int main() {
             check(cudaSetDevice(source));
             cudaDeviceProp prop{};
             check(cudaGetDeviceProperties(&prop, source));
-            if (prop.major < 9 || !prop.canMapHostMemory) return 77;
+            if (prop.major < 9 || !prop.canMapHostMemory || !prop.concurrentKernels) return 77;
             for (int dest = 0; dest < 8; ++dest) if (source != dest) {
                 int supported = 0;
                 check(cudaDeviceGetP2PAttribute(&supported, cudaDevP2PAttrNativeAtomicSupported, source, dest));
@@ -172,8 +181,11 @@ int main() {
                 else check(status);
             }
         }
-        for (int tokens : {1, 33, 257, 20480}) run(tokens);
-        std::cout << "receiver CUDA: peer publication, epochs, guards, empty/full records and timeout passed\n";
+        for (bool overlap : {false, true}) {
+            for (int tokens : {1, 33, 257, 20480}) run(tokens, overlap);
+            std::cout << "receiver CUDA: overlap_exchange=" << overlap
+                      << "; peer publication, epochs, guards, empty/full records and timeout passed\n";
+        }
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
         return 1;

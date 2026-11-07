@@ -3,7 +3,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI 13; Linux CUDA only. All functions except destroy/error return 0 on success.
+/* ABI 14; Linux CUDA only. All functions except destroy/error return 0 on success.
  * create/connect/submit/wait/view must be called serially by one host thread.
  * submit queues work; the owned native thread handles readback and installation.
  * Pointers returned by view are borrowed until the next submit or destroy.
@@ -53,6 +53,11 @@ int rme2_set_batch_payload_copy(Rme2Proxy*, int enabled);
 /* Two-node only; configure before IPC connect/capture. Peer records go to mapped
  * pinned memory through a receiver kernel. Rejects staging-before-D2H ordering. */
 int rme2_set_receiver_kernel(Rme2Proxy*, int enabled);
+/* Setup-only, after enabling receiver and before connect/capture. Wait on the
+ * exchange START event instead of its END event, permitting same-GPU overlap.
+ * Concurrent execution is opportunistic; per-record readiness and bounded
+ * polling remain required. Default is disabled. */
+int rme2_set_receiver_overlap_exchange(Rme2Proxy*, int enabled);
 /* Setup-only: gate all local header/payload D2H on local staging completion.
  * Requires a staging graph before submit; exchange publication is unchanged. */
 int rme2_set_d2h_after_local_staging(Rme2Proxy*, int enabled);

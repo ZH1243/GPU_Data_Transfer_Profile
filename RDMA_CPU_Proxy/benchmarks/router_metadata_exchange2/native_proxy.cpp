@@ -90,6 +90,7 @@ struct Rme2Proxy {
     bool local_staging_after_d2h = false;
     bool direct_x3_x4_output = false;
     bool receiver_kernel = false;
+    bool receiver_overlap_exchange = false;
     int32_t* mapped_pinned = nullptr;
     rme2::receiver::Result* receiver_results = nullptr;
     rme2::receiver::Result* mapped_receiver_results = nullptr;
@@ -552,10 +553,14 @@ struct Rme2Proxy {
         // receiver can read metadata while this stream gathers activation rows.
         check(cudaEventRecord(end, s), "record exchange end");
         if (receiver_kernel) {
-            // Do not wait for all producers or for staging. Waiting for OUR
-            // outbound exchange prevents polling CTAs from blocking that work,
-            // even if this GPU serializes kernels. Other GPUs can still send.
-            check(cudaStreamWaitEvent(receiver_stream, end, 0), "order receiver after local outbound exchange");
+            // Both gates follow metadata on the work stream (and any optional
+            // metadata barrier). Submit outbound work first, then optionally
+            // fork the receiver at begin so it can overlap that same exchange.
+            // This permits concurrency, not guaranteed scheduling/progress;
+            // seven polling CTAs retain their per-record epochs and timeout.
+            // Default end-gating also works when CUDA serializes kernels.
+            check(cudaStreamWaitEvent(receiver_stream, receiver_overlap_exchange ? begin : end, 0),
+                  "order receiver at selected exchange boundary");
             check(cudaEventRecord(receiver_begin, receiver_stream), "record receiver start");
             launch_receiver(inbox, mapped_pinned, rank, node, capacity, sequence,
                             receiver_timeout_cycles, mapped_receiver_results, receiver_stream);
@@ -676,7 +681,23 @@ struct Rme2Proxy {
     }
 };
 
-extern "C" int rme2_abi_version() { return 13; }
+extern "C" int rme2_abi_version() { return 14; }
+extern "C" int rme2_set_receiver_overlap_exchange(Rme2Proxy* p, int enabled) {
+    return api([&] {
+        require(p && (enabled == 0 || enabled == 1), "invalid receiver overlap option");
+        std::lock_guard<std::mutex> lock(p->mutex);
+        require(!p->connected && p->sequence == 0 && !p->capturing &&
+                !p->metadata_graph && !p->staging_graph, "configure receiver overlap before connect/capture");
+        require(!enabled || p->receiver_kernel, "receiver overlap requires receiver kernel enabled first");
+        if (enabled) {
+            check(cudaSetDevice(p->device), "select receiver overlap GPU");
+            cudaDeviceProp prop{};
+            check(cudaGetDeviceProperties(&prop, p->device), "query receiver concurrency");
+            require(prop.concurrentKernels != 0, "receiver overlap requires concurrent kernel support");
+        }
+        p->receiver_overlap_exchange = enabled != 0;
+    });
+}
 extern "C" int rme2_set_receiver_kernel(Rme2Proxy* p, int enabled) {
     return api([&] {
         require(p && (enabled == 0 || enabled == 1), "invalid receiver kernel option");

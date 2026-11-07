@@ -9,6 +9,18 @@ from unittest.mock import patch
 
 
 class LaunchDispatchTests(unittest.TestCase):
+    def test_receiver_overlap_requires_receiver_and_keeps_staging_choice(self):
+        with patch.object(sys, 'argv', ['benchmark.py', '--receiver-kernel']):
+            self.assertFalse(options().receiver_overlap_exchange)
+        for extra in ([], ['--skip-local-staging'], ['--local-staging-after-d2h'],
+                      ['--native-metadata-launch', '--metadata-launch-barrier'], ['--mode', 'eager']):
+            with patch.object(sys, 'argv', ['benchmark.py', '--receiver-kernel',
+                                           '--receiver-overlap-exchange', *extra]):
+                args = options()
+            self.assertTrue(args.receiver_overlap_exchange)
+            self.assertEqual(args.local_staging_after_d2h, '--local-staging-after-d2h' in extra)
+            self.assertEqual(args.skip_local_staging, '--skip-local-staging' in extra)
+
     def test_receiver_kernel_option_and_topology(self):
         for flags, enabled in (([], False), (['--receiver-kernel'], True),
                                (['--receiver-kernel', '--skip-local-staging'], True),
@@ -65,6 +77,8 @@ class LaunchDispatchTests(unittest.TestCase):
                       ['--d2h-after-local-staging', '--skip-local-staging'],
                       ['--local-staging-after-d2h', '--skip-local-staging'],
                       ['--receiver-kernel', '--d2h-after-local-staging'],
+                      ['--receiver-overlap-exchange'],
+                      ['--receiver-kernel', '--receiver-overlap-exchange', '--d2h-after-local-staging'],
                       ['--local-staging-after-d2h', '--d2h-after-local-staging']):
             result = subprocess.run([sys.executable, program, *flags], text=True, capture_output=True)
             self.assertEqual(result.returncode, 2)
