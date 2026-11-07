@@ -10,10 +10,13 @@ from unittest.mock import patch
 
 class LaunchDispatchTests(unittest.TestCase):
     def test_staging_readback_is_opt_in(self):
-        for flags, enabled in (([], False), (['--d2h-after-local-staging'], True)):
+        for flags, before, after in (([], False, False),
+                                     (['--d2h-after-local-staging'], True, False),
+                                     (['--local-staging-after-d2h'], False, True)):
             with patch.object(sys, 'argv', ['benchmark.py', *flags]):
                 args = options()
-            self.assertEqual(args.d2h_after_local_staging, enabled)
+            self.assertEqual(args.d2h_after_local_staging, before)
+            self.assertEqual(args.local_staging_after_d2h, after)
             self.assertFalse(args.skip_local_staging)
 
     def test_native_never_launches_python_kernels_or_events(self):
@@ -35,7 +38,9 @@ class LaunchDispatchTests(unittest.TestCase):
         program = str(Path(__file__).with_name('benchmark.py'))
         for flags in (['--metadata-launch-barrier'], ['--native-metadata-launch', '--mode', 'eager'],
                       ['--batch-payload-copy', '--per-source-readback'], ['--token-dimension', '0'],
-                      ['--d2h-after-local-staging', '--skip-local-staging']):
+                      ['--d2h-after-local-staging', '--skip-local-staging'],
+                      ['--local-staging-after-d2h', '--skip-local-staging'],
+                      ['--local-staging-after-d2h', '--d2h-after-local-staging']):
             result = subprocess.run([sys.executable, program, *flags], text=True, capture_output=True)
             self.assertEqual(result.returncode, 2)
             self.assertIn('requires', result.stderr)

@@ -7,7 +7,7 @@ modes=(eager graph)
 serialized=false
 skip_staging=false
 for arg in "$@"; do
-  if [[ "${arg}" == "--d2h-after-local-staging" ]]; then serialized=true; fi
+  if [[ "${arg}" == "--d2h-after-local-staging" || "${arg}" == "--local-staging-after-d2h" ]]; then serialized=true; fi
   if [[ "${arg}" == "--skip-local-staging" ]]; then skip_staging=true; fi
   if [[ "${arg}" == "--native-metadata-launch" ]]; then modes=(graph); fi
 done
@@ -33,6 +33,9 @@ for mode in "${modes[@]}"; do
     bash "${script_dir}/run_single_node_torchrun.sh" --mode "${mode}" --tokens 33 \
       --d2h-after-local-staging --warmup 1 --iterations 6 --route-pattern cycle --verify all \
       --output "${script_dir}/results/check_${mode}_serialized_staging.json" "$@"
+    bash "${script_dir}/run_single_node_torchrun.sh" --mode "${mode}" --tokens 33 \
+      --local-staging-after-d2h --warmup 1 --iterations 6 --route-pattern cycle --verify all \
+      --output "${script_dir}/results/check_${mode}_staging_after_d2h.json" "$@"
   fi
 
 done

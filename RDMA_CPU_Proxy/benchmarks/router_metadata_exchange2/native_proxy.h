@@ -3,7 +3,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI 10; Linux CUDA only. All functions except destroy/error return 0 on success.
+/* ABI 11; Linux CUDA only. All functions except destroy/error return 0 on success.
  * create/connect/submit/wait/view must be called serially by one host thread.
  * submit queues work; the owned native thread handles readback and installation.
  * Pointers returned by view are borrowed until the next submit or destroy.
@@ -47,6 +47,9 @@ int rme2_set_batch_payload_copy(Rme2Proxy*, int enabled);
 /* Setup-only: gate all local header/payload D2H on local staging completion.
  * Requires a staging graph before submit; exchange publication is unchanged. */
 int rme2_set_d2h_after_local_staging(Rme2Proxy*, int enabled);
+/* Setup-only: defer gather launch until all local payload D2H completes.
+ * Mutually exclusive with d2h_after_local_staging; requires a staging graph. */
+int rme2_set_local_staging_after_d2h(Rme2Proxy*, int enabled);
 const char* rme2_error(void);
 int rme2_create(int rank, int device, int tokens, const char* shm_name,
                 double timeout_seconds, int validate_indices, int cpu_core,
@@ -72,9 +75,11 @@ int rme2_capture_begin(Rme2Proxy*, void* cuda_stream);
 int rme2_capture_end(Rme2Proxy*, int launch_barrier);
 /* Optional setup-only capture of the local token-row gather, separate from
  * metadata capture. Works with Python eager/graph and native metadata launch.
- * submit enqueues this graph AFTER the exchange completion event on the same
+ * By default submit enqueues this graph AFTER the exchange completion event on the same
  * stream. By default CPU readback/RDMA waits only for exchange; the optional
- * d2h_after_local_staging mode gates readback on staging too. wait drains staging.
+ * d2h_after_local_staging mode gates readback on staging too. Conversely,
+ * local_staging_after_d2h defers graph launch until all local D2H completes.
+ * wait drains staging in every mode.
  * Caller keeps captured tensors alive through disconnect/destroy. */
 int rme2_staging_capture_begin(Rme2Proxy*, void* cuda_stream);
 int rme2_staging_capture_end(Rme2Proxy*);

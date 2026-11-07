@@ -72,7 +72,8 @@ def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False, 
               f"{values['mean'] * 1000:10.3f} {values['p95'] * 1000:10.3f}")
     print("GPU and CPU intervals overlap: do not sum these rows.")
     print("Local staging runs after GPU exchange; --d2h-after-local-staging gates readback on it.")
-    print("Otherwise staging may overlap D2H/RDMA. Its residual wait")
+    print("--local-staging-after-d2h launches gather after local D2H; remaining RDMA may overlap.")
+    print("By default staging may overlap D2H/RDMA. Its residual wait")
     print("is measured after metadata installation/send completion, not added GPU execution time.")
     print("Payload subrows partition the payload total per sample (means add; medians/p95 need not).")
     print("Completion wait is residual CPU-observed latency, not pure DMA time; transfers can")
@@ -113,6 +114,8 @@ def options():
                         help="metadata-only baseline; omit activation buffers and local gather")
     parser.add_argument("--d2h-after-local-staging", action="store_true",
                         help="wait for this GPU's gather before header/payload D2H; also delays outgoing RDMA")
+    parser.add_argument("--local-staging-after-d2h", action="store_true",
+                        help="launch local gather after all local payload D2H completes; may overlap remaining RDMA")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--seed", type=int, default=1234)
@@ -138,6 +141,10 @@ def options():
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--output", type=Path, default=Path("results/metadata_exchange2.json"))
     args = parser.parse_args()
+    if args.local_staging_after_d2h and args.d2h_after_local_staging:
+        parser.error("--local-staging-after-d2h requires --d2h-after-local-staging to be disabled")
+    if args.local_staging_after_d2h and args.skip_local_staging:
+        parser.error("--local-staging-after-d2h requires local staging; omit --skip-local-staging")
     if args.d2h_after_local_staging and args.skip_local_staging:
         parser.error("--d2h-after-local-staging requires local staging; omit --skip-local-staging")
     if not 1 <= args.rdma_port <= 255 or not -1 <= args.rdma_gid_index <= 255:
@@ -270,7 +277,8 @@ def main():
             return Proxy(args.library.resolve(), local, local, args.tokens, shm_name,
                          args.timeout, not args.skip_index_validation, args.cores[local],
                          args.per_source_readback, args.metadata_barrier, args.batch_payload_copy, nodes, node,
-                         d2h_after_local_staging=args.d2h_after_local_staging)
+                         d2h_after_local_staging=args.d2h_after_local_staging,
+                         local_staging_after_d2h=args.local_staging_after_d2h)
         if local == 0:
             proxy = create_proxy()
         dist.barrier()  # creator finished initializing shared control
@@ -342,7 +350,7 @@ def main():
             if nodes == 2:
                 print("x3/x4 exchange enabled: same-index remote slice; nine RDMA records per proxy/iteration", flush=True)
             print(f"local_staging={staging is not None}; d2h_after_local_staging={args.d2h_after_local_staging}; "
-                  f"token_dimension={args.token_dimension}; "
+                  f"local_staging_after_d2h={args.local_staging_after_d2h}; token_dimension={args.token_dimension}; "
                   f"dtype=BF16; gather={staging.plan.implementation if staging else 'disabled'}", flush=True)
         records = []
         total = args.warmup + args.iterations
@@ -379,7 +387,7 @@ def main():
             metrics = {key: summary([r[key] for report in reports for r in report["records"]])
                        for key in records[0] if key.endswith("_ms")}
             critical_metrics = {key: summary([r[key] for r in critical_records]) for key in metrics}
-            report = dict(schema_version=11, backend=("cpp-thread-cuda-ipc-gpudirect-rdma" if nodes == 2 else "cpp-thread-cuda-ipc"), topology=dict(
+            report = dict(schema_version=12, backend=("cpp-thread-cuda-ipc-gpudirect-rdma" if nodes == 2 else "cpp-thread-cuda-ipc"), topology=dict(
                 nodes=nodes, gpus=world, gpus_per_node=8, experts=128, experts_per_gpu=128 // world, top_k=8),
                 completion_endpoint=("16 source expert tables and remote same-index x3/x4 installed; nine outgoing RDMA sends drained"
                                      if nodes == 2 else "8 source expert tables installed")
@@ -387,8 +395,10 @@ def main():
                 x3_x4_exchange=nodes == 2,
                 local_staging=dict(enabled=staging is not None, dtype="bfloat16", token_dimension=args.token_dimension,
                                    d2h_after_local_staging=args.d2h_after_local_staging,
+                                   local_staging_after_d2h=args.local_staging_after_d2h,
                                    implementation=staging.plan.implementation if staging else None,
-                                   launch="separate native CUDA graph after exchange" if staging else None),
+                                   launch=("separate native CUDA graph after local D2H" if args.local_staging_after_d2h
+                                           else "separate native CUDA graph after exchange") if staging else None),
                 configuration=config, versions=dict(torch=torch.__version__, cuda=torch.version.cuda),
                 critical_rank_end_to_end_ms=summary(critical), all_rank_metrics=metrics,
                 critical_rank_metrics=critical_metrics,
@@ -396,7 +406,7 @@ def main():
                 readback_timing_semantics=("per-source D2H latency sums; readiness observation spans overlap readback"
                                           if args.per_source_readback else ("local D2H overlaps RDMA; payload completion includes CPU progress delays"
                                           if nodes == 2 else "batched D2H wall stages after all-source wait")),
-                timing_note="Overlapping GPU/CPU spans are not additive. Local staging may overlap metadata readback/RDMA unless d2h_after_local_staging is enabled, and is included in native/end-to-end completion. The pre-D2H staging wait is separate from D2H timers. Route/activation generation, setup, outer Gloo barriers and exact verification excluded; enabled native barriers included.",
+                timing_note="Overlapping GPU/CPU spans are not additive. Local staging is included in native/end-to-end completion. By default it may overlap D2H/RDMA; d2h_after_local_staging runs gather first; local_staging_after_d2h runs gather after local D2H and may overlap remaining RDMA. The pre-D2H staging wait is separate from D2H timers. Route/activation generation, setup, outer Gloo barriers and exact verification excluded; enabled native barriers included.",
                 ranks=reports)
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(report, indent=2) + "\n")

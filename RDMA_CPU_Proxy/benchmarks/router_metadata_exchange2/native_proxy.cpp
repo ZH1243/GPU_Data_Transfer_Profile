@@ -87,6 +87,7 @@ struct Rme2Proxy {
     Rme2Stats stats{};
     bool batch_payload_copy = false;
     bool d2h_after_local_staging = false;
+    bool local_staging_after_d2h = false;
     bool staging_readback_started = false, staging_readback_ready = false;
     Clock::time_point staging_readback_start;
     rme2::PayloadBatch payload_batch;
@@ -253,6 +254,8 @@ struct Rme2Proxy {
                 });
             if (!changed) std::this_thread::yield();
         }
+        // Every source's payload completion was observed; all D2H is drained.
+        if (local_staging_after_d2h) launch_staging(work_stream);
         float elapsed = 0;
         check(cudaEventElapsedTime(&elapsed, begin, end), "exchange event timing");
         stats.exchange_gpu_ms = elapsed;
@@ -341,6 +344,9 @@ struct Rme2Proxy {
                 stats.payload_completion_ms = ms(payload_wait_start);
                 stats.payload_d2h_ms = ms(payload_start);
                 finish_payload_breakdown();
+                // Start gathering immediately after local D2H, without waiting
+                // for remote metadata or outgoing RDMA completion.
+                if (local_staging_after_d2h) launch_staging(work_stream);
                 const auto before = Clock::now();
                 for (int s = 0; s < 8; ++s) {
                     const int slot = node * 8 + s;
@@ -468,6 +474,7 @@ struct Rme2Proxy {
         stats.payload_completion_ms = ms(part_start);
         stats.payload_d2h_ms = ms(start);
         finish_payload_breakdown();
+        if (local_staging_after_d2h) launch_staging(work_stream);
         start = Clock::now();
         for (int source = 0; source < rme2::gpus; ++source)
             rme2::install(installed[source], pinned + source * rme2::header_words,
@@ -508,6 +515,9 @@ struct Rme2Proxy {
         // Publish readiness at the exchange boundary, BEFORE the gather. The
         // receiver can read metadata while this stream gathers activation rows.
         check(cudaEventRecord(end, s), "record exchange end");
+        if (!local_staging_after_d2h) launch_staging(s);
+    }
+    void launch_staging(cudaStream_t s) {
         if (staging_graph) {
             check(cudaEventRecord(staging_begin, s), "record local staging start");
             check(cudaGraphLaunch(staging_graph, s), "launch local staging graph");
@@ -614,12 +624,22 @@ struct Rme2Proxy {
     }
 };
 
-extern "C" int rme2_abi_version() { return 10; }
+extern "C" int rme2_abi_version() { return 11; }
+extern "C" int rme2_set_local_staging_after_d2h(Rme2Proxy* p, int enabled) {
+    return api([&] {
+        require(p && (enabled == 0 || enabled == 1), "invalid deferred staging option");
+        std::lock_guard<std::mutex> lock(p->mutex);
+        require(p->sequence == 0 && !p->pending && !p->done, "configure staging order before iterations");
+        require(!enabled || !p->d2h_after_local_staging, "staging ordering options are mutually exclusive");
+        p->local_staging_after_d2h = enabled != 0;
+    });
+}
 extern "C" int rme2_set_d2h_after_local_staging(Rme2Proxy* p, int enabled) {
     return api([&] {
         require(p && (enabled == 0 || enabled == 1), "invalid staging readback option");
         std::lock_guard<std::mutex> lock(p->mutex);
         require(p->sequence == 0 && !p->pending && !p->done, "configure staging readback before iterations");
+        require(!enabled || !p->local_staging_after_d2h, "staging ordering options are mutually exclusive");
         p->d2h_after_local_staging = enabled != 0;
     });
 }
@@ -791,8 +811,8 @@ extern "C" int rme2_submit(Rme2Proxy* p, uint64_t iteration, const int32_t* offs
         require(p->failure.empty(), p->failure.c_str());
         require(!p->pending && !p->done && !p->capturing && iteration == p->sequence + 1 && iteration != 0,
                 "submit requires prior wait and consecutive iterations starting at 1");
-        require(!p->d2h_after_local_staging || p->staging_graph,
-                "D2H after local staging requires a captured staging graph");
+        require(!(p->d2h_after_local_staging || p->local_staging_after_d2h) || p->staging_graph,
+                "serialized staging/D2H requires a captured staging graph");
         check(cudaSetDevice(p->device), "select submit GPU");
         p->submitted = Clock::now();
         p->stats = {};
