@@ -33,7 +33,7 @@ def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False, 
         ("metadata_barrier_wait_ms", "Shared-memory metadata barrier wait"),
         ("exchange_gpu_ms", "GPU exchange / x3/x4 packing (GPU)"),
         ("receiver_gpu_ms", "Receiver: arrival waits + host stores (GPU)"),
-        ("receiver_tail_ms", "Receiver: residual after self D2H (wall)"),
+        ("receiver_wait_ms", "Receiver: residual after producer gate (wall)"),
         ("local_staging_gpu_ms", "Local staging gather (GPU)"),
         ("sender_completion_wait_ms", "Proxy wait for local GPU completion"),
         ("peer_completion_wait_ms", "Proxy wait for peer completions"),
@@ -63,10 +63,12 @@ def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False, 
             label = "GPU exchange / x3/x4 header (GPU)"
         if batch_payload_copy and key == "payload_submit_ms":
             label = "  Payload: cudaMemcpyBatchAsync call"
-        if receiver_kernel and key == "payload_d2h_ms":
-            label = "Self D2H + remaining receiver completion"
-        if receiver_kernel and key == "payload_submit_ms":
-            label = "  Payload: self-only cudaMemcpyAsync"
+        if receiver_kernel:
+            label = {
+                "headers_d2h_ms": "Header D2H (disabled: receiver mode)",
+                "payload_d2h_ms": "Payload D2H (disabled: receiver mode)",
+                "payload_checks_ms": "Local records: CPU header checks",
+            }.get(key, label)
         if metadata_barrier and not per_source_readback and key == "sender_completion_wait_ms":
             label = "Proxy wait for local exchange completion"
         if per_source_readback:
@@ -86,15 +88,19 @@ def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False, 
             print("Its event interval can overlap the local exchange: do not add exchange and receiver times.")
         else:
             print("Receiver starts after this GPU's outbound exchange; it can overlap other GPUs' exchanges.")
-        print("Receiver can also overlap local staging, directory/self D2H and RDMA.")
-        print("Its GPU event span includes scheduling and waiting for peer records, not just host stores.")
-    print("Local staging runs after GPU exchange; --d2h-after-local-staging gates readback on it.")
-    print("--local-staging-after-d2h launches gather after local D2H; remaining RDMA may overlap.")
-    print("By default staging may overlap D2H/RDMA. Its residual wait")
-    print("is measured after metadata installation/send completion, not added GPU execution time.")
-    print("Payload subrows partition the payload total per sample (means add; medians/p95 need not).")
-    print("Completion wait is residual CPU-observed latency, not pure DMA time; transfers can")
-    print("already run during cudaMemcpyAsync submissions. Extra timestamps add measurement overhead.")
+        print("Receiver copies the full directory and all eight local records, including self; no CUDA D2H copies.")
+        print("Gather waits on receiver completion on the GPU; outgoing RDMA also waits for its directory.")
+        print("Its GPU event span includes scheduling and waiting for records, not just host stores.")
+        print("D2H timing/byte fields are zero; payload_checks_ms still measures CPU header checks.")
+    else:
+        print("Local staging runs after GPU exchange; --d2h-after-local-staging gates readback on it.")
+        print("--local-staging-after-d2h launches gather after local D2H; remaining RDMA may overlap.")
+        print("By default staging may overlap D2H/RDMA.")
+        print("Payload subrows partition the payload total per sample (means add; medians/p95 need not).")
+    print("Staging residual wait is measured after metadata installation/send completion, not added GPU execution time.")
+    if not receiver_kernel:
+        print("Completion wait is residual CPU-observed latency, not pure DMA time; transfers can")
+        print("already run during cudaMemcpyAsync submissions. Extra timestamps add measurement overhead.")
     if per_source_readback:
         print("Per-source mode: readiness spans overlap readback/installation; D2H rows")
         print("sum eight overlapping source latencies, not elapsed readback wall time.")
@@ -132,7 +138,7 @@ def options():
     parser.add_argument("--d2h-after-local-staging", action="store_true",
                         help="wait for this GPU's gather before header/payload D2H; also delays outgoing RDMA")
     parser.add_argument("--local-staging-after-d2h", action="store_true",
-                        help="launch local gather after all local payload D2H completes; may overlap remaining RDMA")
+                        help="launch gather after local D2H; redundant with --receiver-kernel (gather always follows receiver)")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--seed", type=int, default=1234)
@@ -144,7 +150,7 @@ def options():
     parser.add_argument("--skip-index-validation", action="store_true",
                         help="omit timed expert-index and x3/x4 scans; structural header checks always remain")
     parser.add_argument("--receiver-kernel", action="store_true",
-                        help="two-node only: copy peer records to mapped host memory as GPU readiness flags arrive")
+                        help="two-node only: receiver copies directory and all local records, including self; gather follows receiver")
     parser.add_argument("--receiver-overlap-exchange", action="store_true",
                         help="requires --receiver-kernel: permit receiver and local exchange to run concurrently")
     parser.add_argument("--direct-x3-x4-output", action="store_true",
@@ -205,6 +211,9 @@ def verify(args, iteration, rank, plan, proxy, nodes=1, stats=None, staging=None
                           x3_x4_sent_bytes=0, x3_x4_received_bytes=0,
                           receiver_copy_bytes=0, payload_copy_bytes=0,
                           header_bytes=1088 if nodes == 2 else 576)
+    if args.receiver_kernel:
+        expected_bytes["header_bytes"] = 0
+        expected_bytes["receiver_copy_bytes"] = 1088
     for source in range(8 * nodes):
         routes = make_routes(args.tokens, sample_seed(args.seed, source, iteration, nodes), pattern)
         if nodes == 2:
@@ -220,7 +229,7 @@ def verify(args, iteration, rank, plan, proxy, nodes=1, stats=None, staging=None
         if nodes == 2 and source // 8 != rank // 8:
             expected_bytes["rdma_received_bytes"] += 64 + payload_bytes
         if nodes == 2 and source // 8 == rank // 8:
-            if args.receiver_kernel and source != rank:
+            if args.receiver_kernel:
                 expected_bytes["receiver_copy_bytes"] += 64 + payload_bytes
             else:
                 expected_bytes["payload_copy_bytes"] += payload_bytes
@@ -261,6 +270,11 @@ def verify(args, iteration, rank, plan, proxy, nodes=1, stats=None, staging=None
             remote_experts = destination_slice(offsets, values, rank ^ 8, nodes)
             expected_bytes["rdma_sent_bytes"] += 64 + len(remote_experts[1]) * 4
     if stats is not None:
+        if args.receiver_kernel:
+            for key in ("headers_d2h_ms", "payload_d2h_ms", "payload_submit_ms",
+                        "payload_event_record_ms", "payload_completion_ms", "payload_other_ms"):
+                if stats[key] != 0:
+                    raise AssertionError(f"receiver mode unexpectedly used D2H stage: {key}={stats[key]}")
         for key, expected in expected_bytes.items():
             if stats[key] != expected:
                 raise AssertionError(f"rank={rank} iteration={iteration}: {key}={stats[key]}, expected {expected}")
@@ -398,7 +412,7 @@ def main():
                       f"direct_x3_x4_output={args.direct_x3_x4_output}", flush=True)
                 print(f"receiver_kernel={args.receiver_kernel}; "
                       f"receiver_overlap_exchange={args.receiver_overlap_exchange}; "
-                      "directory D2H retained; peer payload D2H uses SM stores when enabled", flush=True)
+                      "receiver mode: all local readback uses SM stores; gather follows receiver", flush=True)
             print(f"local_staging={staging is not None}; d2h_after_local_staging={args.d2h_after_local_staging}; "
                   f"local_staging_after_d2h={args.local_staging_after_d2h}; token_dimension={args.token_dimension}; "
                   f"dtype=BF16; gather={staging.plan.implementation if staging else 'disabled'}", flush=True)
@@ -437,7 +451,7 @@ def main():
             metrics = {key: summary([r[key] for report in reports for r in report["records"]])
                        for key in records[0] if key.endswith("_ms")}
             critical_metrics = {key: summary([r[key] for r in critical_records]) for key in metrics}
-            report = dict(schema_version=15, backend=("cpp-thread-cuda-ipc-gpudirect-rdma" if nodes == 2 else "cpp-thread-cuda-ipc"), topology=dict(
+            report = dict(schema_version=16, backend=("cpp-thread-cuda-ipc-gpudirect-rdma" if nodes == 2 else "cpp-thread-cuda-ipc"), topology=dict(
                 nodes=nodes, gpus=world, gpus_per_node=8, experts=128, experts_per_gpu=128 // world, top_k=8),
                 completion_endpoint=("16 source expert tables and remote same-index x3/x4 installed; nine outgoing RDMA sends drained"
                                      if nodes == 2 else "8 source expert tables installed")
@@ -447,23 +461,25 @@ def main():
                 receiver_overlap_exchange=args.receiver_overlap_exchange,
                 receiver_start_gate=("exchange_start" if args.receiver_overlap_exchange else "exchange_end")
                                     if args.receiver_kernel else None,
-                receiver_timing_note="Receiver event span starts after receiver_start_gate, includes scheduling, peer readiness polling and mapped-host stores, and can overlap exchange/staging/readback/RDMA. Same-GPU exchange overlap is permitted only with receiver_overlap_exchange; actual concurrency is not guaranteed. Exchange and receiver durations are not additive. Local payload completion waits for both self DMA and receiver. receiver_copy_bytes includes peer headers; payload_copy_bytes counts API-submitted two-node index bytes. Directory D2H is unchanged.",
+                receiver_timing_note="Receiver events include scheduling, record arrival polling and all mapped-host stores (directory plus eight local records including self). Same-GPU exchange overlap is permitted only with receiver_overlap_exchange; actual concurrency is not guaranteed. Exchange and receiver times are not additive. Gather waits for receiver completion on the GPU. Outgoing RDMA waits for the producer gate and receiver directory. receiver_wait_ms is the CPU residual after the producer gate. D2H API timing and byte counters are zero in receiver mode.",
                 x3_x4_payload_producer=("metadata kernel 4 (direct output)" if args.direct_x3_x4_output
                                        else "GPU exchange packing" if nodes == 2 else None),
                 local_staging=dict(enabled=staging is not None, dtype="bfloat16", token_dimension=args.token_dimension,
                                    d2h_after_local_staging=args.d2h_after_local_staging,
                                    local_staging_after_d2h=args.local_staging_after_d2h,
                                    implementation=staging.plan.implementation if staging else None,
-                                   launch=("separate native CUDA graph after local D2H" if args.local_staging_after_d2h
+                                   launch=("separate native CUDA graph after receiver completion" if args.receiver_kernel
+                                           else "separate native CUDA graph after local D2H" if args.local_staging_after_d2h
                                            else "separate native CUDA graph after exchange") if staging else None),
                 configuration=config, versions=dict(torch=torch.__version__, cuda=torch.version.cuda),
                 critical_rank_end_to_end_ms=summary(critical), all_rank_metrics=metrics,
                 critical_rank_metrics=critical_metrics,
                 critical_rank_per_iteration=[r["rank"] for r in critical_reports],
-                readback_timing_semantics=("per-source D2H latency sums; readiness observation spans overlap readback"
+                readback_timing_semantics=("receiver copies all local metadata; no CPU-submitted D2H" if args.receiver_kernel
+                                          else "per-source D2H latency sums; readiness observation spans overlap readback"
                                           if args.per_source_readback else ("local D2H overlaps RDMA; payload completion includes CPU progress delays"
                                           if nodes == 2 else "batched D2H wall stages after all-source wait")),
-                timing_note="Overlapping GPU/CPU spans are not additive. Local staging is included in native/end-to-end completion. By default it may overlap D2H/RDMA; d2h_after_local_staging runs gather first; local_staging_after_d2h runs gather after local D2H and may overlap remaining RDMA. The pre-D2H staging wait is separate from D2H timers. Route/activation generation, setup, outer Gloo barriers and exact verification excluded; enabled native barriers included.",
+                timing_note="Overlapping GPU/CPU spans are not additive. Local staging is included in native/end-to-end completion. Receiver mode always orders gather after receiver completion. Without receiver it may overlap D2H/RDMA; d2h_after_local_staging runs gather first; local_staging_after_d2h runs gather after local D2H and may overlap remaining RDMA. The pre-D2H staging wait is separate from D2H timers. Route/activation generation, setup, outer Gloo barriers and exact verification excluded; enabled native barriers included.",
                 ranks=reports)
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(report, indent=2) + "\n")

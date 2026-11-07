@@ -294,14 +294,31 @@ struct Rme2Proxy {
             [&](int s) { return acquire(&shared->slots[s].complete); },
             [&] { check_deadline(start); std::this_thread::yield(); });
         stats.peer_completion_wait_ms = ms(start);
-        wait_for_readback();
-        start = Clock::now();
-        stats.header_bytes = two::directory_words * sizeof(int32_t);
-        check(cudaMemcpyAsync(pinned, inbox, stats.header_bytes, cudaMemcpyDeviceToHost, read_stream),
-              "copy two-node directory");
-        check(cudaEventRecord(read_done, read_stream), "record directory completion");
-        wait_event(read_done);
-        stats.headers_d2h_ms = ms(start);
+        if (receiver_kernel) {
+            start = Clock::now();
+            wait_event(receiver_end);
+            stats.receiver_wait_ms = ms(start);
+            // Event completion makes mapped payload/result stores visible to
+            // the CPU. The producer gate above still protects GPUDirect reads.
+            for (int slot = 0; slot < rme2::receiver::records; ++slot) {
+                require(receiver_results[slot].epoch == sequence, "receiver result epoch mismatch");
+                require(receiver_results[slot].error != rme2::receiver::timeout_error,
+                        "receiver kernel timed out waiting for a record");
+                require(receiver_results[slot].error == 0, "receiver kernel rejected a record");
+            }
+            check(cudaEventElapsedTime(&elapsed, receiver_begin, receiver_end), "receiver timing");
+            stats.receiver_gpu_ms = elapsed;
+            stats.receiver_copy_bytes = two::directory_words * sizeof(int32_t);
+        } else {
+            wait_for_readback();
+            start = Clock::now();
+            stats.header_bytes = two::directory_words * sizeof(int32_t);
+            check(cudaMemcpyAsync(pinned, inbox, stats.header_bytes, cudaMemcpyDeviceToHost, read_stream),
+                  "copy two-node directory");
+            check(cudaEventRecord(read_done, read_stream), "record directory completion");
+            wait_event(read_done);
+            stats.headers_d2h_ms = ms(start);
+        }
 
         const auto payload_start = Clock::now();
         for (int s = 0; s < 8; ++s) {
@@ -311,9 +328,9 @@ struct Rme2Proxy {
             const int count = two::check_record(h, capacity, sequence, slot, node * 8 + rank);
             auto* dst = pinned + two::record_offset(slot, capacity);
             auto* src = inbox + two::record_offset(slot, capacity);
-            // The receiver owns peer host records, including their headers.
+            // The receiver owns all local host records, including their headers.
             // Never race its stores with even an identical CPU header write.
-            const bool gpu_copy = receiver_kernel && s != rank;
+            const bool gpu_copy = receiver_kernel;
             if (!gpu_copy) std::memcpy(dst, h, two::record_bytes(0));
             const size_t bytes = size_t(count) * 4;
             stats.payload_checks_ms += ms(before);
@@ -328,9 +345,11 @@ struct Rme2Proxy {
             stats.received_index_bytes += bytes;
             if (s != rank) stats.peer_received_index_bytes += bytes;
         }
-        start = Clock::now();
-        check(cudaEventRecord(read_done, read_stream), "record local payload completion");
-        stats.payload_event_record_ms = ms(start);
+        if (!receiver_kernel) {
+            start = Clock::now();
+            check(cudaEventRecord(read_done, read_stream), "record local payload completion");
+            stats.payload_event_record_ms = ms(start);
+        }
         const auto payload_wait_start = Clock::now();
         const auto rdma_start = Clock::now();
         for (int s = 0; s < 8; ++s) {
@@ -353,36 +372,15 @@ struct Rme2Proxy {
         }
         two::CompletionProgress progress(sequence);
         bool local_installed = false;
-        bool self_copied = false, receiver_copied = !receiver_kernel;
-        Clock::time_point receiver_tail_start;
         while (!local_installed || !progress.complete()) {
             check_deadline(submitted);
-            if (!self_copied && event_ready(read_done)) {
-                self_copied = true;
-                receiver_tail_start = Clock::now();
-            }
-            if (!receiver_copied && event_ready(receiver_end)) {
-                // Event completion, not a host-polled GPU flag, makes all
-                // mapped payload/result stores available to the CPU.
-                for (int s = 0; s < 8; ++s) if (s != rank) {
-                    require(receiver_results[s].epoch == sequence, "receiver result epoch mismatch");
-                    require(receiver_results[s].error != rme2::receiver::timeout_error,
-                            "receiver kernel timed out waiting for a peer record");
-                    require(receiver_results[s].error == 0, "receiver kernel rejected a peer record");
+            if (!local_installed && (receiver_kernel || event_ready(read_done))) {
+                if (!receiver_kernel) {
+                    stats.payload_completion_ms = ms(payload_wait_start);
+                    stats.payload_d2h_ms = ms(payload_start);
+                    finish_payload_breakdown();
+                    if (local_staging_after_d2h) launch_staging(work_stream);
                 }
-                float elapsed = 0;
-                check(cudaEventElapsedTime(&elapsed, receiver_begin, receiver_end), "receiver timing");
-                stats.receiver_gpu_ms = elapsed;
-                if (self_copied) stats.receiver_tail_ms = ms(receiver_tail_start);
-                receiver_copied = true;
-            }
-            if (!local_installed && self_copied && receiver_copied) {
-                stats.payload_completion_ms = ms(payload_wait_start);
-                stats.payload_d2h_ms = ms(payload_start);
-                finish_payload_breakdown();
-                // Start gathering immediately after local D2H, without waiting
-                // for remote metadata or outgoing RDMA completion.
-                if (local_staging_after_d2h) launch_staging(work_stream);
                 const auto before = Clock::now();
                 for (int s = 0; s < 8; ++s) {
                     const int slot = node * 8 + s;
@@ -549,15 +547,14 @@ struct Rme2Proxy {
         else
             launch_exchange(peers, rank, capacity, local_offsets, local_values, s);
         check(cudaGetLastError(), "launch metadata exchange");
-        // Publish readiness at the exchange boundary, BEFORE the gather. The
-        // receiver can read metadata while this stream gathers activation rows.
+        // Publish outbound completion before any receiver-dependent gather.
         check(cudaEventRecord(end, s), "record exchange end");
         if (receiver_kernel) {
             // Both gates follow metadata on the work stream (and any optional
             // metadata barrier). Submit outbound work first, then optionally
             // fork the receiver at begin so it can overlap that same exchange.
             // This permits concurrency, not guaranteed scheduling/progress;
-            // seven polling CTAs retain their per-record epochs and timeout.
+            // seventeen polling CTAs retain their per-record epochs and timeout.
             // Default end-gating also works when CUDA serializes kernels.
             check(cudaStreamWaitEvent(receiver_stream, receiver_overlap_exchange ? begin : end, 0),
                   "order receiver at selected exchange boundary");
@@ -566,8 +563,11 @@ struct Rme2Proxy {
                             receiver_timeout_cycles, mapped_receiver_results, receiver_stream);
             check(cudaGetLastError(), "launch metadata receiver");
             check(cudaEventRecord(receiver_end, receiver_stream), "record receiver completion");
-        }
-        if (!local_staging_after_d2h) launch_staging(s);
+            // Device-side dependency: gather cannot contend with host stores,
+            // and does not need a CPU round trip to start after the receiver.
+            check(cudaStreamWaitEvent(s, receiver_end, 0), "order staging after receiver");
+            launch_staging(s);
+        } else if (!local_staging_after_d2h) launch_staging(s);
     }
     void launch_staging(cudaStream_t s) {
         if (staging_graph) {
@@ -681,7 +681,7 @@ struct Rme2Proxy {
     }
 };
 
-extern "C" int rme2_abi_version() { return 14; }
+extern "C" int rme2_abi_version() { return 15; }
 extern "C" int rme2_set_receiver_overlap_exchange(Rme2Proxy* p, int enabled) {
     return api([&] {
         require(p && (enabled == 0 || enabled == 1), "invalid receiver overlap option");
@@ -716,8 +716,8 @@ extern "C" int rme2_set_receiver_kernel(Rme2Proxy* p, int enabled) {
         check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&p->mapped_pinned), p->pinned, 0),
               "map pinned receiver records");
         check(cudaHostAlloc(reinterpret_cast<void**>(&p->receiver_results),
-                            8 * sizeof(rme2::receiver::Result), cudaHostAllocMapped), "allocate receiver results");
-        std::memset(p->receiver_results, 0, 8 * sizeof(rme2::receiver::Result));
+                            rme2::receiver::records * sizeof(rme2::receiver::Result), cudaHostAllocMapped), "allocate receiver results");
+        std::memset(p->receiver_results, 0, rme2::receiver::records * sizeof(rme2::receiver::Result));
         check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&p->mapped_receiver_results),
                                       p->receiver_results, 0), "map receiver results");
         p->receiver_timeout_cycles = uint64_t(std::min(p->timeout, 3600.0) * prop.clockRate * 1000.0) + 1;

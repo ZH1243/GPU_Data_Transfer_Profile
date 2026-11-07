@@ -11,7 +11,7 @@ int main() {
         const auto wire_bytes = two::words(capacity) * 4;
         const auto start = receiver::flags_offset(capacity);
         if (start < wire_bytes || start % 64 || start - wire_bytes >= 64 ||
-            receiver::allocation_bytes(capacity) != start + 8 * sizeof(receiver::Flag))
+            receiver::allocation_bytes(capacity) != start + receiver::records * sizeof(receiver::Flag))
             throw std::runtime_error("flags overlap wire records or are misaligned");
         for (int node = 0; node < 2; ++node)
             for (int source = 0; source < 8; ++source) {

@@ -10,7 +10,7 @@ class Stats(C.Structure):
         "payload_event_record_ms", "payload_completion_ms", "payload_other_ms", "install_ms", "native_ms",
         "rdma_post_ms", "rdma_poll_ms", "rdma_post_recv_ms", "rdma_work_complete_ms",
         "local_staging_gpu_ms", "local_staging_wait_ms", "staging_before_d2h_wait_ms",
-        "receiver_gpu_ms", "receiver_tail_ms")]
+        "receiver_gpu_ms", "receiver_wait_ms")]
     _fields_ += [(name, C.c_uint64) for name in (
         "received_index_bytes", "peer_received_index_bytes", "header_bytes", "rdma_sent_bytes", "rdma_received_bytes",
         "x3_x4_sent_bytes", "x3_x4_received_bytes", "receiver_copy_bytes", "payload_copy_bytes")]
@@ -30,7 +30,7 @@ class Proxy:
         self.lib = C.CDLL(str(library))  # CDLL releases the GIL in native calls.
         self.handle = C.c_void_p()
         self.lib.rme2_abi_version.restype = C.c_int
-        if self.lib.rme2_abi_version() != 14:
+        if self.lib.rme2_abi_version() != 15:
             raise RuntimeError("native ABI mismatch; rebuild the library")
         signatures = {
             "rme2_abi_version": ([], C.c_int),
@@ -64,7 +64,7 @@ class Proxy:
         for name, (args, result) in signatures.items():
             fn = getattr(self.lib, name)
             fn.argtypes, fn.restype = args, result
-        if self.lib.rme2_abi_version() != 14:
+        if self.lib.rme2_abi_version() != 15:
             raise RuntimeError("native ABI mismatch; rebuild the library")
         self.check(self.lib.rme2_create(rank, device, tokens, shm_name.encode(), timeout,
                                        int(validate), core, int(per_source_readback), int(metadata_barrier),

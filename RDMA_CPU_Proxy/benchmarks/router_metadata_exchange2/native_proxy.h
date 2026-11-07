@@ -3,7 +3,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI 14; Linux CUDA only. All functions except destroy/error return 0 on success.
+/* ABI 15; Linux CUDA only. All functions except destroy/error return 0 on success.
  * create/connect/submit/wait/view must be called serially by one host thread.
  * submit queues work; the owned native thread handles readback and installation.
  * Pointers returned by view are borrowed until the next submit or destroy.
@@ -33,10 +33,10 @@ typedef struct {
     double local_staging_gpu_ms;
     double local_staging_wait_ms;
     double staging_before_d2h_wait_ms;
-    /* Receiver span includes GPU polling for arrivals; tail is CPU-observed
-     * delay after self D2H, overlapping RDMA progress. Neither is additive. */
+    /* Receiver span includes GPU arrival polling and all host stores.
+     * wait is the CPU residual after the all-producer gate, before RDMA post. */
     double receiver_gpu_ms;
-    double receiver_tail_ms;
+    double receiver_wait_ms;
     uint64_t received_index_bytes;
     uint64_t peer_received_index_bytes;
     uint64_t header_bytes;
@@ -45,13 +45,15 @@ typedef struct {
     /* x3/x4 payload only (5 bytes/token); RDMA totals above include its header. */
     uint64_t x3_x4_sent_bytes;
     uint64_t x3_x4_received_bytes;
-    uint64_t receiver_copy_bytes; /* Peer record headers + indices written by SMs. */
+    uint64_t receiver_copy_bytes; /* Directory + all eight local records written by SMs. */
     uint64_t payload_copy_bytes;  /* Two-node indices submitted through CUDA D2H APIs. */
 } Rme2Stats;
 int rme2_abi_version(void);
 int rme2_set_batch_payload_copy(Rme2Proxy*, int enabled);
-/* Two-node only; configure before IPC connect/capture. Peer records go to mapped
- * pinned memory through a receiver kernel. Rejects staging-before-D2H ordering. */
+/* Two-node only; configure before IPC connect/capture. Receiver copies the
+ * directory and all eight local records (including self) to mapped host memory.
+ * No CPU-submitted D2H; gather always waits on receiver completion on the GPU.
+ * Rejects staging-before-D2H ordering. */
 int rme2_set_receiver_kernel(Rme2Proxy*, int enabled);
 /* Setup-only, after enabling receiver and before connect/capture. Wait on the
  * exchange START event instead of its END event, permitting same-GPU overlap.
@@ -62,6 +64,7 @@ int rme2_set_receiver_overlap_exchange(Rme2Proxy*, int enabled);
  * Requires a staging graph before submit; exchange publication is unchanged. */
 int rme2_set_d2h_after_local_staging(Rme2Proxy*, int enabled);
 /* Setup-only: defer gather launch until all local payload D2H completes.
+ * Redundant in receiver mode, which always orders gather after the receiver.
  * Mutually exclusive with d2h_after_local_staging; requires a staging graph. */
 int rme2_set_local_staging_after_d2h(Rme2Proxy*, int enabled);
 /* Two-node setup, after connect and before any capture/submit. Enables skipping
@@ -100,6 +103,7 @@ int rme2_capture_end(Rme2Proxy*, int launch_barrier);
  * stream. By default CPU readback/RDMA waits only for exchange; the optional
  * d2h_after_local_staging mode gates readback on staging too. Conversely,
  * local_staging_after_d2h defers graph launch until all local D2H completes.
+ * Receiver mode always gates staging on receiver completion, on the GPU.
  * wait drains staging in every mode.
  * Caller keeps captured tensors alive through disconnect/destroy. */
 int rme2_staging_capture_begin(Rme2Proxy*, void* cuda_stream);

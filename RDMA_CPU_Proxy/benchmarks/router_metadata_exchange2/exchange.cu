@@ -98,15 +98,18 @@ __global__ void exchange_two_kernel(PeerArenas peers, int source, int node, int 
         }
     }
     __threadfence_system();
-    if (receiver_kernel && dest / 8 == node && relay != source) {
+    if (receiver_kernel) {
         // Every writer fenced its payload, then joins before the publishing
         // thread releases the flag. Headers alone are never readiness signals.
         __syncthreads();
         if (threadIdx.x == 0) {
             auto* flags = reinterpret_cast<rme2::receiver::Flag*>(
                 reinterpret_cast<char*>(arena) + flags_offset);
-            cuda::atomic_ref<uint64_t, cuda::thread_scope_system>(flags[source].epoch)
+            cuda::atomic_ref<uint64_t, cuda::thread_scope_system>(flags[slot].epoch)
                 .store(iteration, cuda::memory_order_release);
+            if (dest == (1 - node) * 8 + source)
+                cuda::atomic_ref<uint64_t, cuda::thread_scope_system>(flags[rme2::two::sources].epoch)
+                    .store(iteration, cuda::memory_order_release);
         }
     }
 }
@@ -124,17 +127,22 @@ void launch_exchange_two(PeerArenas peers, int source, int node, int capacity,
 __global__ void receiver_kernel(int32_t* inbox, int32_t* host, int rank, int node,
                                 int capacity, uint64_t iteration, uint64_t timeout_cycles,
                                 size_t flags_offset, rme2::receiver::Result* results) {
-    const int source = int(blockIdx.x) + (int(blockIdx.x) >= rank);
+    namespace two = rme2::two;
+    const int slot = int(blockIdx.x);
+    const bool route_header = slot == two::sources;
+    const bool local_record = !route_header && slot / 8 == node;
     auto* flags = reinterpret_cast<rme2::receiver::Flag*>(
         reinterpret_cast<char*>(inbox) + flags_offset);
-    const size_t offset = rme2::two::directory_words +
-        size_t(node * 8 + source) * (size_t(capacity) + rme2::two::header_words);
+    const size_t offset = two::directory_words +
+        size_t(slot) * (size_t(capacity) + two::header_words);
+    // Read the record header, published together with its directory duplicate.
     const int32_t* record = inbox + offset;
     __shared__ int count, error;
     if (threadIdx.x == 0) {
         error = 0;
+        count = 0;
         const auto started = clock64();
-        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> ready(flags[source].epoch);
+        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> ready(flags[slot].epoch);
         while (ready.load(cuda::memory_order_acquire) != iteration) {
             if (clock64() - started >= timeout_cycles) {
                 error = rme2::receiver::timeout_error;
@@ -143,35 +151,49 @@ __global__ void receiver_kernel(int32_t* inbox, int32_t* host, int rank, int nod
             __nanosleep(64);
         }
         if (!error) {
-            count = record[15];
             const uint64_t epoch = uint64_t(uint32_t(record[2])) |
                 (uint64_t(uint32_t(record[3])) << 32);
-            if (record[0] != rme2::two::magic || record[1] != rme2::two::version ||
-                epoch != iteration || record[4] != node * 8 + source ||
-                record[5] != node * 8 + rank || record[6] < 0 || record[6] > capacity ||
-                record[7] != 0 || count < 0 || count > capacity - record[6])
+            if (record[1] != two::version || epoch != iteration)
                 error = rme2::receiver::record_error;
-            for (int i = 7; i < 15; ++i)
-                if (record[i] > record[i + 1]) error = rme2::receiver::record_error;
+            if (route_header) {
+                if (record[0] != two::x3_x4_magic || record[4] != node * 8 + rank ||
+                    record[5] != (1 - node) * 8 + rank || record[6] < 0 || record[6] > capacity / 8)
+                    error = rme2::receiver::record_error;
+                for (int i = 7; i < two::header_words; ++i)
+                    if (record[i] != 0) error = rme2::receiver::record_error;
+            } else {
+                count = record[15];
+                if (record[0] != two::magic || record[4] != node * 8 + slot % 8 ||
+                    record[5] != (slot / 8) * 8 + rank || record[6] < 0 || record[6] > capacity ||
+                    record[7] != 0 || count < 0 || count > capacity - record[6])
+                    error = rme2::receiver::record_error;
+                for (int i = 7; i < 15; ++i)
+                    if (record[i] > record[i + 1]) error = rme2::receiver::record_error;
+            }
         }
     }
     // Propagate the acquiring thread's visibility to all copying threads.
     __syncthreads();
     if (!error) {
-        for (int i = threadIdx.x; i < rme2::two::header_words + count; i += blockDim.x)
-            host[offset + i] = record[i];
+        if (threadIdx.x < two::header_words)
+            host[slot * two::header_words + threadIdx.x] = record[threadIdx.x];
+        // Include self. The other bank and the host x3/x4 record belong to
+        // incoming RDMA; only their OUTGOING directory headers are read back.
+        if (local_record)
+            for (int i = threadIdx.x; i < two::header_words + count; i += blockDim.x)
+                host[offset + i] = record[i];
         __threadfence_system();
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        results[source].error = error;
-        results[source].epoch = iteration;
+        results[slot].error = error;
+        results[slot].epoch = iteration;
     }
 }
 
 void launch_receiver(int32_t* inbox, int32_t* mapped_host, int rank, int node,
                      int capacity, uint64_t iteration, uint64_t timeout_cycles,
                      rme2::receiver::Result* results, cudaStream_t stream) {
-    receiver_kernel<<<7, 256, 0, stream>>>(inbox, mapped_host, rank, node, capacity,
+    receiver_kernel<<<rme2::receiver::records, 256, 0, stream>>>(inbox, mapped_host, rank, node, capacity,
         iteration, timeout_cycles, rme2::receiver::flags_offset(capacity), results);
 }

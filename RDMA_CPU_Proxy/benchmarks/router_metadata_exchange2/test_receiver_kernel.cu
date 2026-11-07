@@ -17,11 +17,38 @@ __global__ void delay(uint64_t cycles) {
     const auto begin = clock64();
     while (clock64() - begin < cycles) __nanosleep(256);
 }
+// Stand in for work queued after the receiver: read its host output on the
+// work stream without any intervening CPU synchronization. A delayed producer
+// must not let this consumer observe stale headers or partially copied payloads.
+__global__ void consume_host(const int32_t* arena, const int32_t* host, int node,
+                              int capacity, uint64_t epoch,
+                              const rme2::receiver::Result* results, int32_t* status) {
+    namespace two = rme2::two;
+    __shared__ int bad;
+    if (threadIdx.x == 0) bad = 0;
+    __syncthreads();
+    for (int slot = 0; slot < rme2::receiver::records; ++slot) {
+        const size_t offset = two::directory_words + size_t(slot) * (capacity + two::header_words);
+        if (threadIdx.x == 0 && (results[slot].epoch != epoch || results[slot].error))
+            atomicOr(&bad, 1);
+        if (threadIdx.x < two::header_words &&
+            host[slot * two::header_words + threadIdx.x] != arena[offset + threadIdx.x])
+            atomicOr(&bad, 1);
+        if (slot < two::sources && slot / 8 == node) {
+            const int count = arena[offset + 15];
+            for (int i = threadIdx.x; i < two::header_words + count; i += blockDim.x)
+                if (host[offset + i] != arena[offset + i]) atomicOr(&bad, 1);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) *status = bad;
+}
 struct Device {
     int32_t *arena{}, *host{}, *mapped{}, *offsets{}, *values{}, *nodes{};
+    int32_t *consumer_status{}, *mapped_consumer_status{};
     rme2::receiver::Result *results{}, *mapped_results{};
     cudaStream_t send{}, receive{};
-    cudaEvent_t exchange_start{}, sent{}, received{};
+    cudaEvent_t exchange_start{}, sent{}, received{}, consumed{};
     uint64_t cycles_per_ms{};
     std::vector<int32_t> offsets_cpu, values_cpu;
 };
@@ -44,8 +71,10 @@ void run(int tokens, bool overlap_exchange) {
         peers.ptr[g] = d.arena;
         check(cudaHostAlloc(reinterpret_cast<void**>(&d.host), words * 4, cudaHostAllocMapped));
         check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&d.mapped), d.host, 0));
-        check(cudaHostAlloc(reinterpret_cast<void**>(&d.results), 8 * sizeof(receiver::Result), cudaHostAllocMapped));
+        check(cudaHostAlloc(reinterpret_cast<void**>(&d.results), receiver::records * sizeof(receiver::Result), cudaHostAllocMapped));
         check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&d.mapped_results), d.results, 0));
+        check(cudaHostAlloc(reinterpret_cast<void**>(&d.consumer_status), 4, cudaHostAllocMapped));
+        check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&d.mapped_consumer_status), d.consumer_status, 0));
         check(cudaMalloc(reinterpret_cast<void**>(&d.offsets), 129 * 4));
         check(cudaMalloc(reinterpret_cast<void**>(&d.values), capacity * 4));
         check(cudaMalloc(reinterpret_cast<void**>(&d.nodes), 3 * 4));
@@ -55,6 +84,7 @@ void run(int tokens, bool overlap_exchange) {
         check(cudaEventCreateWithFlags(&d.exchange_start, cudaEventDisableTiming));
         check(cudaEventCreateWithFlags(&d.sent, cudaEventDisableTiming));
         check(cudaEventCreateWithFlags(&d.received, cudaEventDisableTiming));
+        check(cudaEventCreateWithFlags(&d.consumed, cudaEventDisableTiming));
         check(cudaDeviceSynchronize());
     }
     uint64_t epoch = uint64_t{1} << 32; // Exercise both halves of the wire epoch.
@@ -67,7 +97,8 @@ void run(int tokens, bool overlap_exchange) {
                 check(cudaSetDevice(source));
                 auto& d = gpu[source];
                 std::fill(d.host, d.host + words, sentinel);
-                for (int s = 0; s < 8; ++s) d.results[s] = {};
+                *d.consumer_status = sentinel;
+                for (int s = 0; s < receiver::records; ++s) d.results[s] = {};
                 d.offsets_cpu.assign(129, 0);
                 d.values_cpu.resize(capacity);
                 const int routes = pattern == 0 ? 0 : pattern == 4 ? capacity / 3 : capacity;
@@ -101,6 +132,11 @@ void run(int tokens, bool overlap_exchange) {
                                 d.cycles_per_ms * 10000, d.mapped_results, d.receive);
                 check(cudaGetLastError());
                 check(cudaEventRecord(d.received, d.receive));
+                check(cudaStreamWaitEvent(d.send, d.received, 0));
+                consume_host<<<1, 256, 0, d.send>>>(d.arena, d.mapped, node, capacity, epoch,
+                                                   d.mapped_results, d.mapped_consumer_status);
+                check(cudaGetLastError());
+                check(cudaEventRecord(d.consumed, d.send));
             }
             for (int dest = 0; dest < 8; ++dest) {
                 check(cudaSetDevice(dest));
@@ -109,24 +145,37 @@ void run(int tokens, bool overlap_exchange) {
                 // A receiver can now finish before its local exchange. Both
                 // streams must drain before inputs/arenas are reused or freed.
                 check(cudaEventSynchronize(d.sent));
+                check(cudaEventSynchronize(d.consumed));
+                require(*d.consumer_status == 0, "downstream consumer ran before all host stores completed");
                 std::vector<int32_t> expected(words, sentinel);
-                for (int source = 0; source < 8; ++source) if (source != dest) {
-                    require(d.results[source].epoch == epoch && !d.results[source].error,
+                for (int slot = 0; slot < receiver::records; ++slot)
+                    require(d.results[slot].epoch == epoch && !d.results[slot].error,
                             "receiver completion mismatch");
+                for (int slot = 0; slot < two::sources; ++slot) {
+                    const int source = slot % 8;
                     const auto& input = gpu[source];
-                    const int global_dest = node * 8 + dest;
+                    const int global_dest = (slot / 8) * 8 + dest;
                     const int first = input.offsets_cpu[global_dest * 8];
                     const int count = input.offsets_cpu[(global_dest + 1) * 8] - first;
-                    auto* out = expected.data() + two::record_offset(node * 8 + source, capacity);
+                    auto* out = expected.data() + slot * two::header_words;
                     out[0] = two::magic; out[1] = two::version;
                     out[2] = int32_t(uint32_t(epoch)); out[3] = int32_t(uint32_t(epoch >> 32));
                     out[4] = node * 8 + source; out[5] = global_dest; out[6] = first;
                     for (int e = 0; e <= 8; ++e)
                         out[7 + e] = input.offsets_cpu[global_dest * 8 + e] - first;
-                    std::copy_n(input.values_cpu.data() + first, count, out + two::header_words);
+                    if (slot / 8 == node) {
+                        auto* record = expected.data() + two::record_offset(slot, capacity);
+                        std::copy_n(out, two::header_words, record);
+                        std::copy_n(input.values_cpu.data() + first, count, record + two::header_words);
+                    }
                 }
-                // Includes untouched self record, incoming RDMA bank, directory,
-                // x3/x4 record, and every unused capacity tail.
+                auto* route_header = expected.data() + two::sources * two::header_words;
+                std::fill_n(route_header, two::header_words, 0);
+                route_header[0] = two::x3_x4_magic; route_header[1] = two::version;
+                route_header[2] = int32_t(uint32_t(epoch)); route_header[3] = int32_t(uint32_t(epoch >> 32));
+                route_header[4] = node * 8 + dest; route_header[5] = (1 - node) * 8 + dest;
+                // Includes self, the entire directory, untouched incoming RDMA
+                // bank/x3/x4 receive record, and every unused capacity tail.
                 require(std::equal(expected.begin(), expected.end(), d.host), "payload/guard mismatch");
             }
         }
@@ -140,13 +189,13 @@ void run(int tokens, bool overlap_exchange) {
     launch_receiver(d.arena, d.mapped, 0, 1, capacity, epoch, d.cycles_per_ms * 1000,
                     d.mapped_results, d.receive);
     check(cudaStreamSynchronize(d.receive));
-    require(d.results[1].error == receiver::record_error, "invalid count was not rejected");
-    require(d.host[bad_slot] == sentinel, "invalid record overwrote host memory");
+    require(d.results[9].error == receiver::record_error, "invalid count was not rejected");
+    require(d.host[bad_slot] == sentinel && d.host[9 * two::header_words] == sentinel, "invalid record overwrote host memory");
     std::fill(d.host, d.host + words, sentinel);
     launch_receiver(d.arena, d.mapped, 0, 1, capacity, epoch + 1, d.cycles_per_ms * 5,
                     d.mapped_results, d.receive);
     check(cudaStreamSynchronize(d.receive));
-    for (int s = 1; s < 8; ++s)
+    for (int s = 0; s < receiver::records; ++s)
         require(d.results[s].epoch == epoch + 1 && d.results[s].error == receiver::timeout_error,
                 "missing producer/stale epoch did not time out");
     require(std::all_of(d.host, d.host + words, [](int x) { return x == sentinel; }),
@@ -156,10 +205,11 @@ void run(int tokens, bool overlap_exchange) {
         auto& item = gpu[g];
         check(cudaStreamDestroy(item.send)); check(cudaStreamDestroy(item.receive));
         check(cudaEventDestroy(item.sent)); check(cudaEventDestroy(item.received));
-        check(cudaEventDestroy(item.exchange_start));
+        check(cudaEventDestroy(item.exchange_start)); check(cudaEventDestroy(item.consumed));
         check(cudaFree(item.arena)); check(cudaFree(item.offsets));
         check(cudaFree(item.values)); check(cudaFree(item.nodes));
         check(cudaFreeHost(item.host)); check(cudaFreeHost(item.results));
+        check(cudaFreeHost(item.consumer_status));
     }
 }
 } // namespace
@@ -184,7 +234,7 @@ int main() {
         for (bool overlap : {false, true}) {
             for (int tokens : {1, 33, 257, 20480}) run(tokens, overlap);
             std::cout << "receiver CUDA: overlap_exchange=" << overlap
-                      << "; peer publication, epochs, guards, empty/full records and timeout passed\n";
+                      << "; publication, self/directory readback, downstream ordering, guards and timeout passed\n";
         }
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

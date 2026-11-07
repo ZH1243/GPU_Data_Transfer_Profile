@@ -12,7 +12,7 @@ class NativeAbiTests(unittest.TestCase):
     def test_receiver_overlap_is_configured_after_receiver_before_connect(self):
         for overlap in (False, True):
             lib = MagicMock()
-            lib.rme2_abi_version.return_value = 14
+            lib.rme2_abi_version.return_value = 15
             def create(*args):
                 ctypes.cast(args[-1], ctypes.POINTER(ctypes.c_void_p))[0] = 123
                 return 0

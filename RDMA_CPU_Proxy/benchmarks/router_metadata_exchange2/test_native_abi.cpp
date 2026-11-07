@@ -11,7 +11,7 @@ int main() {
     FIELD(local_staging_wait_ms);
     FIELD(staging_before_d2h_wait_ms);
     FIELD(receiver_gpu_ms);
-    FIELD(receiver_tail_ms);
+    FIELD(receiver_wait_ms);
     FIELD(received_index_bytes);
     FIELD(x3_x4_received_bytes);
     FIELD(receiver_copy_bytes);
