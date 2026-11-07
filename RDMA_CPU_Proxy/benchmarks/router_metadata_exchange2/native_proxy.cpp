@@ -89,6 +89,13 @@ struct Rme2Proxy {
     bool d2h_after_local_staging = false;
     bool local_staging_after_d2h = false;
     bool direct_x3_x4_output = false;
+    bool receiver_kernel = false;
+    int32_t* mapped_pinned = nullptr;
+    rme2::receiver::Result* receiver_results = nullptr;
+    rme2::receiver::Result* mapped_receiver_results = nullptr;
+    cudaStream_t receiver_stream = nullptr;
+    cudaEvent_t receiver_begin = nullptr, receiver_end = nullptr;
+    uint64_t receiver_timeout_cycles = 0;
     bool staging_readback_started = false, staging_readback_ready = false;
     Clock::time_point staging_readback_start;
     rme2::PayloadBatch payload_batch;
@@ -108,10 +115,11 @@ struct Rme2Proxy {
     void initialize() {
         check(cudaSetDevice(device), "select GPU");
         // Dedicated allocations: IPC does not expose a PyTorch allocator slab.
-        check(cudaMalloc(reinterpret_cast<void**>(&inbox), words() * 4), "allocate IPC inbox");
+        const size_t inbox_bytes = nodes == 2 ? rme2::receiver::allocation_bytes(capacity) : words() * 4;
+        check(cudaMalloc(reinterpret_cast<void**>(&inbox), inbox_bytes), "allocate IPC inbox");
         check(cudaMallocHost(reinterpret_cast<void**>(&pinned), words() * 4), "allocate pinned records");
         std::memset(pinned, 0, words() * 4); // prefault before timing
-        check(cudaMemset(inbox, 0, words() * 4), "initialize IPC inbox");
+        check(cudaMemset(inbox, 0, inbox_bytes), "initialize IPC inbox");
         check(cudaStreamCreateWithFlags(&read_stream, cudaStreamNonBlocking), "create readback stream");
         check(cudaEventCreate(&begin), "create exchange start event");
         check(cudaEventCreate(&end), "create exchange end event");
@@ -302,15 +310,20 @@ struct Rme2Proxy {
             const int count = two::check_record(h, capacity, sequence, slot, node * 8 + rank);
             auto* dst = pinned + two::record_offset(slot, capacity);
             auto* src = inbox + two::record_offset(slot, capacity);
-            std::memcpy(dst, h, two::record_bytes(0));
+            // The receiver owns peer host records, including their headers.
+            // Never race its stores with even an identical CPU header write.
+            const bool gpu_copy = receiver_kernel && s != rank;
+            if (!gpu_copy) std::memcpy(dst, h, two::record_bytes(0));
             const size_t bytes = size_t(count) * 4;
             stats.payload_checks_ms += ms(before);
-            if (bytes) {
+            if (bytes && !gpu_copy) {
                 const auto submit_start = Clock::now();
                 check(cudaMemcpyAsync(dst + two::header_words, src + two::header_words,
                                       bytes, cudaMemcpyDeviceToHost, read_stream), "copy local-node indices");
                 stats.payload_submit_ms += ms(submit_start);
             }
+            if (gpu_copy) stats.receiver_copy_bytes += two::record_bytes(count);
+            else stats.payload_copy_bytes += bytes;
             stats.received_index_bytes += bytes;
             if (s != rank) stats.peer_received_index_bytes += bytes;
         }
@@ -339,9 +352,30 @@ struct Rme2Proxy {
         }
         two::CompletionProgress progress(sequence);
         bool local_installed = false;
+        bool self_copied = false, receiver_copied = !receiver_kernel;
+        Clock::time_point receiver_tail_start;
         while (!local_installed || !progress.complete()) {
             check_deadline(submitted);
-            if (!local_installed && event_ready(read_done)) {
+            if (!self_copied && event_ready(read_done)) {
+                self_copied = true;
+                receiver_tail_start = Clock::now();
+            }
+            if (!receiver_copied && event_ready(receiver_end)) {
+                // Event completion, not a host-polled GPU flag, makes all
+                // mapped payload/result stores available to the CPU.
+                for (int s = 0; s < 8; ++s) if (s != rank) {
+                    require(receiver_results[s].epoch == sequence, "receiver result epoch mismatch");
+                    require(receiver_results[s].error != rme2::receiver::timeout_error,
+                            "receiver kernel timed out waiting for a peer record");
+                    require(receiver_results[s].error == 0, "receiver kernel rejected a peer record");
+                }
+                float elapsed = 0;
+                check(cudaEventElapsedTime(&elapsed, receiver_begin, receiver_end), "receiver timing");
+                stats.receiver_gpu_ms = elapsed;
+                if (self_copied) stats.receiver_tail_ms = ms(receiver_tail_start);
+                receiver_copied = true;
+            }
+            if (!local_installed && self_copied && receiver_copied) {
                 stats.payload_completion_ms = ms(payload_wait_start);
                 stats.payload_d2h_ms = ms(payload_start);
                 finish_payload_breakdown();
@@ -509,13 +543,25 @@ struct Rme2Proxy {
         check(cudaEventRecord(begin, s), "record exchange start");
         if (nodes == 2)
             launch_exchange_two(peers, rank, node, capacity, sequence, local_offsets, local_values,
-                                local_node_offsets, local_x3, local_x4, direct_x3_x4_output, s);
+                                local_node_offsets, local_x3, local_x4, direct_x3_x4_output,
+                                receiver_kernel, s);
         else
             launch_exchange(peers, rank, capacity, local_offsets, local_values, s);
         check(cudaGetLastError(), "launch metadata exchange");
         // Publish readiness at the exchange boundary, BEFORE the gather. The
         // receiver can read metadata while this stream gathers activation rows.
         check(cudaEventRecord(end, s), "record exchange end");
+        if (receiver_kernel) {
+            // Do not wait for all producers or for staging. Waiting for OUR
+            // outbound exchange prevents polling CTAs from blocking that work,
+            // even if this GPU serializes kernels. Other GPUs can still send.
+            check(cudaStreamWaitEvent(receiver_stream, end, 0), "order receiver after local outbound exchange");
+            check(cudaEventRecord(receiver_begin, receiver_stream), "record receiver start");
+            launch_receiver(inbox, mapped_pinned, rank, node, capacity, sequence,
+                            receiver_timeout_cycles, mapped_receiver_results, receiver_stream);
+            check(cudaGetLastError(), "launch metadata receiver");
+            check(cudaEventRecord(receiver_end, receiver_stream), "record receiver completion");
+        }
         if (!local_staging_after_d2h) launch_staging(s);
     }
     void launch_staging(cudaStream_t s) {
@@ -600,11 +646,15 @@ struct Rme2Proxy {
         }
         if ((metadata_graph || staging_graph) && work_stream) cudaStreamSynchronize(work_stream);
         if (read_stream) cudaStreamSynchronize(read_stream);
+        if (receiver_stream) cudaStreamSynchronize(receiver_stream);
         for (auto stream : source_streams) if (stream) cudaStreamSynchronize(stream);
         if (end) cudaEventSynchronize(end);
         for (int p = 0; p < rme2::gpus; ++p)
             if (opened[p]) cudaIpcCloseMemHandle(peers.ptr[p]);
         if (read_stream) cudaStreamDestroy(read_stream);
+        if (receiver_stream) cudaStreamDestroy(receiver_stream);
+        if (receiver_begin) cudaEventDestroy(receiver_begin);
+        if (receiver_end) cudaEventDestroy(receiver_end);
         if (begin) cudaEventDestroy(begin);
         if (end) cudaEventDestroy(end);
         if (read_done) cudaEventDestroy(read_done);
@@ -620,12 +670,42 @@ struct Rme2Proxy {
         rdma.reset();
         if (inbox) cudaFree(inbox);
         if (pinned) cudaFreeHost(pinned);
+        if (receiver_results) cudaFreeHost(receiver_results);
         if (shared) munmap(shared, sizeof(Shared));
         if (owner) shm_unlink(name.c_str());
     }
 };
 
-extern "C" int rme2_abi_version() { return 12; }
+extern "C" int rme2_abi_version() { return 13; }
+extern "C" int rme2_set_receiver_kernel(Rme2Proxy* p, int enabled) {
+    return api([&] {
+        require(p && (enabled == 0 || enabled == 1), "invalid receiver kernel option");
+        std::lock_guard<std::mutex> lock(p->mutex);
+        require(!p->connected && p->sequence == 0 && !p->receiver_stream,
+                "configure receiver kernel once before connect/capture");
+        require(!enabled || (p->nodes == 2 && p->device == p->rank),
+                "receiver kernel requires two nodes with identity local CUDA ordinals");
+        require(!enabled || !p->d2h_after_local_staging,
+                "receiver kernel requires d2h_after_local_staging disabled");
+        if (!enabled) return;
+        check(cudaSetDevice(p->device), "select receiver GPU");
+        cudaDeviceProp prop{};
+        check(cudaGetDeviceProperties(&prop, p->device), "query receiver GPU");
+        require(prop.canMapHostMemory && prop.clockRate > 0, "receiver requires mapped host memory and GPU clock");
+        check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&p->mapped_pinned), p->pinned, 0),
+              "map pinned receiver records");
+        check(cudaHostAlloc(reinterpret_cast<void**>(&p->receiver_results),
+                            8 * sizeof(rme2::receiver::Result), cudaHostAllocMapped), "allocate receiver results");
+        std::memset(p->receiver_results, 0, 8 * sizeof(rme2::receiver::Result));
+        check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&p->mapped_receiver_results),
+                                      p->receiver_results, 0), "map receiver results");
+        p->receiver_timeout_cycles = uint64_t(std::min(p->timeout, 3600.0) * prop.clockRate * 1000.0) + 1;
+        check(cudaStreamCreateWithFlags(&p->receiver_stream, cudaStreamNonBlocking), "create receiver stream");
+        check(cudaEventCreate(&p->receiver_begin), "create receiver start event");
+        check(cudaEventCreate(&p->receiver_end), "create receiver completion event");
+        p->receiver_kernel = true;
+    });
+}
 extern "C" int rme2_enable_direct_x3_x4(Rme2Proxy* p, void** payload, uint64_t* bytes) {
     return api([&] {
         require(p && payload && bytes, "invalid direct x3/x4 output arguments");
@@ -654,6 +734,7 @@ extern "C" int rme2_set_d2h_after_local_staging(Rme2Proxy* p, int enabled) {
         std::lock_guard<std::mutex> lock(p->mutex);
         require(p->sequence == 0 && !p->pending && !p->done, "configure staging readback before iterations");
         require(!enabled || !p->local_staging_after_d2h, "staging ordering options are mutually exclusive");
+        require(!enabled || !p->receiver_kernel, "staging-before-D2H requires receiver kernel disabled");
         p->d2h_after_local_staging = enabled != 0;
     });
 }
@@ -733,6 +814,12 @@ extern "C" int rme2_connect(Rme2Proxy* p, const void* handles) {
         check(cudaSetDevice(p->device), "select connect GPU");
         for (int peer = 0; peer < 8; ++peer) {
             if (peer == p->rank) { p->peers.ptr[peer] = p->inbox; continue; }
+            if (p->receiver_kernel) {
+                int supported = 0;
+                check(cudaDeviceGetP2PAttribute(&supported, cudaDevP2PAttrNativeAtomicSupported,
+                                                p->device, peer), "query peer system-scope atomics");
+                require(supported != 0, "receiver kernel requires native P2P atomics on every local GPU pair");
+            }
             cudaIpcMemHandle_t h;
             std::memcpy(&h, static_cast<const char*>(handles) + peer * sizeof(h), sizeof(h));
             check(cudaIpcOpenMemHandle(reinterpret_cast<void**>(&p->peers.ptr[peer]), h,

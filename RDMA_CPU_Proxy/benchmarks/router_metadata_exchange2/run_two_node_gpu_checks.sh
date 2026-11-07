@@ -7,11 +7,13 @@ modes=(eager graph)
 serialized=false
 skip_staging=false
 direct_output=false
+receiver=false
 for arg in "$@"; do
   if [[ "${arg}" == "--d2h-after-local-staging" || "${arg}" == "--local-staging-after-d2h" ]]; then serialized=true; fi
   if [[ "${arg}" == "--skip-local-staging" ]]; then skip_staging=true; fi
   if [[ "${arg}" == "--native-metadata-launch" ]]; then modes=(graph); fi
   if [[ "${arg}" == "--direct-x3-x4-output" ]]; then direct_output=true; fi
+  if [[ "${arg}" == "--receiver-kernel" ]]; then receiver=true; fi
 done
 for mode in "${modes[@]}"; do
   for tokens in 1 33 257 8193 16385; do
@@ -34,9 +36,11 @@ for mode in "${modes[@]}"; do
   fi
 
   if ! "${skip_staging}" && ! "${serialized}"; then
-    bash "${script_dir}/run_two_node_torchrun.sh" "${node_rank}" --mode "${mode}" --tokens 33 \
-      --d2h-after-local-staging --warmup 1 --iterations 6 --route-pattern cycle --verify all \
-      --output "${script_dir}/results/check_two_${mode}_serialized_staging.json" "$@"
+    if ! "${receiver}"; then
+      bash "${script_dir}/run_two_node_torchrun.sh" "${node_rank}" --mode "${mode}" --tokens 33 \
+        --d2h-after-local-staging --warmup 1 --iterations 6 --route-pattern cycle --verify all \
+        --output "${script_dir}/results/check_two_${mode}_serialized_staging.json" "$@"
+    fi
     bash "${script_dir}/run_two_node_torchrun.sh" "${node_rank}" --mode "${mode}" --tokens 33 \
       --local-staging-after-d2h --warmup 1 --iterations 6 --route-pattern cycle --verify all \
       --output "${script_dir}/results/check_two_${mode}_staging_after_d2h.json" "$@"

@@ -9,6 +9,19 @@ from unittest.mock import patch
 
 
 class LaunchDispatchTests(unittest.TestCase):
+    def test_receiver_kernel_option_and_topology(self):
+        for flags, enabled in (([], False), (['--receiver-kernel'], True),
+                               (['--receiver-kernel', '--skip-local-staging'], True),
+                               (['--receiver-kernel', '--local-staging-after-d2h'], True)):
+            with patch.object(sys, 'argv', ['benchmark.py', *flags]):
+                self.assertEqual(options().receiver_kernel, enabled)
+        program = str(Path(__file__).with_name('benchmark.py'))
+        env = dict(os.environ, WORLD_SIZE='8', RANK='0', LOCAL_RANK='0', LOCAL_WORLD_SIZE='8')
+        result = subprocess.run([sys.executable, program, '--receiver-kernel'],
+                                env=env, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('requires two-node mode', result.stderr)
+
     def test_staging_readback_is_opt_in(self):
         for flags, before, after in (([], False, False),
                                      (['--d2h-after-local-staging'], True, False),
@@ -51,6 +64,7 @@ class LaunchDispatchTests(unittest.TestCase):
                       ['--batch-payload-copy', '--per-source-readback'], ['--token-dimension', '0'],
                       ['--d2h-after-local-staging', '--skip-local-staging'],
                       ['--local-staging-after-d2h', '--skip-local-staging'],
+                      ['--receiver-kernel', '--d2h-after-local-staging'],
                       ['--local-staging-after-d2h', '--d2h-after-local-staging']):
             result = subprocess.run([sys.executable, program, *flags], text=True, capture_output=True)
             self.assertEqual(result.returncode, 2)

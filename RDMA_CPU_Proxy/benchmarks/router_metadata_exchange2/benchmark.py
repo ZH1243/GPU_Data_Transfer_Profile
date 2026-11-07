@@ -24,7 +24,7 @@ def summary(values):
 
 
 def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False, batch_payload_copy=False,
-                    direct_x3_x4_output=False):
+                    direct_x3_x4_output=False, receiver_kernel=False):
     labels = (
         ("end_to_end_ms", "End to end (wall)"),
         ("metadata_launch_barrier_ms", "Native metadata launch barrier wait"),
@@ -32,6 +32,8 @@ def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False, 
         ("metadata_completion_wait_ms", "CPU wait for local metadata completion"),
         ("metadata_barrier_wait_ms", "Shared-memory metadata barrier wait"),
         ("exchange_gpu_ms", "GPU exchange / x3/x4 packing (GPU)"),
+        ("receiver_gpu_ms", "Receiver: arrival waits + host stores (GPU)"),
+        ("receiver_tail_ms", "Receiver: residual after self D2H (wall)"),
         ("local_staging_gpu_ms", "Local staging gather (GPU)"),
         ("sender_completion_wait_ms", "Proxy wait for local GPU completion"),
         ("peer_completion_wait_ms", "Proxy wait for peer completions"),
@@ -61,6 +63,10 @@ def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False, 
             label = "GPU exchange / x3/x4 header (GPU)"
         if batch_payload_copy and key == "payload_submit_ms":
             label = "  Payload: cudaMemcpyBatchAsync call"
+        if receiver_kernel and key == "payload_d2h_ms":
+            label = "Self D2H + remaining receiver completion"
+        if receiver_kernel and key == "payload_submit_ms":
+            label = "  Payload: self-only cudaMemcpyAsync"
         if metadata_barrier and not per_source_readback and key == "sender_completion_wait_ms":
             label = "Proxy wait for local exchange completion"
         if per_source_readback:
@@ -74,6 +80,9 @@ def print_breakdown(metrics, per_source_readback=False, metadata_barrier=False, 
         print(f"{label:45s} {values['median'] * 1000:10.3f} "
               f"{values['mean'] * 1000:10.3f} {values['p95'] * 1000:10.3f}")
     print("GPU and CPU intervals overlap: do not sum these rows.")
+    if receiver_kernel:
+        print("Receiver starts after this GPU's outbound exchange; it can overlap other GPUs' exchanges,")
+        print("local staging, directory/self D2H and RDMA. Its GPU span includes waiting for peer records.")
     print("Local staging runs after GPU exchange; --d2h-after-local-staging gates readback on it.")
     print("--local-staging-after-d2h launches gather after local D2H; remaining RDMA may overlap.")
     print("By default staging may overlap D2H/RDMA. Its residual wait")
@@ -129,6 +138,8 @@ def options():
                         default="affine", help="cycle stresses empty lists and changing lengths")
     parser.add_argument("--skip-index-validation", action="store_true",
                         help="omit timed expert-index and x3/x4 scans; structural header checks always remain")
+    parser.add_argument("--receiver-kernel", action="store_true",
+                        help="two-node only: copy peer records to mapped host memory as GPU readiness flags arrive")
     parser.add_argument("--direct-x3-x4-output", action="store_true",
                         help="two-node only: metadata kernel 4 also writes remote x3/x4 directly into the RDMA buffer")
     parser.add_argument("--native-metadata-launch", action="store_true",
@@ -146,6 +157,8 @@ def options():
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--output", type=Path, default=Path("results/metadata_exchange2.json"))
     args = parser.parse_args()
+    if args.receiver_kernel and args.d2h_after_local_staging:
+        parser.error("--receiver-kernel requires --d2h-after-local-staging to be disabled")
     if args.local_staging_after_d2h and args.d2h_after_local_staging:
         parser.error("--local-staging-after-d2h requires --d2h-after-local-staging to be disabled")
     if args.local_staging_after_d2h and args.skip_local_staging:
@@ -181,6 +194,7 @@ def verify(args, iteration, rank, plan, proxy, nodes=1, stats=None, staging=None
     expected_bytes = dict(received_index_bytes=0, peer_received_index_bytes=0,
                           rdma_sent_bytes=0, rdma_received_bytes=0,
                           x3_x4_sent_bytes=0, x3_x4_received_bytes=0,
+                          receiver_copy_bytes=0, payload_copy_bytes=0,
                           header_bytes=1088 if nodes == 2 else 576)
     for source in range(8 * nodes):
         routes = make_routes(args.tokens, sample_seed(args.seed, source, iteration, nodes), pattern)
@@ -196,6 +210,11 @@ def verify(args, iteration, rank, plan, proxy, nodes=1, stats=None, staging=None
             expected_bytes["peer_received_index_bytes"] += payload_bytes
         if nodes == 2 and source // 8 != rank // 8:
             expected_bytes["rdma_received_bytes"] += 64 + payload_bytes
+        if nodes == 2 and source // 8 == rank // 8:
+            if args.receiver_kernel and source != rank:
+                expected_bytes["receiver_copy_bytes"] += 64 + payload_bytes
+            else:
+                expected_bytes["payload_copy_bytes"] += payload_bytes
         if proxy.snapshot(source) != expected:
             raise AssertionError(f"rank={rank} source={source} iteration={iteration}: installed metadata mismatch")
         if nodes == 2 and source == (rank ^ 8):
@@ -245,6 +264,8 @@ def main():
         raise ValueError("two-node mode requires default all-senders readback; disable per-source and batch-copy options")
     if args.direct_x3_x4_output and nodes != 2:
         raise ValueError("--direct-x3-x4-output requires two-node mode")
+    if args.receiver_kernel and nodes != 2:
+        raise ValueError("--receiver-kernel requires two-node mode")
     nic = rdma_device(args.rdma_device_map, local) if nodes == 2 else None
     import torch
     import torch.distributed as dist
@@ -285,7 +306,8 @@ def main():
                          args.timeout, not args.skip_index_validation, args.cores[local],
                          args.per_source_readback, args.metadata_barrier, args.batch_payload_copy, nodes, node,
                          d2h_after_local_staging=args.d2h_after_local_staging,
-                         local_staging_after_d2h=args.local_staging_after_d2h)
+                         local_staging_after_d2h=args.local_staging_after_d2h,
+                         receiver_kernel=args.receiver_kernel)
         if local == 0:
             proxy = create_proxy()
         dist.barrier()  # creator finished initializing shared control
@@ -364,6 +386,8 @@ def main():
             if nodes == 2:
                 print("x3/x4 exchange enabled: same-index remote slice; nine RDMA records per proxy/iteration; "
                       f"direct_x3_x4_output={args.direct_x3_x4_output}", flush=True)
+                print(f"receiver_kernel={args.receiver_kernel}; "
+                      "directory D2H retained; peer payload D2H uses SM stores when enabled", flush=True)
             print(f"local_staging={staging is not None}; d2h_after_local_staging={args.d2h_after_local_staging}; "
                   f"local_staging_after_d2h={args.local_staging_after_d2h}; token_dimension={args.token_dimension}; "
                   f"dtype=BF16; gather={staging.plan.implementation if staging else 'disabled'}", flush=True)
@@ -402,12 +426,14 @@ def main():
             metrics = {key: summary([r[key] for report in reports for r in report["records"]])
                        for key in records[0] if key.endswith("_ms")}
             critical_metrics = {key: summary([r[key] for r in critical_records]) for key in metrics}
-            report = dict(schema_version=13, backend=("cpp-thread-cuda-ipc-gpudirect-rdma" if nodes == 2 else "cpp-thread-cuda-ipc"), topology=dict(
+            report = dict(schema_version=14, backend=("cpp-thread-cuda-ipc-gpudirect-rdma" if nodes == 2 else "cpp-thread-cuda-ipc"), topology=dict(
                 nodes=nodes, gpus=world, gpus_per_node=8, experts=128, experts_per_gpu=128 // world, top_k=8),
                 completion_endpoint=("16 source expert tables and remote same-index x3/x4 installed; nine outgoing RDMA sends drained"
                                      if nodes == 2 else "8 source expert tables installed")
                                     + ("; local token staging complete" if staging is not None else ""),
                 x3_x4_exchange=nodes == 2,
+                receiver_kernel=args.receiver_kernel,
+                receiver_timing_note="Receiver GPU span includes peer readiness polling and mapped-host stores; it starts after local outbound exchange and overlaps late peer exchange/staging/readback/RDMA. Local payload completion waits for both self DMA and receiver. receiver_copy_bytes includes peer headers; payload_copy_bytes counts API-submitted two-node index bytes. Directory D2H is unchanged.",
                 x3_x4_payload_producer=("metadata kernel 4 (direct output)" if args.direct_x3_x4_output
                                        else "GPU exchange packing" if nodes == 2 else None),
                 local_staging=dict(enabled=staging is not None, dtype="bfloat16", token_dimension=args.token_dimension,
@@ -430,7 +456,7 @@ def main():
             print(json.dumps(dict(critical_rank_end_to_end_ms=summary(critical),
                                   output=str(args.output), verification=args.verify), indent=2), flush=True)
             print_breakdown(critical_metrics, args.per_source_readback, args.metadata_barrier, args.batch_payload_copy,
-                            args.direct_x3_x4_output)
+                            args.direct_x3_x4_output, args.receiver_kernel)
         dist.barrier()
         proxy.disconnect()
         dist.barrier()  # close every IPC import before any owning GPU allocation is freed

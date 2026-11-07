@@ -3,7 +3,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI 12; Linux CUDA only. All functions except destroy/error return 0 on success.
+/* ABI 13; Linux CUDA only. All functions except destroy/error return 0 on success.
  * create/connect/submit/wait/view must be called serially by one host thread.
  * submit queues work; the owned native thread handles readback and installation.
  * Pointers returned by view are borrowed until the next submit or destroy.
@@ -33,6 +33,10 @@ typedef struct {
     double local_staging_gpu_ms;
     double local_staging_wait_ms;
     double staging_before_d2h_wait_ms;
+    /* Receiver span includes GPU polling for arrivals; tail is CPU-observed
+     * delay after self D2H, overlapping RDMA progress. Neither is additive. */
+    double receiver_gpu_ms;
+    double receiver_tail_ms;
     uint64_t received_index_bytes;
     uint64_t peer_received_index_bytes;
     uint64_t header_bytes;
@@ -41,9 +45,14 @@ typedef struct {
     /* x3/x4 payload only (5 bytes/token); RDMA totals above include its header. */
     uint64_t x3_x4_sent_bytes;
     uint64_t x3_x4_received_bytes;
+    uint64_t receiver_copy_bytes; /* Peer record headers + indices written by SMs. */
+    uint64_t payload_copy_bytes;  /* Two-node indices submitted through CUDA D2H APIs. */
 } Rme2Stats;
 int rme2_abi_version(void);
 int rme2_set_batch_payload_copy(Rme2Proxy*, int enabled);
+/* Two-node only; configure before IPC connect/capture. Peer records go to mapped
+ * pinned memory through a receiver kernel. Rejects staging-before-D2H ordering. */
+int rme2_set_receiver_kernel(Rme2Proxy*, int enabled);
 /* Setup-only: gate all local header/payload D2H on local staging completion.
  * Requires a staging graph before submit; exchange publication is unchanged. */
 int rme2_set_d2h_after_local_staging(Rme2Proxy*, int enabled);

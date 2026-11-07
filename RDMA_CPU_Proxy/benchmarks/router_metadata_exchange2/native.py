@@ -9,10 +9,11 @@ class Stats(C.Structure):
         "headers_d2h_ms", "payload_d2h_ms", "payload_checks_ms", "payload_submit_ms",
         "payload_event_record_ms", "payload_completion_ms", "payload_other_ms", "install_ms", "native_ms",
         "rdma_post_ms", "rdma_poll_ms", "rdma_post_recv_ms", "rdma_work_complete_ms",
-        "local_staging_gpu_ms", "local_staging_wait_ms", "staging_before_d2h_wait_ms")]
+        "local_staging_gpu_ms", "local_staging_wait_ms", "staging_before_d2h_wait_ms",
+        "receiver_gpu_ms", "receiver_tail_ms")]
     _fields_ += [(name, C.c_uint64) for name in (
         "received_index_bytes", "peer_received_index_bytes", "header_bytes", "rdma_sent_bytes", "rdma_received_bytes",
-        "x3_x4_sent_bytes", "x3_x4_received_bytes")]
+        "x3_x4_sent_bytes", "x3_x4_received_bytes", "receiver_copy_bytes", "payload_copy_bytes")]
 
     def as_dict(self):
         return {name: getattr(self, name) for name, _ in self._fields_}
@@ -21,14 +22,15 @@ class Stats(C.Structure):
 class Proxy:
     def __init__(self, library, rank, device, tokens, shm_name, timeout, validate, core,
                  per_source_readback=False, metadata_barrier=False, batch_payload_copy=False,
-                 nodes=1, node=0, d2h_after_local_staging=False, local_staging_after_d2h=False):
+                 nodes=1, node=0, d2h_after_local_staging=False, local_staging_after_d2h=False,
+                 receiver_kernel=False):
         self.experts_per_gpu = 128 // (nodes * 8)
         self.nodes = nodes
         self.tokens = tokens
         self.lib = C.CDLL(str(library))  # CDLL releases the GIL in native calls.
         self.handle = C.c_void_p()
         self.lib.rme2_abi_version.restype = C.c_int
-        if self.lib.rme2_abi_version() != 12:
+        if self.lib.rme2_abi_version() != 13:
             raise RuntimeError("native ABI mismatch; rebuild the library")
         signatures = {
             "rme2_abi_version": ([], C.c_int),
@@ -38,6 +40,7 @@ class Proxy:
             "rme2_rdma_init": ([C.c_void_p, C.c_char_p, C.c_int, C.c_int, C.c_void_p, C.c_int], C.c_int),
             "rme2_rdma_connect": ([C.c_void_p, C.c_char_p], C.c_int),
             "rme2_set_batch_payload_copy": ([C.c_void_p, C.c_int], C.c_int),
+            "rme2_set_receiver_kernel": ([C.c_void_p, C.c_int], C.c_int),
             "rme2_set_d2h_after_local_staging": ([C.c_void_p, C.c_int], C.c_int),
             "rme2_set_local_staging_after_d2h": ([C.c_void_p, C.c_int], C.c_int),
             "rme2_enable_direct_x3_x4": ([C.c_void_p, C.POINTER(C.c_void_p), C.POINTER(C.c_uint64)], C.c_int),
@@ -60,7 +63,7 @@ class Proxy:
         for name, (args, result) in signatures.items():
             fn = getattr(self.lib, name)
             fn.argtypes, fn.restype = args, result
-        if self.lib.rme2_abi_version() != 12:
+        if self.lib.rme2_abi_version() != 13:
             raise RuntimeError("native ABI mismatch; rebuild the library")
         self.check(self.lib.rme2_create(rank, device, tokens, shm_name.encode(), timeout,
                                        int(validate), core, int(per_source_readback), int(metadata_barrier),
@@ -69,6 +72,7 @@ class Proxy:
             self.check(self.lib.rme2_set_batch_payload_copy(self.handle, int(batch_payload_copy)))
             self.check(self.lib.rme2_set_d2h_after_local_staging(self.handle, int(d2h_after_local_staging)))
             self.check(self.lib.rme2_set_local_staging_after_d2h(self.handle, int(local_staging_after_d2h)))
+            self.check(self.lib.rme2_set_receiver_kernel(self.handle, int(receiver_kernel)))
         except Exception:
             self.close()
             raise
