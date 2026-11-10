@@ -25,6 +25,40 @@ Before the first measured send, peers also exchange a TCP ready barrier after QP
 
 When `nvlink_forwarding_enabled=true`, each proxy also starts NVLink forwarding threads for its local GPU. The QP CQ workers still own CQ polling and immediate decoding; the forwarding-ready thread monitors their per-chunk immediate counters, while the forwarding thread processes peer-node receive buffers in deterministic descending ring order and issues intra-node GPU-to-GPU copies after a forwarding batch has arrived.
 
+## Embedded communication-only run
+
+From `RDMA_CPU_Proxy`, append `--communication-only` to the existing scripts:
+
+```bash
+# Node 0
+bash ./scripts/run_node0_torchrun.sh --communication-only
+# Node 1
+bash ./scripts/run_node1_torchrun.sh --communication-only
+```
+
+The single-node script supports the same option:
+
+```bash
+bash ./scripts/run_single_node_torchrun.sh --communication-only
+```
+
+This exercises local staging and NVLink forwarding without inter-node RDMA
+traffic. The current native library still initializes the configured RDMA NIC.
+
+This worker option overrides the scripts' GEMM, down-projection, result-return,
+combine, and associated check/trace options regardless of argument order. It
+also forces native return notifications and return-ready GPU publication off.
+Routing, local-input staging, RDMA dispatch, NVLink forwarding, and their
+configured preparation/notification settings remain active. QuACK is not
+imported in this mode; CUDA-enabled PyTorch still owns the proxy buffers.
+Unknown options and invalid argument types/choices remain errors.
+
+No shell-script or JSON edits are needed to select this mode. Append `--dry-run`
+to inspect the effective native arguments without loading CUDA or the library.
+The option itself requires only the updated Python worker, not a native rebuild.
+Moving to another GPU platform still requires compatible native device code,
+CUDA/PyTorch, GPU-memory RDMA registration, peer access, and correct node/NIC maps.
+
 ## Optional RDMA QP calibration
 
 For a **two-node, RDMA-only** run, enable `rdma_qp_calibration_enabled=true`

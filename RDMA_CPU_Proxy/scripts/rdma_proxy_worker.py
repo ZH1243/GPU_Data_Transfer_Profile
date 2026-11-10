@@ -1621,6 +1621,11 @@ def main() -> int:
         action="store_true",
         help="launch QuACK multi-buffer GroupedGEMM with every proxy iteration",
     )
+    parser.add_argument(
+        "--communication-only",
+        action="store_true",
+        help="override GEMM, return, and combine options; run only proxy dispatch/forwarding",
+    )
     parser.add_argument("--num-experts", "--num_experts", type=int)
     parser.add_argument(
         "--grouped-gemm-activation",
@@ -1663,11 +1668,24 @@ def main() -> int:
     args, proxy_args = parser.parse_known_args()
     if any(arg.startswith("--down-") for arg in proxy_args):
         parser.error("unsupported --down-* option")
+    if args.communication_only:
+        # Apply the mode after parsing so it wins regardless of argument order.
+        # Reset every option owned by the down/return/combine pipeline together.
+        down_parser = argparse.ArgumentParser(add_help=False)
+        add_down_arguments(down_parser)
+        vars(args).update(vars(down_parser.parse_args([])))
+        args.concurrent_kernel = False
+        args.grouped_gemm_activation = "none"
+        for name in vars(args):
+            if name.startswith("expert_gemm_"):
+                setattr(args, name, parser.get_default(name))
     try:
         validate_down_arguments(args)
     except ValueError as error:
         parser.error(str(error))
-    if not args.down_projection2 and any(arg.startswith("--down-") for arg in sys.argv[1:]):
+    if not args.communication_only and not args.down_projection2 and any(
+        arg.startswith("--down-") for arg in sys.argv[1:]
+    ):
         parser.error("--down-* options require --down-projection2")
     if args.grouped_gemm_activation != "none" and not args.concurrent_kernel:
         parser.error("--grouped-gemm-activation requires --concurrent-kernel")
@@ -1678,6 +1696,13 @@ def main() -> int:
     )
 
     proxy_argv, metadata = build_proxy_argv(args, proxy_args)
+    if args.communication_only:
+        # Last CLI values override both the launch script and JSON settings.
+        proxy_argv.extend([
+            "--nvlink_return_completion_notifications_enabled=false",
+            "--nvlink_return_ready_gpu_publication_enabled=false",
+        ])
+        print("communication-only mode: GEMM, result returns, and combine disabled", flush=True)
     print(
         "starting embedded RDMA CPU proxy "
         f"rank={metadata['rank']} node_rank={metadata['node_rank']} "

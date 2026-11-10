@@ -6,6 +6,7 @@ Run: python -m unittest discover -s RDMA_CPU_Proxy/tests -p test_worker_activati
 import importlib.util
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import unittest
@@ -15,6 +16,56 @@ WORKER = Path(__file__).resolve().parents[1] / "scripts" / "rdma_proxy_worker.py
 spec = importlib.util.spec_from_file_location("rdma_proxy_worker", WORKER)
 worker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(worker)
+
+
+class CommunicationOnlyCliTests(unittest.TestCase):
+    def test_existing_launch_scripts(self):
+        for script_name, node, nodes in (
+            ("run_node0_torchrun.sh", 0, 2),
+            ("run_node1_torchrun.sh", 1, 2),
+            ("run_single_node_torchrun.sh", 0, 1),
+        ):
+            script = WORKER.parent / script_name
+            command = script.read_text().split('"${torchrun_bin}" \\\n', 1)[1]
+            tokens = shlex.split(command.replace("\\\n", ""))
+            start = tokens.index("${script_dir}/rdma_proxy_worker.py") + 1
+            options = tokens[start:]
+            self.assertEqual(options.pop(), "$@")
+            for mode_first in (False, True):
+                with self.subTest(script=script_name, mode_first=mode_first):
+                    mode = ["--communication-only"]
+                    argv = mode + options if mode_first else options + mode
+                    result = subprocess.run(
+                        [sys.executable, str(WORKER), *argv, "--dry-run"],
+                        env={**os.environ, "LOCAL_RANK": "0", "LOCAL_WORLD_SIZE": "8",
+                             "RANK": str(node * 8), "WORLD_SIZE": str(nodes * 8), "GROUP_RANK": str(node)},
+                        text=True, capture_output=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("communication-only mode", result.stdout)
+                    native = shlex.split(result.stdout.splitlines()[-1])
+                    values = dict(arg[2:].split("=", 1) for arg in native
+                                  if arg.startswith("--") and "=" in arg)
+                    self.assertEqual(values["num_nodes"], str(nodes))
+                    for key in ("router_routing_enabled", "router_local_input_staging_enabled",
+                                "nvlink_forwarding_enabled", "nvlink_forward_preparation_enabled",
+                                "nvlink_forward_submit_epilogue_enabled"):
+                        self.assertEqual(values[key], "true")
+                    for key in ("nvlink_return_completion_notifications_enabled",
+                                "nvlink_return_ready_gpu_publication_enabled", "mock_mode"):
+                        self.assertEqual(values[key], "false")
+                    self.assertNotIn("--concurrent-kernel", native)
+                    self.assertNotIn("--down-projection2", native)
+
+    def test_unknown_down_option_still_rejected(self):
+        result = subprocess.run(
+            [sys.executable, str(WORKER), "--library=/unused.so",
+             "--cuda-device-map=0,1", "--rdma-device-map=nic0,nic1",
+             "--communication-only", "--down-typo", "--dry-run"],
+            text=True, capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsupported --down-* option", result.stderr)
 
 
 class ActivationCliTests(unittest.TestCase):
