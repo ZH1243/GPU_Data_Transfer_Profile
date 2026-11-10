@@ -1957,15 +1957,48 @@ void Proxy::drain_forwarding_iteration_notifications(uint64_t iteration) {
     // Publish a watermark only after the dispatcher has sent the entire prefix.
     const auto deadline = std::chrono::steady_clock::now() +
         std::chrono::milliseconds(config_.completion_timeout_ms);
-    auto poll = [&] {
+    const auto required = nvlink_forward_notifications_enqueued_.load();
+    auto poll = [&](const char* stage, int waiting_source) {
         check_forwarding_error();
         if (std::chrono::steady_clock::now() >= deadline) {
-            throw std::runtime_error("timed out draining NVLink iteration notifications");
+            std::ostringstream out;
+            out << "timed out draining NVLink iteration notifications"
+                << " node_rank=" << config_.node_rank
+                << " local_gpu=" << config_.local_gpu_index
+                << " iteration=" << iteration
+                << " stage=" << stage
+                << " waiting_source_gpu=" << waiting_source
+                << " timeout_ms=" << config_.completion_timeout_ms
+                << " required_sent=" << required
+                << " enqueued=" << nvlink_forward_notifications_enqueued_.load()
+                << " sent=" << nvlink_forward_notifications_sent_.load()
+                << " received=" << nvlink_forward_notifications_received_.load();
+            // Include every source: the first queue we wait on need not be the
+            // only stalled worker. A missing watermark can be an upstream
+            // RDMA/forwarding stall, whereas head > tail identifies queued work.
+            for (int source = 0; source < config_.num_gpus_per_node; ++source) {
+                auto* queue = nvlink_forward_notification_queue_for_source(
+                    nvlink_forward_notification_header_, source);
+                out << " source[" << source << "]={completed_iteration="
+                    << atomic_load_u64(&queue->completed_iteration)
+                    << ",expected_iteration=" << iteration + 1
+                    << ",head=" << atomic_load_u64(&queue->head)
+                    << ",tail=" << atomic_load_u64(&queue->tail)
+                    << ",sender_done=" << atomic_load_u64(&queue->sender_done);
+                for (const auto& dst : forwarding_notification_destinations_) {
+                    if (dst.gpu_index == source) {
+                        const auto pid = atomic_load_i32(&dst.header->pid);
+                        out << ",pid=" << pid << ",alive=" << process_is_alive(pid);
+                        break;
+                    }
+                }
+                out << '}';
+            }
+            throw std::runtime_error(out.str());
         }
         cpu_relax();
     };
-    const auto required = nvlink_forward_notifications_enqueued_.load();
-    while (nvlink_forward_notifications_sent_.load() < required) poll();
+    while (nvlink_forward_notifications_sent_.load() < required) poll("outgoing_dispatch", -1);
     for (const auto& dst : forwarding_notification_destinations_) {
         auto* queue = nvlink_forward_notification_queue_for_source(dst.header, config_.local_gpu_index);
         atomic_store_u64(&queue->completed_iteration, iteration + 1);
@@ -1975,7 +2008,7 @@ void Proxy::drain_forwarding_iteration_notifications(uint64_t iteration) {
             nvlink_forward_notification_header_, source);
         while (atomic_load_u64(&queue->completed_iteration) < iteration + 1 ||
                atomic_load_u64(&queue->tail) != atomic_load_u64(&queue->head)) {
-            poll();
+            poll("incoming_drain", source);
         }
     }
 }
