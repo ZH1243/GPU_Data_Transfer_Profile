@@ -21,6 +21,21 @@ namespace rdma_proxy {
 namespace {
 
 #if RDMA_PROXY_HAVE_CUDA
+cudaError_t memcpy_batch_async(
+    void** dsts, void** srcs, std::size_t* sizes, std::size_t count,
+    cudaMemcpyAttributes* attrs, std::size_t* attrs_idxs,
+    std::size_t num_attrs, cudaStream_t stream) {
+    // CUDA 13 removed the failIdx output parameter from the batch-copy API.
+#if CUDART_VERSION >= 13000
+    return cudaMemcpyBatchAsync(
+        dsts, srcs, sizes, count, attrs, attrs_idxs, num_attrs, stream);
+#else
+    std::size_t fail_idx = 0;
+    return cudaMemcpyBatchAsync(
+        dsts, srcs, sizes, count, attrs, attrs_idxs, num_attrs, &fail_idx, stream);
+#endif
+}
+
 void check_cuda(cudaError_t status, const char* what) {
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
@@ -2005,11 +2020,10 @@ void launch_cuda_prepared_forward_batch_async(
         return;
     }
 #if RDMA_PROXY_HAVE_CUDA
-    std::size_t fail_idx = 0;
-    check_cuda(cudaMemcpyBatchAsync(
+    check_cuda(memcpy_batch_async(
                    batch.dsts.data(), batch.srcs.data(), batch.sizes.data(),
                    batch.sizes.size(), &batch.attributes, &batch.attribute_index,
-                   batch.attribute_count, &fail_idx, reinterpret_cast<cudaStream_t>(stream)),
+                   batch.attribute_count, reinterpret_cast<cudaStream_t>(stream)),
                "cudaMemcpyBatchAsync prepared forwarding");
 #else
     (void)stream;
@@ -2037,8 +2051,7 @@ void launch_cuda_forward_copy_batch_async(
         cudaMemcpyAttributes attrs{};
         attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
         std::size_t attrs_idxs[] = {0};
-        std::size_t fail_idx = 0;
-        check_cuda(cudaMemcpyBatchAsync(dsts, srcs, sizes, 1, &attrs, attrs_idxs, 1, &fail_idx, cuda_stream),
+        check_cuda(memcpy_batch_async(dsts, srcs, sizes, 1, &attrs, attrs_idxs, 1, cuda_stream),
                    "cudaMemcpyBatchAsync");
     } else {
         check_cuda(cudaMemcpyAsync(copy.dst, copy.src, copy.bytes, cudaMemcpyDeviceToDevice, cuda_stream),
@@ -2085,8 +2098,7 @@ void launch_cuda_forward_copy_batch_async(
         cudaMemcpyAttributes attrs{};
         attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
         std::vector<std::size_t> attrs_idxs(copies.size(), 0);
-        std::size_t fail_idx = 0;
-        check_cuda(cudaMemcpyBatchAsync(
+        check_cuda(memcpy_batch_async(
                        dsts.data(),
                        srcs.data(),
                        sizes.data(),
@@ -2094,7 +2106,6 @@ void launch_cuda_forward_copy_batch_async(
                        &attrs,
                        attrs_idxs.data(),
                        1,
-                       &fail_idx,
                        cuda_stream),
                    "cudaMemcpyBatchAsync");
     } else {
