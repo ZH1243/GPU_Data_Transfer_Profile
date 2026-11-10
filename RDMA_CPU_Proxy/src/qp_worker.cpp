@@ -72,6 +72,14 @@ DynamicChunkDistributor::DynamicChunkDistributor(
     assignment_.expected_send_completions_by_qp.assign(qp_count, 0);
 }
 
+void DynamicChunkDistributor::set_qp_memory(
+    std::vector<std::pair<MemoryRegionInfo, MemoryRegionInfo>> memory) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (next_chunk_ != 0 || memory.size() != assignment_.chunks_by_qp.size())
+        throw std::runtime_error("invalid per-QP memory configuration");
+    qp_memory_ = std::move(memory);
+}
+
 bool DynamicChunkDistributor::next(int qp_index, SendTask& task) {
     if (qp_index < 0) throw std::runtime_error("invalid QP index");
     const auto q = static_cast<std::size_t>(qp_index);
@@ -103,6 +111,13 @@ bool DynamicChunkDistributor::next(int qp_index, SendTask& task) {
     task.local_lkey = local_lkey_;
     task.remote_base = remote_base_;
     task.remote_rkey = remote_rkey_;
+    if (!qp_memory_.empty()) {
+        const auto& memory = qp_memory_[q];
+        task.local_base = memory.first.addr;
+        task.local_lkey = memory.first.lkey;
+        task.remote_base = memory.second.addr;
+        task.remote_rkey = memory.second.rkey;
+    }
     task.signaled = true;
     task.return_sequence = return_sequence_;
     return true;

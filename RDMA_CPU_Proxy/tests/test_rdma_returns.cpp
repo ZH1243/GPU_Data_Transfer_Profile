@@ -9,7 +9,7 @@ struct RdmaReturnsTestAccess {
     static void require(bool value, const char* message) {
         if (!value) throw std::runtime_error(message);
     }
-    static void exercise(bool empty) {
+    static void exercise(bool empty, bool dual = false) {
         ProxyConfig config;
         config.mock_mode = true;
         config.num_nodes = 2;
@@ -25,8 +25,14 @@ struct RdmaReturnsTestAccess {
         config.peers = {PeerAddress{1, "mock", 12345}};
         // The reverse path must bypass the forward per-token scatter layout.
         config.rdma_chunk_per_token_sge_enabled = true;
+        config.num_qps_per_peer = 8;
+        if (dual) { config.rdma_device_name = "mock0"; config.rdma_device_name2 = "mock1"; }
         Proxy proxy(config);
         proxy.rdma_context_.initialize();
+        if (dual) {
+            proxy.rdma_context2_ = std::make_unique<RdmaContext>(proxy.qp_config(4));
+            proxy.rdma_context2_->initialize();
+        }
         proxy.router_routing_.initialize();
         proxy.initialized_ = true;
         Proxy::PeerState peer;
@@ -34,7 +40,7 @@ struct RdmaReturnsTestAccess {
         peer.router_x4 = proxy.router_routing_.token_masks_for_node(1);
         const auto rows = peer.router_x4.size();
         for (int q = 0; q < 8; ++q) {
-            auto qp = std::make_unique<RdmaQueuePair>(proxy.rdma_context_, config, 1, q);
+            auto qp = std::make_unique<RdmaQueuePair>(proxy.qp_context(q), proxy.qp_config(q), 1, q);
             qp->connect(qp->local_info());
             auto worker = std::make_unique<QPWorker>(*qp, 16, 2);
             worker->configure_expected_chunks(1);
@@ -118,5 +124,7 @@ struct RdmaReturnsTestAccess {
 int main() {
     rdma_proxy::RdmaReturnsTestAccess::exercise(false);
     rdma_proxy::RdmaReturnsTestAccess::exercise(true);
+    rdma_proxy::RdmaReturnsTestAccess::exercise(false, true);
+    rdma_proxy::RdmaReturnsTestAccess::exercise(true, true);
     std::cout << "test_rdma_returns passed\n";
 }

@@ -269,6 +269,13 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "rdma_qp_calibration_max_attempts") config.rdma_qp_calibration_max_attempts = std::stoi(value);
     else if (key == "rdma_qp_calibration_timeout_ms") config.rdma_qp_calibration_timeout_ms = std::stoull(value);
     else if (key == "rdma_device_name") config.rdma_device_name = value;
+    else if (key == "rdma_device_name2") config.rdma_device_name2 = value;
+    else if (key == "rdma_port2") {
+        const int port = std::stoi(value);
+        if (port < 0 || port > 255) throw std::runtime_error("invalid rdma_port2");
+        config.rdma_port2 = static_cast<uint8_t>(port);
+    }
+    else if (key == "gid_index2") config.gid_index2 = std::stoi(value);
     else if (key == "rdma_port") config.rdma_port = static_cast<uint8_t>(std::stoi(value));
     else if (key == "gid_index") config.gid_index = std::stoi(value);
     else if (key == "cuda_device_id") config.cuda_device_id = std::stoi(value);
@@ -603,6 +610,11 @@ static ProxyConfig parse_config_file(const std::string& path) {
     config.rdma_qp_calibration_max_attempts = number_as<int>(object, "rdma_qp_calibration_max_attempts", config.rdma_qp_calibration_max_attempts);
     config.rdma_qp_calibration_timeout_ms = number_as<uint64_t>(object, "rdma_qp_calibration_timeout_ms", config.rdma_qp_calibration_timeout_ms);
     config.rdma_device_name = get_string(object, "rdma_device_name", config.rdma_device_name);
+    config.rdma_device_name2 = get_string(object, "rdma_device_name2", config.rdma_device_name2);
+    const int port2 = number_as<int>(object, "rdma_port2", config.rdma_port2);
+    if (port2 < 0 || port2 > 255) throw std::runtime_error("invalid rdma_port2");
+    config.rdma_port2 = static_cast<uint8_t>(port2);
+    config.gid_index2 = number_as<int>(object, "gid_index2", config.gid_index2);
     config.rdma_port = number_as<uint8_t>(object, "rdma_port", config.rdma_port);
     config.gid_index = number_as<int>(object, "gid_index", config.gid_index);
     config.cuda_device_id = number_as<int>(object, "cuda_device_id", config.cuda_device_id);
@@ -830,6 +842,11 @@ ProxyConfig load_config(int argc, char** argv) {
 }
 
 void validate_config(const ProxyConfig& config) {
+    if (config.gid_index2 < -2) throw std::runtime_error("invalid gid_index2");
+    if (!config.rdma_device_name2.empty() &&
+        (config.rdma_device_name.empty() || config.rdma_device_name == config.rdma_device_name2 ||
+         config.num_qps_per_peer < 2 || config.num_qps_per_peer % 2))
+        throw std::runtime_error("two RDMA devices require distinct explicit names and an even num_qps_per_peer >= 2");
     if (config.rdma_qp_calibration_enabled) {
         if (config.num_nodes != 2 || config.nvlink_forwarding_enabled) {
             throw std::runtime_error("rdma_qp_calibration_enabled requires two nodes and nvlink_forwarding_enabled=false");
@@ -1264,6 +1281,8 @@ std::string config_summary(const ProxyConfig& config) {
         << " dim=" << config.token_dimension
         << " chunk_tokens=" << config.tokens_per_chunk
         << " qps_per_peer=" << config.num_qps_per_peer
+        << " rdma_devices=" << config.rdma_device_name
+        << (config.rdma_device_name2.empty() ? "" : "+" + config.rdma_device_name2)
         << " data_signal_interval=" << config.data_signal_interval
         << " max_in_flight_chunks_per_qp=" << config.max_in_flight_chunks_per_qp
         << " rdma_chunk_per_token_sge_enabled="

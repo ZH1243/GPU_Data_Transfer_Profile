@@ -111,6 +111,12 @@ uintptr_t Proxy::configure_rdma_returns(
                 std::max(element, send_bytes), "rdma_return_source");
             p.destination = rdma_context_.register_memory(reinterpret_cast<void*>(b.destination),
                 std::max(element, recv_bytes), "rdma_return_destination");
+            if (rdma_context2_) {
+                p.source2 = rdma_context2_->register_memory(reinterpret_cast<void*>(b.source),
+                    std::max(element, send_bytes), "rdma_return_source_device2");
+                p.destination2 = rdma_context2_->register_memory(reinterpret_cast<void*>(b.destination),
+                    std::max(element, recv_bytes), "rdma_return_destination_device2");
+            }
             p.chunks = return_chunks(b.source_rows, width, tile, group_tiles, element, chunk_bytes);
             for (auto& worker : it->workers) worker->configure_return_protocol(total_groups);
         }
@@ -121,23 +127,30 @@ uintptr_t Proxy::configure_rdma_returns(
                 [&](const auto& a) { return a.node_rank == b.peer; });
             if (addr == config_.peers.end()) throw std::runtime_error("RDMA return peer address missing");
             std::ostringstream payload;
-            payload << "rdma_return_v1 " << config_.node_rank << ' ' << config_.local_gpu_index << ' '
+            payload << (rdma_context2_ ? "rdma_return_v2 " : "rdma_return_v1 ") << config_.node_rank << ' ' << config_.local_gpu_index << ' '
                     << width << ' ' << tile << ' ' << group_tiles << ' ' << element << ' '
                     << chunk_bytes << ' ' << config_.num_iterations << ' '
                     << b.source_rows << ' ' << b.destination_rows << ' '
                     << p.destination.addr << ' ' << p.destination.rkey << ' ' << p.destination.length;
+            if (rdma_context2_) payload << ' ' << p.destination2.addr << ' '
+                << p.destination2.rkey << ' ' << p.destination2.length;
             std::istringstream remote(connection_manager_.exchange_control_message(*addr, payload.str(), timeout_ms));
             std::string version, trailing;
             int node = -1, gpu = -1;
             std::size_t rw = 0, rt = 0, rg = 0, re = 0, rc = 0, ri = 0, rs = 0, rr = 0;
             if (!(remote >> version >> node >> gpu >> rw >> rt >> rg >> re >> rc >> ri >> rs >> rr
-                         >> p.remote.addr >> p.remote.rkey >> p.remote.length) || remote >> trailing ||
-                version != "rdma_return_v1" || node != (config_.mock_mode ? config_.node_rank : b.peer) ||
+                         >> p.remote.addr >> p.remote.rkey >> p.remote.length) ||
+                version != (rdma_context2_ ? "rdma_return_v2" : "rdma_return_v1") || node != (config_.mock_mode ? config_.node_rank : b.peer) ||
                 gpu != config_.local_gpu_index || rw != width || rt != tile || rg != group_tiles ||
                 re != element || rc != chunk_bytes || ri != config_.num_iterations ||
                 rs != b.destination_rows || rr != b.source_rows || !p.remote.addr ||
                 p.remote.length != std::max(element, product(product(b.source_rows, width), element)))
                 throw std::runtime_error("RDMA return remote metadata mismatch");
+            if (rdma_context2_ &&
+                (!(remote >> p.remote2.addr >> p.remote2.rkey >> p.remote2.length) ||
+                 p.remote2.addr != p.remote.addr || p.remote2.length != p.remote.length))
+                throw std::runtime_error("RDMA return second-device metadata mismatch");
+            if (remote >> trailing) throw std::runtime_error("RDMA return unexpected metadata suffix");
         }
     } catch (...) {
         release_rdma_returns();
@@ -173,6 +186,8 @@ void Proxy::service_rdma_returns() const {
             auto distributor = std::make_shared<DynamicChunkDistributor>(
                 p.chunks[p.next_group], peer.peer_rank, peer.workers.size(),
                 p.source.addr, p.source.lkey, p.remote.addr, p.remote.rkey, sequence);
+            configure_distributor_memory(*distributor, peer.workers.size(),
+                p.source, p.remote, p.source2, p.remote2);
             for (auto& worker : peer.workers) {
                 SendTask task;
                 task.distributor = distributor;
@@ -229,6 +244,10 @@ void Proxy::release_rdma_returns() {
     for (auto& p : rdma_returns_->peers) {
         if (p.source.addr) rdma_context_.deregister_memory(p.source);
         if (p.destination.addr) rdma_context_.deregister_memory(p.destination);
+        if (rdma_context2_) {
+            if (p.source2.addr) rdma_context2_->deregister_memory(p.source2);
+            if (p.destination2.addr) rdma_context2_->deregister_memory(p.destination2);
+        }
     }
     if (config_.mock_mode) delete rdma_returns_->host_prefix;
 #if RDMA_PROXY_HAVE_CUDA

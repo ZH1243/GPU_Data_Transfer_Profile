@@ -59,6 +59,57 @@ The option itself requires only the updated Python worker, not a native rebuild.
 Moving to another GPU platform still requires compatible native device code,
 CUDA/PyTorch, GPU-memory RDMA registration, peer access, and correct node/NIC maps.
 
+## Two RDMA devices per GPU
+
+The worker accepts `deviceA+deviceB` for each entry in `--rdma-device-map`.
+Commas still separate GPUs. `--num_qps_per_peer` is the **total** per peer GPU:
+with 20 QPs, indices 0–9 use device A and 10–19 use device B. Both endpoints
+must use the same total QP count and device count. Device A connects to the
+remote entry's device A, and B to B; names may differ between nodes, but each
+pair must have fabric connectivity. Two-device mode requires an even QP count
+of at least two and two distinct device names.
+
+After syncing the updated source and Python worker to **both nodes**, rebuild:
+
+```bash
+cmake --build RDMA_CPU_Proxy/build-hopper \
+  --target rdma_cpu_proxy rdma_cpu_proxy_shared -j4
+```
+
+From `RDMA_CPU_Proxy`, use this map on a node with the previously inspected
+Blackwell device names (adjust independently for the other node):
+
+```bash
+# Node 0; use run_node1_torchrun.sh on node 1.
+bash ./scripts/run_node0_torchrun.sh --communication-only \
+  --num_qps_per_peer=20 \
+  --rdma-device-map=mlx5_000+mlx5_001,mlx5_002+mlx5_003,mlx5_004+mlx5_005,mlx5_006+mlx5_007,mlx5_008+mlx5_009,mlx5_010+mlx5_011,mlx5_012+mlx5_013,mlx5_014+mlx5_015
+```
+
+The single-node script accepts the same options, but performs no inter-node
+traffic. One-device map entries retain the original behavior. The map controls
+both native device names, overriding any device names in JSON.
+
+Native CLI/JSON options are `rdma_device_name` and `rdma_device_name2` (empty
+second name disables the mode). Device B inherits `rdma_port` and `gid_index`
+unless `rdma_port2` (default 0 = inherit) or `gid_index2` (default -2 = inherit)
+is supplied. `gid_index2=-1` disables global addressing, just like `gid_index=-1`;
+it does not automatically discover a RoCE GID. Select valid GIDs for each
+Ethernet device. Existing master/peer IP settings must also match the new nodes.
+
+Each device owns a context/PD, registers the same GPU allocations independently,
+and creates its own QPs/CQs. The shared chunk distributor uses the claiming QP's
+local and remote registration keys. Payload buffers are not duplicated and no
+fixed 50/50 payload split is imposed. Readiness and completion tracking still
+span all QPs. Reverse RDMA and calibration QP recreation use both devices too;
+calibration bandwidth thresholds apply to their combined outgoing bandwidth.
+Initialization logs show the device assigned to each logical QP.
+
+Dual-device metadata is versioned; upgrade both endpoints together. This feature
+does not bond interfaces or enable Blackwell GEMM. CPU/mock tests cover key
+selection, metadata, forwarding, returns, and recreation; actual two-port
+bandwidth and GPUDirect behavior must be measured on the remote nodes.
+
 ## Optional RDMA QP calibration
 
 For a **two-node, RDMA-only** run, enable `rdma_qp_calibration_enabled=true`

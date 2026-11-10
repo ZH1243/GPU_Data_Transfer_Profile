@@ -1013,6 +1013,12 @@ def build_proxy_argv(
     rdma_devices = comma_separated_values(
         "--rdma-device-map", args.rdma_device_map, local_world_size
     )
+    # Commas separate GPUs; '+' separates the two devices owned by one GPU.
+    device_pairs = [[name.strip() for name in entry.split("+")] for entry in rdma_devices]
+    for pair in device_pairs:
+        if len(pair) not in (1, 2) or any(not name.strip() for name in pair) or len(set(pair)) != len(pair):
+            raise RuntimeError("--rdma-device-map requires one device or two distinct devices joined by '+' per GPU")
+    local_devices = device_pairs[local_rank]
     try:
         cuda_device_id = int(cuda_devices[local_rank])
     except ValueError as error:
@@ -1032,7 +1038,8 @@ def build_proxy_argv(
         f"--num_gpus_per_node={local_world_size}",
         f"--local_gpu_index={local_rank}",
         f"--cuda_device_id={cuda_device_id}",
-        f"--rdma_device_name={rdma_devices[local_rank]}",
+        f"--rdma_device_name={local_devices[0]}",
+        f"--rdma_device_name2={local_devices[1] if len(local_devices) == 2 else ''}",
         f"--listen_port={listen_port}",
     ]
     if args.num_experts is not None:
@@ -1613,7 +1620,8 @@ def main() -> int:
     )
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--cuda-device-map", required=True)
-    parser.add_argument("--rdma-device-map", required=True)
+    parser.add_argument("--rdma-device-map", required=True,
+                        help="comma-separated GPU entries; use deviceA+deviceB for two devices per GPU")
     parser.add_argument("--listen-port-base", type=int, default=18515)
     parser.add_argument("--local-rank", "--local_rank", dest="launcher_local_rank", type=int)
     parser.add_argument(

@@ -49,6 +49,9 @@ struct ProxyConfig {
     uint64_t rdma_qp_calibration_timeout_ms{300000};
 
     std::string rdma_device_name;
+    std::string rdma_device_name2; // Empty preserves the single-device path.
+    uint8_t rdma_port2{0}; // Zero inherits rdma_port.
+    int gid_index2{-2}; // -2 inherits gid_index; -1 disables global addressing.
     uint8_t rdma_port{1};
     int gid_index{-1};
     int cuda_device_id{0};

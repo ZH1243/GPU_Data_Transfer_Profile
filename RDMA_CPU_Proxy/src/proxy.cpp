@@ -442,8 +442,39 @@ void Proxy::set_external_device_buffer_allocator(
     cuda_buffers_.set_external_device_buffer_allocator(std::move(allocator));
 }
 
+bool Proxy::second_device(int qp) const {
+    return !config_.rdma_device_name2.empty() && qp >= config_.num_qps_per_peer / 2;
+}
+
+ProxyConfig Proxy::qp_config(int qp) const {
+    auto config = config_;
+    if (second_device(qp)) {
+        config.rdma_device_name = config_.rdma_device_name2;
+        config.rdma_port = config_.rdma_port2 ? config_.rdma_port2 : config_.rdma_port;
+        config.gid_index = config_.gid_index2 == -2 ? config_.gid_index : config_.gid_index2;
+    }
+    return config;
+}
+
+RdmaContext& Proxy::qp_context(int qp) {
+    return second_device(qp) ? *rdma_context2_ : rdma_context_;
+}
+
+void Proxy::configure_distributor_memory(
+    DynamicChunkDistributor& distributor, std::size_t qps,
+    const MemoryRegionInfo& source, const MemoryRegionInfo& remote,
+    const MemoryRegionInfo& source2, const MemoryRegionInfo& remote2) const {
+    if (config_.rdma_device_name2.empty()) return;
+    std::vector<std::pair<MemoryRegionInfo, MemoryRegionInfo>> memory;
+    for (std::size_t q = 0; q < qps; ++q)
+        memory.emplace_back(second_device(q) ? source2 : source,
+                            second_device(q) ? remote2 : remote);
+    distributor.set_qp_memory(std::move(memory));
+}
+
 void Proxy::initialize() {
     if (initialized_) return;
+    if (!config_.rdma_device_name2.empty()) validate_config(config_);
     RDMA_PROXY_LOG_INFO("initializing proxy: ", config_summary(config_));
 
     rdma_iteration_bandwidth_gbps_.clear();
@@ -453,6 +484,10 @@ void Proxy::initialize() {
     cuda_buffers_.initialize();
     exchange_router_expert_metadata_all_to_all();
     rdma_context_.initialize();
+    if (!config_.rdma_device_name2.empty()) {
+        rdma_context2_ = std::make_unique<RdmaContext>(qp_config(config_.num_qps_per_peer / 2));
+        rdma_context2_->initialize();
+    }
 
     for (auto& peer_buffers : cuda_buffers_.peer_buffers()) {
         setup_peer(peer_buffers);
@@ -727,6 +762,10 @@ void Proxy::shutdown() {
         }
         rdma_context_.deregister_memory(peer.local_send_mr);
         rdma_context_.deregister_memory(peer.local_recv_mr);
+        if (rdma_context2_) {
+            rdma_context2_->deregister_memory(peer.local_send_mr2);
+            rdma_context2_->deregister_memory(peer.local_recv_mr2);
+        }
     }
     release_rdma_returns();
     peers_.clear();
@@ -750,6 +789,7 @@ PeerConnectionInfo Proxy::make_local_peer_info(const PeerState& peer) const {
     info.node_rank = config_.node_rank;
     info.gpu_index = config_.local_gpu_index;
     info.recv_buffer = peer.local_recv_mr;
+    info.recv_buffer2 = peer.local_recv_mr2;
     info.qps.reserve(peer.qps.size());
     for (const auto& qp : peer.qps) {
         info.qps.push_back(qp->local_info());
@@ -765,8 +805,16 @@ void Proxy::setup_peer(PeerGpuBuffers& buffers) {
     peer.local_recv_mr = rdma_context_.register_memory(
         buffers.recv.ptr, buffers.recv.bytes, "recv_buffer_peer_" + std::to_string(buffers.peer_rank));
 
+    if (rdma_context2_) {
+        peer.local_send_mr2 = rdma_context2_->register_memory(
+            buffers.send.ptr, buffers.send.bytes, "send_buffer_device2");
+        peer.local_recv_mr2 = rdma_context2_->register_memory(
+            buffers.recv.ptr, buffers.recv.bytes, "recv_buffer_device2");
+    }
     for (int q = 0; q < config_.num_qps_per_peer; ++q) {
-        peer.qps.emplace_back(new RdmaQueuePair(rdma_context_, config_, buffers.peer_rank, q));
+        peer.qps.emplace_back(new RdmaQueuePair(qp_context(q), qp_config(q), buffers.peer_rank, q));
+        RDMA_PROXY_LOG_INFO("QP device assignment peer=", buffers.peer_rank, " qp=", q,
+                            " device=", qp_config(q).rdma_device_name);
     }
 
     const auto local_info = make_local_peer_info(peer);
@@ -777,6 +825,9 @@ void Proxy::setup_peer(PeerGpuBuffers& buffers) {
     if (remote_info.qps.size() != peer.qps.size()) {
         throw std::runtime_error("remote QP count does not match local QP count");
     }
+    if (bool(remote_info.recv_buffer2.addr) != bool(rdma_context2_))
+        throw std::runtime_error("peer RDMA device count mismatch");
+    peer.remote_recv_mr2 = remote_info.recv_buffer2;
     peer.remote_recv_mr = remote_info.recv_buffer;
     peer.remote_gpu_index = remote_info.gpu_index;
     if (config_.router_routing_enabled) {
@@ -865,11 +916,14 @@ void Proxy::recreate_peer_qps(PeerState& peer) {
     peer.workers.clear(); // Workers hold references into qps.
     peer.qps.clear();
     for (int q = 0; q < config_.num_qps_per_peer; ++q)
-        peer.qps.emplace_back(new RdmaQueuePair(rdma_context_, config_, peer.peer_rank, q));
+        peer.qps.emplace_back(new RdmaQueuePair(qp_context(q), qp_config(q), peer.peer_rank, q));
     const auto& address = config_.peers.front();
     const auto remote = connection_manager_.exchange_peer_info(address, make_local_peer_info(peer), calibration_remaining_ms());
     if (remote.qps.size() != peer.qps.size())
         throw std::runtime_error("calibration remote QP count mismatch");
+    if (bool(remote.recv_buffer2.addr) != bool(rdma_context2_))
+        throw std::runtime_error("calibration peer RDMA device count mismatch");
+    peer.remote_recv_mr2 = remote.recv_buffer2;
     peer.remote_recv_mr = remote.recv_buffer;
     for (std::size_t q = 0; q < peer.qps.size(); ++q) {
         peer.qps[q]->connect(remote.qps[q]);
@@ -3049,6 +3103,8 @@ std::shared_ptr<DynamicChunkDistributor> Proxy::enqueue_chunks(
         peer.local_send_mr.lkey,
         static_cast<uintptr_t>(peer.remote_recv_mr.addr),
         peer.remote_recv_mr.rkey);
+    configure_distributor_memory(*distributor, peer.workers.size(),
+        peer.local_send_mr, peer.remote_recv_mr, peer.local_send_mr2, peer.remote_recv_mr2);
 
     for (std::size_t q = 0; q < peer.workers.size(); ++q) {
         SendTask task;

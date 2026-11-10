@@ -19,6 +19,30 @@ spec.loader.exec_module(worker)
 
 
 class CommunicationOnlyCliTests(unittest.TestCase):
+    def test_dual_device_map(self):
+        for rank in (0, 1):
+            result = subprocess.run(
+                [sys.executable, str(WORKER), "--library=/unused.so",
+                 "--cuda-device-map=0,1", "--rdma-device-map=nic0+nic1,nic2+nic3",
+                 "--num_qps_per_peer=20", "--communication-only", "--dry-run"],
+                env={**os.environ, "LOCAL_RANK": str(rank), "LOCAL_WORLD_SIZE": "2",
+                     "RANK": str(rank), "WORLD_SIZE": "4", "GROUP_RANK": "0"},
+                text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"--rdma_device_name=nic{rank * 2}", result.stdout)
+            self.assertIn(f"--rdma_device_name2=nic{rank * 2 + 1}", result.stdout)
+        for device_map in ("a+a,b+c", "a+,b+c", "a+b+c,d+e"):
+            result = subprocess.run(
+                [sys.executable, str(WORKER), "--library=/unused.so",
+                 "--cuda-device-map=0,1", f"--rdma-device-map={device_map}", "--dry-run"],
+                env={**os.environ, "LOCAL_RANK": "0", "LOCAL_WORLD_SIZE": "2",
+                     "RANK": "0", "WORLD_SIZE": "4", "GROUP_RANK": "0"},
+                text=True, capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("two distinct devices", result.stderr)
+
     def test_existing_launch_scripts(self):
         for script_name, node, nodes in (
             ("run_node0_torchrun.sh", 0, 2),

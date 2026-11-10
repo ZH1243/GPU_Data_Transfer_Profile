@@ -13,6 +13,7 @@
 #include <queue>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace rdma_proxy {
@@ -70,6 +71,8 @@ public:
     void make_marker(int qp_index, SendTask& task) const;
     IterationAssignment assignment() const;
     std::size_t chunk_count() const;
+    // Set before publishing this distributor to workers. One entry per logical QP.
+    void set_qp_memory(std::vector<std::pair<MemoryRegionInfo, MemoryRegionInfo>> memory);
 
 private:
     mutable std::mutex mutex_;
@@ -82,6 +85,7 @@ private:
     int64_t return_sequence_{-1};
     std::size_t next_chunk_{0};
     IterationAssignment assignment_;
+    std::vector<std::pair<MemoryRegionInfo, MemoryRegionInfo>> qp_memory_;
 };
 
 class QPWorker {

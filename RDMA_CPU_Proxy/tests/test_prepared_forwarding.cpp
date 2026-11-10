@@ -210,13 +210,14 @@ int main(int argc, char** argv) {
     using namespace rdma_proxy;
     Logger::instance().set_level(LogLevel::kError);
     const std::string mode_arg = argc == 2 ? argv[1] : "";
-    const bool unified = mode_arg == "--unified-local" || mode_arg == "--unified-local-atomic" ||
+    const bool dual = mode_arg == "--dual-device";
+    const bool unified = dual || mode_arg == "--unified-local" || mode_arg == "--unified-local-atomic" ||
         mode_arg == "--unified-local-query";
     const bool ping_pong2_only = argc == 2 && std::string(argv[1]) == "--ping-pong2-only";
     const bool query_atomic = argc == 2 && std::string(argv[1]) == "--stream-query-atomic";
     const bool query_mode = mode_arg == "--unified-local-query" || query_atomic || (argc == 2 && std::string(argv[1]) == "--stream-query");
     const bool atomic_ring_depth4 = argc == 2 && std::string(argv[1]) == "--atomic-ring-depth4";
-    const bool atomic_ring_only = mode_arg == "--unified-local-atomic" || query_atomic || atomic_ring_depth4 ||
+    const bool atomic_ring_only = dual || mode_arg == "--unified-local-atomic" || query_atomic || atomic_ring_depth4 ||
         (argc == 2 && std::string(argv[1]) == "--atomic-ring-only");
     const bool submit_epilogue_only = argc == 2 && std::string(argv[1]) == "--submit-epilogue-only";
     if (argc != 1 && !unified && !ping_pong2_only && !submit_epilogue_only && !atomic_ring_only && !query_mode) throw std::runtime_error("unknown test argument");
@@ -245,6 +246,10 @@ int main(int argc, char** argv) {
         config.token_dimension = 8;
         config.tokens_per_chunk = mode == 0 ? 1 : 4;
         config.num_qps_per_peer = 2;
+        if (dual) {
+            config.rdma_device_name = "mock0"; config.rdma_device_name2 = "mock1";
+            config.num_qps_per_peer = 4;
+        }
         config.num_iterations = 3;
         config.completion_timeout_ms = 10000;
         config.mock_mode = true;

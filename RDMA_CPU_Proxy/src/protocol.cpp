@@ -316,6 +316,7 @@ std::vector<uint8_t> normalize_router_x4_for_nvlink(
 
 std::string serialize_peer_info(const PeerConnectionInfo& info) {
     std::ostringstream out;
+    if (info.recv_buffer2.addr) out << "dual_rdma_v1 ";
     out << info.node_rank << ' ' << info.gpu_index << ' ' << info.recv_buffer.addr << ' '
         << info.recv_buffer.lkey << ' ' << info.recv_buffer.rkey << ' ' << info.recv_buffer.length << ' '
         << info.qps.size();
@@ -325,16 +326,24 @@ std::string serialize_peer_info(const PeerConnectionInfo& info) {
             out << ' ' << static_cast<unsigned>(byte);
         }
     }
+    if (info.recv_buffer2.addr) {
+        const auto& mr = info.recv_buffer2;
+        out << ' ' << mr.addr << ' ' << mr.lkey << ' ' << mr.rkey << ' ' << mr.length;
+    }
     return out.str();
 }
 
 PeerConnectionInfo deserialize_peer_info(const std::string& payload) {
     std::istringstream in(payload);
     PeerConnectionInfo info;
+    const bool dual = payload.rfind("dual_rdma_v1 ", 0) == 0;
+    if (dual) { std::string version; in >> version; }
     std::size_t qp_count = 0;
     in >> info.node_rank >> info.gpu_index >> info.recv_buffer.addr >> info.recv_buffer.lkey
        >> info.recv_buffer.rkey >> info.recv_buffer.length >> qp_count;
     if (!in) throw std::runtime_error("failed to parse peer metadata header");
+    if (qp_count == 0 || qp_count > 65536 || (dual && qp_count % 2))
+        throw std::runtime_error("invalid peer QP count");
     info.qps.resize(qp_count);
     for (auto& qp : info.qps) {
         in >> qp.qp_num >> qp.lid >> qp.psn;
@@ -345,6 +354,14 @@ PeerConnectionInfo deserialize_peer_info(const std::string& payload) {
         }
         if (!in) throw std::runtime_error("failed to parse QP metadata");
     }
+    if (dual) {
+        auto& mr = info.recv_buffer2;
+        if (!(in >> mr.addr >> mr.lkey >> mr.rkey >> mr.length) ||
+            mr.addr != info.recv_buffer.addr || mr.length != info.recv_buffer.length || !mr.addr)
+            throw std::runtime_error("invalid second-device receive registration");
+    }
+    std::string trailing;
+    if (in >> trailing) throw std::runtime_error("unexpected peer metadata suffix");
     return info;
 }
 

@@ -121,9 +121,13 @@ void test_config() {
     std::filesystem::remove(path);
 }
 
-void test_run(bool enabled) {
+void test_run(bool enabled, bool dual = false) {
     auto c = config();
     c.rdma_qp_calibration_enabled = enabled;
+    if (dual) {
+        c.rdma_device_name = "mock0"; c.rdma_device_name2 = "mock1";
+        c.num_qps_per_peer = 4;
+    }
     Proxy p(c);
     p.initialize();
     require(!QpCalibrationTestAccess::complete(p), "calibration ran before external buffer initialization");
@@ -513,6 +517,8 @@ int main(int argc, char** argv) {
     test_config();
     test_run(false);
     test_run(true);
+    test_run(false, true);
+    test_run(true, true);
     test_exhaustion();
     test_timeout();
     test_local_coordination(false);

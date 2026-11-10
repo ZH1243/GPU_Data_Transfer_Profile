@@ -18,6 +18,23 @@ int main(int argc, char** argv) {
     assert(config.token_dimension == 128);
     assert(config.tokens_per_chunk == 32);
     assert(config.num_qps_per_peer == 10);
+    assert(config.rdma_device_name2.empty());
+    assert(config.rdma_port2 == 0 && config.gid_index2 == -2);
+    const char* dual_args[] = {"rdma_cpu_proxy", "--config", argv[1],
+        "--rdma_device_name=nic0", "--rdma_device_name2=nic1", "--num_qps_per_peer=20",
+        "--rdma_port2=2", "--gid_index2=7"};
+    const auto dual = rdma_proxy::load_config(8, const_cast<char**>(dual_args));
+    assert(dual.rdma_device_name2 == "nic1" && dual.num_qps_per_peer == 20 &&
+           dual.rdma_port2 == 2 && dual.gid_index2 == 7);
+    {
+        std::ofstream out("dual_device_config.json");
+        out << R"({"num_nodes":1, "num_gpus_per_node":1, "num_tokens":64, "token_dimension":8,
+                   "rdma_device_name":"nic0", "rdma_device_name2":"nic1",
+                   "num_qps_per_peer":20, "rdma_port2":2, "gid_index2":7})";
+    }
+    const auto dual_json = rdma_proxy::load_config_file("dual_device_config.json");
+    assert(dual_json.rdma_device_name2 == "nic1" && dual_json.rdma_port2 == 2 &&
+           dual_json.gid_index2 == 7);
     assert(config.data_signal_interval == 16);
     assert(config.max_in_flight_chunks_per_qp == 4);
     assert(!config.rdma_chunk_per_token_sge_enabled);

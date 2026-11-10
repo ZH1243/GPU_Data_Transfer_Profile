@@ -71,6 +71,7 @@ private:
     struct RdmaReturnPeer {
         std::size_t peer_index{0};
         MemoryRegionInfo source, destination, remote;
+        MemoryRegionInfo source2, destination2, remote2;
         std::vector<std::vector<ChunkDescriptor>> chunks;
         std::size_t next_group{0};
     };
@@ -92,12 +93,14 @@ private:
     friend struct ReturnNotificationsTestAccess;
     friend struct QpCalibrationTestAccess;
     friend struct RdmaReturnsTestAccess;
+    friend struct DualRdmaTestAccess;
     struct PeerState {
         int peer_rank{-1};
         int remote_gpu_index{-1};
         MemoryRegionInfo local_send_mr;
         MemoryRegionInfo local_recv_mr;
         MemoryRegionInfo remote_recv_mr;
+        MemoryRegionInfo local_send_mr2, local_recv_mr2, remote_recv_mr2;
         std::vector<ChunkDescriptor> receive_chunks;
         std::vector<uint8_t> router_x4;
         std::vector<uint8_t> forwarding_routing_table;
@@ -329,6 +332,13 @@ private:
     CudaBuffers cuda_buffers_;
     RouterRouting router_routing_;
     RdmaContext rdma_context_;
+    std::unique_ptr<RdmaContext> rdma_context2_;
+    bool second_device(int qp) const;
+    ProxyConfig qp_config(int qp) const;
+    RdmaContext& qp_context(int qp);
+    void configure_distributor_memory(DynamicChunkDistributor& distributor, std::size_t qps,
+        const MemoryRegionInfo& source, const MemoryRegionInfo& remote,
+        const MemoryRegionInfo& source2, const MemoryRegionInfo& remote2) const;
     ConnectionManager connection_manager_;
     std::vector<PeerState> peers_;
     std::atomic<bool> forwarding_stop_{false};

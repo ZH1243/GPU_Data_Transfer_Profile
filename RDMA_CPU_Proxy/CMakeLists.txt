@@ -101,6 +101,11 @@ target_link_libraries(rdma_cpu_proxy_shared PRIVATE rdma_cpu_proxy_lib)
 if(RDMA_PROXY_BUILD_TESTS)
   enable_testing()
 
+  add_executable(test_dual_rdma tests/test_dual_rdma.cpp)
+  target_link_libraries(test_dual_rdma PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_dual_rdma COMMAND test_dual_rdma)
+  set_tests_properties(test_dual_rdma PROPERTIES TIMEOUT 30)
+
   add_executable(test_cpu_scatter tests/test_cpu_scatter.cpp)
   target_link_libraries(test_cpu_scatter PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_cpu_scatter COMMAND test_cpu_scatter)
@@ -178,6 +183,8 @@ if(RDMA_PROXY_BUILD_TESTS)
   set_tests_properties(test_ping_pong2 PROPERTIES TIMEOUT 120)
 
   add_test(NAME test_unified_local COMMAND test_prepared_forwarding --unified-local)
+  add_test(NAME test_dual_device_forwarding COMMAND test_prepared_forwarding --dual-device)
+  set_tests_properties(test_dual_device_forwarding PROPERTIES TIMEOUT 120)
   add_test(NAME test_unified_local_atomic COMMAND test_prepared_forwarding --unified-local-atomic)
   add_test(NAME test_unified_local_query COMMAND test_prepared_forwarding --unified-local-query)
   set_tests_properties(test_unified_local test_unified_local_atomic test_unified_local_query

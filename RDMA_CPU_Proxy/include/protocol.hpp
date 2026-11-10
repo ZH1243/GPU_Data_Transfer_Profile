@@ -26,6 +26,7 @@ struct PeerConnectionInfo {
     int gpu_index{-1};
     std::vector<QPInfo> qps;
     MemoryRegionInfo recv_buffer;
+    MemoryRegionInfo recv_buffer2; // addr != 0 identifies a two-device peer.
 };
 
 struct ChunkDescriptor {
