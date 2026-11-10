@@ -2468,9 +2468,12 @@ void Proxy::run_iteration(uint64_t iteration) {
         }
     }
 
-    wait_for_forwarding_iteration(iteration);
+    // All peer QPs have completed their send/receive markers. Exclude the
+    // remaining NVLink forwarding tail from RDMA throughput, but still drain
+    // forwarding before validation or any next-iteration buffer reuse.
     const auto end = std::chrono::steady_clock::now();
     const auto seconds = std::chrono::duration<double>(end - start).count();
+    wait_for_forwarding_iteration(iteration);
 
     std::vector<IterationAssignment> assignments;
     assignments.reserve(dispatchers.size());

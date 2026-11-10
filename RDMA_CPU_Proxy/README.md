@@ -110,6 +110,23 @@ does not bond interfaces or enable Blackwell GEMM. CPU/mock tests cover key
 selection, metadata, forwarding, returns, and recreation; actual two-port
 bandwidth and GPUDirect behavior must be measured on the remote nodes.
 
+## RDMA bandwidth timing
+
+The iteration `elapsed_us` and `bandwidth_gbps` use a host wall-clock interval
+starting before RDMA work is enqueued, after iteration-start synchronization,
+and ending after all peers' QPs complete their send and receive markers.
+The subsequent NVLink completion wait is excluded. That wait still runs before
+validation and iteration retirement, so buffers cannot be reused prematurely.
+The per-QP bandwidth reports and iteration bandwidth summary use this same
+interval. The numerator counts outgoing RDMA payload bytes, not send-plus-receive
+bytes or NVLink traffic.
+
+This measures RDMA completion under the configured concurrent workload, not raw
+NIC wire time: CPU scheduling, posting, completion polling, and marker overhead
+remain included. Overlapping NVLink work can still contend with RDMA, and any
+local-forwarding work that delays RDMA progress before the end timestamp remains
+included. Older builds included the final NVLink wait in the reported interval.
+
 ## Optional RDMA QP calibration
 
 For a **two-node, RDMA-only** run, enable `rdma_qp_calibration_enabled=true`
