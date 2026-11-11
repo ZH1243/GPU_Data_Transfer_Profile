@@ -479,6 +479,7 @@ void Proxy::initialize() {
 
     rdma_iteration_bandwidth_gbps_.clear();
     metadata_exchange_reports_.clear();
+    rdma_bandwidth_reports_.clear();
     initialize_local_iteration_sync();
     router_routing_.initialize();
     cuda_buffers_.initialize();
@@ -781,6 +782,10 @@ void Proxy::shutdown() {
         RDMA_PROXY_LOG_INFO(report);
     }
     metadata_exchange_reports_.clear();
+    for (const auto& report : rdma_bandwidth_reports_) {
+        RDMA_PROXY_LOG_INFO(report);
+    }
+    rdma_bandwidth_reports_.clear();
     check_forwarding_error();
 }
 
@@ -6139,7 +6144,7 @@ std::size_t Proxy::validate_received_data(uint64_t iteration) const {
     return errors;
 }
 
-void Proxy::report_rdma_bandwidth_summary() const {
+void Proxy::report_rdma_bandwidth_summary() {
     if (rdma_iteration_bandwidth_gbps_.empty()) return;
 
     double sum = 0.0;
@@ -6194,7 +6199,7 @@ void Proxy::report_rdma_bandwidth_summary() const {
                 << forwarding_availability_avg_us_per_batch;
 
     if (config_.rdma_bandwidth_summary_dir.empty()) {
-        RDMA_PROXY_LOG_INFO(summary.str());
+        rdma_bandwidth_reports_.push_back(summary.str());
         return;
     }
 
@@ -6236,14 +6241,17 @@ void Proxy::report_iteration(
     const double latency_us = seconds * 1.0e6;
     rdma_iteration_bandwidth_gbps_.push_back(gbps);
 
-    RDMA_PROXY_LOG_INFO("iteration=", iteration,
-                        " local_rank=", config_.node_rank,
-                        " local_gpu=", config_.local_gpu_index,
-                        " total_bytes=", total_bytes,
-                        " elapsed_us=", static_cast<uint64_t>(latency_us),
-                        " bandwidth_gbps=", std::fixed, std::setprecision(3), gbps,
-                        " immediate_mismatches=", verification_errors,
-                        " validation_errors=", validation_errors);
+    // Print the measured bandwidth block after metadata timings at shutdown.
+    std::ostringstream report;
+    report << "iteration=" << iteration
+           << " local_rank=" << config_.node_rank
+           << " local_gpu=" << config_.local_gpu_index
+           << " total_bytes=" << total_bytes
+           << " elapsed_us=" << static_cast<uint64_t>(latency_us)
+           << " bandwidth_gbps=" << std::fixed << std::setprecision(3) << gbps
+           << " immediate_mismatches=" << verification_errors
+           << " validation_errors=" << validation_errors;
+    rdma_bandwidth_reports_.push_back(report.str());
 
     if (config_.log_marker_wait_reports) {
         for (std::size_t peer_index = 0; peer_index < peers_.size(); ++peer_index) {

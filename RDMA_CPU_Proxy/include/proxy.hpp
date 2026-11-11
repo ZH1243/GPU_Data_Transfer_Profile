@@ -317,7 +317,7 @@ private:
         const IterationAssignment& assignment,
         uint64_t iteration) const;
     std::size_t validate_received_data(uint64_t iteration) const;
-    void report_rdma_bandwidth_summary() const;
+    void report_rdma_bandwidth_summary();
     void report_iteration(
         uint64_t iteration,
         std::chrono::steady_clock::time_point start,
@@ -414,6 +414,7 @@ private:
     std::deque<std::string> nvlink_forward_notification_log_queue_;
     std::vector<double> rdma_iteration_bandwidth_gbps_;
     std::vector<std::string> metadata_exchange_reports_;
+    std::vector<std::string> rdma_bandwidth_reports_;
     bool iteration_prepared_{false};
     uint64_t prepared_iteration_{0};
     LocalIterationSyncHeader* local_iteration_sync_header_{nullptr};
