@@ -2,6 +2,7 @@
 
 import ctypes
 import os
+import time
 
 
 class ReturnCopy(ctypes.Structure):
@@ -20,6 +21,15 @@ class ReturnExchange:
     """
 
     def __init__(self, torch, library, handle, down, options, node, rank, device, iterations):
+        startup_begin = time.monotonic()
+
+        def trace_startup(message):
+            if getattr(options, "trace_down_ready", False):
+                elapsed = time.monotonic() - startup_begin
+                print(f"[node={node} gpu={device}] return startup +{elapsed:.3f}s: {message}",
+                      flush=True)
+
+        trace_startup("loading CUDA IPC helpers")
         from run.token_exchange import CudaCopies, SharedExchange
         from run.hopper_stream_gather_table_gemm import export_cuda_ipc_allocation
 
@@ -27,9 +37,11 @@ class ReturnExchange:
         self.rank, self.device = rank, device
         self.node = node
         self.world = int(os.environ["LOCAL_WORLD_SIZE"])
+        trace_startup("opening local shared control")
         self.control = SharedExchange(rank, self.world, options.return_token_timeout,
                                       namespace=f"rdma-return-node{node}")
         self.exports = []
+        trace_startup("binding CUDA runtime and allocating pinned counts")
         self.cuda = CudaCopies()
         self.outputs = down.inputs.output_buffers()
         self.check_enabled = options.check_return_token_results
@@ -40,6 +52,7 @@ class ReturnExchange:
             self.rows_host.copy_(down.cpu_scatter_counts)
         self.down_done = torch.cuda.Event()
         self.down_done.record()
+        trace_startup("initial CUDA synchronization")
         torch.cuda.synchronize(device)
         self.closed = False
         try:
@@ -60,17 +73,21 @@ class ReturnExchange:
                          options.rdma_return_chunk_bytes,
                          options.inter_node_combine, options.check_inter_node_combine,
                          os.environ.get("CUDA_VISIBLE_DEVICES")]
+            trace_startup(f"configuration exchange: waiting for {self.world} local ranks")
             settings = self.control.gather("configuration", {
                 "signature": signature, "device": device, "sources": sources,
             })
             if any(item["signature"] != signature for item in settings):
                 raise ValueError("return layouts/options must match across local ranks")
             self.settings = settings
+            trace_startup(f"allocating {(self.world - 1) * len(nodes)} receive buffers")
             for peer in range(self.world):
                 if peer != rank:
                     for source_node in nodes:
                         self.received[peer, source_node] = torch.empty_like(self.outputs[0])
             allocations = {}
+            trace_startup(f"exporting CUDA IPC allocations: receives={len(self.received)} "
+                          f"validation_outputs={len(self.outputs) if self.check_enabled else 0}")
             for (peer, source_node), tensor in self.received.items():
                 exported = export_cuda_ipc_allocation(tensor)
                 self.exports.append(exported)
@@ -87,7 +104,9 @@ class ReturnExchange:
                     output_allocations[str(index)] = [
                         exported.handle_hex, exported.allocation_offset_bytes,
                     ]
+            trace_startup("CUDA IPC exports complete; synchronizing device")
             torch.cuda.synchronize(device)
+            trace_startup("allocation metadata exchange: waiting for local ranks")
             self.metadata = self.control.gather(
                 "allocations", {"received": allocations, "outputs": output_allocations})
             copies = []
@@ -95,6 +114,7 @@ class ReturnExchange:
                 if peer == rank:
                     continue
                 entry = self.metadata[peer]["received"][f"{rank}:{source_node}"]
+                trace_startup(f"opening CUDA IPC destination: peer={peer} source_node={source_node}")
                 destination = self.cuda.peer_pointer(entry[:2], device, settings[peer]["device"])
                 tensor = self.outputs[index]
                 capacity = min(entry[2], tensor.numel() * tensor.element_size())
@@ -115,18 +135,22 @@ class ReturnExchange:
             group_tiles = min(options.down_max_swizzle_size,
                               (width + options.down_tile_n - 1) // options.down_tile_n)
             descriptors = (ReturnCopy * len(copies))(*copies)
+            trace_startup(f"configuring native return stream: copies={len(copies)}")
             self.require(configure(
                 handle, descriptors, len(copies),
                 ctypes.cast(self.rows_host.data_ptr(), ctypes.POINTER(ctypes.c_int64)),
                 len(self.outputs), width, tile, group_tiles, self.outputs[0].element_size(),
                 int(options.return_token_results_per_group), self.down_done.cuda_event))
             down.return_exchange = self
+            trace_startup("native return stream configured; waiting for local ranks")
             self.control.gather("configured")
+            trace_startup("return exchange ready")
             print(f"Return copies configured: receive_slots={len(self.received)} "
                   f"mode={'per-group' if options.return_token_results_per_group else 'whole-buffer'} "
                   "stream=dedicated-nonblocking; return completion/barrier excluded from GEMM timing",
                   flush=True)
         except BaseException as error:
+            trace_startup(f"return setup failed: {error}")
             self.control.state("error", str(error))
             # Retain allocations/imports on failure until process exit.
             _failed_exchanges.append(self)

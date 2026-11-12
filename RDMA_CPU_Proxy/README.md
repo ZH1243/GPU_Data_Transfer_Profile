@@ -604,8 +604,10 @@ If CUDA or libibverbs is found automatically, the relevant real path is compiled
 
 ## Blackwell embedded GEMM integration
 
-Use the CUDA 12.9 / Python 3.12 environment in QuACK's
-`README.md` (section “Blackwell node development environment”). Update **both**
+The CUDA 12.9 / Python 3.12 environment in QuACK's
+`README.md` (section “Blackwell node development environment”) is the documented
+validation baseline. A [CUDA 13 alternative](#cuda-13-alternative) is available
+for nodes with a CUDA 13 toolkit. Update **both**
 repositories on both nodes and rebuild the native library. The Python worker
 continues to load `librdma_cpu_proxy.so` in its own process with `ctypes`; no
 separate proxy executable or Python distributed process group is introduced.
@@ -750,6 +752,16 @@ bash ./scripts/run_node1_torchrun.sh --check-projections --trace-down-ready \
   --return-token-timeout=600
 ```
 
+`DownGEMM warmup complete` is printed after CUDA synchronization; it marks the
+end of down warmup, before return exchange and combine setup. With
+`--trace-down-ready`, startup also reports elapsed times for local configuration
+exchange, receive-buffer allocation, CUDA IPC export/import, and native return
+configuration, followed by combine setup/compilation markers. The next milestone
+is `Return copies configured`. A short pause here alone does not establish a
+hang. `--return-token-timeout` bounds each shared-control polling stage; it does
+not impose a timeout on CUDA calls or shared-control lock acquisition. If startup
+stops progressing, retain the last stage from every local rank and any traceback.
+
 The launchers retain all return/intra-node/RDMA/inter-node numerical checks.
 `--check-projections` additionally decodes the real native table and compares
 every meaningful up row and down destination to chunked FP32 GEMM references,
@@ -759,6 +771,77 @@ iteration. After the small run passes, repeat both commands with
 `--cpu-scatter-preparation` to exercise native scatter metadata under streaming
 arrival. Inspect startup geometry, per-iteration checks, final ready prefixes,
 and timing; a successful isolated GEMM is insufficient.
+
+### CUDA 13 alternative
+
+QuACK supports CUDA 13 through its `cu13` extra. The proxy accepts CUDA 12.9 or
+newer, handles the CUDA 13 batch-copy API, and checks the loaded runtime against
+PyTorch's CUDA major version. A fresh CUDA 13 environment with a CUDA 13 native
+build addresses the CUDA 12/13 runtime mismatch without changing GEMM geometry.
+The worker still requires exactly one loaded runtime; creating an environment
+alone does not validate the final embedded process.
+
+This replaces the CUDA 12.9 environment/build steps above. On **each** node,
+create a new environment and point it at the existing CUDA 13.0 toolkit. Use
+`pip` for QuACK's CUDA 13 extra, as required by its README's installation-order
+guidance. Install the local checkout to retain the communication extensions.
+
+```bash
+conda create -n zh_quack_blackwell312_cu130 python=3.12 pip -y
+conda activate zh_quack_blackwell312_cu130
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH="$CONDA_PREFIX/bin:$CUDA_HOME/bin:$PATH"
+export PROXY_ROOT=/path/to/GPU_Data_Transfer_Profile/RDMA_CPU_Proxy
+export QUACK_ROOT=/path/to/quack_for_communication_overlap
+export RDMA_PROXY_BUILD_DIR="$PROXY_ROOT/build-blackwell-cu130"
+# Keep compiled objects separate from the CUDA 12.9 environment, with caching on.
+export QUACK_CACHE_DIR="$CONDA_PREFIX/var/cache/quack"
+
+python -m pip install --upgrade pip
+python -m pip install 'torch==2.13.0+cu130' \
+  --index-url https://download.pytorch.org/whl/cu130
+python -m pip install 'cuda-python==13.0.3' 'cuda-bindings==13.0.3'
+cd "$QUACK_ROOT"
+python -m pip install -e '.[dev,cu13]' \
+  --extra-index-url https://download.pytorch.org/whl/cu130
+python -m pip check
+python -c 'import torch, quack; print(torch.__version__, torch.version.cuda, quack.__file__); assert torch.version.cuda == "13.0"'
+"$CUDA_HOME/bin/nvcc" --version
+nvidia-smi
+
+cmake -S "$PROXY_ROOT" -B "$RDMA_PROXY_BUILD_DIR" \
+  -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
+  -DCUDAToolkit_ROOT="$CUDA_HOME" -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \
+  -DCMAKE_CUDA_ARCHITECTURES=100 \
+  -DRDMA_PROXY_REQUIRE_CUDA=ON -DRDMA_PROXY_REQUIRE_VERBS=ON
+cmake --build "$RDMA_PROXY_BUILD_DIR" -j4
+readelf -d "$RDMA_PROXY_BUILD_DIR/librdma_cpu_proxy.so" | grep libcudart
+# Expected: libcudart.so.13. Also run the embedded-process preflight above.
+ctest --test-dir "$RDMA_PROXY_BUILD_DIR" --output-on-failure
+
+cd "$QUACK_ROOT"
+CUDA_VISIBLE_DEVICES=0 timeout 1800 python -m pytest -q \
+  run/test_proxy_gemm_integration.py -x
+cd "$PROXY_ROOT"
+CUDA_VISIBLE_DEVICES=0 timeout 1800 python -m unittest discover \
+  -s tests -p 'test_worker*.py' -v
+```
+
+After these pass, run the staged two-node commands above with the same
+per-node network settings, `--check-projections`, and repeated iterations.
+Keep the new environment active and `RDMA_PROXY_BUILD_DIR` and `QUACK_CACHE_DIR`
+exported. The launch scripts will then use the CUDA 13 build.
+
+This recipe has been checked against repository requirements and published
+package versions, but has not been executed on B300 here. CUTLASS DSL 4.7.0's
+[`cu13` compiler bundle corresponds to CUDA 13.3](https://docs.nvidia.com/cutlass/4.7.0/media/docs/pythonDSL/quick_start.html),
+even though the native compiler and PyTorch above use 13.0. The wheel supplies
+its GEMM compiler; installing the system 13.3 toolkit is not implied. Runtime
+alignment alone does not establish driver compatibility with that compiler.
+CUDA 13.x [minor-version compatibility has feature and PTX limitations](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html),
+so retain driver information and run the numerical tests before the two-node
+test. Neither this environment change nor a passing runtime preflight guarantees
+full proxy correctness or throughput.
 
 ### Bulk-store configuration and performance
 

@@ -1497,9 +1497,15 @@ def run_proxy_with_concurrent_kernel(
                     node_rank, local_gpu_index, cuda_device_id, num_iterations.value)
                 if down_options.intra_node_combine:
                     from intra_node_combine import IntraNodeCombine
+                    if down_options.trace_down_ready:
+                        print(f"[gpu={cuda_device_id}] Intra-node combine setup/compilation begin",
+                              flush=True)
                     down.intra_node_combine = IntraNodeCombine(return_exchange, down_options)
                     if down_options.inter_node_combine:
                         from inter_node_combine import InterNodeCombine
+                        if down_options.trace_down_ready:
+                            print(f"[gpu={cuda_device_id}] Inter-node combine setup/compilation begin",
+                                  flush=True)
                         down.intra_node_combine.inter_node_combine = InterNodeCombine(
                             down.intra_node_combine, down_options)
         useful_flops = (
