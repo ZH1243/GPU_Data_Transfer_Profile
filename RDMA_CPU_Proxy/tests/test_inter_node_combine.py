@@ -1,4 +1,4 @@
-"""CPU map tests and opt-in Hopper post-RDMA reduction tests."""
+"""CPU map tests and opt-in Hopper/Blackwell post-RDMA reduction tests."""
 import os
 from pathlib import Path
 import sys
@@ -34,12 +34,12 @@ class MappingTests(unittest.TestCase):
             inverse_token_rows([], -1)
 
 
-@unittest.skipUnless(os.environ.get('RDMA_PROXY_TEST_CUDA') == '1', 'requires Hopper opt-in')
+@unittest.skipUnless(os.environ.get('RDMA_PROXY_TEST_CUDA') == '1', 'requires CUDA opt-in')
 class KernelTests(unittest.TestCase):
     def test_token_order_empty_domains_and_iteration_reuse(self):
         import torch
-        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
-            self.skipTest('requires SM90')
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (9, 10):
+            self.skipTest('requires SM90 or SM100/SM103')
         sys.path.insert(0, os.environ.get('QUACK_ROOT', str(
             Path(__file__).resolve().parents[3] / 'quack_for_communication_overlap')))
         from inter_node_combine import TokenOrderCombine

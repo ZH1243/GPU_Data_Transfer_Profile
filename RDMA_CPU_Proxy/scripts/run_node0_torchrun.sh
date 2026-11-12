@@ -3,30 +3,21 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 project_dir="$(cd -- "${script_dir}/.." && pwd)"
-build_dir="${RDMA_PROXY_BUILD_DIR:-${project_dir}/build-hopper}"
-torchrun_bin="${TORCHRUN_BIN:-torchrun}"
-master_addr="${MASTER_ADDR:-28.59.80.49}"
-master_port="${MASTER_PORT:-29500}"
-
-# --cuda-device-map=0,1,2,3,5,6,7 \
-# --rdma-device-map=mlx5_bond_1,mlx5_bond_4,mlx5_bond_3,mlx5_bond_2,mlx5_bond_6,mlx5_bond_8,mlx5_bond_5 \
-
-# --cuda-device-map=0,1,2,3,4,5,6,7 \
-# --rdma-device-map=mlx5_bond_1,mlx5_bond_4,mlx5_bond_3,mlx5_bond_2,mlx5_bond_7,mlx5_bond_6,mlx5_bond_8,mlx5_bond_5 \
+source "${script_dir}/torchrun_common.sh"
 
 "${torchrun_bin}" \
     --nnodes=2 \
-    --nproc_per_node=8 \
+    --nproc_per_node="${nproc_per_node}" \
     --node_rank=0 \
     --master_addr="${master_addr}" \
     --master_port="${master_port}" \
     --max_restarts=0 \
     "${script_dir}/rdma_proxy_worker.py" \
     --library="${build_dir}/librdma_cpu_proxy.so" \
-    --cuda-device-map=0,1,2,3,4,5,6,7 \
-    --rdma-device-map=mlx5_bond_1,mlx5_bond_4,mlx5_bond_3,mlx5_bond_2,mlx5_bond_7,mlx5_bond_6,mlx5_bond_8,mlx5_bond_5 \
+    --cuda-device-map="${cuda_device_map}" \
+    --rdma-device-map="${rdma_device_map}" \
     --listen-port-base=18515 \
-    --config "${project_dir}/config/node0_config.json" \
+    --config "${RDMA_PROXY_CONFIG:-${project_dir}/config/node0_config.json}" \
     --node_rank=0 \
     --num_nodes=2 \
     --token_dimension=4096 \
@@ -80,7 +71,7 @@ master_port="${MASTER_PORT:-29500}"
     --grouped-gemm-activation=swiglu \
     --down-projection2 --down-sm-count=70 --local-gpu-combine \
     --down-n-tile-major-output --down-tile-m=128 --down-tile-n=128 \
-    --down-pingpong --down-gather-table --down-gather-table-expert-waves \
+    --down-gather-table --down-gather-table-expert-waves \
     --down-max-swizzle-size=1 --down-gather-table-wave-barrier \
     --down-epilogue-store bulk_rows_reduce \
     --down-gather-table-publish-ready \
@@ -98,4 +89,5 @@ master_port="${MASTER_PORT:-29500}"
     --inter-node-combine \
     --inter-node-combine-ctas=78 \
     --check-inter-node-combine \
+    "${site_args[@]}" \
     "$@"

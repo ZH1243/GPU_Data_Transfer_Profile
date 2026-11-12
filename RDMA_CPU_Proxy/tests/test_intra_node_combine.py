@@ -1,4 +1,4 @@
-"""CPU mapping checks; opt-in Hopper numerical/readiness checks.
+"""CPU mapping checks; opt-in Hopper/Blackwell numerical/readiness checks.
 
 RDMA_PROXY_TEST_CUDA=1 QUACK_ROOT=/path/to/quack_for_communication_overlap \
 python -m unittest discover -s RDMA_CPU_Proxy/tests -p test_intra_node_combine.py -v
@@ -36,7 +36,7 @@ class MappingTests(unittest.TestCase):
                 contribution_indices(masks, 8)
 
 
-@unittest.skipUnless(os.environ.get("RDMA_PROXY_TEST_CUDA") == "1", "requires Hopper opt-in")
+@unittest.skipUnless(os.environ.get("RDMA_PROXY_TEST_CUDA") == "1", "requires CUDA opt-in")
 class KernelTests(unittest.TestCase):
     def test_register_prefetch_group_readiness_and_reuse(self):
         import torch
@@ -47,8 +47,8 @@ class KernelTests(unittest.TestCase):
         import cutlass.cute as cute
         from cutlass.cute.runtime import from_dlpack
         from intra_node_combine_kernel import RegisterIntraNodeKernel
-        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
-            self.skipTest("requires SM90")
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (9, 10):
+            self.skipTest("requires SM90 or SM100/SM103")
         width, tile, tokens = 512, 128, 56
         for group_tiles, poll_once, local_domains in product((1, 2, 3), (False, True), (False, True)):
             for dtype in (torch.bfloat16, torch.float16):
@@ -187,8 +187,8 @@ class KernelTests(unittest.TestCase):
 
     def test_empty_outputs_publish_without_payload(self):
         import torch
-        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
-            self.skipTest("requires SM90")
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (9, 10):
+            self.skipTest("requires SM90 or SM100/SM103")
         sys.path.insert(0, os.environ.get("QUACK_ROOT", str(Path(__file__).resolve().parents[3] /
                                                          "quack_for_communication_overlap")))
         import cuda.bindings.driver as cuda

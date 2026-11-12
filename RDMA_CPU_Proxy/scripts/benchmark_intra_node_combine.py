@@ -68,8 +68,8 @@ def main():
     from intra_node_combine_kernel import RegisterIntraNodeKernel
 
     torch.cuda.set_device(args.device)
-    if torch.cuda.get_device_capability()[0] != 9:
-        raise RuntimeError('This benchmark targets Hopper (SM90)')
+    if torch.cuda.get_device_capability()[0] not in (9, 10):
+        raise RuntimeError('This benchmark targets Hopper (SM90) and Blackwell (SM100)')
     properties = torch.cuda.get_device_properties(args.device)
     # The production publication algorithm polls other CTAs. Avoid oversubscribing
     # the device with blocks that might wait on blocks which have not been scheduled.

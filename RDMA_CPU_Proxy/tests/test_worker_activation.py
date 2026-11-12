@@ -1,14 +1,16 @@
-"""CPU CLI checks and optional numerical Hopper checks for the embedded runner.
+"""CPU CLI checks and numerical SM90/SM100 checks for the embedded runner.
 
 Run: python -m unittest discover -s RDMA_CPU_Proxy/tests -p test_worker_activation.py -v
 """
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import shlex
 import subprocess
 import sys
+import tempfile
 import unittest
 
 
@@ -19,6 +21,21 @@ spec.loader.exec_module(worker)
 
 
 class CommunicationOnlyCliTests(unittest.TestCase):
+    def test_hopper_launcher_defaults(self):
+        # An empty optional site-argument array fails under macOS Bash 3 + nounset.
+        env = {key: value for key, value in os.environ.items()
+               if key not in ("PEER_HOST", "MASTER_ADDR", "CUDA_DEVICE_MAP", "RDMA_DEVICE_MAP",
+                              "RDMA_GID_INDEX", "RDMA_PORT", "RDMA_PROXY_BUILD_DIR")}
+        env.update(TORCHRUN_BIN="echo", RDMA_PROXY_GEMM_ARCH="auto")
+        for node in (0, 1):
+            result = subprocess.run(["bash", str(WORKER.parent / f"run_node{node}_torchrun.sh")],
+                                    env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            options = shlex.split(result.stdout)
+            self.assertIn("--gemm-arch=auto", options)
+            self.assertIn(f"--library={WORKER.parent.parent}/build-hopper/librdma_cpu_proxy.so", options)
+            self.assertNotIn("--down-pingpong", options)
+
     def test_dual_device_map(self):
         for rank in (0, 1):
             result = subprocess.run(
@@ -50,11 +67,23 @@ class CommunicationOnlyCliTests(unittest.TestCase):
             ("run_single_node_torchrun.sh", 0, 1),
         ):
             script = WORKER.parent / script_name
-            command = script.read_text().split('"${torchrun_bin}" \\\n', 1)[1]
-            tokens = shlex.split(command.replace("\\\n", ""))
-            start = tokens.index("${script_dir}/rdma_proxy_worker.py") + 1
-            options = tokens[start:]
-            self.assertEqual(options.pop(), "$@")
+            # Exercise real shell expansion, including architecture/site arrays,
+            # while replacing torchrun with an argv recorder (no CUDA/network).
+            with tempfile.TemporaryDirectory() as temp:
+                recorder = Path(temp) / "torchrun-recorder"
+                recorder.write_text(f"#!{sys.executable}\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n")
+                recorder.chmod(0o700)
+                launched = subprocess.run(
+                    ["bash", str(script)], capture_output=True, text=True,
+                    env={**os.environ, "TORCHRUN_BIN": str(recorder),
+                         "RDMA_PROXY_GEMM_ARCH": "blackwell", "MASTER_ADDR": "127.0.0.1",
+                         "PEER_HOST": "127.0.0.2", "CUDA_DEVICE_MAP": "0,1,2,3,4,5,6,7",
+                         "RDMA_DEVICE_MAP": "nic0,nic1,nic2,nic3,nic4,nic5,nic6,nic7",
+                         "RDMA_GID_INDEX": "-1"},
+                )
+                self.assertEqual(launched.returncode, 0, launched.stderr)
+                tokens = json.loads(launched.stdout)
+            options = tokens[tokens.index(str(WORKER)) + 1:]
             for mode_first in (False, True):
                 with self.subTest(script=script_name, mode_first=mode_first):
                     mode = ["--communication-only"]
@@ -93,6 +122,35 @@ class CommunicationOnlyCliTests(unittest.TestCase):
 
 
 class ActivationCliTests(unittest.TestCase):
+    def test_architecture_and_pingpong_selection(self):
+        for capability in ((9, 0), (10, 0), (10, 3)):
+            self.assertEqual(worker.resolve_gemm_architecture("auto", capability), capability[0])
+        self.assertEqual(worker.resolve_gemm_architecture("blackwell", (10, 3)), 10)
+        for requested, capability in (("hopper", (10, 3)), ("blackwell", (9, 0)),
+                                      ("auto", (12, 0)), ("auto", (8, 0))):
+            with self.assertRaises(ValueError):
+                worker.resolve_gemm_architecture(requested, capability)
+        self.assertTrue(worker.resolve_down_pingpong(None, 9, True))
+        self.assertFalse(worker.resolve_down_pingpong(None, 10, True))
+        self.assertFalse(worker.resolve_down_pingpong(None, 9, False))
+        for values in ((True, 10, True), (False, 9, True)):
+            with self.assertRaises(ValueError):
+                worker.resolve_down_pingpong(*values)
+        common = ("--concurrent-kernel", "--grouped-gemm-activation=swiglu",
+                  "--down-projection2", "--down-gather-table",
+                  "--down-gather-table-expert-waves", "--down-gather-table-wave-barrier",
+                  "--down-epilogue-store=bulk_rows_reduce", "--down-gather-table-publish-ready")
+        for architecture, flag in (("hopper", "--down-pingpong"),
+                                   ("blackwell", "--no-down-pingpong")):
+            for explicit in ((), (flag,)):
+                result = self.run_cli(*common, f"--gemm-arch={architecture}", *explicit,
+                                      "--check-projections")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"--expert_gemm_device_capacity={9 if architecture == 'hopper' else 10}",
+                              result.stdout)
+            wrong = "--no-down-pingpong" if architecture == "hopper" else "--down-pingpong"
+            self.assertNotEqual(self.run_cli(*common, f"--gemm-arch={architecture}", wrong).returncode, 0)
+
     def test_cpu_scatter_cli(self):
         self.assertNotEqual(self.run_cli("--cpu-scatter-preparation").returncode, 0)
         result = self.run_cli("--cpu-scatter-preparation", "--concurrent-kernel",
@@ -266,7 +324,7 @@ class ActivationCliTests(unittest.TestCase):
         result = self.run_cli(*options)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("--down-", result.stdout)
-        for required in options[:-1]:
+        for required in (option for option in options[:-1] if option != "--down-pingpong"):
             with self.subTest(missing=required):
                 result = self.run_cli(*(option for option in options if option != required))
                 self.assertNotEqual(result.returncode, 0)
@@ -324,14 +382,15 @@ class CombineCompactionTests(unittest.TestCase):
 
 
 class HopperActivationTests(unittest.TestCase):
+    # Retain the class name for existing remote commands; both architectures run it.
     @classmethod
     def setUpClass(cls):
         try:
             import torch
         except ImportError:
             raise unittest.SkipTest("PyTorch is not installed")
-        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
-            raise unittest.SkipTest("requires a Hopper CUDA device")
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (9, 10):
+            raise unittest.SkipTest("requires a Hopper or Blackwell CUDA device")
         cls.torch = torch
 
     def test_combine_dynamic_mapping(self):
@@ -445,6 +504,8 @@ class HopperActivationTests(unittest.TestCase):
                     parser = argparse.ArgumentParser()
                     worker.add_down_arguments(parser)
                     for flags in variants:
+                        if torch.cuda.get_device_capability()[0] == 10:
+                            flags = tuple(flag for flag in flags if flag != "--down-pingpong")
                         with self.subTest(down=flags):
                             options = parser.parse_args(["--down-projection2", *flags])
                             host_flag = None

@@ -1,6 +1,6 @@
 # RDMA CPU Proxy for GPU Token Buffers
 
-This project is a C++17/CUDA scaffold for a CPU-side RDMA proxy that initiates GPU-to-GPU token-buffer transfers with RDMA Reliable Connection (RC). It is designed for NVIDIA Hopper GPUs plus NVIDIA/Mellanox NICs, with GPUDirect RDMA used when the platform and verbs provider support CUDA device-pointer memory registration.
+This project is a C++17/CUDA scaffold for a CPU-side RDMA proxy that initiates GPU-to-GPU token-buffer transfers with RDMA Reliable Connection (RC). It supports NVIDIA Hopper and Blackwell GPUs plus NVIDIA/Mellanox NICs, with GPUDirect RDMA used when the platform and verbs provider support CUDA device-pointer memory registration.
 
 The code is intentionally split between real hardware paths and explicit mock mode. Mock mode is useful for building and testing chunk/config logic on machines without CUDA or RDMA, but it is not presented as a successful RDMA transfer.
 
@@ -291,7 +291,7 @@ When NVLink forwarding completion notifications are also enabled, every source-s
 
 The grouped-GEMM scheduler now publishes the same multi-buffer gather-table ABI used by QuACK's `hopper_stream_gather_table_gemm.py`. After the all-to-all expert metadata exchange, each source-specific `expert_token_indices` vector is copied to GPU HBM as one QuACK `A_idx_j` array. For compact NVLink inputs, an index is the token's compact rank among tokens routed to that destination GPU. For a remote same-local-GPU direct input, an index is instead the token's position in the complete destination-node `x3` RDMA receive sequence. All `A_idx_j` allocations have the same padded length, while `expert_token_index_count` records each meaningful prefix. Receive buffer slot `j`, `A_idx_j`, and pair `(start_j, end_j)` in every table row use the same stable active-input order.
 
-One M-cluster holds `expert_gemm_m_tile * expert_gemm_cluster_m` tokens. Let `clusters_n = ceil(expert_gemm_dimension / expert_gemm_n_tile)`, `group_size = min(expert_gemm_max_swizzle_size, clusters_n)`, and `n_groups = clusters_n / group_size`; `clusters_n` must be divisible by `group_size`. The proxy allocates `sum_e ceil(expert_tokens[e] / M_cluster_capacity) * n_groups` rows. A partial final M-cluster is emitted when all remaining tokens for that expert are ready.
+One M-cluster holds `cta_m * expert_gemm_cluster_m` tokens. `expert_gemm_m_tile` always means the MMA M tile. With `expert_gemm_device_capacity=9` (Hopper, native default), `cta_m = expert_gemm_m_tile`. With capacity 10 (Blackwell), even cluster M and MMA M of 128 or 256 select two-CTA MMA, so `cta_m = expert_gemm_m_tile / 2`; otherwise it is unchanged. Thus Blackwell M=128/cluster M=2 covers 128 rows per descriptor, and M=256/cluster M=2 covers 256. Allocation, notification scheduling, and CPU scatter preparation use this same geometry, matching QuACK `cta_tile_shape_m`. Let `clusters_n = ceil(expert_gemm_dimension / expert_gemm_n_tile)`, `group_size = min(expert_gemm_max_swizzle_size, clusters_n)`, and `n_groups = clusters_n / group_size`; `clusters_n` must be divisible by `group_size`. The proxy allocates `sum_e ceil(expert_tokens[e] / M_cluster_capacity) * n_groups` rows. A partial final M-cluster is emitted when all remaining tokens for that expert are ready.
 
 Each fixed-size row has QuACK's contiguous `int32_t` ABI:
 
@@ -602,6 +602,181 @@ cmake --build RDMA_CPU_Proxy/build
 
 If CUDA or libibverbs is found automatically, the relevant real path is compiled in. Otherwise the binary can still be built for mock-mode tests.
 
+## Blackwell embedded GEMM integration
+
+Use the CUDA 12.9 / Python 3.12 environment in QuACK's
+`README.md` (section “Blackwell node development environment”). Update **both**
+repositories on both nodes and rebuild the native library. The Python worker
+continues to load `librdma_cpu_proxy.so` in its own process with `ctypes`; no
+separate proxy executable or Python distributed process group is introduced.
+
+`--gemm-arch=auto` detects the selected CUDA device before native initialization.
+`--gemm-arch=hopper` and `--gemm-arch=blackwell` select explicit geometry and reject
+a device mismatch. B300 capability `(10,3)` uses QuACK `device_capacity=10`.
+The worker forwards `expert_gemm_device_capacity` before C++ allocates its table.
+An auto-mode `--dry-run` needs no CUDA and reports that resolution is deferred;
+use an explicit architecture to inspect the native arguments on the Mac.
+
+Up uses streamed multi-buffer input gather and fused SwiGLU with
+`concat_layout=("B",)`, `store_preact=False`. Down uses a separate non-streaming,
+single-input, four-column gather table. The historical helper filename remains
+`run/hopper_pregather_gemm.py`, but its geometry and launches support both
+architectures. Blackwell uses static persistence, `use_tma_gather=False`, and
+`pingpong=False`. Hopper wave launches retain pingpong. The helper computes row
+spans from `cta_tile_shape_m` and queries resident clusters using the same device,
+cluster size, and `--down-sm-count` as the cooperative kernel. This cap limits
+CTAs; it does not reserve physical SMs. Leave capacity for concurrent combine
+and communication kernels, and validate residency with the full concurrent run.
+
+Input visibility still precedes descriptor readiness: the native RDMA owner-flush
+handling is retained, then table/scatter H2D copies precede the ready-row write
+on the publication stream. Down output zeroing and GPU wave/ready resets occur
+on its compute stream each invocation. Native iteration preparation resets the
+mapped host prefix after the previous consumers finish. Python output tensors,
+scatter destinations, host flags, and address tensors live through completion
+and native shutdown. Ready prefixes continue to drive per-group NVLink returns,
+intra-node combine, and RDMA returns; up and down themselves run sequentially.
+
+### Staged B300 validation
+
+On **each** node, set these paths to your synchronized checkouts, activate the
+QuACK Blackwell environment, and run:
+
+```bash
+export PROXY_ROOT=/path/to/GPU_Data_Transfer_Profile/RDMA_CPU_Proxy
+export QUACK_ROOT=/path/to/quack_for_communication_overlap
+cd "$QUACK_ROOT"
+python -m pip install -e '.[dev]'
+python -m pip check
+cmake -S "$PROXY_ROOT" -B "$PROXY_ROOT/build-blackwell" \
+  -DRDMA_PROXY_REQUIRE_CUDA=ON -DRDMA_PROXY_REQUIRE_VERBS=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=100
+cmake --build "$PROXY_ROOT/build-blackwell" -j4
+ctest --test-dir "$PROXY_ROOT/build-blackwell" --output-on-failure
+
+# Small native SM100 numerical cases first; timeout also catches polling hangs.
+CUDA_VISIBLE_DEVICES=0 timeout 900 python -m pytest -q \
+  run/test_blackwell_gemm_communication.py \
+  -k 'test_gather_table and 1-2-128' -x
+CUDA_VISIBLE_DEVICES=0 timeout 1800 python -m pytest -q \
+  run/test_proxy_gemm_integration.py -x
+
+# Actual worker runners: SwiGLU -> down -> compact scatter-add, repeats/readiness.
+cd "$PROXY_ROOT"
+CUDA_VISIBLE_DEVICES=0 timeout 1800 python -m unittest discover \
+  -s tests -p 'test_worker*.py' -v
+RDMA_PROXY_TEST_CUDA=1 CUDA_VISIBLE_DEVICES=0 timeout 900 \
+  python -m unittest discover -s tests -p 'test_*node_combine.py' -v
+
+# Broaden after the focused checks pass; retain failure IDs and full tracebacks.
+cd "$QUACK_ROOT"
+CUDA_VISIBLE_DEVICES=0 timeout 3600 python -m pytest -q \
+  run/test_blackwell_gemm_communication.py -x
+```
+
+Native transport kernels require CUDA 12.9+ and default to a `90;100` fatbin on
+fresh builds; explicit `CMAKE_CUDA_ARCHITECTURES` or `CUDAARCHS` wins. `100` is
+the generic native Blackwell target; QuACK independently compiles its SM100-family
+MMA kernels. Existing build directories retain their cached targets. Build with
+`-DCMAKE_CUDA_ARCHITECTURES=90` for Hopper and run the same worker regressions
+there to check SM90 preservation.
+
+Next set the actual network configuration on **each** node. No Blackwell NIC or
+address defaults are assumed. NIC entries can be `nicA+nicB` for dual-device
+mode; choose an even `--num_qps_per_peer` in that case. Both nodes need matching
+GPU counts and workload options. Ports/GIDs may differ by node.
+
+```bash
+export RDMA_PROXY_GEMM_ARCH=blackwell
+export MASTER_ADDR='node-0-rendezvous-address'
+export PEER_HOST='other-node-proxy-address'
+export CUDA_DEVICE_MAP='comma-separated-local-CUDA-indices'
+export RDMA_DEVICE_MAP='comma-separated-matching-local-NIC-entries'
+export RDMA_GID_INDEX='valid-local-GID-index-or-minus-one'
+export RDMA_PORT='local-NIC-port'
+export MASTER_PORT=29500
+cd "$PROXY_ROOT"
+
+# Node 0; run the corresponding node 1 command concurrently on node 1.
+bash ./scripts/run_node0_torchrun.sh --check-projections --trace-down-ready \
+  --num_iterations=10 --num_tokens=1024 --completion_timeout_ms=600000 \
+  --return-token-timeout=600
+# Node 1:
+bash ./scripts/run_node1_torchrun.sh --check-projections --trace-down-ready \
+  --num_iterations=10 --num_tokens=1024 --completion_timeout_ms=600000 \
+  --return-token-timeout=600
+```
+
+The launchers retain all return/intra-node/RDMA/inter-node numerical checks.
+`--check-projections` additionally decodes the real native table and compares
+every meaningful up row and down destination to chunked FP32 GEMM references,
+including compact scatter-add and readiness. It runs outside GEMM timing each
+iteration. After the small run passes, repeat both commands with
+`--num_tokens=20480 --num_iterations=20`, then repeat with
+`--cpu-scatter-preparation` to exercise native scatter metadata under streaming
+arrival. Inspect startup geometry, per-iteration checks, final ready prefixes,
+and timing; a successful isolated GEMM is insufficient.
+
+### Bulk-store configuration and performance
+
+Production settings are explicit per-call values, propagated through the shared
+helper into immutable QuACK `BlackwellBulkStoreConfig` and both compilation caches:
+
+```bash
+--down-bulk-smem-padding=16 --down-bulk-smem-cols=128 \
+--down-bulk-smem-buffers=1 --down-bulk-store-warps=4
+```
+
+Omitting them preserves library defaults. These values select a **total**
+128-column buffering budget, one reusable buffer, and four existing epilogue
+warps; they do not add warps. They require SM100 bulk stores and are validated
+against the selected layout. Normal caching can remain enabled. Do not import
+the process-global benchmark override hooks into a worker. Test the candidate
+settings numerically with the node commands above before measuring them.
+
+The reported standalone improvements (about 4.1% bulk-row latency overhead versus
+single-table TMA and 7.7% complete host-ready overhead versus packed GEMM) used
+R=32768, E=8, K=7168, N=2048, tile=(256,512), cluster M=2. They do not establish
+proxy throughput. The current two-node scripts use up K=4096/projection N=1024,
+down K=512/N=4096, tile=(128,128), up cluster M=2, down cluster M=1, and a down
+CTA cap of 70. Native routed counts vary; use the logged `routes`/`counts`.
+
+For a controlled standalone comparison near the scripts' expected route volume
+(16 sources, roughly 163840 total routes), run in QuACK:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run/blackwell_gemm_communication_bench.py \
+  --experts 8 --buffers 16 --routes-per-buffer 10240 --tokens-per-buffer 20480 \
+  --k 4096 --n 1024 --tile-m 128 --tile-n 128 --cluster-m 2 --group-size 8 \
+  --packed-baseline --readiness --swiglu
+for warps in 1 4; do
+  QUACK_CACHE_ENABLED=0 CUDA_VISIBLE_DEVICES=0 \
+  python run/blackwell_gemm_communication_bench.py \
+    --experts 8 --buffers 16 --routes-per-buffer 10240 --tokens-per-buffer 20480 \
+    --k 512 --n 4096 --tile-m 128 --tile-n 128 --cluster-m 1 --sm-count 70 \
+    --group-size 1 --packed-baseline --host-ready \
+    --bulk-smem-padding 16 --bulk-smem-cols 128 --bulk-smem-buffers 1 \
+    --bulk-store-warps "$warps"
+done
+```
+
+Only these older standalone benchmark override hooks require
+`QUACK_CACHE_ENABLED=0`. Their uniform route counts and synthetic destination
+mapping are approximations; compare the **actual concurrent two-node runs** as
+well. After correctness passes, append `--no-check-projections
+--no-check-return-token-results --no-check-intra-node-combine
+--no-check-rdma-return-token-results --no-check-inter-node-combine` for timing,
+with identical shapes, SM caps, data, warmup and node conditions. Compare library
+defaults and the explicit candidate in fresh processes, reverse the order, and
+use warm iterations. Record up, down, reset/mapping, and communication timings;
+the smaller down GEMM may prefer different store settings or tile sizes.
+
+Implementation was checked locally with mock native tests, CPU Python tests,
+syntax and diff checks. This Mac cannot compile CUDA or run NVIDIA kernels.
+New GPU tests, full QuACK pytest, B300 cooperative residency, two-node numerical
+execution, and throughput remain remote validation tasks. Earlier standalone
+13-variant numerical success does not validate this integration or every shape.
+
 ## Shared Library and torchrun
 
 The build also produces a shared library for embedding the proxy in another
@@ -647,23 +822,20 @@ applies only to the supplied Python worker; the standalone executable and
 `rdma_proxy_run_argv` continue to allocate their buffers internally. The worker
 requires CUDA-enabled PyTorch in both normal and concurrent-kernel modes.
 
-For the checked-in two-node, seven-GPU launch, start node 0 and node 1 with:
+For the checked-in two-node, eight-GPU launch, start node 0 and node 1 with:
 
 ```bash
 RDMA_CPU_Proxy/scripts/run_node0_torchrun.sh
 RDMA_CPU_Proxy/scripts/run_node1_torchrun.sh
 ```
 
-The scripts preserve the original mapping of logical GPUs `0..6` to physical
-CUDA devices `0,1,2,3,5,6,7`, including the corresponding RDMA devices. They
-also pass the same proxy workload options as `run_node0.sh` and `run_node1.sh`.
-The rendezvous defaults to node 0 at `28.49.38.169:29500`; override it when
-needed:
-
-```bash
-MASTER_ADDR=<node-0-address> MASTER_PORT=<unused-port> \
-  RDMA_CPU_Proxy/scripts/run_node0_torchrun.sh
-```
+The default scripts retain the original deployment's eight-GPU CUDA/NIC map
+and rendezvous address. Set `CUDA_DEVICE_MAP`, `RDMA_DEVICE_MAP`, `MASTER_ADDR`,
+`PEER_HOST`, and `RDMA_GID_INDEX` for another deployment. The number of processes
+is inferred from the CUDA map (or overridden by `NPROC_PER_NODE`). `PEER_HOST`
+overrides the single peer in each node's JSON; `MASTER_ADDR` alone does not.
+`RDMA_PROXY_CONFIG` selects an alternate JSON, and `RDMA_PORT` selects a NIC port.
+For Blackwell, use the explicit environment and staged commands below.
 
 Set `RDMA_PROXY_BUILD_DIR` if the shared library is in a build directory other
 than `RDMA_CPU_Proxy/build-hopper`, or `TORCHRUN_BIN` to select a different
@@ -727,7 +899,7 @@ executes when the kernel finishes. The reported useful work is
 Because the interval begins at the first table flush, it includes readiness
 stalling and table streaming after that point, not just GEMM math.
 
-Concurrent-kernel mode requires a Hopper SM90 GPU, CUDA-enabled PyTorch, QuACK,
+Concurrent-kernel mode requires a Hopper SM90 or Blackwell SM100-family GPU, CUDA-enabled PyTorch, QuACK,
 `--num-experts`, and a finite nonzero `num_iterations`. Tile/output parameters
 default to the proxy scheduler values and can be overridden with the
 `--grouped-gemm-*` worker options; the worker forwards matching scheduler values
@@ -759,7 +931,7 @@ Python's explicit tile/cluster/swizzle options continue to override the JSON
 scheduler settings in concurrent mode.
 
 Activation uses QuACK's existing `gemm_act` fused epilogue with an explicit
-Hopper configuration, the same multi-buffer gather table and ready-row flag,
+architecture-specific configuration, the same multi-buffer gather table and ready-row flag,
 and no saved pre-activation tensor. No separate activation kernel, down
 projection, or token-combine stage is launched. No QuACK or C++ implementation
 changes are needed. Timing includes the fused epilogue; effective TFLOP/s counts
@@ -774,7 +946,7 @@ python -m unittest discover -s RDMA_CPU_Proxy/tests -p test_worker_activation.py
 Run from the parent of `RDMA_CPU_Proxy`. Set `QUACK_ROOT` for a non-sibling QuACK
 checkout. Numerical tests compare plain GEMM, ReLU, and SwiGLU against FP32
 references with multiple input buffers and ragged expert batches. They require
-Hopper and CUDA PyTorch and are skipped otherwise. The full two-node run is
+SM90/SM100 and CUDA PyTorch and are skipped otherwise. The full two-node run is
 still required to validate RDMA/activation overlap.
 
 ### Configurable down projection
@@ -805,8 +977,10 @@ Append the following options to both existing node commands:
 --down-epilogue-store=bulk_rows_reduce
 ```
 
-Down defaults are tile M/N=128/128, cluster M=1, swizzle=1, pingpong disabled,
-and `tma` stores. `--down-cluster-m` also permits explicit cluster sizing.
+Down defaults are tile M/N=128/128, cluster M=1, swizzle=1, and `tma` stores.
+Pingpong is selected automatically: enabled for Hopper wave barriers and disabled
+otherwise. Explicit `--down-pingpong` / `--no-down-pingpong` are validated for the
+selected architecture; Blackwell rejects pingpong. `--down-cluster-m` also permits explicit cluster sizing.
 Add `--down-sm-count=40` to cap the down GEMM's persistent CTA count. The value
 must be positive and divisible by `--down-cluster-m`; omitting it keeps QuACK's
 default hardware capacity. This limits launch parallelism without reserving
@@ -818,13 +992,13 @@ needs updating for this option; no C++ library rebuild is required.
 Without the down gather table, the kernel uses per-expert sequence lengths.
 With it, a separate static table and identity indices describe the materialized
 activated input. Expert waves require that table; the wave barrier additionally
-requires pingpong and a bulk-row epilogue. QuACK validates device-dependent wave
+requires a bulk-row epilogue and, on Hopper only, pingpong. QuACK validates device-dependent wave
 capacity and tile/layout constraints. No down options are forwarded to C++.
 
 Add `--down-gather-table-publish-ready` to publish completed down-output column
 groups to `DownProjectionRunner.inputs.ready_groups`, a GPU `int32[1]` flag.
 It requires `--down-gather-table-expert-waves` and
-`--down-gather-table-wave-barrier`, including their gather-table, pingpong, and
+`--down-gather-table-wave-barrier`, including their gather-table, architecture-specific schedule, and
 bulk-row epilogue prerequisites. For example, append the flag to the down
 projection command above. The worker passes it to QuACK's existing preparation
 and launch helpers, which reset the readiness flag on every down invocation.
@@ -1496,7 +1670,8 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_notification_flush_only_enabled`
 - `nvlink_forward_notification_flush_per_entry_enabled`
 - `nvlink_forward_notification_flag_update_mode` (`stream-write` or `memcpy`)
-- `expert_gemm_m_tile`
+- `expert_gemm_m_tile` (MMA M tile, not per-CTA M)
+- `expert_gemm_device_capacity` (`9` Hopper/native default, `10` Blackwell; worker resolves automatically)
 - `expert_gemm_n_tile`
 - `expert_gemm_dimension`
 - `expert_gemm_cluster_m`

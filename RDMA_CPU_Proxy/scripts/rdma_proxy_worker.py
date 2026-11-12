@@ -23,6 +23,27 @@ GATED_ACTIVATIONS = (
 )
 
 
+def resolve_gemm_architecture(requested, capability):
+    """Use the device's major architecture, including B300's SM103 as SM100."""
+    major, minor = capability
+    if major not in (9, 10):
+        raise ValueError(f"proxy GEMMs require Hopper SM90 or Blackwell SM100, got SM{major}{minor}")
+    expected = {"auto": major, "hopper": 9, "blackwell": 10}[requested]
+    if expected != major:
+        raise ValueError(f"--gemm-arch={requested} disagrees with device SM{major}{minor}")
+    return major
+
+
+def resolve_down_pingpong(requested, device_capacity, wave_barrier):
+    if requested is None:
+        return device_capacity == 9 and wave_barrier
+    if device_capacity == 10 and requested:
+        raise ValueError("Blackwell requires --no-down-pingpong (or omit the pingpong option)")
+    if device_capacity == 9 and wave_barrier and not requested:
+        raise ValueError("Hopper down wave barriers require --down-pingpong")
+    return requested
+
+
 def projection_dimension(output_dimension: int, activation: str | None) -> int:
     """The table schedules projection columns, before gated activation halves them."""
     return output_dimension * (2 if activation in GATED_ACTIVATIONS else 1)
@@ -267,10 +288,7 @@ class GroupedGemmRunner:
                 "set --nvlink_forward_completion_notifications_enabled=true"
             )
         capability = torch_module.cuda.get_device_capability(cuda_device_id)
-        if capability[0] != 9:
-            raise RuntimeError(
-                f"QuACK GroupedGEMM requires Hopper SM90, got SM{capability[0]}{capability[1]}"
-            )
+        self.device_capacity = resolve_gemm_architecture("auto", capability)
         if num_experts <= 0 or num_experts % world_size != 0:
             raise RuntimeError(
                 f"--num-experts={num_experts} must be divisible by WORLD_SIZE={world_size}"
@@ -299,7 +317,7 @@ class GroupedGemmRunner:
                 cluster_m=cluster_m, cluster_n=1, cluster_k=1,
                 pingpong=False, is_dynamic_persistent=False,
                 max_swizzle_size=max_swizzle_size,
-                device_capacity=9, use_tma_gather=False,
+                device_capacity=self.device_capacity, use_tma_gather=False,
             )
 
         a_idx_entries = [
@@ -401,8 +419,12 @@ class GroupedGemmRunner:
         self.tile_k = tile_k
         self.cluster_m = cluster_m
         self.max_swizzle_size = max_swizzle_size
+        from quack.gemm_config import cta_tile_shape_m
+        self.cta_tile_m = cta_tile_shape_m(tile_m, cluster_m, self.device_capacity)
         print(
             "GroupedGEMM configured: "
+            f"device_capacity={self.device_capacity} mma_tile_m={tile_m} "
+            f"cta_tile_m={self.cta_tile_m} cluster_rows={self.cta_tile_m * cluster_m} "
             f"activation={activation or 'none'} projection_N={self.gemm_dimension} "
             f"active_sources={source_pairs} X={tuple(first_x.shape)} "
             f"A_idx={tuple(first_a_idx.shape)} W={tuple(self.weights.shape)} "
@@ -460,11 +482,11 @@ def add_down_arguments(parser):
                         help="combine node sums into original token order after local combine and any RDMA returns")
     parser.add_argument("--inter-node-combine-ctas", type=int, default=None,
                         help="positive CTA count for inter-node combine; defaults to GPU SM count")
-    parser.add_argument("--check-inter-node-combine", action="store_true",
+    parser.add_argument("--check-inter-node-combine", action=argparse.BooleanOptionalAction, default=False,
                         help="check final token-order output against an FP32 reference")
     parser.add_argument("--rdma-return-token-results", action="store_true",
                         help="return completed intra-node combine column groups over existing RDMA QPs")
-    parser.add_argument("--check-rdma-return-token-results", action="store_true",
+    parser.add_argument("--check-rdma-return-token-results", action=argparse.BooleanOptionalAction, default=False,
                         help="compare returned payload SHA256 with the remote source after each iteration")
     parser.add_argument("--rdma-return-chunk-bytes", type=int, default=1048576)
     parser.add_argument("--intra-node-combine", action="store_true",
@@ -473,7 +495,7 @@ def add_down_arguments(parser):
                         help="store each source output as [N tiles, input rows, tile N]")
     parser.add_argument("--intra-node-combine-publish-ready", action="store_true",
                         help="publish completed intra-node output column-group prefix in HBM")
-    parser.add_argument("--check-intra-node-combine", action="store_true",
+    parser.add_argument("--check-intra-node-combine", action=argparse.BooleanOptionalAction, default=False,
                         help="compare intra-node output with an FP32 reference each iteration")
     parser.add_argument("--intra-node-combine-ctas", type=int, default=4)
     parser.add_argument("--intra-node-combine-elements-per-thread", type=int,
@@ -486,7 +508,7 @@ def add_down_arguments(parser):
                         help="return local-combine outputs to their same-node NVLink senders")
     parser.add_argument("--return-token-results-per-group", action="store_true",
                         help="return each ready column group while down GEMM continues")
-    parser.add_argument("--check-return-token-results", action="store_true",
+    parser.add_argument("--check-return-token-results", action=argparse.BooleanOptionalAction, default=False,
                         help="compare received valid bytes with producing GPU outputs each iteration")
     parser.add_argument("--return-token-timeout", type=float, default=120.0,
                         help="same-node return setup/completion barrier timeout in seconds")
@@ -503,7 +525,12 @@ def add_down_arguments(parser):
     for name, default in (("tile-m", 128), ("tile-n", 128), ("cluster-m", 1),
                           ("max-swizzle-size", 1), ("scatter-output-buffers", 2)):
         parser.add_argument(f"--down-{name}", type=int, default=default)
-    for name in ("pingpong", "scatter-table", "n-tile-major-output",
+    parser.add_argument("--down-pingpong", action=argparse.BooleanOptionalAction, default=None,
+                        help="default: enabled for Hopper waves, disabled for Blackwell")
+    for name in ("bulk-smem-padding", "bulk-smem-cols", "bulk-smem-buffers", "bulk-store-warps"):
+        parser.add_argument(f"--down-{name}", type=int, default=None,
+                            help="explicit SM100 bulk-store compilation setting; omitted keeps QuACK defaults")
+    for name in ("scatter-table", "n-tile-major-output",
                  "multi-buffer-scatter", "gather-table", "gather-table-expert-waves",
                  "gather-table-wave-barrier"):
         parser.add_argument(f"--down-{name}", action="store_true")
@@ -603,10 +630,14 @@ def validate_down_arguments(args):
         raise ValueError("--down-gather-table-publish-ready requires "
                          "--down-gather-table-expert-waves and --down-gather-table-wave-barrier")
     if args.down_gather_table_wave_barrier and (
-        not args.down_gather_table_expert_waves or not args.down_pingpong
+        not args.down_gather_table_expert_waves
         or args.down_epilogue_store == "tma"
     ):
-        raise ValueError("down wave barrier requires expert waves, pingpong, and a bulk-row epilogue")
+        raise ValueError("down wave barrier requires expert waves and a bulk-row epilogue")
+    requested_arch = getattr(args, "gemm_arch", "auto")
+    if requested_arch != "auto":
+        resolve_down_pingpong(args.down_pingpong, 9 if requested_arch == "hopper" else 10,
+                              args.down_gather_table_wave_barrier)
 
 
 def local_combine_mapping(torch, work_table, a_idx, routes, n_groups, trace=None):
@@ -698,6 +729,9 @@ class DownProjectionRunner:
         for name, value in vars(options).items():
             if name.startswith("down_") and name != "down_projection2":
                 setattr(args, name[5:], value)
+        args.device_capacity = up.device_capacity
+        args.pingpong = resolve_down_pingpong(
+            args.pingpong, up.device_capacity, args.gather_table_wave_barrier)
         hidden = int(up.output.shape[1])
         output_dim = int(up.x_buffers[0].shape[1])
         vars(args).update(tokens=routes, routes=routes, experts=len(counts),
@@ -772,7 +806,12 @@ class DownProjectionRunner:
         self.gemm_start = torch.cuda.Event(enable_timing=True)
         self.end = torch.cuda.Event(enable_timing=True)
         torch.cuda.synchronize(up.cuda_device_id)
-        print(f"DownGEMM configured: routes={routes} H={hidden} K={output_dim} "
+        print(f"DownGEMM configured: device_capacity={up.device_capacity} "
+              f"tile=({args.tile_m},{args.tile_n}) cluster_m={args.cluster_m} "
+              f"pingpong={args.pingpong} sm_count={args.sm_count} "
+              f"wave_work_ids={self.inputs.wave_work_ids} "
+              f"bulk_store_config={pregather.bulk_store_config_for_args(args)} "
+              f"routes={routes} H={hidden} K={output_dim} "
               f"counts={counts} output_shapes="
               f"{[tuple(x.shape) for x in self.inputs.output_buffers()]}", flush=True)
         if self.combine:
@@ -1056,6 +1095,10 @@ def build_proxy_argv(
                 f"--expert_gemm_max_swizzle_size={args.expert_gemm_max_swizzle_size}",
             ]
         )
+        architecture = getattr(args, "gemm_arch", "auto")
+        if architecture != "auto":
+            generated_args.append(
+                f"--expert_gemm_device_capacity={9 if architecture == 'hopper' else 10}")
     if args.inter_node_combine and num_nodes > 1 and not args.rdma_return_token_results:
         raise ValueError("--inter-node-combine requires --rdma-return-token-results with multiple nodes")
     if args.rdma_return_token_results and num_nodes < 2:
@@ -1315,8 +1358,16 @@ def run_proxy_with_concurrent_kernel(
 ) -> int:
     """Launch readiness-gated QuACK GroupedGEMM with each proxy iteration."""
 
-    c_argv = encode_proxy_argv(proxy_argv)
     torch = import_torch_for_proxy(cuda_device_id)
+    capacity = resolve_gemm_architecture(
+        getattr(down_options, "gemm_arch", "auto"),
+        torch.cuda.get_device_capability(cuda_device_id))
+    if down_options.down_projection2:
+        resolve_down_pingpong(down_options.down_pingpong, capacity,
+                              down_options.down_gather_table_wave_barrier)
+    # Resolve before C++ allocates tables: SM100 MMA M is not per-CTA M.
+    proxy_argv = [*proxy_argv, f"--expert_gemm_device_capacity={capacity}"]
+    c_argv = encode_proxy_argv(proxy_argv)
     handle = library.rdma_proxy_create(len(proxy_argv), c_argv)
     if not handle:
         raise RuntimeError(f"proxy creation failed: {proxy_last_error(library)}")
@@ -1521,6 +1572,12 @@ def run_proxy_with_concurrent_kernel(
                         down.intra_node_combine.inter_node_combine.run()
                     # No rank may overwrite returned buffers while a peer still combines.
                     return_exchange.control.gather(f"intra-node-done-{iteration}")
+            if down_options.check_projections:
+                from projection_validation import check_projections
+                check_projections(torch, grouped_gemm, down, int(computation_tokens.value))
+                if return_exchange is not None:
+                    return_exchange.control.gather(f"projections-checked-{iteration}")
+                print(f"Projection numerical checks passed: iteration={iteration}", flush=True)
             elapsed_ms = ctypes.c_float()
             require_proxy_success(
                 library,
@@ -1590,13 +1647,13 @@ def run_proxy_with_concurrent_kernel(
     finally:
         if down is not None and down.intra_node_combine is not None:
             down.intra_node_combine.abort()
-        # Keep both the mapped host flag and its GPU address tensor alive until
-        # the last possible kernel write, including exceptional launch paths.
-        if trace is not None and kernel_stream is not None:
+        # Keep borrowed inputs, scatter destinations, and any mapped host flag
+        # alive until the last possible kernel write, including launch failures.
+        if kernel_stream is not None:
             try:
                 kernel_stream.synchronize()
             except Exception as error:
-                print(f"down-ready stream cleanup failed: {error}", file=sys.stderr, flush=True)
+                print(f"compute stream cleanup failed: {error}", file=sys.stderr, flush=True)
         if coordinator is not None:
             commands.put(None)
             coordinator.join()
@@ -1635,6 +1692,10 @@ def main() -> int:
         help="override GEMM, return, and combine options; run only proxy dispatch/forwarding",
     )
     parser.add_argument("--num-experts", "--num_experts", type=int)
+    parser.add_argument("--gemm-arch", choices=("auto", "hopper", "blackwell"), default="auto",
+                        help="resolve GEMM/table geometry before native initialization; explicit values are checked against the GPU")
+    parser.add_argument("--check-projections", action=argparse.BooleanOptionalAction, default=False,
+                        help="check up/down numerical values each iteration, outside GEMM timing")
     parser.add_argument(
         "--grouped-gemm-activation",
         choices=("none", *ORDINARY_ACTIVATIONS, *GATED_ACTIVATIONS),
@@ -1665,7 +1726,7 @@ def main() -> int:
     parser.add_argument(
         "--quack-root",
         type=Path,
-        default=Path(__file__).resolve().parents[3] / "quack_for_communication_overlap",
+        default=Path(os.environ.get("QUACK_ROOT", Path(__file__).resolve().parents[3] / "quack_for_communication_overlap")),
     )
     parser.add_argument(
         "--dry-run",
@@ -1674,7 +1735,7 @@ def main() -> int:
     )
     add_down_arguments(parser)
     args, proxy_args = parser.parse_known_args()
-    if any(arg.startswith("--down-") for arg in proxy_args):
+    if any(arg.startswith(("--down-", "--no-down-")) for arg in proxy_args):
         parser.error("unsupported --down-* option")
     if args.communication_only:
         # Apply the mode after parsing so it wins regardless of argument order.
@@ -1683,6 +1744,7 @@ def main() -> int:
         add_down_arguments(down_parser)
         vars(args).update(vars(down_parser.parse_args([])))
         args.concurrent_kernel = False
+        args.check_projections = False
         args.grouped_gemm_activation = "none"
         for name in vars(args):
             if name.startswith("expert_gemm_"):
@@ -1692,11 +1754,13 @@ def main() -> int:
     except ValueError as error:
         parser.error(str(error))
     if not args.communication_only and not args.down_projection2 and any(
-        arg.startswith("--down-") for arg in sys.argv[1:]
+        arg.startswith(("--down-", "--no-down-")) for arg in sys.argv[1:]
     ):
         parser.error("--down-* options require --down-projection2")
     if args.grouped_gemm_activation != "none" and not args.concurrent_kernel:
         parser.error("--grouped-gemm-activation requires --concurrent-kernel")
+    if args.check_projections and not args.concurrent_kernel:
+        parser.error("--check-projections requires --concurrent-kernel")
     if args.expert_gemm_dimension <= 0:
         parser.error("--grouped-gemm-output-dimension must be positive")
     args.grouped_gemm_activation = (
@@ -1720,6 +1784,9 @@ def main() -> int:
         flush=True,
     )
     if args.dry_run:
+        if args.concurrent_kernel and args.gemm_arch == "auto":
+            print("GEMM architecture: auto (resolved from CUDA before native initialization; "
+                  "use --gemm-arch=blackwell or hopper to inspect explicit scheduler geometry)", flush=True)
         print(shlex.join(proxy_argv), flush=True)
         return 0
 

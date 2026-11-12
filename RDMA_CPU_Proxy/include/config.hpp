@@ -121,7 +121,10 @@ struct ProxyConfig {
     NvlinkForwardNotificationFlagUpdateMode
         nvlink_forward_notification_flag_update_mode{
             NvlinkForwardNotificationFlagUpdateMode::kStreamWrite};
+    // QuACK MMA M tile, not rows per CTA. SM100 two-CTA MMA splits this
+    // across a CTA pair; expert_gemm_cluster_rows() defines descriptor capacity.
     std::size_t expert_gemm_m_tile{128};
+    int expert_gemm_device_capacity{9};
     std::size_t expert_gemm_n_tile{256};
     std::size_t expert_gemm_dimension{8192};
     std::size_t expert_gemm_cluster_m{1};
@@ -164,6 +167,8 @@ bool nvlink_forward_dynamic_threshold_enabled(const ProxyConfig& config);
 std::size_t effective_nvlink_forward_threshold_tokens(const ProxyConfig& config);
 bool effective_rdma_chunk_per_token_sge_enabled(const ProxyConfig& config);
 bool effective_rdma_discontinuous_token_payload_enabled(const ProxyConfig& config);
+std::size_t expert_gemm_cta_m_tile(const ProxyConfig& config);
+std::size_t expert_gemm_cluster_rows(const ProxyConfig& config);
 
 ProxyConfig load_config_file(const std::string& path);
 ProxyConfig load_config(int argc, char** argv);

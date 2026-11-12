@@ -684,12 +684,7 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
         config_.expert_gemm_max_swizzle_size == 0) {
         throw std::runtime_error("invalid expert GEMM tile configuration");
     }
-    if (config_.expert_gemm_m_tile >
-        std::numeric_limits<std::size_t>::max() / config_.expert_gemm_cluster_m) {
-        throw std::runtime_error("expert GEMM M-cluster size overflows size_t");
-    }
-    const auto m_cluster_tokens =
-        config_.expert_gemm_m_tile * config_.expert_gemm_cluster_m;
+    const auto m_cluster_tokens = expert_gemm_cluster_rows(config_);
     const auto clusters_n = config_.expert_gemm_dimension / config_.expert_gemm_n_tile +
         (config_.expert_gemm_dimension % config_.expert_gemm_n_tile != 0 ? 1 : 0);
     if (clusters_n >
@@ -874,6 +869,10 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
         "initialized QuACK gather-table scheduler local_experts=",
         experts_per_gpu,
         " receive_buffers=", receive_buffer_count,
+        " device_capacity=", config_.expert_gemm_device_capacity,
+        " mma_m_tile=", config_.expert_gemm_m_tile,
+        " cta_m_tile=", expert_gemm_cta_m_tile(config_),
+        " cluster_rows=", m_cluster_tokens,
         " m_clusters=", total_batches,
         " n_groups_per_m_cluster=", n_groups_per_m_cluster,
         " group_size=", publication.group_size,
@@ -1259,8 +1258,7 @@ CudaBuffers::schedule_ready_computation_batches_for_expert_locked(
         throw std::runtime_error("router computation expert index is out of range");
     }
     const auto first_new_row = scheduler.published_rows;
-    const auto m_cluster_tokens =
-        config_.expert_gemm_m_tile * config_.expert_gemm_cluster_m;
+    const auto m_cluster_tokens = expert_gemm_cluster_rows(config_);
     while (scheduler.expert_num_notified_batches[expert] <
            scheduler.expert_total_batches[expert]) {
         const auto next_expert_batch =

@@ -428,6 +428,9 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "expert_gemm_m_tile") {
         config.expert_gemm_m_tile = static_cast<std::size_t>(std::stoull(value));
     }
+    else if (key == "expert_gemm_device_capacity") {
+        config.expert_gemm_device_capacity = std::stoi(value);
+    }
     else if (key == "expert_gemm_n_tile") {
         config.expert_gemm_n_tile = static_cast<std::size_t>(std::stoull(value));
     }
@@ -492,6 +495,31 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
 }
 
 }  // namespace
+
+std::size_t expert_gemm_cta_m_tile(const ProxyConfig& config) {
+    if (config.expert_gemm_device_capacity != 9 &&
+        config.expert_gemm_device_capacity != 10) {
+        throw std::runtime_error("expert_gemm_device_capacity must be 9 (Hopper) or 10 (Blackwell)");
+    }
+    if (config.expert_gemm_m_tile == 0 || config.expert_gemm_cluster_m == 0) {
+        throw std::runtime_error("expert GEMM M tile and cluster M must be > 0");
+    }
+    // Keep aligned with quack.gemm_config.cta_tile_shape_m for non-blockscaled
+    // SM90/SM100 GEMMs. The worker passes MMA geometry, so applying the Hopper
+    // product directly here would leave half the routes in a descriptor unused.
+    const bool two_cta_mma = config.expert_gemm_device_capacity == 10 &&
+        config.expert_gemm_cluster_m % 2 == 0 &&
+        (config.expert_gemm_m_tile == 128 || config.expert_gemm_m_tile == 256);
+    return config.expert_gemm_m_tile / (two_cta_mma ? 2 : 1);
+}
+
+std::size_t expert_gemm_cluster_rows(const ProxyConfig& config) {
+    const auto cta_rows = expert_gemm_cta_m_tile(config);
+    if (cta_rows > std::numeric_limits<std::size_t>::max() / config.expert_gemm_cluster_m) {
+        throw std::runtime_error("expert GEMM CTA M tile * cluster M overflows size_t");
+    }
+    return cta_rows * config.expert_gemm_cluster_m;
+}
 
 std::size_t dtype_size(DataType dtype) {
     switch (dtype) {
@@ -726,6 +754,8 @@ static ProxyConfig parse_config_file(const std::string& path) {
         config.router_local_input_staging_enabled);
     config.expert_gemm_m_tile = number_as<std::size_t>(
         object, "expert_gemm_m_tile", config.expert_gemm_m_tile);
+    config.expert_gemm_device_capacity = number_as<int>(
+        object, "expert_gemm_device_capacity", config.expert_gemm_device_capacity);
     config.expert_gemm_n_tile = number_as<std::size_t>(
         object, "expert_gemm_n_tile", config.expert_gemm_n_tile);
     config.expert_gemm_dimension = number_as<std::size_t>(
@@ -842,6 +872,12 @@ ProxyConfig load_config(int argc, char** argv) {
 }
 
 void validate_config(const ProxyConfig& config) {
+    // Validate this even when the scheduler is disabled, so misspelled or
+    // unsupported architectures never silently survive a CLI/JSON load.
+    if (config.expert_gemm_device_capacity != 9 &&
+        config.expert_gemm_device_capacity != 10) {
+        throw std::runtime_error("expert_gemm_device_capacity must be 9 (Hopper) or 10 (Blackwell)");
+    }
     if (config.gid_index2 < -2) throw std::runtime_error("invalid gid_index2");
     if (!config.rdma_device_name2.empty() &&
         (config.rdma_device_name.empty() || config.rdma_device_name == config.rdma_device_name2 ||
@@ -1070,11 +1106,7 @@ void validate_config(const ProxyConfig& config) {
                     "expert_gemm_cluster_m, and expert_gemm_max_swizzle_size "
                     "must be > 0 for router completion notifications");
             }
-            if (config.expert_gemm_m_tile >
-                std::numeric_limits<std::size_t>::max() / config.expert_gemm_cluster_m) {
-                throw std::runtime_error(
-                    "expert_gemm_m_tile * expert_gemm_cluster_m overflows size_t");
-            }
+            (void)expert_gemm_cluster_rows(config);
             const auto clusters_n =
                 config.expert_gemm_dimension / config.expert_gemm_n_tile +
                 (config.expert_gemm_dimension % config.expert_gemm_n_tile != 0 ? 1 : 0);
@@ -1338,6 +1370,7 @@ std::string config_summary(const ProxyConfig& config) {
         << " nvlink_forward_notification_flag_update_mode="
         << to_string(config.nvlink_forward_notification_flag_update_mode)
         << " expert_gemm_m_tile=" << config.expert_gemm_m_tile
+        << " expert_gemm_device_capacity=" << config.expert_gemm_device_capacity
         << " expert_gemm_n_tile=" << config.expert_gemm_n_tile
         << " expert_gemm_dimension=" << config.expert_gemm_dimension
         << " expert_gemm_cluster_m=" << config.expert_gemm_cluster_m

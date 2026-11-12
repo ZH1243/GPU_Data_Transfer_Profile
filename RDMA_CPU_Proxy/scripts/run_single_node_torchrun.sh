@@ -78,7 +78,7 @@ master_port="${MASTER_PORT:-29500}"
     --grouped-gemm-activation=swiglu \
     --down-projection2 --down-sm-count=74 --local-gpu-combine \
     --down-n-tile-major-output --down-tile-m=128 --down-tile-n=128 \
-    --down-pingpong --down-gather-table --down-gather-table-expert-waves \
+    --down-gather-table --down-gather-table-expert-waves \
     --down-max-swizzle-size=1 --down-gather-table-wave-barrier \
     --down-epilogue-store bulk_rows_reduce \
     --down-gather-table-publish-ready \

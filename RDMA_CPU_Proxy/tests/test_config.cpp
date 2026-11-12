@@ -30,11 +30,16 @@ int main(int argc, char** argv) {
         std::ofstream out("dual_device_config.json");
         out << R"({"num_nodes":1, "num_gpus_per_node":1, "num_tokens":64, "token_dimension":8,
                    "rdma_device_name":"nic0", "rdma_device_name2":"nic1",
-                   "num_qps_per_peer":20, "rdma_port2":2, "gid_index2":7})";
+                   "num_qps_per_peer":20, "rdma_port2":2, "gid_index2":7,
+                   "expert_gemm_device_capacity":10, "expert_gemm_m_tile":128,
+                   "expert_gemm_cluster_m":2})";
     }
     const auto dual_json = rdma_proxy::load_config_file("dual_device_config.json");
     assert(dual_json.rdma_device_name2 == "nic1" && dual_json.rdma_port2 == 2 &&
            dual_json.gid_index2 == 7);
+    assert(dual_json.expert_gemm_device_capacity == 10);
+    assert(rdma_proxy::expert_gemm_cta_m_tile(dual_json) == 64);
+    assert(rdma_proxy::expert_gemm_cluster_rows(dual_json) == 128);
     assert(config.data_signal_interval == 16);
     assert(config.max_in_flight_chunks_per_qp == 4);
     assert(!config.rdma_chunk_per_token_sge_enabled);
@@ -84,6 +89,7 @@ int main(int argc, char** argv) {
     }
     assert(rejected_invalid_flag_update_mode);
     assert(config.expert_gemm_m_tile == 128);
+    assert(config.expert_gemm_device_capacity == 9);
     assert(config.expert_gemm_n_tile == 256);
     assert(config.expert_gemm_dimension == 8192);
     assert(config.expert_gemm_cluster_m == 1);
@@ -198,6 +204,7 @@ int main(int argc, char** argv) {
         "--nvlink_forward_max_threshold_chunks=6",
         "--nvlink_forward_out_of_order_chunks_enabled=true",
         "--expert_gemm_m_tile=64",
+        "--expert_gemm_device_capacity=10",
         "--expert_gemm_n_tile=128",
         "--expert_gemm_dimension=4096",
         "--expert_gemm_cluster_m=2",
@@ -230,6 +237,7 @@ int main(int argc, char** argv) {
     assert(peer_port_config.nvlink_forward_max_threshold_chunks == 6);
     assert(peer_port_config.nvlink_forward_out_of_order_chunks_enabled);
     assert(peer_port_config.expert_gemm_m_tile == 64);
+    assert(peer_port_config.expert_gemm_device_capacity == 10);
     assert(peer_port_config.expert_gemm_n_tile == 128);
     assert(peer_port_config.expert_gemm_dimension == 4096);
     assert(peer_port_config.expert_gemm_cluster_m == 2);
