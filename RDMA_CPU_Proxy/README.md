@@ -645,14 +645,20 @@ QuACK Blackwell environment, and run:
 ```bash
 export PROXY_ROOT=/path/to/GPU_Data_Transfer_Profile/RDMA_CPU_Proxy
 export QUACK_ROOT=/path/to/quack_for_communication_overlap
+export CUDA_HOME=/path/to/cuda-12.9  # Full toolkit containing bin/nvcc.
+export RDMA_PROXY_BUILD_DIR="$PROXY_ROOT/build-blackwell-cu129"
+"$CUDA_HOME/bin/nvcc" --version  # Must report release 12.9.
+python -c 'import torch; print("PyTorch CUDA:", torch.version.cuda)'  # 12.9
 cd "$QUACK_ROOT"
 python -m pip install -e '.[dev]'
 python -m pip check
-cmake -S "$PROXY_ROOT" -B "$PROXY_ROOT/build-blackwell" \
+cmake -S "$PROXY_ROOT" -B "$RDMA_PROXY_BUILD_DIR" \
+  -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
+  -DCUDAToolkit_ROOT="$CUDA_HOME" -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \
   -DRDMA_PROXY_REQUIRE_CUDA=ON -DRDMA_PROXY_REQUIRE_VERBS=ON \
   -DCMAKE_CUDA_ARCHITECTURES=100
-cmake --build "$PROXY_ROOT/build-blackwell" -j4
-ctest --test-dir "$PROXY_ROOT/build-blackwell" --output-on-failure
+cmake --build "$RDMA_PROXY_BUILD_DIR" -j4
+ctest --test-dir "$RDMA_PROXY_BUILD_DIR" --output-on-failure
 
 # Small native SM100 numerical cases first; timeout also catches polling hangs.
 CUDA_VISIBLE_DEVICES=0 timeout 900 python -m pytest -q \
@@ -680,6 +686,43 @@ the generic native Blackwell target; QuACK independently compiles its SM100-fami
 MMA kernels. Existing build directories retain their cached targets. Build with
 `-DCMAKE_CUDA_ARCHITECTURES=90` for Hopper and run the same worker regressions
 there to check SM90 preservation.
+
+The native library and PyTorch share one loaded CUDA runtime. Pin **both** the
+compiler and toolkit root: activating a Python environment does not select the
+system `nvcc`, and `CUDAToolkit_ROOT` alone does not override an already selected
+CUDA compiler. Use a fresh build directory when changing CUDA toolkits; CMake
+caches the compiler. The build uses the shared runtime explicitly. Keep
+`RDMA_PROXY_BUILD_DIR` exported when launching so the scripts load this build.
+PyTorch's runtime package alone does not supply the full CUDA 12.9 toolkit.
+
+If `CudaCopies` reports both `libcudart.so.12` and `libcudart.so.13`, inspect the
+native dependency and run this preflight on **each** node after rebuilding:
+
+```bash
+readelf -d "$RDMA_PROXY_BUILD_DIR/librdma_cpu_proxy.so" | grep libcudart
+# The CUDA 12.9 build should depend on libcudart.so.12.
+cd "$PROXY_ROOT"
+python - <<'PY'
+import os
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd() / "scripts"))
+from rdma_proxy_worker import import_torch_for_proxy, load_proxy_library
+torch = import_torch_for_proxy(0)
+library = load_proxy_library(
+    Path(os.environ["RDMA_PROXY_BUILD_DIR"]) / "librdma_cpu_proxy.so",
+    torch_cuda_version=torch.version.cuda,
+)
+print(f"Embedded CUDA runtime check passed (PyTorch CUDA {torch.version.cuda})")
+PY
+```
+
+The worker now loads PyTorch first and checks the mapped runtimes immediately
+after loading the proxy, before creating a native proxy or exchanging metadata.
+This reports a mismatched build early; it cannot make CUDA 12 and CUDA 13 runtimes
+interchangeable. Keep QuACK's single-runtime check. If a previous launch failed
+partway through initialization, stop both old jobs and use a fresh `MASTER_PORT`
+on both nodes when retrying, to avoid reusing their return-exchange shared state.
 
 Next set the actual network configuration on **each** node. No Blackwell NIC or
 address defaults are assumed. NIC entries can be `nicA+nicB` for dual-device

@@ -26,6 +26,10 @@ if(CMAKE_CUDA_COMPILER)
     message(FATAL_ERROR "RDMA_CPU_Proxy requires CUDA 12.9 or newer for cudaMemcpyBatchAsync and Blackwell support.")
   endif()
   message(STATUS "Native CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+  message(STATUS "Native CUDA toolkit: ${CUDAToolkit_VERSION} (${CUDAToolkit_NVCC_EXECUTABLE})")
+  # All consumers embed/share CUDA handles and allocations with PyTorch. Avoid
+  # implicitly adding cudart_static alongside the explicit CUDA::cudart link.
+  set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
   set(RDMA_PROXY_HAVE_CUDA 1)
 elseif(RDMA_PROXY_REQUIRE_CUDA)
   message(FATAL_ERROR "CUDA compiler not found. Install CUDA or configure with -DRDMA_PROXY_REQUIRE_CUDA=OFF.")

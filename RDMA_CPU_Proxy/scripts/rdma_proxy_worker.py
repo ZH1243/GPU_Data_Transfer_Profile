@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import queue
+import re
 import shlex
 import sys
 import threading
@@ -1121,7 +1122,41 @@ def build_proxy_argv(
     return ["rdma_cpu_proxy", *proxy_args, *generated_args], metadata
 
 
-def load_proxy_library(path: Path) -> ctypes.CDLL:
+def check_cuda_runtime_compatibility(torch_cuda_version, library_path, *, mappings=None):
+    """Reject mixed runtimes before creating a proxy or starting peer exchanges.
+
+    Match the major ABI, not the patch version. Linux maps repeat a library for
+    each segment; the unique path count also preserves QuACK's IPC contract.
+    """
+    if mappings is None:
+        maps_path = Path("/proc/self/maps")
+        if not maps_path.exists():
+            return  # The real embedded CUDA/RDMA path runs on Linux.
+        mappings = maps_path.read_text()
+    runtimes = {}
+    for line in mappings.splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) != 6:
+            continue
+        mapped_path = fields[5]
+        path = mapped_path.removesuffix(" (deleted)")
+        match = re.fullmatch(r"libcudart\.so(?:\.(\d+)(?:\..*)?)?", Path(path).name)
+        if match:
+            runtimes[mapped_path] = int(match[1]) if match[1] else None
+    expected_major = int(torch_cuda_version.split(".")[0])
+    if len(runtimes) != 1 or next(iter(runtimes.values()), None) != expected_major:
+        raise RuntimeError(
+            f"CUDA runtime mismatch before proxy initialization: PyTorch was built for "
+            f"CUDA {torch_cuda_version}, but after loading {library_path} the process has "
+            f"these CUDA runtimes: {sorted(runtimes)}. Expected exactly one libcudart.so."
+            f"{expected_major}. Rebuild the proxy in a fresh build directory using the "
+            f"CUDA {torch_cuda_version} toolkit: set both CMAKE_CUDA_COMPILER to its "
+            "bin/nvcc and CUDAToolkit_ROOT to that toolkit root, then point "
+            "RDMA_PROXY_BUILD_DIR at the new build. Do not bypass QuACK's runtime check."
+        )
+
+
+def load_proxy_library(path: Path, *, torch_cuda_version=None) -> ctypes.CDLL:
     if not path.is_file():
         raise RuntimeError(
             f"RDMA proxy shared library does not exist: {path}; "
@@ -1129,6 +1164,8 @@ def load_proxy_library(path: Path) -> ctypes.CDLL:
         )
 
     library = ctypes.CDLL(str(path))
+    if torch_cuda_version is not None:
+        check_cuda_runtime_compatibility(torch_cuda_version, path)
     library.rdma_proxy_abi_version.argtypes = []
     library.rdma_proxy_abi_version.restype = ctypes.c_int
     library.rdma_proxy_run_argv.argtypes = [
@@ -1790,7 +1827,10 @@ def main() -> int:
         print(shlex.join(proxy_argv), flush=True)
         return 0
 
-    library = load_proxy_library(args.library.resolve())
+    # Load PyTorch's runtime first so a matching native SONAME reuses it. Check
+    # immediately after dlopen, before native initialization can contact peers.
+    torch = import_torch_for_proxy(int(metadata["cuda_device_id"]))
+    library = load_proxy_library(args.library.resolve(), torch_cuda_version=torch.version.cuda)
     if args.concurrent_kernel:
         if args.num_experts is None:
             raise RuntimeError("--concurrent-kernel requires --num-experts")
