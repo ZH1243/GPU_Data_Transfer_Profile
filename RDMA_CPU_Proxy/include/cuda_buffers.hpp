@@ -84,10 +84,13 @@ struct RouterNotificationPublicationBuffers {
     std::size_t a_idx_capacity{0};
     std::size_t n_groups_per_m_cluster{0};
     int32_t group_size{0};
-    // CPU-side diagnostics counting successfully enqueued/copied table ranges
-    // and their corresponding ready-row publications.
+    // Cumulative CPU-side diagnostics for table/ready publications, packed
+    // metadata rows, and successfully enqueued/copied metadata transfers.
     uint64_t table_flush_count{0};
     uint64_t ready_rows_publication_count{0};
+    uint64_t cpu_scatter_packed_rows{0};
+    // Ready-publication count observed when the last deferred packing began.
+    uint64_t cpu_scatter_pack_ready_publication_count{0};
     uint64_t cpu_scatter_copy_count{0};
     uint64_t cpu_scatter_copy_bytes{0};
 };
@@ -269,7 +272,7 @@ private:
         std::size_t table_bytes);
 
     ProxyConfig config_;
-    void publish_cpu_scatter_batch(const std::vector<int32_t>& ranges);
+    void prepare_cpu_scatter_batch(const int32_t* ranges);
     void publish_deferred_cpu_scatter_locked();
     CpuPinnedBuffer cpu_scatter_staging_;
     CpuPinnedBuffer cpu_route_weights_staging_;

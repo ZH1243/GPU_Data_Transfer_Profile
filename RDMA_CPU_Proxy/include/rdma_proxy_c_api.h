@@ -53,8 +53,9 @@ RDMA_PROXY_C_API int rdma_proxy_configure_cpu_route_weights(
  * aligned borrowed allocation. Its exact size is routes*columns*8 unweighted;
  * weighted storage places FP32[routes] at round_up(scatter_bytes,16), and bytes
  * includes that weight array. Retain the entire allocation through shutdown.
- * CPU staging completes while gather readiness streams. One slab H2D copy and
- * event record follow final gather-ready publication on the publication stream.
+ * After final gather-ready publication is enqueued, CPU staging is reconstructed
+ * from the completed host gather table, once per M batch. One slab H2D copy and
+ * event record then follow on the publication stream.
  * The existing per-batch behavior remains default unless this API is called. */
 RDMA_PROXY_C_API int rdma_proxy_configure_cpu_scatter_deferred(
     RdmaProxyHandle* handle, uint64_t bytes);

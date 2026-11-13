@@ -1081,9 +1081,27 @@ void CudaBuffers::publish_deferred_cpu_scatter_locked() {
     const auto& scheduler = router_computation_scheduler_state_;
     auto& publication = router_notification_publication_buffers_;
     if (!scheduler.iteration_initialized || scheduler.published_rows != publication.table_rows) return;
+    // Called after the FINAL gather table and ready-prefix writes were enqueued.
+    // Reconstruct packed rows from that immutable host table instead of doing
+    // scatter work between gather submissions on the notification thread.
+    const auto groups = publication.n_groups_per_m_cluster;
+    if (!groups || publication.table_rows % groups ||
+        publication.table_width != 2 + 2 * cpu_scatter_lookup_.size() ||
+        publication.table_row_bytes != publication.table_width * sizeof(int32_t) ||
+        !publication.host_table.ptr || cpu_scatter_staged_rows_ != 0)
+        throw std::runtime_error("invalid completed gather table for deferred CPU scatter packing");
+    publication.cpu_scatter_pack_ready_publication_count = publication.ready_rows_publication_count;
+    const auto* table = static_cast<const int32_t*>(publication.host_table.ptr);
+    for (std::size_t row = 0; row < publication.table_rows; row += groups) {
+        const auto* descriptor = table + row * publication.table_width;
+        if (descriptor[1] != 0)
+            throw std::runtime_error("deferred CPU scatter expected first N group of each M batch");
+        // All N groups for an M batch repeat these source/list positions. The
+        // packed base is sum(start_j), independent of descriptor arrival order.
+        prepare_cpu_scatter_batch(descriptor + 2);
+    }
     if (cpu_scatter_staged_rows_ != cpu_scatter_routes_)
-        throw std::runtime_error("final gather publication has incomplete CPU scatter staging");
-    // Called only after the FINAL gather-ready write was enqueued on this stream.
+        throw std::runtime_error("completed gather table has incomplete CPU scatter staging");
     if (config_.mock_mode) {
         std::memcpy(reinterpret_cast<void*>(cpu_scatter_device_), cpu_scatter_deferred_staging_.ptr,
                     cpu_scatter_deferred_staging_.bytes);
@@ -1103,7 +1121,7 @@ void CudaBuffers::publish_deferred_cpu_scatter_locked() {
     cpu_scatter_ready_cv_.notify_all();
 }
 
-void CudaBuffers::publish_cpu_scatter_batch(const std::vector<int32_t>& ranges) {
+void CudaBuffers::prepare_cpu_scatter_batch(const int32_t* ranges) {
     std::size_t base = 0, count = 0;
     for (std::size_t j = 0; j < cpu_scatter_lookup_.size(); ++j) {
         const auto start = ranges[2*j], end = ranges[2*j+1];
@@ -1139,6 +1157,7 @@ void CudaBuffers::publish_cpu_scatter_batch(const std::vector<int32_t>& ranges) 
                                       weights.begin() + ranges[2*j+1], weight_cursor);
         }
     }
+    router_notification_publication_buffers_.cpu_scatter_packed_rows += count;
     if (cpu_scatter_deferred_staging_.ptr) {
         if (count > cpu_scatter_routes_ - cpu_scatter_staged_rows_)
             throw std::runtime_error("deferred CPU scatter staged row count exceeds capacity");
@@ -1513,9 +1532,11 @@ CudaBuffers::schedule_ready_computation_batches_for_expert_locked(
                 "num_ready_tokens is inconsistent with expert Head/Tail state");
         }
 
-        // One scatter range per M batch, shared by all repeated N groups.
-        // Its H2D copy precedes gather readiness on the publication stream.
-        if (cpu_scatter_device_) publish_cpu_scatter_batch(ranges);
+        // Only the per-batch policy prepares/uploads scatter metadata here.
+        // Deferred mode reconstructs it from the completed host gather table
+        // after the final publication, leaving this streaming path undisturbed.
+        if (cpu_scatter_device_ && !cpu_scatter_deferred_staging_.ptr)
+            prepare_cpu_scatter_batch(ranges.data());
 
         for (std::size_t n_group = 0;
              n_group < publication.n_groups_per_m_cluster; ++n_group) {

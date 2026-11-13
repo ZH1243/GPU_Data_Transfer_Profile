@@ -493,7 +493,7 @@ def add_down_arguments(parser):
     parser.add_argument("--cpu-scatter-preparation", action="store_true",
                         help="prepare down scatter addresses in the CPU notification receiver; requires local GPU combine")
     parser.add_argument("--cpu-scatter-publication", choices=("deferred", "per-batch"), default=None,
-                        help="CPU metadata upload policy: deferred (default) uploads one buffer after all up gather entries; "
+                        help="CPU metadata policy: deferred (default) packs and uploads one buffer after all up gather entries; "
                              "per-batch uploads each M batch before gather readiness")
     parser.add_argument("--inter-node-combine", action="store_true",
                         help="combine node sums into original token order after local combine and any RDMA returns")
@@ -1000,7 +1000,7 @@ class DownProjectionRunner:
             self.combine_output_to_input.copy_(inverse)
         self.cpu_scatter_counts = counts
         torch.cuda.synchronize(self.up.cuda_device_id)
-        policy = (f"one {self.cpu_scatter_metadata.numel()}-byte metadata H2D after final gather publication"
+        policy = (f"CPU packing then one {self.cpu_scatter_metadata.numel()}-byte metadata H2D after final gather publication"
                   if self.cpu_scatter_publication == "deferred" else
                   "scatter batches published before gather readiness")
         print(f"CPU scatter preparation enabled: compact metadata fixed at setup; {policy}", flush=True)

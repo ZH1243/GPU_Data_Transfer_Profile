@@ -142,9 +142,16 @@ static void run(bool per_entry, uint64_t tile, bool cuda, int weight_mode, bool 
     const auto& publication = buffers.router_notification_publication_buffers();
     std::vector<int64_t> first_iteration;
     for (uint64_t iteration = 0; iteration < 2; ++iteration) {
+        const auto packed_before = publication.cpu_scatter_packed_rows;
+        const auto pack_ready_before = publication.cpu_scatter_pack_ready_publication_count;
         buffers.begin_router_notification_iteration(iteration);
+        require(publication.cpu_scatter_packed_rows == packed_before);
+        require(publication.cpu_scatter_pack_ready_publication_count == pack_ready_before);
         const auto copies_before = publication.cpu_scatter_copy_count;
         const auto bytes_before = publication.cpu_scatter_copy_bytes;
+        std::vector<int32_t> partial_ready_prefixes;
+        bool final_publication_seen = false;
+        uint64_t final_pack_ready_count = 0;
         std::fill(scatter.begin(), scatter.end(), -1);
         if (!cuda) std::memset(device_scatter, 0xff, allocation_bytes);
 #if RDMA_PROXY_HAVE_CUDA
@@ -202,7 +209,14 @@ static void run(bool per_entry, uint64_t tile, bool cuda, int weight_mode, bool 
 #endif
             require(ready == static_cast<int32_t>(
                 buffers.router_computation_scheduler_state().published_rows));
+            if (ready > 0 && static_cast<std::size_t>(ready) < publication.table_rows &&
+                (partial_ready_prefixes.empty() || partial_ready_prefixes.back() != ready))
+                partial_ready_prefixes.push_back(ready);
             if (deferred && static_cast<std::size_t>(ready) != publication.table_rows) {
+                // Deferral covers the CPU lookup/copy work itself, not only H2D.
+                // Multiple nonzero published prefixes must leave staging untouched.
+                require(publication.cpu_scatter_packed_rows == packed_before);
+                require(publication.cpu_scatter_pack_ready_publication_count == pack_ready_before);
                 require(publication.cpu_scatter_copy_count == copies_before);
                 require(publication.cpu_scatter_copy_bytes == bytes_before);
                 require(std::all_of(scatter.begin(), scatter.end(), [](int64_t x) { return x == -1; }));
@@ -210,6 +224,7 @@ static void run(bool per_entry, uint64_t tile, bool cuda, int weight_mode, bool 
                 return;
             }
             std::vector<int> seen(routes);
+            std::size_t expected_packed = 0;
             for (int r = 0; r < ready; r += publication.n_groups_per_m_cluster) {
                 auto* row = table + r * publication.table_width;
                 std::size_t packed = 0;
@@ -217,6 +232,7 @@ static void run(bool per_entry, uint64_t tile, bool cuda, int weight_mode, bool 
                 for (int s = 0; s < 3; ++s) {
                     for (int i = row[2+2*s]; i < row[3+2*s]; ++i, ++packed) {
                         require(packed < routes && !seen[packed]++);
+                        ++expected_packed;
                         if (weight_mode) require(packed_weights[packed] == weights[s][i]);
                         const auto input = indices[s][i];
                         const auto begin = inverse.begin() + s*10;
@@ -228,13 +244,32 @@ static void run(bool per_entry, uint64_t tile, bool cuda, int weight_mode, bool 
                     }
                 }
             }
+            // Repeated N groups share each M batch's packing; no routed row is
+            // repacked either in legacy mode or during the final deferred walk.
+            require(publication.cpu_scatter_packed_rows == packed_before + expected_packed);
             if (static_cast<std::size_t>(ready) == publication.table_rows)
                 require(std::all_of(seen.begin(), seen.end(), [](int n) { return n == 1; }));
         };
-        // Reversing source arrival changes packed positions, but destinations
-        // and duplicate-route reduction addresses must remain correct.
-        for (int s : (iteration == 0 ? std::vector<int>{0,1,2} : std::vector<int>{1,0,2})) {
-            buffers.process_router_notification_completion(0, s, iteration, 0, 10);
+        // Chunked arrivals cause several partial gather publications before the
+        // final one. Reversing source priority changes packed row positions.
+        // Unused tail rows and the empty source still notify after finalization.
+        struct Arrival { int source; std::size_t begin; std::size_t count; };
+        const auto arrivals = iteration == 0 ?
+            std::vector<Arrival>{{0,0,6}, {1,0,2}, {1,2,6}, {0,6,4}, {1,8,2}, {2,0,10}} :
+            std::vector<Arrival>{{1,0,8}, {0,0,3}, {0,3,3}, {0,6,4}, {1,8,2}, {2,0,10}};
+        for (const auto& arrival : arrivals) {
+            buffers.process_router_notification_completion(
+                0, arrival.source, iteration, arrival.begin, arrival.count);
+            if (deferred && !final_publication_seen &&
+                buffers.router_computation_scheduler_state().published_rows == publication.table_rows) {
+                // Snapshot is taken at the start of CPU packing. Matching the
+                // FINAL ready-publication counter proves packing starts after
+                // that submission, not immediately before it in the same call.
+                final_pack_ready_count = publication.ready_rows_publication_count;
+                require(publication.cpu_scatter_pack_ready_publication_count == final_pack_ready_count);
+                require(final_pack_ready_count > pack_ready_before);
+                final_publication_seen = true;
+            }
             if (deferred && waiter.valid() &&
                 buffers.router_computation_scheduler_state().published_rows == publication.table_rows) {
                 // Join the event-dependent consumer BEFORE any publication-stream sync below.
@@ -242,19 +277,40 @@ static void run(bool per_entry, uint64_t tile, bool cuda, int weight_mode, bool 
                 require(std::all_of(consumer_scatter.begin(), consumer_scatter.end(), [](int64_t x) { return x != -1; }));
             }
             check_published();
+            if (final_publication_seen)
+                require(publication.cpu_scatter_pack_ready_publication_count == final_pack_ready_count);
+            if (buffers.router_computation_scheduler_state().published_rows < publication.table_rows) {
+                const auto packed_before_flush = publication.cpu_scatter_packed_rows;
+                buffers.flush_router_notification_publication();
+                require(publication.cpu_scatter_packed_rows == packed_before_flush);
+                check_published();
+            }
         }
         require(buffers.router_computation_scheduler_state().published_rows == publication.table_rows);
+        require(partial_ready_prefixes.size() >= 2);
+        require(publication.cpu_scatter_packed_rows == packed_before + routes);
         if (deferred) {
+            require(final_publication_seen);
             require(publication.cpu_scatter_copy_count == copies_before + 1);
             require(publication.cpu_scatter_copy_bytes == bytes_before + slab_bytes);
             require(consumer_scatter == scatter);
             buffers.wait_cpu_scatter_ready(iteration, compute_stream_address, 1);
             buffers.flush_router_notification_publication();
             require(publication.cpu_scatter_copy_count == copies_before + 1);
+            require(publication.cpu_scatter_pack_ready_publication_count == final_pack_ready_count);
         } else {
             require(publication.cpu_scatter_copy_count > copies_before + 1);
             require(publication.cpu_scatter_copy_bytes == bytes_before + scatter_bytes +
                 (weight_mode ? routes * sizeof(float) : 0));
+        }
+        // Repeated final flushes must neither upload nor pack a second time.
+        const auto final_copies = publication.cpu_scatter_copy_count;
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            buffers.flush_router_notification_publication();
+            require(publication.cpu_scatter_packed_rows == packed_before + routes);
+            require(publication.cpu_scatter_copy_count == final_copies);
+            if (deferred)
+                require(publication.cpu_scatter_pack_ready_publication_count == final_pack_ready_count);
         }
         if (!iteration) first_iteration = scatter;
         else require(scatter != first_iteration);

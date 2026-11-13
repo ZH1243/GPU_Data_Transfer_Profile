@@ -1323,8 +1323,8 @@ Each source owns an immutable FP32 buffer padded exactly like its `A_idx`.
 Every iteration builds a separate FP32 vector in the actual packed up-output
 row order using the gather descriptor's exact source/list positions. GPU
 preparation shares the scatter mapping calculation; `--cpu-scatter-preparation`
-copies selected source ranges into pinned staging. By default it uploads all
-scatter addresses and weights together after the final gather publication;
+copies selected source ranges into pinned staging. By default both CPU packing
+and the combined scatter/weight upload occur after the final gather publication;
 down waits for that upload. `--cpu-scatter-publication=per-batch` retains uploads
 before each batch's gather readiness for comparison. Repeated N
 groups reuse those weights. Python retains all borrowed GPU tensors until native
@@ -1462,13 +1462,16 @@ per-source valid-count-based tile stride; in this mode tile N must divide the
 output width. Routing metadata and output allocations must remain fixed through
 the run, as they do in the supplied test.
 
-During each iteration the notification receiver fills a pinned scatter range
-once per newly scheduled M batch (not per repeated N group). The default
-`--cpu-scatter-publication=deferred` keeps this work on the CPU while gather
-entries are published. After all routed rows are prepared and the final gather
-table range **and its ready prefix** have been enqueued, it queues exactly one
-metadata H2D on the same publication stream. Stream ordering makes that upload
-execute after the gather publications, without waiting for up GEMM to finish.
+With the default `--cpu-scatter-publication=deferred`, the notification receiver
+does no scatter-address or routing-weight packing between gather submissions.
+After the final gather table range **and its ready prefix** have been enqueued,
+it walks the completed, immutable host gather table to pack the metadata. It
+visits only the first descriptor of each M batch, skipping the repeated N
+groups. Each descriptor's exact source/list ranges determine both the packed
+base (`sum(start_j)`) and the weights, preserving arrival-dependent row order.
+The CPU then queues exactly one metadata H2D on the same publication stream.
+This needs no gather-table D2H or extra descriptor allocation. Up GEMM can
+continue consuming the published table while the CPU packs the metadata.
 
 Scatter addresses, optional N-tile strides, and optional FP32 routing weights
 share one contiguous allocation. Row-major addresses use 8 bytes per route;
@@ -1490,9 +1493,12 @@ iteration reset, and a previous iteration's event cannot satisfy a new request.
 To compare with the former incremental behavior, select
 `--cpu-scatter-publication=per-batch`. That mode issues one scatter H2D per M
 batch, plus one weight H2D when weighted, before the batch's gather readiness.
-The deferred mode removes these small interleaved uploads, but still performs
-CPU packing during dispatch. Its larger final upload and host wakeup may extend
-the up-to-down gap, so a throughput improvement must be measured.
+Deferred mode removes both the small interleaved uploads and their CPU packing
+from between gather submissions. Notification handling, range selection, table
+construction, and CUDA submission work still remain there. Packing now occurs
+after final gather submission and may overlap the remaining up-GEMM work; any
+exposed packing, final upload, or host wakeup can extend the up-to-down gap.
+Compare total iteration time as well as the cadence of gather H2Ds.
 
 The measured path skips `local_combine_mapping`, `compact_combine_mapping`,
 scatter-address tensor updates, and per-iteration return-count D2H copies.
@@ -1527,7 +1533,9 @@ one H2D per GPU per iteration, independent of the number of M batches or N group
 the gather/readiness H2Ds remain. Repeat the same checks on Hopper and both nodes
 when available. This change does not modify GEMM kernels or residency settings.
 
-`test_cpu_scatter` checks both publication policies against expert metadata with
+`test_cpu_scatter` checks zero deferred CPU packing and zero metadata uploads
+before final gather publication, one packed copy of each route afterwards,
+and a single metadata H2D. It checks both policies against expert metadata with
 changed source arrival order, duplicate routes, empty sources, repeated N
 groups, both output layouts, both gather flush policies, and iteration reuse
 in mock mode. `test_cpu_scatter_cuda` runs the same checks with actual GPU
