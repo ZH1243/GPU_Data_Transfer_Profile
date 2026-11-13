@@ -45,6 +45,16 @@ def resolve_down_pingpong(requested, device_capacity, wave_barrier):
     return requested
 
 
+def validate_up_sm_count(sm_count: int | None, cluster_m: int) -> None:
+    """Match QuACK's requested cluster budget; hardware supplies its own cap."""
+    if sm_count is None:
+        return
+    if cluster_m <= 0:
+        raise ValueError("--grouped-gemm-cluster-m must be positive with --up-sm-count")
+    if sm_count <= 0 or sm_count % cluster_m:
+        raise ValueError("--up-sm-count must be positive and divisible by --grouped-gemm-cluster-m")
+
+
 def projection_dimension(output_dimension: int, activation: str | None) -> int:
     """The table schedules projection columns, before gated activation halves them."""
     return output_dimension * (2 if activation in GATED_ACTIVATIONS else 1)
@@ -282,9 +292,12 @@ class GroupedGemmRunner:
         cluster_m: int,
         max_swizzle_size: int,
         quack_root: Path,
+        sm_count: int | None = None,
     ) -> None:
+        validate_up_sm_count(sm_count, cluster_m)
         self.torch = torch_module
         self.cuda_device_id = cuda_device_id
+        self.sm_count = sm_count
         if not device_buffers.tensors_of_kind(DEVICE_BUFFER_GATHER_READY_ROWS):
             raise RuntimeError(
                 "--concurrent-kernel requires the notification-driven router scheduler; "
@@ -439,6 +452,7 @@ class GroupedGemmRunner:
             "GroupedGEMM configured: "
             f"device_capacity={self.device_capacity} mma_tile_m={tile_m} "
             f"cta_tile_m={self.cta_tile_m} cluster_rows={self.cta_tile_m * cluster_m} "
+            f"sm_count={self.sm_count if self.sm_count is not None else 'hardware-default'} "
             f"activation={activation or 'none'} projection_N={self.gemm_dimension} "
             f"active_sources={source_pairs} X={tuple(first_x.shape)} "
             f"A_idx={tuple(first_a_idx.shape)} W={tuple(self.weights.shape)} "
@@ -462,6 +476,9 @@ class GroupedGemmRunner:
                 tuned=False,
                 config=self.activation_config,
                 concat_layout=("B",) if self.gated else None,
+                # Preserve default launches with older QuACK checkouts. An
+                # explicit cap requires the updated fused API and is never lost.
+                **({"sm_count": self.sm_count} if self.sm_count is not None else {}),
             )
             return
         self.quack_gemm(
@@ -486,6 +503,7 @@ class GroupedGemmRunner:
             gather_work_table_ready=self.ready_rows,
             multi_buffer_gather=True,
             use_tma_gather=False,
+            sm_count=self.sm_count,
         )
 
 
@@ -1530,9 +1548,14 @@ def run_proxy_with_concurrent_kernel(
     expert_gemm_max_swizzle_size: int,
     quack_root: Path,
     down_options: argparse.Namespace,
+    up_sm_count: int | None = None,
 ) -> int:
     """Launch readiness-gated QuACK GroupedGEMM with each proxy iteration."""
 
+    # Validate before native initialization can allocate buffers or contact peers.
+    # Like down GEMM, oversized budgets are accepted and capped by QuACK's
+    # hardware-aware cluster capacity; this is not physical SM reservation.
+    validate_up_sm_count(up_sm_count, expert_gemm_cluster_m)
     torch = import_torch_for_proxy(cuda_device_id)
     capacity = resolve_gemm_architecture(
         getattr(down_options, "gemm_arch", "auto"),
@@ -1601,6 +1624,7 @@ def run_proxy_with_concurrent_kernel(
             cluster_m=expert_gemm_cluster_m,
             max_swizzle_size=expert_gemm_max_swizzle_size,
             quack_root=quack_root,
+            sm_count=up_sm_count,
         )
         computation_tokens = ctypes.c_uint64()
         require_proxy_success(
@@ -1911,6 +1935,11 @@ def main() -> int:
         "--grouped-gemm-cluster-m", dest="expert_gemm_cluster_m", type=int, default=1
     )
     parser.add_argument(
+        "--up-sm-count", "--grouped-gemm-sm-count", dest="up_sm_count", type=int, default=None,
+        help="cap up GEMM persistent CTAs; positive multiple of --grouped-gemm-cluster-m. "
+             "Defaults to hardware capacity; hardware caps larger requests; does not reserve physical SMs",
+    )
+    parser.add_argument(
         "--grouped-gemm-max-swizzle-size",
         dest="expert_gemm_max_swizzle_size",
         type=int,
@@ -1940,10 +1969,14 @@ def main() -> int:
         args.check_projections = False
         args.weighted_contributions = False
         args.grouped_gemm_activation = "none"
+        args.up_sm_count = None
         for name in vars(args):
             if name.startswith("expert_gemm_"):
                 setattr(args, name, parser.get_default(name))
     try:
+        if args.up_sm_count is not None and not args.concurrent_kernel:
+            raise ValueError("--up-sm-count requires --concurrent-kernel")
+        validate_up_sm_count(args.up_sm_count, args.expert_gemm_cluster_m)
         validate_down_arguments(args)
     except ValueError as error:
         parser.error(str(error))
@@ -1980,6 +2013,10 @@ def main() -> int:
         flush=True,
     )
     if args.dry_run:
+        if args.concurrent_kernel:
+            print("Up GEMM SM budget: "
+                  f"requested={args.up_sm_count if args.up_sm_count is not None else 'hardware-default'} "
+                  f"cluster_m={args.expert_gemm_cluster_m}; QuACK hardware capacity applies", flush=True)
         if args.concurrent_kernel and args.gemm_arch == "auto":
             print("GEMM architecture: auto (resolved from CUDA before native initialization; "
                   "use --gemm-arch=blackwell or hopper to inspect explicit scheduler geometry)", flush=True)
@@ -2010,6 +2047,7 @@ def main() -> int:
             expert_gemm_max_swizzle_size=args.expert_gemm_max_swizzle_size,
             quack_root=args.quack_root,
             down_options=args,
+            up_sm_count=args.up_sm_count,
         )
     return run_proxy(
         library,

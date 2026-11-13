@@ -172,7 +172,12 @@ class CompositionCudaTests(unittest.TestCase):
                     self._composition(tile_m, 4, preparation=preparation,
                                       publication_default=preparation == "deferred")
 
-    def _composition(self, tile_m, sm_count, policy=None, preparation="gpu", publication_default=False):
+    def test_capped_up_keeps_weighted_down_and_combine_correct(self):
+        # Up budgets change and repeat while down retains its independent cap.
+        self._composition(128, 2, policy="distinct", up_sm_counts=(2, 4, 2))
+
+    def _composition(self, tile_m, sm_count, policy=None, preparation="gpu",
+                     publication_default=False, up_sm_counts=None):
         torch = self.torch
         single_upload = preparation in ("deferred", "threaded")
         root = Path(os.environ.get("QUACK_ROOT", SCRIPTS.parents[2] / "quack_for_communication_overlap"))
@@ -223,7 +228,8 @@ class CompositionCudaTests(unittest.TestCase):
             torch, buffers, cuda_device_id=torch.cuda.current_device(), world_size=1,
             num_experts=2, output_dimension=intermediate, activation="swiglu",
             tile_m=tile_m, tile_n=tile_n, tile_k=None, cluster_m=cluster_m,
-            max_swizzle_size=1, quack_root=root)
+            max_swizzle_size=1, quack_root=root,
+            sm_count=None if up_sm_counts is None else up_sm_counts[0])
         up.original_reference = original
         up.original_reference_recompute = True
         parser = argparse.ArgumentParser()
@@ -253,6 +259,12 @@ class CompositionCudaTests(unittest.TestCase):
         if preparation != "gpu":
             self.assertEqual(down.cpu_scatter_publication, preparation)
         down.warmup()
+        if up_sm_counts is not None:
+            # Compile capped up variants before poisoning the streaming table.
+            for count in dict.fromkeys(up_sm_counts):
+                up.sm_count = count
+                up.launch()
+            torch.cuda.synchronize()
         # Build initial compact maps before simulated CPU publication starts.
         down.cpu_scatter = False
         up.launch()
@@ -317,6 +329,9 @@ class CompositionCudaTests(unittest.TestCase):
         publish()
         publication.synchronize()
         for iteration in range(3):
+            if up_sm_counts is not None:
+                up.sm_count = up_sm_counts[iteration]
+                self.assertEqual(options.down_sm_count, sm_count)
             changed = descriptor_rows(counts, span, 2 * intermediate // tile_n,
                                       list(range(sources))[::-1] if iteration % 2 else None)
             pinned_table.copy_(torch.tensor(changed, dtype=torch.int32))

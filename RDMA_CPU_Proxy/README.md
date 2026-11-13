@@ -1145,6 +1145,45 @@ default to the proxy scheduler values and can be overridden with the
 `--grouped-gemm-*` worker options; the worker forwards matching scheduler values
 to C++. The shell launchers forward additional arguments to the worker.
 
+Use `--up-sm-count=128` to cap the up GEMM's persistent CTA parallelism,
+independently of `--down-sm-count`. This supports plain GEMM, ordinary fused
+activations, and fused SwiGLU on Hopper and Blackwell, including streamed
+multi-buffer gather and early local readiness. For example, append to your
+working command:
+
+```bash
+--up-sm-count=128 --down-sm-count=128
+```
+
+The up count must be positive and divisible by `--grouped-gemm-cluster-m`.
+QuACK limits the grid to the requested budget, hardware cluster capacity, and
+available work. The count budgets CTAs, not M tiles: Blackwell two-CTA MMA
+still uses two units of the budget per two-CTA cluster. It does not reserve or
+pin particular physical SMs. Omitting the option preserves the existing full
+hardware-capacity policy; `--communication-only` ignores it. It requires
+`--concurrent-kernel`. Existing gather-table geometry and routed-row mapping
+contracts still apply; the down/combine residency policy is unchanged.
+
+Update both the Python worker and the QuACK checkout used by `--quack-root`
+(or `QUACK_ROOT`); the fused activation API now accepts `sm_count`. No native
+library rebuild is needed. The worker prints the up cap in its dry-run output
+and `GroupedGEMM configured` line. Validate on each NVIDIA architecture with:
+
+```bash
+cd "$PROXY_ROOT"
+QUACK_ROOT="$QUACK_ROOT" CUDA_VISIBLE_DEVICES=0 timeout 1800 python -m unittest discover \
+  -s tests -p test_worker_activation.py -v
+QUACK_ROOT="$QUACK_ROOT" CUDA_VISIBLE_DEVICES=0 timeout 3600 python -m unittest discover \
+  -s tests -p test_worker_composition.py -v
+```
+
+Then append `--up-sm-count=128 --check-projections --num_iterations=12` to your
+working single-node command, retaining its down/combine and forwarding settings.
+For performance comparison, use identical warmed workloads and check settings
+with the up cap omitted, then with caps such as 128, 112, and 96. Compare total
+iteration time and communication/GEMM overlap; reducing the up grid is a tuning
+option and does not guarantee a speedup.
+
 ### Fused up-projection activation
 
 Add `--grouped-gemm-activation=swiglu` (or an ordinary activation such as `relu`)

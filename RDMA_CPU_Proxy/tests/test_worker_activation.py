@@ -278,6 +278,80 @@ class SingleNodeLauncherCliTests(unittest.TestCase):
 
 
 class ActivationCliTests(unittest.TestCase):
+    def test_up_sm_count_validation(self):
+        for count, cluster in ((None, 1), (2, 2), (128, 2), (256, 2)):
+            # Oversized requests retain the established QuACK hardware clamp.
+            worker.validate_up_sm_count(count, cluster)
+        for count, cluster in ((0, 1), (-1, 1), (3, 2), (4, 0), (4, -1)):
+            with self.subTest(count=count, cluster=cluster), self.assertRaises(ValueError):
+                worker.validate_up_sm_count(count, cluster)
+
+    def test_up_sm_count_cli_defaults_alias_and_independent_down_count(self):
+        common = ("--concurrent-kernel", "--grouped-gemm-cluster-m=2")
+        baseline = self.run_cli(*common)
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        self.assertIn("requested=hardware-default cluster_m=2", baseline.stdout)
+        baseline_native = shlex.split(baseline.stdout.splitlines()[-1])
+        for activation in ("none", "relu", "swiglu"):
+            for flag in ("--up-sm-count=8", "--grouped-gemm-sm-count=8"):
+                with self.subTest(activation=activation, flag=flag):
+                    result = self.run_cli(*common, f"--grouped-gemm-activation={activation}", flag)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("requested=8 cluster_m=2", result.stdout)
+                    native = shlex.split(result.stdout.splitlines()[-1])
+                    self.assertFalse(any("sm-count" in option for option in native))
+                    if activation == "none":
+                        self.assertEqual(native, baseline_native)
+        result = self.run_cli(*common, "--up-sm-count=8", "--grouped-gemm-sm-count=128",
+                              "--grouped-gemm-activation=swiglu", "--down-projection2",
+                              "--down-sm-count=40", "--down-cluster-m=2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("requested=128 cluster_m=2", result.stdout)
+        for flags in (("--up-sm-count=0",), ("--up-sm-count=-2",), ("--up-sm-count=3",)):
+            result = self.run_cli(*common, *flags)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("positive and divisible", result.stderr)
+        result = self.run_cli("--up-sm-count=8")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires --concurrent-kernel", result.stderr)
+        # Communication-only clears compute settings, including an invalid cap.
+        result = self.run_cli(*common, "--up-sm-count=0", "--communication-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Up GEMM SM budget", result.stdout)
+        self.assertNotIn("sm-count", result.stdout.splitlines()[-1])
+
+    def test_up_sm_count_reaches_plain_and_fused_launches(self):
+        # CPU-only boundary test: do not import CUDA/QuACK or construct buffers.
+        for activation in (None, "relu", "swiglu"):
+            for count in (None, 2, 128):
+                with self.subTest(activation=activation, count=count):
+                    runner = worker.GroupedGemmRunner.__new__(worker.GroupedGemmRunner)
+                    runner.activation, runner.gated = activation, activation == "swiglu"
+                    runner.sm_count = count
+                    runner.x_buffers = (object(), object())
+                    runner.weights = runner.transposed_weights = object()
+                    runner.output = runner.a_idx = runner.work_table = runner.ready_rows = object()
+                    runner.activation_config = object()
+                    runner.tile_m = runner.tile_n = 128
+                    runner.tile_k = None
+                    runner.cluster_m, runner.max_swizzle_size = 2, 1
+                    calls = []
+                    runner.quack_gemm = runner.quack_gemm_act = (
+                        lambda *args, **kwargs: calls.append((args, kwargs))
+                    )
+                    runner.launch()
+                    self.assertEqual(len(calls), 1)
+                    kwargs = calls[0][1]
+                    self.assertIs(kwargs.get("sm_count"), count)
+                    if activation is not None and count is None:
+                        self.assertNotIn("sm_count", kwargs)  # Existing QuACK fused API remains usable.
+                    self.assertIs(kwargs["gather_work_table_ready"], runner.ready_rows)
+                    self.assertIs(kwargs["gather_work_table"], runner.work_table)
+                    self.assertTrue(kwargs["multi_buffer_gather"])
+                    if activation is not None:
+                        self.assertFalse(kwargs["store_preact"])
+                        self.assertEqual(kwargs["concat_layout"], ("B",) if runner.gated else None)
+
     def test_architecture_and_pingpong_selection(self):
         for capability in ((9, 0), (10, 0), (10, 3)):
             self.assertEqual(worker.resolve_gemm_architecture("auto", capability), capability[0])
