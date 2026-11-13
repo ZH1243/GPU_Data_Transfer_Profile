@@ -311,6 +311,75 @@ In this combined router/NVLink mode, every destination GPU keeps one logical inb
 
 `router_local_input_staging_enabled=true` gathers the local-node `x3` rows from the shared router send tensor into the already allocated `(local_node, local_gpu)` input before the first iteration. That source GPU consumes the full staged x3 sequence directly; the proxy drains the staged source in batches capped by `nvlink_forward_max_threshold_chunks`, compacts x4-selected rows into the other local GPUs, and sends the same completion notifications as the remote path. With local batch synchronization enabled, these batches use a dedicated local-input-staging phase; a proxy with a shorter local `x3` retires from the remaining staging rounds without retiring from the later remote-forwarding phase. Remote-node forwarding is held until the local drain finishes for that proxy and iteration. The staging copy is intentionally performed once and reused, so this mode requires `fill_test_data=false`, automatic CUDA-IPC destinations, and an embedded send tensor and routing table that remain unchanged across iterations.
 
+To make the own-GPU input eligible for computation before its first forwarding
+batch completes, append `--router_local_input_early_ready_enabled=true` to the
+existing torchrun command. This native CLI/JSON option defaults to `false` and
+passes through the Python worker unchanged. It requires local input staging and
+forward-completion notifications, and rejects the diagnostic flush-only mode.
+
+After the iteration-start barrier, before activating its forwarding pipeline,
+the proxy marks `[0, local_x3.size())` of its own staged source ready. Staging
+has already completed and the input is reused across iterations. Existing
+expert lists select only routes belonging to this GPU's experts; the range is
+in staged x3 coordinates, not original token IDs or compact peer coordinates.
+Normal Head/Tail scheduling builds and publishes the gather rows and ready
+prefix, with the same per-entry or coalesced publication policy. Other sources
+may already have arrived and are handled by the same scheduler lock.
+
+Later local forwarding batches suppress only their redundant own-source
+notifications. Copies to other GPUs, their notifications, local batch barriers,
+phase retirement, and remote same-index RDMA visibility/completion remain
+active. Both the legacy and prepared local-forwarding paths support the option.
+The early direct publication does not add an entry to the forwarding notification
+log. With `--nvlink_forward_prepared_nvtx_enabled=true`, its CPU work is labeled
+`router/local_input_early_ready` in Nsight Systems.
+
+Early readiness does not force an undersized cluster: each expert still needs
+one full M cluster unless all its remaining routes form its final partial
+cluster. Blackwell M=256/cluster-M=2 holds 256 routed rows; Hopper with the same
+settings holds 512. An empty local source or too few local rows may produce no
+early gather work. The existing GPU scatter preparation and all three CPU
+scatter policies support the resulting row order, including FP32 route weights.
+In threaded mode, the scatter worker can start packing this early prefix while
+forwarding continues; its single final metadata upload keeps the existing gate.
+
+The enabled iteration timer includes early publication work. The native up-GEMM
+timer still begins at its first gather-table submission; publication is not
+moved into pre-iteration setup. Earlier GEMM activity can overlap forwarding but
+can also compete for GPU resources, and building the local prefix adds CPU work
+before forwarding activation. Compare total warmed iteration latency as well
+as the first gather publication and first useful GEMM activity.
+
+Rebuild and run the focused native checks on the NVIDIA host using the existing
+CUDA-compatible build directory:
+
+```bash
+cd "$PROXY_ROOT"
+cmake --build "$RDMA_PROXY_BUILD_DIR" \
+  --target rdma_cpu_proxy_shared test_prepared_forwarding test_cpu_scatter -j4
+ctest --test-dir "$RDMA_PROXY_BUILD_DIR" \
+  -R '^(test_early_local_ready|test_cpu_scatter(_cuda)?)$' --output-on-failure
+```
+
+`test_early_local_ready` is a CPU/mock integration test, including when built on
+a CUDA host. Actual GPU scheduling and overlap require the following workload
+checks. Keep all geometry, NIC maps, residency and bulk epilogue settings from
+your working single-node command. First append:
+
+```bash
+--router_local_input_early_ready_enabled=true \
+--cpu-scatter-preparation --cpu-scatter-publication=threaded \
+--weighted-contributions --check-projections --num_iterations=12
+```
+
+Repeat with `--router_local_input_early_ready_enabled=false` as a baseline, then
+check `deferred` and `per-batch` CPU scatter modes and the GPU scatter path
+(omit both CPU scatter options). Existing return and combine checks should stay
+enabled for these numerical runs. For performance comparison, disable checks
+on both runs with `--no-check-projections --no-check-return-token-results
+--no-check-intra-node-combine --no-check-inter-node-combine` and use identical
+iteration counts. Repeat on Hopper and with both node scripts when available.
+
 Each source-specific inbound buffer also owns a `RouterExpertMetadata` table for the experts living on the destination GPU. Its `expert_offsets` has `experts_per_gpu + 1` entries and is normalized to zero; local expert `e` owns `expert_token_indices[expert_offsets[e]:expert_offsets[e + 1]]`. Those indices address rows in that particular source-specific compact buffer. `first_global_expert` identifies the global ID of local expert zero. Code using a `Proxy` can retrieve the table with `router_expert_metadata_for_source(source_node_rank, source_gpu_index)`.
 
 When NVLink forwarding completion notifications are also enabled, every source-specific inbound buffer keeps a CPU-side Head and Tail for each expert list. A dequeued notification identifies the buffer by `(peer_rank, source_gpu)` and supplies the newly completed compact token range. The proxy advances each Head past all expert-list indices below the new received-token frontier and adds the Head delta to that local expert's `num_ready_tokens`. The Tail is the number of leading list entries already assigned to GPU work: `[0, Tail)` is published, `[Tail, Head)` is ready but unpublished, and `[Head, end)` has not arrived. Notification ranges are required to be contiguous. Heads, Tails, ready counts, and per-expert notified-batch counts reset on a new iteration. Code can obtain thread-safe progress snapshots from `router_expert_token_head_state_for_source(...)` and `router_computation_scheduler_state()`.

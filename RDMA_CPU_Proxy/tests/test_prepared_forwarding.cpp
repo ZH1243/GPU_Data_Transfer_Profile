@@ -131,6 +131,267 @@ struct PreparedForwardingTestAccess {
             bytes[i] = static_cast<unsigned char>((i * 17 + iteration * 29 + proxy.config_.local_gpu_index) % 251);
     }
 
+    static void check_early_local_ready(Proxy& proxy, uint64_t iteration, int shape) {
+        const auto& config = proxy.config_;
+        const auto before = proxy.router_expert_token_head_state_for_source(
+            config.node_rank, config.local_gpu_index);
+        if (before.received_token_frontier != 0 ||
+            proxy.router_computation_scheduler_state().published_rows != 0)
+            throw std::runtime_error("early readiness did not reset across iterations");
+        bool rejected = false;
+        try { proxy.publish_local_router_input_ready(iteration + 1); }
+        catch (const std::runtime_error&) { rejected = true; }
+        if (!rejected) throw std::runtime_error("early readiness accepted an unprepared iteration");
+
+        const auto queued = proxy.nvlink_forward_notifications_enqueued_.load();
+        proxy.publish_local_router_input_ready(iteration);
+        const auto& publication = proxy.cuda_buffers_.router_notification_publication_buffers();
+        const auto state = proxy.router_computation_scheduler_state();
+        const auto& inputs = proxy.cuda_buffers_.nvlink_receive_buffers();
+        const auto cluster_rows = expert_gemm_cluster_rows(config);
+        std::size_t expected_batches = 0;
+        std::size_t own_slot = inputs.size();
+        for (std::size_t slot = 0; slot < inputs.size(); ++slot) {
+            const auto& input = inputs[slot];
+            const bool own = input.source_node_rank == config.node_rank &&
+                input.source_gpu_index == config.local_gpu_index;
+            const auto head = proxy.router_expert_token_head_state_for_source(
+                input.source_node_rank, input.source_gpu_index);
+            const auto expected_frontier = own ?
+                proxy.router_routing_.token_indices_for_node(config.node_rank).size() : 0;
+            if (head.received_token_frontier != expected_frontier)
+                throw std::runtime_error("early readiness advanced the wrong source or x3 range");
+            if (!own) continue;
+            own_slot = slot;
+            const auto& offsets = input.expert_metadata.expert_offsets;
+            for (std::size_t expert = 0; expert < state.expert_total_tokens.size(); ++expert) {
+                const auto count = static_cast<std::size_t>(offsets[expert + 1] - offsets[expert]);
+                const auto batches = count == state.expert_total_tokens[expert] ?
+                    (count + cluster_rows - 1) / cluster_rows : count / cluster_rows;
+                if (head.expert_token_heads[expert] != count ||
+                    state.expert_num_notified_batches[expert] != batches)
+                    throw std::runtime_error("early readiness lost expert heads or released a partial cluster");
+                expected_batches += batches;
+            }
+        }
+        if (own_slot == inputs.size() || state.published_batches != expected_batches ||
+            state.published_rows != expected_batches * publication.n_groups_per_m_cluster ||
+            (shape == 0 && expected_batches == 0) || (shape != 0 && expected_batches != 0))
+            throw std::runtime_error("early readiness published the wrong gather prefix");
+        const auto* table = static_cast<const int32_t*>(publication.host_table.ptr);
+        for (std::size_t row = 0; row < state.published_rows; ++row) {
+            const auto* ranges = table + row * publication.table_width + 2;
+            for (std::size_t slot = 0; slot < inputs.size(); ++slot)
+                if (slot != own_slot && ranges[slot * 2] != ranges[slot * 2 + 1])
+                    throw std::runtime_error("early gather prefix consumed an unready source");
+        }
+        if (proxy.local_router_forwarding_completed_iterations_.load() != iteration ||
+            proxy.nvlink_forward_notifications_enqueued_.load() != queued)
+            throw std::runtime_error("early readiness waited for forwarding or queued a notification");
+        // Reentry must not duplicate descriptors or mutate the selected ranges.
+        const auto heads = proxy.router_expert_token_head_state_for_source(
+            config.node_rank, config.local_gpu_index);
+        proxy.publish_local_router_input_ready(iteration);
+        const auto repeated = proxy.router_expert_token_head_state_for_source(
+            config.node_rank, config.local_gpu_index);
+        if (proxy.router_computation_scheduler_state().published_rows != state.published_rows ||
+            repeated.expert_token_tails != heads.expert_token_tails)
+            throw std::runtime_error("early readiness is not idempotent");
+    }
+
+    static void verify_early_completion(Proxy& proxy, uint64_t iteration) {
+        const auto& config = proxy.config_;
+        // With one chunk per batch, independently count direct and compact-copy
+        // records. Only the local-self direct records may disappear.
+        std::size_t expected_notifications = 0;
+        auto count = [&](const auto& chunks, const std::vector<uint8_t>& masks, bool local) {
+            for (const auto& chunk : chunks) {
+                if (!local || !config.router_local_input_early_ready_enabled)
+                    ++expected_notifications;
+                for (int destination = 0; destination < config.num_gpus_per_node; ++destination) {
+                    if (destination == config.local_gpu_index) continue;
+                    const auto column = (destination - config.local_gpu_index - 1 +
+                        config.num_gpus_per_node) % config.num_gpus_per_node;
+                    const auto mask = static_cast<uint8_t>(1U << (7 - column));
+                    for (std::size_t token = chunk.start_token;
+                         token < chunk.start_token + chunk.num_tokens; ++token) {
+                        if (masks.at(token) & mask) { ++expected_notifications; break; }
+                    }
+                }
+            }
+        };
+        count(proxy.local_router_forwarding_chunks_, proxy.local_router_forwarding_routing_table_, true);
+        for (const auto& peer : proxy.peers_)
+            count(peer.receive_chunks, peer.forwarding_routing_table, false);
+        expected_notifications *= iteration + 1;
+        if (proxy.nvlink_forward_notifications_enqueued_.load() != expected_notifications ||
+            proxy.nvlink_forward_notifications_sent_.load() != expected_notifications)
+            throw std::runtime_error("early readiness changed non-self notifications or left duplicates");
+
+        const auto state = proxy.router_computation_scheduler_state();
+        const auto& publication = proxy.cuda_buffers_.router_notification_publication_buffers();
+        const auto& inputs = proxy.cuda_buffers_.nvlink_receive_buffers();
+        if (state.published_rows != publication.table_rows)
+            throw std::runtime_error("early readiness left gather work incomplete");
+        std::vector<std::vector<unsigned>> seen;
+        for (const auto& input : inputs) seen.emplace_back(input.expert_token_index_count, 0);
+        const auto* table = static_cast<const int32_t*>(publication.host_table.ptr);
+        for (std::size_t row = 0; row < publication.table_rows;
+             row += publication.n_groups_per_m_cluster) {
+            const auto* first = table + row * publication.table_width;
+            for (std::size_t group = 0; group < publication.n_groups_per_m_cluster; ++group) {
+                const auto* repeated = first + group * publication.table_width;
+                if (repeated[0] != first[0] || repeated[1] != static_cast<int32_t>(group) * publication.group_size ||
+                    !std::equal(first + 2, first + publication.table_width, repeated + 2))
+                    throw std::runtime_error("early readiness changed repeated N-group ranges");
+            }
+            for (std::size_t slot = 0; slot < inputs.size(); ++slot) {
+                const auto& metadata = inputs[slot].expert_metadata;
+                const auto start = first[2 + 2 * slot], end = first[3 + 2 * slot];
+                if (start < metadata.expert_offsets.at(first[0]) ||
+                    end > metadata.expert_offsets.at(first[0] + 1) || start > end)
+                    throw std::runtime_error("early readiness produced an invalid expert range");
+                for (int32_t index = start; index < end; ++index)
+                    if (++seen[slot].at(index) != 1)
+                        throw std::runtime_error("early readiness duplicated a routed row");
+            }
+        }
+        for (const auto& source : seen)
+            if (std::find(source.begin(), source.end(), 0) != source.end())
+                throw std::runtime_error("early readiness omitted a routed row");
+    }
+
+    static void test_early_local_ready() {
+        // Legacy, prepared with ordinary local forwarding, unified epilogue,
+        // and atomic/query paths. Dense, partial, no-own-route, and empty inputs
+        // run with and without weights; final four cases retain the default.
+        for (int scenario = 0; scenario < 36; ++scenario) {
+            const bool enabled = scenario < 32;
+            const int policy = scenario % 4;
+            const int shape = enabled ? (scenario / 4) % 4 : 0;
+            ProxyConfig config;
+            config.mock_mode = true;
+            config.num_nodes = shape == 2 ? 1 : 2;
+            config.num_gpus_per_node = 2;
+            config.num_tokens = shape == 0 ? 1025 : shape == 1 ? 17 : 1;
+            config.token_dimension = 8;
+            config.tokens_per_chunk = 32;
+            config.num_iterations = 3;
+            config.completion_timeout_ms = 10000;
+            config.fill_test_data = config.validate_data = false;
+            config.router_routing_enabled = true;
+            config.router_num_experts = config.num_nodes * 2;
+            // Mock RDMA echoes outbound node x3/x4. Selecting every expert
+            // makes those mirrored rows agree with reconstructed inbound expert
+            // metadata in the two-node cases that assert complete gather work.
+            config.router_top_k = shape >= 2 ? 1 : config.router_num_experts;
+            config.router_weighted_contributions_enabled = enabled && scenario >= 16;
+            config.router_local_input_staging_enabled = true;
+            config.router_local_input_early_ready_enabled = enabled;
+            config.nvlink_forwarding_enabled = true;
+            config.nvlink_forward_completion_notifications_enabled = true;
+            config.nvlink_forward_preparation_enabled = policy != 0;
+            config.nvlink_forward_local_staging_prepared_enabled = policy >= 2;
+            config.nvlink_forward_submit_epilogue_enabled = policy >= 2;
+            config.nvlink_forward_prepared_atomic_ring_enabled = policy == 3;
+            config.nvlink_forward_completion_mode = policy == 3 ? "stream_query" : "stream_sync";
+            config.nvlink_forward_prepared_batch_chunks = 1;
+            config.nvlink_forward_chunk_tokens = config.tokens_per_chunk;
+            config.nvlink_forward_min_threshold_chunks = 1;
+            config.nvlink_forward_max_threshold_chunks = 1;
+            config.nvlink_forward_prepared_queue_depth = 2;
+            config.nvlink_forward_notification_queue_depth = 1;
+            config.nvlink_forward_synchronize_batches = true;
+            config.nvlink_forward_synchronize_iteration = false;
+            config.nvlink_forward_local_batch_sync_enabled = true;
+            config.local_iteration_sync_enabled = true;
+            config.sequential_peer_transfers = true;
+            config.local_forwarding_rdma_overlap_enabled = scenario % 2 == 0;
+            config.expert_gemm_dimension = 768;
+            config.expert_gemm_n_tile = 128;
+            config.expert_gemm_max_swizzle_size = 2; // Three repeated N groups.
+            config.expert_gemm_device_capacity = scenario % 2 ? 10 : 9;
+            config.expert_gemm_cluster_m = scenario % 2 ? 2 : 1;
+            config.nvlink_forward_notification_flush_per_entry_enabled = scenario % 2;
+            const auto nonce = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+            config.local_iteration_sync_run_id = "test_early_local_" + nonce;
+            config.nvlink_forward_exchange_dir = "/tmp/test_early_local_" + nonce;
+            if (config.num_nodes > 1) config.peers.push_back(PeerAddress{1, "mock-peer", 18515});
+            if (shape >= 2) {
+                // Use one seed on all actual proxies: mock expert exchange
+                // reconstructs other sources using the receiver's seed. Shape
+                // two selects only GPU1 locally; shape three has no local x3.
+                for (uint64_t seed = 1;; ++seed) {
+                    config.router_seed = seed;
+                    RouterRouting routing(config);
+                    routing.initialize();
+                    const bool matches = shape == 2 ?
+                        routing.expert_metadata_for_gpu(0, 0).expert_token_indices.empty() :
+                        routing.token_indices_for_node(0).empty();
+                    if (matches) break;
+                    if (seed == 10000) throw std::runtime_error("could not find empty-route fixture seed");
+                }
+            }
+            std::cerr << "early local readiness scenario=" << scenario << " policy=" << policy
+                      << " shape=" << shape << " enabled=" << enabled << '\n';
+            std::array<std::unique_ptr<Proxy>, 2> proxies;
+            for (int gpu = 0; gpu < 2; ++gpu) {
+                auto cfg = config;
+                cfg.local_gpu_index = cfg.cuda_device_id = gpu;
+                validate_config(cfg);
+                proxies[gpu] = std::make_unique<Proxy>(cfg);
+            }
+            std::array<std::exception_ptr, 2> errors;
+            std::atomic<unsigned> phase{0};
+            std::atomic<bool> failed{false};
+            auto barrier = [&](unsigned target) {
+                phase.fetch_add(1);
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                while (phase.load() < target) {
+                    if (failed.load() || std::chrono::steady_clock::now() >= deadline)
+                        throw std::runtime_error("early local readiness test barrier cancelled");
+                    std::this_thread::yield();
+                }
+            };
+            auto run = [&](int gpu) {
+                try {
+                    auto& proxy = *proxies[gpu];
+                    proxy.initialize();
+                    for (uint64_t iteration = 0; iteration < config.num_iterations; ++iteration) {
+                        fill_source(proxy, iteration);
+                        proxy.prepare_iteration_step(iteration);
+                        // Source staging is immutable throughout this fixture.
+                        if (iteration == 0) fill_local_source(proxy, 0);
+                        if (enabled && iteration != 1) check_early_local_ready(proxy, iteration, shape);
+                        barrier(static_cast<unsigned>(iteration * 6 + 2));
+                        // Iteration one exercises the production activation call
+                        // with no manual early publication from the test.
+                        proxy.run_iteration_step(iteration);
+                        // Ordinary legacy forwarding has never promised queue
+                        // draining at run return; explicitly retire its records
+                        // before inspecting receiver state or reusing inputs.
+                        if (!config.nvlink_forward_preparation_enabled)
+                            proxy.drain_forwarding_iteration_notifications(iteration);
+                        barrier(static_cast<unsigned>(iteration * 6 + 4));
+                        verify(proxy, *proxies[1 - gpu], iteration);
+                        verify_early_completion(proxy, iteration);
+                        barrier(static_cast<unsigned>(iteration * 6 + 6));
+                    }
+                    proxy.finish_run();
+                } catch (...) { errors[gpu] = std::current_exception(); failed.store(true); }
+            };
+            std::thread first(run, 0), second(run, 1);
+            first.join(); second.join();
+            auto stop = [&](int gpu) {
+                try { proxies[gpu]->shutdown(); }
+                catch (...) { if (!errors[gpu]) errors[gpu] = std::current_exception(); }
+            };
+            std::thread stop0(stop, 0), stop1(stop, 1);
+            stop0.join(); stop1.join();
+            for (auto error : errors) if (error) std::rethrow_exception(error);
+        }
+    }
+
     static void verify(Proxy& source, Proxy& receiver, uint64_t iteration) {
         const auto& config = source.config_;
         if (!config.nvlink_forward_completion_notifications_enabled &&
@@ -162,7 +423,13 @@ struct PreparedForwardingTestAccess {
             if (!config.nvlink_forward_completion_notifications_enabled) return;
             const auto head = receiver.router_expert_token_head_state_for_source(node, config.local_gpu_index);
             if (head.received_token_frontier != compacted || (compacted && head.iteration != iteration)) {
-                throw std::runtime_error("prepared forwarding returned before notifications drained");
+                throw std::runtime_error("prepared forwarding returned before notifications drained: source_node=" +
+                    std::to_string(node) + " source_gpu=" + std::to_string(config.local_gpu_index) +
+                    " destination_gpu=" + std::to_string(receiver.config_.local_gpu_index) +
+                    " expected_frontier=" + std::to_string(compacted) +
+                    " actual_frontier=" + std::to_string(head.received_token_frontier) +
+                    " expected_iteration=" + std::to_string(iteration) +
+                    " actual_iteration=" + std::to_string(head.iteration));
             }
             const auto direct = source.router_expert_token_head_state_for_source(node, config.local_gpu_index);
             if (direct.received_token_frontier != masks.size() ||
@@ -210,6 +477,11 @@ int main(int argc, char** argv) {
     using namespace rdma_proxy;
     Logger::instance().set_level(LogLevel::kError);
     const std::string mode_arg = argc == 2 ? argv[1] : "";
+    if (mode_arg == "--early-local-ready") {
+        PreparedForwardingTestAccess::test_early_local_ready();
+        std::cout << "test_early_local_ready passed\n";
+        return 0;
+    }
     const bool dual = mode_arg == "--dual-device";
     const bool unified = dual || mode_arg == "--unified-local" || mode_arg == "--unified-local-atomic" ||
         mode_arg == "--unified-local-query";

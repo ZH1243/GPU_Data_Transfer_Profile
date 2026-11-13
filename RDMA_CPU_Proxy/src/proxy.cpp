@@ -815,6 +815,7 @@ void Proxy::shutdown() {
     release_local_iteration_sync();
     iteration_prepared_ = false;
     local_router_input_staged_ = false;
+    local_router_input_early_ready_published_ = false;
     rdma_qp_calibration_complete_ = false;
     calibration_barrier_sequence_ = 0;
     initialized_ = false;
@@ -2487,6 +2488,14 @@ void Proxy::run_iteration(uint64_t iteration) {
             peers_[peer_index], peers_[peer_index].receive_chunks));
     }
     synchronize_iteration_start(iteration);
+    std::chrono::steady_clock::time_point start;
+    if (config_.router_local_input_early_ready_enabled) {
+        // Count the publication cost and any compute overlap in this iteration.
+        // Publish before releasing prepared producers, whose local self entries
+        // are suppressed because the full staged source is already readable.
+        start = std::chrono::steady_clock::now();
+        publish_local_router_input_ready(iteration);
+    }
     if (prepared_forwarding_) {
         {
             std::lock_guard<std::mutex> lock(forwarding_mutex_);
@@ -2496,7 +2505,9 @@ void Proxy::run_iteration(uint64_t iteration) {
         prepared_forwarding_->changed.notify_all();
     }
 
-    const auto start = std::chrono::steady_clock::now();
+    // Retain the existing timing boundary when early readiness is disabled.
+    if (!config_.router_local_input_early_ready_enabled)
+        start = std::chrono::steady_clock::now();
     std::vector<std::shared_ptr<DynamicChunkDistributor>> dispatchers(peers_.size());
     std::vector<std::size_t> sequential_order;
     if (config_.sequential_peer_transfers) {
@@ -4351,7 +4362,8 @@ void Proxy::issue_local_router_forwarding_batch(
     // The source GPU consumes the complete local-node x3 sequence directly
     // from its staging buffer, just as it consumes a remote same-index RDMA
     // receive buffer directly.
-    if (config_.nvlink_forward_completion_notifications_enabled) {
+    if (config_.nvlink_forward_completion_notifications_enabled &&
+        !config_.router_local_input_early_ready_enabled) {
         NvlinkForwardNotification direct;
         direct.iteration = iteration;
         direct.batch_index = batch_index_in_iteration;
@@ -4468,6 +4480,39 @@ void Proxy::issue_local_router_forwarding_batch(
         stats.sum_batch_bandwidth_gbytes_per_sec += batch_gbytes_per_sec;
         stats.sum_batch_bandwidth_gbits_per_sec += batch_gbytes_per_sec * 8.0;
     }
+}
+
+void Proxy::publish_local_router_input_ready(uint64_t iteration) {
+    if (!config_.router_local_input_early_ready_enabled) return;
+    if (!config_.router_local_input_staging_enabled ||
+        !config_.nvlink_forward_completion_notifications_enabled ||
+        !iteration_prepared_ || prepared_iteration_ != iteration ||
+        !local_router_input_staged_ || !local_router_staging_buffer_ ||
+        !local_router_staging_buffer_->ptr) {
+        throw std::runtime_error("early local input readiness requires this iteration's staged input");
+    }
+    if (local_router_input_early_ready_published_) {
+        if (iteration < local_router_input_early_ready_iteration_)
+            throw std::runtime_error("cannot publish stale early local input readiness");
+        if (iteration == local_router_input_early_ready_iteration_) return;
+    }
+    const auto& local_x3 = router_routing_.token_indices_for_node(config_.node_rank);
+    const auto token_bytes = config_.token_dimension * dtype_size(config_.dtype);
+    if (!token_bytes || local_x3.size() > config_.num_tokens ||
+        local_x3.size() != local_router_forwarding_routing_table_.size() ||
+        local_x3.size() > local_router_staging_buffer_->bytes / token_bytes) {
+        throw std::runtime_error("early local input readiness exceeds the staged x3 range");
+    }
+    // The one-time staging gather completed in prepare_iteration_step; this
+    // allocation remains immutable across iterations. Reuse normal Head/Tail
+    // scheduling so partial clusters still wait and all scatter policies keep
+    // their usual table/weight ordering. No peer-copy completion is implied.
+    ScopedPreparedRange publication(config_.nvlink_forward_prepared_nvtx_enabled,
+                                    "router/local_input_early_ready");
+    cuda_buffers_.process_router_notification_completion(
+        config_.node_rank, config_.local_gpu_index, iteration, 0, local_x3.size());
+    local_router_input_early_ready_iteration_ = iteration;
+    local_router_input_early_ready_published_ = true;
 }
 
 void Proxy::process_local_router_forwarding_iteration(uint64_t iteration) {
@@ -4639,8 +4684,10 @@ void Proxy::prepare_forwarding_batch(
         entry.peer_rank = source_node;
         entry.flags = flags;
     };
-    // Direct input notification covers the full unfiltered source range.
-    notify(config_.local_gpu_index, start, end - start, start * token_bytes, kDirectRdmaInputFlag);
+    // Remote direct inputs still require their RDMA visibility/completion path.
+    // Only the immutable local staging source can have been published early.
+    if (!local || !config_.router_local_input_early_ready_enabled)
+        notify(config_.local_gpu_index, start, end - start, start * token_bytes, kDirectRdmaInputFlag);
     for (std::size_t d = 0; d < forwarding_destinations_.size(); ++d) {
         auto& arguments = batch.destinations[d];
         arguments.clear();

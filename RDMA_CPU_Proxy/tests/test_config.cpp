@@ -75,6 +75,7 @@ int main(int argc, char** argv) {
     assert(!config.nvlink_forward_notification_flush_only_enabled);
     assert(!config.nvlink_forward_notification_flush_per_entry_enabled);
     assert(!config.router_local_input_staging_enabled);
+    assert(!config.router_local_input_early_ready_enabled);
     assert(config.nvlink_forward_notification_flag_update_mode ==
            rdma_proxy::NvlinkForwardNotificationFlagUpdateMode::kStreamWrite);
     assert(rdma_proxy::to_string(
@@ -672,6 +673,44 @@ int main(int argc, char** argv) {
     valid_local_staging_config.fill_test_data = false;
     valid_local_staging_config.router_local_input_staging_enabled = true;
     rdma_proxy::validate_config(valid_local_staging_config);
+
+    auto early_local = valid_local_staging_config;
+    early_local.router_local_input_early_ready_enabled = true;
+    rdma_proxy::validate_config(early_local);
+    early_local.nvlink_forward_notification_flush_per_entry_enabled = true;
+    rdma_proxy::validate_config(early_local);
+    for (int conflict = 0; conflict < 3; ++conflict) {
+        auto bad = early_local;
+        bad.nvlink_forward_notification_flush_per_entry_enabled = false;
+        if (conflict == 0) bad.router_local_input_staging_enabled = false;
+        if (conflict == 1) bad.nvlink_forward_completion_notifications_enabled = false;
+        if (conflict == 2) bad.nvlink_forward_notification_flush_only_enabled = true;
+        bool rejected = false;
+        try { rdma_proxy::validate_config(bad); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+    }
+    {
+        std::ofstream json("early_local_config.json");
+        json << R"({"num_tokens":65, "token_dimension":8, "tokens_per_chunk":4,
+                   "num_gpus_per_node":2, "router_routing_enabled":true,
+                   "num_experts":2, "top_k":1, "nvlink_forwarding_enabled":true,
+                   "nvlink_forward_synchronize_batches":true,
+                   "nvlink_forward_completion_notifications_enabled":true,
+                   "nvlink_forward_preparation_enabled":true,
+                   "nvlink_forward_prepared_batch_chunks":3,
+                   "router_local_input_staging_enabled":true,
+                   "router_local_input_early_ready_enabled":true,
+                   "fill_test_data":false})";
+    }
+    assert(rdma_proxy::load_config_file("early_local_config.json").router_local_input_early_ready_enabled);
+    const char* early_local_args[] = {"test_config", "--config", "early_local_config.json",
+        "--router_local_input_early_ready_enabled=false", "--router_local_input_early_ready_enabled=true"};
+    assert(!rdma_proxy::load_config(4, const_cast<char**>(early_local_args)).router_local_input_early_ready_enabled);
+    const auto early_local_cli = rdma_proxy::load_config(5, const_cast<char**>(early_local_args));
+    assert(early_local_cli.router_local_input_early_ready_enabled);
+    assert(rdma_proxy::config_summary(early_local_cli).find(
+        "router_local_input_early_ready_enabled=true") != std::string::npos);
 
     auto invalid_local_staging_fill_config = valid_local_staging_config;
     invalid_local_staging_fill_config.fill_test_data = true;

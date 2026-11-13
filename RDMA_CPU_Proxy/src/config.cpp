@@ -424,6 +424,10 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
         config.router_local_input_staging_enabled =
             (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "router_local_input_early_ready_enabled") {
+        config.router_local_input_early_ready_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "nvlink_forward_notification_flag_update_mode") {
         config.nvlink_forward_notification_flag_update_mode =
             nvlink_forward_notification_flag_update_mode_from_string(value);
@@ -757,6 +761,10 @@ static ProxyConfig parse_config_file(const std::string& path) {
         object,
         "router_local_input_staging_enabled",
         config.router_local_input_staging_enabled);
+    config.router_local_input_early_ready_enabled = get_bool(
+        object,
+        "router_local_input_early_ready_enabled",
+        config.router_local_input_early_ready_enabled);
     config.expert_gemm_m_tile = number_as<std::size_t>(
         object, "expert_gemm_m_tile", config.expert_gemm_m_tile);
     config.expert_gemm_device_capacity = number_as<int>(
@@ -1185,6 +1193,20 @@ void validate_config(const ProxyConfig& config) {
                 "source-node-specific buffers");
         }
     }
+    if (config.router_local_input_early_ready_enabled) {
+        if (!config.router_local_input_staging_enabled ||
+            !config.nvlink_forward_completion_notifications_enabled) {
+            throw std::runtime_error(
+                "router_local_input_early_ready_enabled requires "
+                "router_local_input_staging_enabled=true and "
+                "nvlink_forward_completion_notifications_enabled=true");
+        }
+        if (config.nvlink_forward_notification_flush_only_enabled) {
+            throw std::runtime_error(
+                "router_local_input_early_ready_enabled cannot be combined with "
+                "nvlink_forward_notification_flush_only_enabled");
+        }
+    }
     if (config.nvlink_forward_notification_log_enabled) {
         if (!config.nvlink_forward_completion_notifications_enabled) {
             throw std::runtime_error(
@@ -1375,6 +1397,8 @@ std::string config_summary(const ProxyConfig& config) {
         << (config.router_computation_forwarded_inputs_only ? "true" : "false")
         << " router_local_input_staging_enabled="
         << (config.router_local_input_staging_enabled ? "true" : "false")
+        << " router_local_input_early_ready_enabled="
+        << (config.router_local_input_early_ready_enabled ? "true" : "false")
         << " nvlink_forward_notification_flag_update_mode="
         << to_string(config.nvlink_forward_notification_flag_update_mode)
         << " expert_gemm_m_tile=" << config.expert_gemm_m_tile

@@ -311,6 +311,7 @@ private:
         std::size_t batch_start_token,
         std::size_t batch_tokens);
     void process_local_router_forwarding_iteration(uint64_t iteration);
+    void publish_local_router_input_ready(uint64_t iteration);
     void forwarding_ready_loop();
     void record_out_of_order_forwarding_arrival(std::size_t peer_index, std::size_t chunk_index);
     void wait_for_forwarding_iteration(uint64_t iteration);
@@ -395,6 +396,10 @@ private:
     std::mutex forwarding_stream_mutex_;
     std::atomic<uint64_t> local_router_forwarding_completed_iterations_{0};
     bool local_router_input_staged_{false};
+    // Owned by the iteration coordinator; forwarding threads only consult the
+    // immutable configuration when suppressing their redundant self entries.
+    bool local_router_input_early_ready_published_{false};
+    uint64_t local_router_input_early_ready_iteration_{0};
     std::string forwarding_error_;
     std::atomic<uint64_t> forwarding_batch_available_calls_{0};
     std::atomic<uint64_t> forwarding_batch_available_total_ns_{0};

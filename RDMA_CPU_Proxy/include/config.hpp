@@ -119,6 +119,9 @@ struct ProxyConfig {
     // Populate the otherwise-unused local-node source descriptors from the
     // shared router send buffer and include them in the QuACK input set.
     bool router_local_input_staging_enabled{false};
+    // Publish the already-staged own-GPU input at iteration activation, before
+    // forwarding batches complete. Other sources still need notifications.
+    bool router_local_input_early_ready_enabled{false};
     NvlinkForwardNotificationFlagUpdateMode
         nvlink_forward_notification_flag_update_mode{
             NvlinkForwardNotificationFlagUpdateMode::kStreamWrite};

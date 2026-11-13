@@ -218,6 +218,20 @@ class SingleNodeLauncherCliTests(unittest.TestCase):
                 self.assertEqual(native["rdma_port"], "2")
                 self.assertEqual(native["expert_gemm_device_capacity"], "10")
 
+    def test_early_local_ready_native_option(self):
+        for architecture in ("hopper", "blackwell"):
+            for enabled in ("true", "false"):
+                with self.subTest(architecture=architecture, enabled=enabled):
+                    _, options = self.record_launch(
+                        f"--router_local_input_early_ready_enabled={enabled}",
+                        "--cpu-scatter-preparation", "--cpu-scatter-publication=threaded",
+                        environment={"RDMA_PROXY_GEMM_ARCH": architecture},
+                    )
+                    native = self.native_arguments(options, rank=0, count=8)
+                    self.assertEqual(native["router_local_input_early_ready_enabled"], enabled)
+                    self.assertEqual(native["router_local_input_staging_enabled"], "true")
+                    self.assertEqual(native["nvlink_forward_completion_notifications_enabled"], "true")
+
     def test_custom_maps_infer_process_count_without_peer(self):
         launcher, options = self.record_launch(environment={
             "CUDA_DEVICE_MAP": "5,2", "RDMA_DEVICE_MAP": "custom5,custom2",
