@@ -154,6 +154,30 @@ extern "C" int rdma_proxy_configure_cpu_route_weights(
     } catch (...) { return record_current_exception(); }
 }
 
+extern "C" int rdma_proxy_configure_cpu_scatter_deferred(RdmaProxyHandle* handle, uint64_t bytes) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down || handle->finished ||
+            handle->next_iteration != 0 || bytes > std::numeric_limits<std::size_t>::max())
+            throw std::runtime_error("deferred CPU scatter must be configured before iteration zero");
+        select_proxy_cuda_device(*handle);
+        handle->proxy.configure_cpu_scatter_deferred(static_cast<std::size_t>(bytes));
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
+extern "C" int rdma_proxy_wait_cpu_scatter_ready(
+    RdmaProxyHandle* handle, uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down)
+            throw std::runtime_error("invalid deferred CPU scatter wait handle");
+        select_proxy_cuda_device(*handle);
+        handle->proxy.wait_cpu_scatter_ready(iteration, cuda_stream, timeout_ms);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
 extern "C" int rdma_proxy_get_local_router_assignments(
     RdmaProxyHandle* handle, int32_t* experts, float* weights, uint64_t capacity,
     uint64_t* count, uint64_t* num_tokens, uint64_t* top_k) {

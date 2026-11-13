@@ -1323,8 +1323,10 @@ Each source owns an immutable FP32 buffer padded exactly like its `A_idx`.
 Every iteration builds a separate FP32 vector in the actual packed up-output
 row order using the gather descriptor's exact source/list positions. GPU
 preparation shares the scatter mapping calculation; `--cpu-scatter-preparation`
-copies selected source ranges into pinned weight staging and publishes them
-on the same stream as scatter addresses, before gather readiness. Repeated N
+copies selected source ranges into pinned staging. By default it uploads all
+scatter addresses and weights together after the final gather publication;
+down waits for that upload. `--cpu-scatter-publication=per-batch` retains uploads
+before each batch's gather readiness for comparison. Repeated N
 groups reuse those weights. Python retains all borrowed GPU tensors until native
 shutdown, and native pinned staging remains alive until publication completes.
 
@@ -1438,15 +1440,18 @@ Append `--cpu-scatter-preparation` to both torchrun commands to move the
 per-iteration local-combine mapping work from the GPU to the proxy notification
 receiver. It requires `--local-gpu-combine` and its existing prerequisites.
 The option is disabled by default; without it the existing GPU mapping path is
-unchanged. Rebuild `rdma_cpu_proxy_shared` and update the Python scripts on both
-Hopper nodes before enabling it:
+unchanged. Rebuild `rdma_cpu_proxy_shared` in the matching Hopper or Blackwell
+build and update the Python scripts before enabling it:
 
 ```bash
-cmake --build RDMA_CPU_Proxy/build-hopper --target rdma_cpu_proxy_shared -j4
+cd "$PROXY_ROOT"
+cmake --build "$RDMA_PROXY_BUILD_DIR" --target rdma_cpu_proxy_shared -j4
+# Single node:
+bash ./scripts/run_single_node_torchrun.sh --cpu-scatter-preparation
 # Node 0:
-bash RDMA_CPU_Proxy/scripts/run_node0_torchrun.sh --cpu-scatter-preparation
+bash ./scripts/run_node0_torchrun.sh --cpu-scatter-preparation
 # Node 1:
-bash RDMA_CPU_Proxy/scripts/run_node1_torchrun.sh --cpu-scatter-preparation
+bash ./scripts/run_node1_torchrun.sh --cpu-scatter-preparation
 ```
 
 After metadata exchange and down-runner warmup, the CPU derives sorted compact
@@ -1458,12 +1463,36 @@ output width. Routing metadata and output allocations must remain fixed through
 the run, as they do in the supplied test.
 
 During each iteration the notification receiver fills a pinned scatter range
-once per newly scheduled M batch (not per repeated N group). Its asynchronous
-H2D copy is ordered before the corresponding gather-ready publication on the
-same stream. Thus completed up work has published scatter metadata, and down
-continues on the compute stream without a new host wait. Staging rows are
-immutable within an iteration and reused only after publication-stream
-synchronization at the next iteration reset.
+once per newly scheduled M batch (not per repeated N group). The default
+`--cpu-scatter-publication=deferred` keeps this work on the CPU while gather
+entries are published. After all routed rows are prepared and the final gather
+table range **and its ready prefix** have been enqueued, it queues exactly one
+metadata H2D on the same publication stream. Stream ordering makes that upload
+execute after the gather publications, without waiting for up GEMM to finish.
+
+Scatter addresses, optional N-tile strides, and optional FP32 routing weights
+share one contiguous allocation. Row-major addresses use 8 bytes per route;
+N-tile-major addresses use 16. Weighted mode appends 4 bytes per route, with the
+weight vector aligned to 16 bytes (at most 8 bytes of padding). No gather table
+or token payload is included in this upload. Both typed views and their owning
+allocation stay alive through native shutdown.
+
+Down GEMM explicitly waits on the upload's CUDA event. Because a CUDA event wait
+cannot target a future event record, the launching host thread first waits only
+until the native producer has **submitted** this iteration's copy and event.
+It then enqueues the compute-stream event wait; it does not synchronize the GPU.
+This host wait releases the scheduler lock and is bounded by
+`--return-token-timeout` (seconds). Up GEMM can keep running throughout. See
+[CUDA event-wait semantics](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html).
+Staging is reused only after publication-stream synchronization at the next
+iteration reset, and a previous iteration's event cannot satisfy a new request.
+
+To compare with the former incremental behavior, select
+`--cpu-scatter-publication=per-batch`. That mode issues one scatter H2D per M
+batch, plus one weight H2D when weighted, before the batch's gather readiness.
+The deferred mode removes these small interleaved uploads, but still performs
+CPU packing during dispatch. Its larger final upload and host wakeup may extend
+the up-to-down gap, so a throughput improvement must be measured.
 
 The measured path skips `local_combine_mapping`, `compact_combine_mapping`,
 scatter-address tensor updates, and per-iteration return-count D2H copies.
@@ -1471,12 +1500,34 @@ Only the final `scatter_row_addresses` tensor consumed by down is refreshed;
 the intermediate `scatter_mapping` and flat `scatter_table` are setup/warmup
 scratch in this mode. Output zeroing and down wave-counter resets remain.
 Warmup still exercises the GPU mapping path, so those kernels can appear before
-iteration zero. `mapping_ms` no longer measures CPU preparation: that work and
-its copies overlap dispatch/up and can delay gather readiness. Compare complete
-iteration latency as well as the up-to-down gap when profiling; speedup requires
-Hopper measurement.
+iteration zero. `mapping_ms` does not measure CPU packing that overlaps up GEMM;
+in deferred mode it includes any exposed metadata wait before down. Compare
+complete iteration latency as well as the up-to-down gap on both architectures.
+Exclude startup and numerical-reference work when counting publication copies.
 
-`test_cpu_scatter` checks published addresses against expert metadata with
+After syncing the native library and Python worker, validate on the NVIDIA node
+(use the existing CUDA/PyTorch-compatible build directory):
+
+```bash
+cd "$PROXY_ROOT"
+cmake --build "$RDMA_PROXY_BUILD_DIR" --target rdma_cpu_proxy_shared test_cpu_scatter -j4
+ctest --test-dir "$RDMA_PROXY_BUILD_DIR" -R '^test_cpu_scatter(_cuda)?$' --output-on-failure
+QUACK_ROOT="$QUACK_ROOT" CUDA_VISIBLE_DEVICES=0 timeout 3600 \
+  python -m unittest discover -s tests -p test_worker_composition.py -v
+```
+
+Then repeat the existing single-node workload command, retaining its geometry,
+with `--cpu-scatter-preparation --cpu-scatter-publication=deferred
+--weighted-contributions --check-projections --num_iterations=12`. Repeat with
+`--cpu-scatter-publication=per-batch`. For timing/profiling, disable numerical
+checks after both pass (`--no-check-projections --no-check-return-token-results
+--no-check-intra-node-combine --no-check-inter-node-combine`), and compare warmed
+iterations with identical options. The expected deferred metadata traffic is
+one H2D per GPU per iteration, independent of the number of M batches or N groups;
+the gather/readiness H2Ds remain. Repeat the same checks on Hopper and both nodes
+when available. This change does not modify GEMM kernels or residency settings.
+
+`test_cpu_scatter` checks both publication policies against expert metadata with
 changed source arrival order, duplicate routes, empty sources, repeated N
 groups, both output layouts, both gather flush policies, and iteration reuse
 in mock mode. `test_cpu_scatter_cuda` runs the same checks with actual GPU

@@ -492,6 +492,9 @@ class GroupedGemmRunner:
 def add_down_arguments(parser):
     parser.add_argument("--cpu-scatter-preparation", action="store_true",
                         help="prepare down scatter addresses in the CPU notification receiver; requires local GPU combine")
+    parser.add_argument("--cpu-scatter-publication", choices=("deferred", "per-batch"), default=None,
+                        help="CPU metadata upload policy: deferred (default) uploads one buffer after all up gather entries; "
+                             "per-batch uploads each M batch before gather readiness")
     parser.add_argument("--inter-node-combine", action="store_true",
                         help="combine node sums into original token order after local combine and any RDMA returns")
     parser.add_argument("--inter-node-combine-ctas", type=int, default=None,
@@ -525,7 +528,7 @@ def add_down_arguments(parser):
     parser.add_argument("--check-return-token-results", action=argparse.BooleanOptionalAction, default=False,
                         help="compare received valid bytes with producing GPU outputs each iteration")
     parser.add_argument("--return-token-timeout", type=float, default=120.0,
-                        help="same-node return setup/completion barrier timeout in seconds")
+                        help="same-node return setup/completion and CPU metadata submission timeout in seconds")
     parser.add_argument("--down-projection2", action="store_true")
     parser.add_argument(
         "--down-sm-count", type=int, default=None,
@@ -560,6 +563,13 @@ def add_down_arguments(parser):
 def validate_down_arguments(args):
     if args.cpu_scatter_preparation and not args.local_gpu_combine:
         raise ValueError("--cpu-scatter-preparation requires --local-gpu-combine")
+    if args.cpu_scatter_publication is not None and not args.cpu_scatter_preparation:
+        raise ValueError("--cpu-scatter-publication requires --cpu-scatter-preparation")
+    if args.cpu_scatter_preparation and (
+        not math.isfinite(args.return_token_timeout) or args.return_token_timeout <= 0
+        or args.return_token_timeout > ((1 << 63) - 1) // 1000
+    ):
+        raise ValueError("--return-token-timeout must be finite, positive, and fit signed 64-bit milliseconds")
     if args.inter_node_combine_ctas is not None:
         if not args.inter_node_combine or args.inter_node_combine_ctas <= 0:
             raise ValueError("--inter-node-combine-ctas requires --inter-node-combine and a positive count")
@@ -729,6 +739,36 @@ def compact_combine_mapping(torch, mapping, num_sources, capacity):
     return compact, used.sum(dim=1), output_to_input
 
 
+def make_cpu_scatter_metadata_storage(torch, scatter_row_addresses, route_weights=None):
+    """One owned byte allocation, with contiguous typed views for one native H2D.
+
+    Preserve QuACK's tensor shapes and align FP32 route weights to 16 bytes.
+    The native deferred publisher validates this exact layout before borrowing it.
+    """
+    if (scatter_row_addresses.dtype != torch.int64 or not scatter_row_addresses.is_contiguous()
+            or scatter_row_addresses.ndim not in (1, 2)
+            or (scatter_row_addresses.ndim == 2 and scatter_row_addresses.shape[1] != 2)
+            or scatter_row_addresses.shape[0] <= 0):
+        raise ValueError("CPU scatter storage requires contiguous int64 routes or routes-by-2 addresses")
+    scatter_bytes = scatter_row_addresses.numel() * scatter_row_addresses.element_size()
+    weight_offset = (scatter_bytes + 15) // 16 * 16
+    if route_weights is not None and (
+        route_weights.dtype != torch.float32 or route_weights.shape != (scatter_row_addresses.shape[0],)
+        or route_weights.device != scatter_row_addresses.device or not route_weights.is_contiguous()
+    ):
+        raise ValueError("CPU scatter weights require contiguous FP32 storage matching address rows and device")
+    total_bytes = (scatter_bytes if route_weights is None else
+                   weight_offset + route_weights.numel() * route_weights.element_size())
+    storage = torch.zeros(total_bytes, dtype=torch.uint8, device=scatter_row_addresses.device)
+    addresses = storage[:scatter_bytes].view(torch.int64).reshape(scatter_row_addresses.shape)
+    addresses.copy_(scatter_row_addresses)
+    weights = None
+    if route_weights is not None:
+        weights = storage[weight_offset:].view(torch.float32)
+        weights.copy_(route_weights)
+    return storage, addresses, weights
+
+
 class DownProjectionRunner:
     """Compose QuACK's existing plain grouped-GEMM runner with the up output."""
 
@@ -756,6 +796,11 @@ class DownProjectionRunner:
                           down_projection=False, iterations=1, timing_samples=1, warmup=0)
         self.combine = options.local_gpu_combine
         self.cpu_scatter = options.cpu_scatter_preparation
+        self.cpu_scatter_publication = options.cpu_scatter_publication or "deferred"
+        self.cpu_scatter_metadata = None
+        self._cpu_scatter_wait = None
+        self.cpu_scatter_timeout_ms = (max(1, math.ceil(options.return_token_timeout * 1000))
+                                       if self.cpu_scatter else 0)
         self.cpu_scatter_counts = None
         self.up = up
         self.routes = routes
@@ -815,6 +860,11 @@ class DownProjectionRunner:
         self.inputs = pregather.prepare_grouped_inputs(
             args, up.output[:routes], self.weights, counts, **external
         )
+        if self.cpu_scatter and self.cpu_scatter_publication == "deferred":
+            (self.cpu_scatter_metadata, self.inputs.scatter_row_addresses,
+             self.route_weights) = make_cpu_scatter_metadata_storage(
+                torch, self.inputs.scatter_row_addresses, self.route_weights)
+            self.inputs.route_weights = self.route_weights
         if options.trace_down_ready or options.return_token_results:
             if trace_configure is None:
                 raise ValueError("down readiness requires the proxy trace allocator")
@@ -931,13 +981,43 @@ class DownProjectionRunner:
             require_proxy_success(library, configure_weights(
                 handle, self.route_weights.data_ptr(), self.routes),
                 "configuring CPU packed routing weights")
+        if self.cpu_scatter_publication == "deferred":
+            try:
+                configure_deferred = library.rdma_proxy_configure_cpu_scatter_deferred
+                wait_ready = library.rdma_proxy_wait_cpu_scatter_ready
+            except AttributeError as error:
+                raise RuntimeError("deferred CPU scatter requires rebuilding librdma_cpu_proxy") from error
+            configure_deferred.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+            configure_deferred.restype = ctypes.c_int
+            wait_ready.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_size_t, ctypes.c_uint64]
+            wait_ready.restype = ctypes.c_int
+            require_proxy_success(library, configure_deferred(handle, self.cpu_scatter_metadata.numel()),
+                                  "configuring deferred CPU scatter publication")
+            self._cpu_scatter_wait = wait_ready
+            self._cpu_scatter_library, self._cpu_scatter_handle = library, handle
         with torch.inference_mode():
             self.combine_valid_rows.copy_(counts)
             self.combine_output_to_input.copy_(inverse)
         self.cpu_scatter_counts = counts
         torch.cuda.synchronize(self.up.cuda_device_id)
-        print("CPU scatter preparation enabled: compact metadata fixed at setup; "
-              "scatter batches published before gather readiness", flush=True)
+        policy = (f"one {self.cpu_scatter_metadata.numel()}-byte metadata H2D after final gather publication"
+                  if self.cpu_scatter_publication == "deferred" else
+                  "scatter batches published before gather readiness")
+        print(f"CPU scatter preparation enabled: compact metadata fixed at setup; {policy}", flush=True)
+
+    def wait_cpu_scatter_ready(self, iteration):
+        """Join the current native upload after its event record has been submitted.
+
+        Waiting on a CUDA event before the producer records this iteration would
+        observe an old/unrecorded event. The native API first waits for host-side
+        submission, then queues the event dependency without synchronizing the GPU.
+        """
+        if self._cpu_scatter_wait is None:
+            raise RuntimeError("deferred CPU scatter publication is not configured")
+        stream = self.up.torch.cuda.current_stream(self.up.cuda_device_id)
+        require_proxy_success(self._cpu_scatter_library, self._cpu_scatter_wait(
+            self._cpu_scatter_handle, iteration, int(stream.cuda_stream), self.cpu_scatter_timeout_ms),
+            f"waiting for CPU scatter metadata for iteration {iteration}")
 
     def _prepare_combine(self, work_table, a_idx):
         torch = self.up.torch
@@ -965,7 +1045,7 @@ class DownProjectionRunner:
                                * self.up.output.element_size())
         self.inputs.scatter_row_addresses.copy_(addresses)
 
-    def launch(self):
+    def launch(self, wait_for_metadata=None):
         # QuACK prepares output and metadata tensors under inference_mode.
         # Keep their resets and in-place updates in the same mode.
         with self.up.torch.inference_mode():
@@ -973,6 +1053,10 @@ class DownProjectionRunner:
             self.reset_start.record()
             self.inputs.zero_up_output()
             self.mapping_start.record()
+            if wait_for_metadata is not None:
+                # Include an exposed upload/wakeup gap in mapping_ms. CPU packing
+                # that overlaps dispatch/up remains outside that GPU interval.
+                wait_for_metadata()
             if self.combine and not self.cpu_scatter:
                 self._log_combine_startup("route mapping begin")
                 self._prepare_combine(self.up.work_table, self.up.a_idx)
@@ -1634,7 +1718,9 @@ def run_proxy_with_concurrent_kernel(
                 )
                 with torch.cuda.stream(kernel_stream):
                     if down is not None:
-                        down.launch()
+                        deferred = down.cpu_scatter and down.cpu_scatter_publication == "deferred"
+                        down.launch(wait_for_metadata=(lambda: down.wait_cpu_scatter_ready(iteration))
+                                    if deferred else None)
                     if return_exchange is not None:
                         return_exchange.arm(iteration)
                     kernel_finished.record(kernel_stream)

@@ -301,6 +301,24 @@ class ActivationCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("--cpu-scatter-preparation", result.stdout)
 
+    def test_cpu_scatter_publication_cli(self):
+        common = ("--cpu-scatter-preparation", "--concurrent-kernel",
+                  "--grouped-gemm-activation=swiglu", "--down-projection2",
+                  "--local-gpu-combine")
+        for mode in ("deferred", "per-batch"):
+            with self.subTest(mode=mode):
+                result = self.run_cli(*common, f"--cpu-scatter-publication={mode}")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                # Publication belongs to Python/native setup, not proxy argv.
+                self.assertNotIn("--cpu-scatter-publication", result.stdout)
+        result = self.run_cli(*common, "--cpu-scatter-publication=invalid")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid choice", result.stderr)
+        result = self.run_cli(*common, "--cpu-scatter-publication=deferred",
+                              "--communication-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--cpu-scatter-publication", result.stdout)
+
     def test_weighted_contributions_cli(self):
         common = ("--concurrent-kernel", "--grouped-gemm-activation=swiglu",
                   "--down-projection2", "--down-gather-table", "--local-gpu-combine")

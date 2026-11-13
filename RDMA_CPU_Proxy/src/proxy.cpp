@@ -627,6 +627,20 @@ void Proxy::configure_cpu_route_weights(uintptr_t packed_weights, std::size_t ro
     cuda_buffers_.configure_cpu_route_weights(packed_weights, routes);
 }
 
+void Proxy::configure_cpu_scatter_deferred(std::size_t bytes) {
+    if (!initialized_ || iteration_prepared_)
+        throw std::runtime_error("deferred CPU scatter requires initialized idle proxy");
+    cuda_buffers_.configure_cpu_scatter_deferred(bytes);
+}
+
+void Proxy::wait_cpu_scatter_ready(uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms) {
+    if (!initialized_)
+        throw std::runtime_error("CPU scatter wait requires initialized proxy");
+    // The scheduler owns the synchronized prepared generation. Do not inspect
+    // iteration_prepared_: the communication coordinator updates it concurrently.
+    cuda_buffers_.wait_cpu_scatter_ready(iteration, cuda_stream, timeout_ms);
+}
+
 const std::vector<int32_t>& Proxy::original_router_experts() const {
     return router_routing_.original_experts();
 }

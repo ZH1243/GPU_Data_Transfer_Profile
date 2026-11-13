@@ -6,6 +6,8 @@ QUACK_ROOT=/path/to/quack python -m unittest discover -s tests \
 CUDA cases run on SM90 and SM100/SM103 and otherwise skip. They stream poisoned
 tables, use partial multi-source clusters, run fused SwiGLU -> compact additive
 down -> concurrent ready-gated combine, and compare values on every iteration.
+CPU metadata covers per-batch publication and a deferred single-slab upload
+intentionally delayed until after up completes, with an explicit event dependency.
 """
 
 import argparse
@@ -158,12 +160,17 @@ class CompositionCudaTests(unittest.TestCase):
 
     def test_weighted_streamed_composition(self):
         for tile_m in ((128, 256) if self.arch == 10 else (128,)):
-            for preparation in ("gpu", "cpu-publication"):
+            for preparation in ("gpu", "per-batch", "deferred"):
                 for policy in ("distinct", "ones", "zeros"):
                     with self.subTest(tile_m=tile_m, preparation=preparation, weights=policy):
                         self._composition(tile_m, 4, policy=policy, preparation=preparation)
 
-    def _composition(self, tile_m, sm_count, policy=None, preparation="gpu"):
+    def test_unweighted_deferred_metadata_after_up_completion(self):
+        for tile_m in ((128, 256) if self.arch == 10 else (128,)):
+            with self.subTest(tile_m=tile_m):
+                self._composition(tile_m, 4, preparation="deferred", publication_default=True)
+
+    def _composition(self, tile_m, sm_count, policy=None, preparation="gpu", publication_default=False):
         torch = self.torch
         root = Path(os.environ.get("QUACK_ROOT", SCRIPTS.parents[2] / "quack_for_communication_overlap"))
         sys.path.insert(0, str(root))
@@ -225,6 +232,9 @@ class CompositionCudaTests(unittest.TestCase):
             "--trace-down-ready", f"--down-tile-m={tile_m}", f"--down-tile-n={tile_n}",
             "--down-cluster-m=2", "--down-max-swizzle-size=1", f"--down-sm-count={sm_count}"])
         options.weighted_contributions = policy is not None
+        options.cpu_scatter_preparation = preparation != "gpu"
+        options.cpu_scatter_publication = (preparation if preparation != "gpu" and not publication_default
+                                           else None)
         host_ready = torch.zeros(1, dtype=torch.int32, pin_memory=True)
 
         def configure_trace(groups):
@@ -237,7 +247,11 @@ class CompositionCudaTests(unittest.TestCase):
         routes = sum(expert_counts)
         down = worker.DownProjectionRunner(torch, up, expert_counts, options,
                                            trace_configure=configure_trace)
+        if preparation != "gpu":
+            self.assertEqual(down.cpu_scatter_publication, preparation)
         down.warmup()
+        # Build initial compact maps before simulated CPU publication starts.
+        down.cpu_scatter = False
         up.launch()
         down.launch()
         torch.cuda.synchronize()
@@ -263,6 +277,9 @@ class CompositionCudaTests(unittest.TestCase):
 
         pinned_route_weights = None
         pinned_addresses = None
+        pinned_metadata = None
+        publication_up_done = None
+        metadata_ready = torch.cuda.Event()
 
         def publish():
             # H2D copies use copy engines: a spinning full-SM up GEMM cannot
@@ -271,18 +288,28 @@ class CompositionCudaTests(unittest.TestCase):
                 for destination, source in zip(up.x_buffers, pinned_x):
                     destination.copy_(source, non_blocking=True)
                 for index, count in enumerate(pinned_counts):
-                    if pinned_route_weights is not None and pinned_table[index, 1].item() == 0:
+                    if (preparation == "per-batch" and pinned_addresses is not None
+                            and pinned_table[index, 1].item() == 0):
                         # Mirrors native CPU scatter preparation: route weights
                         # and addresses become visible before gather readiness.
                         # The actual C++ publisher is covered by test_cpu_scatter_cuda.
                         ranges = pinned_table[index, 2:].tolist()
                         begin = sum(ranges[::2])
                         end = begin + sum(stop - start for start, stop in zip(ranges[::2], ranges[1::2]))
-                        down.route_weights[begin:end].copy_(pinned_route_weights[begin:end], non_blocking=True)
+                        if pinned_route_weights is not None:
+                            down.route_weights[begin:end].copy_(pinned_route_weights[begin:end], non_blocking=True)
                         down.inputs.scatter_row_addresses[begin:end].copy_(pinned_addresses[begin:end],
                                                                           non_blocking=True)
                     table[index:index + 1].copy_(pinned_table[index:index + 1], non_blocking=True)
                     ready.copy_(count, non_blocking=True)
+                if pinned_metadata is not None:
+                    # Intentionally defer metadata beyond ALL up computation.
+                    # Gathering readiness can no longer imply metadata visibility.
+                    publication.wait_event(publication_up_done)
+                    down.cpu_scatter_metadata.copy_(pinned_metadata, non_blocking=True)
+                    # Recording is submitted before the consumer stream waits;
+                    # otherwise a reused event could observe a previous iteration.
+                    metadata_ready.record(publication)
 
         publish()
         publication.synchronize()
@@ -291,7 +318,7 @@ class CompositionCudaTests(unittest.TestCase):
                                       list(range(sources))[::-1] if iteration % 2 else None)
             pinned_table.copy_(torch.tensor(changed, dtype=torch.int32))
             table.copy_(pinned_table)
-            if policy is not None and preparation == "cpu-publication":
+            if preparation != "gpu":
                 # Use the tested GPU address builder only to obtain invariant
                 # compact destination addresses; source weights are packed by a
                 # separate CPU descriptor walk, never by the implementation.
@@ -300,9 +327,18 @@ class CompositionCudaTests(unittest.TestCase):
                     down._prepare_combine(up.work_table, up.a_idx)
                 torch.cuda.synchronize()
                 pinned_addresses = down.inputs.scatter_row_addresses.cpu().pin_memory()
-                expected_values = [up.route_weights[source][position].item()
-                                   for _, source, position in validation.route_positions(up, routes)]
-                pinned_route_weights = torch.tensor(expected_values, dtype=torch.float32).pin_memory()
+                if policy is not None:
+                    expected_values = [up.route_weights[source][position].item()
+                                       for _, source, position in validation.route_positions(up, routes)]
+                    pinned_route_weights = torch.tensor(expected_values, dtype=torch.float32).pin_memory()
+                if preparation == "deferred":
+                    pinned_metadata = down.cpu_scatter_metadata.cpu().pin_memory()
+                    self.assertEqual(down.inputs.scatter_row_addresses.data_ptr(),
+                                     down.cpu_scatter_metadata.data_ptr())
+                    if pinned_route_weights is not None:
+                        offset = down.route_weights.data_ptr() - down.cpu_scatter_metadata.data_ptr()
+                        self.assertEqual(offset % 16, 0)
+                        pinned_metadata[offset:offset + routes * 4].view(torch.float32).copy_(pinned_route_weights)
                 down.cpu_scatter = True
             for source in pinned_x:
                 source.mul_(-1.1)  # New values each iteration detect stale reads.
@@ -314,13 +350,23 @@ class CompositionCudaTests(unittest.TestCase):
                 combine.output.fill_(float("nan"))
                 if down.route_weights is not None:
                     down.route_weights.fill_(float("nan"))
+                if preparation == "deferred":
+                    # Includes invalid addresses and NaN weights. Only the
+                    # current-generation slab upload can make down safe to run.
+                    down.cpu_scatter_metadata.fill_(255)
             host_ready.zero_()
             torch.cuda.synchronize()
             with torch.cuda.stream(producer):
                 up.launch()  # Enqueue before any descriptor/input publication.
+                if preparation == "deferred":
+                    publication_up_done = torch.cuda.Event()
+                    publication_up_done.record(producer)
             publish()
             with torch.cuda.stream(producer):
-                down.launch()
+                if preparation == "deferred":
+                    down.launch(wait_for_metadata=lambda: producer.wait_event(metadata_ready))
+                else:
+                    down.launch()
             with torch.cuda.stream(consumer):
                 combine()  # Acquires GPU ready prefixes while down stores continue.
             producer.synchronize()

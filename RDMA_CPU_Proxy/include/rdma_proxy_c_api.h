@@ -43,9 +43,28 @@ RDMA_PROXY_C_API int rdma_proxy_configure_cpu_scatter(
 
 /* Optional weighted CPU scatter setup: call after configure_cpu_scatter and
  * before iteration zero. Borrowed FP32[routes] storage must survive shutdown.
- * Each selected range is copied once, before its gather readiness publication. */
+ * Each selected range is copied once before its gather readiness publication,
+ * unless deferred publication is configured below. */
 RDMA_PROXY_C_API int rdma_proxy_configure_cpu_route_weights(
     RdmaProxyHandle* handle, uintptr_t packed_weights, uint64_t routes);
+
+/* Opt-in one-copy CPU metadata publication. Call after scatter and optional
+ * weights setup, before iteration zero. scatter_addresses begins a 16-byte
+ * aligned borrowed allocation. Its exact size is routes*columns*8 unweighted;
+ * weighted storage places FP32[routes] at round_up(scatter_bytes,16), and bytes
+ * includes that weight array. Retain the entire allocation through shutdown.
+ * CPU staging completes while gather readiness streams. One slab H2D copy and
+ * event record follow final gather-ready publication on the publication stream.
+ * The existing per-batch behavior remains default unless this API is called. */
+RDMA_PROXY_C_API int rdma_proxy_configure_cpu_scatter_deferred(
+    RdmaProxyHandle* handle, uint64_t bytes);
+/* Host-wait, bounded by timeout_ms > 0, until this prepared iteration's event
+ * RECORD is submitted, then enqueue cudaStreamWaitEvent on a nonzero caller
+ * stream. This does not synchronize the GPU. Call before down GEMM submission;
+ * another host thread must continue driving notification/communication work.
+ * Join compute consumers before preparing the next iteration or shutting down. */
+RDMA_PROXY_C_API int rdma_proxy_wait_cpu_scatter_ready(
+    RdmaProxyHandle* handle, uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms);
 
 /* Original source [num_tokens,top_k] assignments, before destination row mapping.
  * Query with both arrays NULL and capacity=0; otherwise copy both host arrays.

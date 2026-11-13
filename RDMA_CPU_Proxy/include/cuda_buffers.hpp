@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -87,6 +88,8 @@ struct RouterNotificationPublicationBuffers {
     // and their corresponding ready-row publications.
     uint64_t table_flush_count{0};
     uint64_t ready_rows_publication_count{0};
+    uint64_t cpu_scatter_copy_count{0};
+    uint64_t cpu_scatter_copy_bytes{0};
 };
 
 struct PeerGpuBuffers {
@@ -215,6 +218,8 @@ public:
     std::size_t router_computation_num_tokens() const;
     void configure_cpu_scatter(const RdmaProxyCpuScatterConfig& config);
     void configure_cpu_route_weights(uintptr_t packed_weights, std::size_t routes);
+    void configure_cpu_scatter_deferred(std::size_t bytes);
+    void wait_cpu_scatter_ready(uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms);
     void update_expert_token_heads(
         int source_node_rank,
         int source_gpu_index,
@@ -265,8 +270,16 @@ private:
 
     ProxyConfig config_;
     void publish_cpu_scatter_batch(const std::vector<int32_t>& ranges);
+    void publish_deferred_cpu_scatter_locked();
     CpuPinnedBuffer cpu_scatter_staging_;
     CpuPinnedBuffer cpu_route_weights_staging_;
+    CpuPinnedBuffer cpu_scatter_deferred_staging_;
+    std::size_t cpu_scatter_routes_{0};
+    std::size_t cpu_scatter_weight_offset_{0};
+    std::size_t cpu_scatter_staged_rows_{0};
+    bool cpu_scatter_submitted_{false};
+    void* cpu_scatter_ready_event_{nullptr};
+    std::condition_variable cpu_scatter_ready_cv_;
     uintptr_t cpu_route_weights_device_{0};
     uintptr_t cpu_scatter_device_{0};
     std::size_t cpu_scatter_columns_{0};

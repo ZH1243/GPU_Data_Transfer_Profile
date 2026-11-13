@@ -174,6 +174,15 @@ CudaBuffers::~CudaBuffers() {
         }
 #endif
     }
+#if RDMA_PROXY_HAVE_CUDA
+    if (!config_.mock_mode && cpu_scatter_ready_event_) {
+        const auto status = cudaEventDestroy(reinterpret_cast<cudaEvent_t>(cpu_scatter_ready_event_));
+        if (status != cudaSuccess)
+            RDMA_PROXY_LOG_WARN("cudaEventDestroy(CPU scatter ready) failed during cleanup: ",
+                                cudaGetErrorString(status));
+    }
+#endif
+    cpu_scatter_ready_event_ = nullptr;
     router_computation_start_event_ = nullptr;
     router_computation_end_event_ = nullptr;
     destroy_cuda_stream(
@@ -196,6 +205,7 @@ CudaBuffers::~CudaBuffers() {
     free_pinned_buffer(router_notification_ready_values_);
     free_pinned_buffer(cpu_scatter_staging_);
     free_pinned_buffer(cpu_route_weights_staging_);
+    free_pinned_buffer(cpu_scatter_deferred_staging_);
 }
 
 void CudaBuffers::initialize() {
@@ -978,19 +988,119 @@ void CudaBuffers::configure_cpu_scatter(const RdmaProxyCpuScatterConfig& c) {
     allocate_pinned_buffer(cpu_scatter_staging_, routes * columns * sizeof(int64_t));
     cpu_scatter_lookup_ = std::move(lookup);
     cpu_scatter_columns_ = columns;
+    cpu_scatter_routes_ = routes;
     cpu_scatter_device_ = c.scatter_addresses;
 }
 
 void CudaBuffers::configure_cpu_route_weights(uintptr_t packed_weights, std::size_t routes) {
     std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
     if (!config_.router_weighted_contributions_enabled || !cpu_scatter_device_ ||
-        cpu_route_weights_device_ || router_computation_scheduler_state_.iteration_initialized ||
+        cpu_route_weights_device_ || cpu_scatter_deferred_staging_.ptr ||
+        router_computation_scheduler_state_.iteration_initialized ||
         !packed_weights || packed_weights % alignof(float) ||
-        routes != cpu_scatter_staging_.bytes / (cpu_scatter_columns_ * sizeof(int64_t)) ||
+        routes != cpu_scatter_routes_ ||
         routes > std::numeric_limits<std::size_t>::max() / sizeof(float))
         throw std::runtime_error("invalid CPU route-weight setup; configure scatter before weights");
     allocate_pinned_buffer(cpu_route_weights_staging_, routes * sizeof(float));
     cpu_route_weights_device_ = packed_weights;
+}
+
+void CudaBuffers::configure_cpu_scatter_deferred(std::size_t bytes) {
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    if (!cpu_scatter_device_ || cpu_scatter_deferred_staging_.ptr ||
+        router_computation_scheduler_state_.iteration_initialized ||
+        cpu_scatter_device_ % 16 ||
+        (config_.router_weighted_contributions_enabled && !cpu_route_weights_device_))
+        throw std::runtime_error("deferred CPU scatter requires aligned configured storage before iteration zero");
+    const auto scatter_bytes = cpu_scatter_staging_.bytes;
+    if (scatter_bytes > std::numeric_limits<std::size_t>::max() - 15)
+        throw std::runtime_error("deferred CPU scatter alignment overflows");
+    const auto weight_offset = (scatter_bytes + 15) & ~std::size_t{15};
+    const auto weight_bytes = cpu_route_weights_staging_.bytes;
+    if (weight_bytes > std::numeric_limits<std::size_t>::max() - weight_offset ||
+        cpu_scatter_device_ > std::numeric_limits<uintptr_t>::max() - bytes ||
+        bytes != (cpu_route_weights_device_ ? weight_offset + weight_bytes : scatter_bytes) ||
+        (cpu_route_weights_device_ && cpu_route_weights_device_ != cpu_scatter_device_ + weight_offset))
+        throw std::runtime_error("deferred CPU scatter requires exact contiguous scatter/weight slab");
+    allocate_pinned_buffer(cpu_scatter_deferred_staging_, bytes);
+    // Initialize the possible alignment gap so the complete slab is defined.
+    std::memset(cpu_scatter_deferred_staging_.ptr, 0, bytes);
+#if RDMA_PROXY_HAVE_CUDA
+    if (!config_.mock_mode) {
+        cudaEvent_t event = nullptr;
+        check_cuda(cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
+                   "cudaEventCreate CPU scatter ready");
+        cpu_scatter_ready_event_ = event;
+    }
+#endif
+    cpu_scatter_weight_offset_ = weight_offset;
+    free_pinned_buffer(cpu_scatter_staging_);
+    free_pinned_buffer(cpu_route_weights_staging_);
+}
+
+void CudaBuffers::wait_cpu_scatter_ready(
+    uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms) {
+    std::unique_lock<std::mutex> lock(expert_token_heads_mutex_);
+    const auto& scheduler = router_computation_scheduler_state_;
+    const auto max_wait = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::time_point::max() - std::chrono::steady_clock::now()).count();
+    if (!cpu_scatter_deferred_staging_.ptr || !cuda_stream || !timeout_ms ||
+        timeout_ms > static_cast<uint64_t>(max_wait) ||
+        !scheduler.iteration_initialized || scheduler.iteration != iteration)
+        throw std::runtime_error("invalid deferred CPU scatter wait mode, stream, timeout, or iteration");
+#if RDMA_PROXY_HAVE_CUDA
+    if (!config_.mock_mode) {
+        check_cuda(cudaSetDevice(config_.cuda_device_id), "cudaSetDevice CPU scatter waiter");
+        unsigned flags = 0;
+        check_cuda(cudaStreamGetFlags(reinterpret_cast<cudaStream_t>(cuda_stream), &flags),
+                   "cudaStreamGetFlags CPU scatter waiter");
+    }
+#endif
+    if (!cpu_scatter_ready_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
+            return scheduler.iteration != iteration || cpu_scatter_submitted_;
+        }))
+        throw std::runtime_error("timed out waiting for deferred CPU scatter submission iteration=" +
+            std::to_string(iteration) + " staged_rows=" + std::to_string(cpu_scatter_staged_rows_) +
+            "/" + std::to_string(cpu_scatter_routes_) + " published_rows=" +
+            std::to_string(scheduler.published_rows) + "/" +
+            std::to_string(router_notification_publication_buffers_.table_rows));
+    if (scheduler.iteration != iteration)
+        throw std::runtime_error("CPU scatter iteration changed during wait");
+    // An event wait submitted before its first record would be a CUDA no-op.
+    // Keep the scheduler mutex through submission to prevent a new recording.
+#if RDMA_PROXY_HAVE_CUDA
+    if (!config_.mock_mode)
+        check_cuda(cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(cuda_stream),
+            reinterpret_cast<cudaEvent_t>(cpu_scatter_ready_event_), 0),
+            "cudaStreamWaitEvent CPU scatter ready");
+#endif
+}
+
+void CudaBuffers::publish_deferred_cpu_scatter_locked() {
+    if (!cpu_scatter_deferred_staging_.ptr || cpu_scatter_submitted_) return;
+    const auto& scheduler = router_computation_scheduler_state_;
+    auto& publication = router_notification_publication_buffers_;
+    if (!scheduler.iteration_initialized || scheduler.published_rows != publication.table_rows) return;
+    if (cpu_scatter_staged_rows_ != cpu_scatter_routes_)
+        throw std::runtime_error("final gather publication has incomplete CPU scatter staging");
+    // Called only after the FINAL gather-ready write was enqueued on this stream.
+    if (config_.mock_mode) {
+        std::memcpy(reinterpret_cast<void*>(cpu_scatter_device_), cpu_scatter_deferred_staging_.ptr,
+                    cpu_scatter_deferred_staging_.bytes);
+    } else {
+#if RDMA_PROXY_HAVE_CUDA
+        const auto stream = reinterpret_cast<cudaStream_t>(router_notification_publication_stream_);
+        check_cuda(cudaMemcpyAsync(reinterpret_cast<void*>(cpu_scatter_device_),
+            cpu_scatter_deferred_staging_.ptr, cpu_scatter_deferred_staging_.bytes,
+            cudaMemcpyHostToDevice, stream), "cudaMemcpyAsync H2D deferred CPU scatter slab");
+        check_cuda(cudaEventRecord(reinterpret_cast<cudaEvent_t>(cpu_scatter_ready_event_), stream),
+                   "cudaEventRecord CPU scatter ready");
+#endif
+    }
+    ++publication.cpu_scatter_copy_count;
+    publication.cpu_scatter_copy_bytes += cpu_scatter_deferred_staging_.bytes;
+    cpu_scatter_submitted_ = true;
+    cpu_scatter_ready_cv_.notify_all();
 }
 
 void CudaBuffers::publish_cpu_scatter_batch(const std::vector<int32_t>& ranges) {
@@ -1004,11 +1114,11 @@ void CudaBuffers::publish_cpu_scatter_batch(const std::vector<int32_t>& ranges) 
         count += end - start;
     }
     const auto row_bytes = cpu_scatter_columns_ * sizeof(int64_t);
-    if (base > cpu_scatter_staging_.bytes / row_bytes ||
-        count > cpu_scatter_staging_.bytes / row_bytes - base)
+    if (base > cpu_scatter_routes_ || count > cpu_scatter_routes_ - base)
         throw std::runtime_error("CPU scatter packed output out of bounds");
-    auto* destination = static_cast<int64_t*>(cpu_scatter_staging_.ptr) +
-                        base * cpu_scatter_columns_;
+    void* staging = cpu_scatter_deferred_staging_.ptr ?
+        cpu_scatter_deferred_staging_.ptr : cpu_scatter_staging_.ptr;
+    auto* destination = static_cast<int64_t*>(staging) + base * cpu_scatter_columns_;
     auto* cursor = destination;
     for (std::size_t j = 0; j < cpu_scatter_lookup_.size(); ++j) {
         const auto& lookup = cpu_scatter_lookup_[j];
@@ -1017,7 +1127,10 @@ void CudaBuffers::publish_cpu_scatter_batch(const std::vector<int32_t>& ranges) 
     }
     float* weight_destination = nullptr;
     if (cpu_route_weights_device_) {
-        weight_destination = static_cast<float*>(cpu_route_weights_staging_.ptr) + base;
+        void* weight_staging = cpu_scatter_deferred_staging_.ptr ?
+            static_cast<void*>(static_cast<uint8_t*>(staging) + cpu_scatter_weight_offset_) :
+            cpu_route_weights_staging_.ptr;
+        weight_destination = static_cast<float*>(weight_staging) + base;
         auto* weight_cursor = weight_destination;
         for (std::size_t j = 0; j < cpu_scatter_lookup_.size(); ++j) {
             const auto& weights = nvlink_recv_buffers_[router_computation_buffer_indices_[j]]
@@ -1025,6 +1138,12 @@ void CudaBuffers::publish_cpu_scatter_batch(const std::vector<int32_t>& ranges) 
             weight_cursor = std::copy(weights.begin() + ranges[2*j],
                                       weights.begin() + ranges[2*j+1], weight_cursor);
         }
+    }
+    if (cpu_scatter_deferred_staging_.ptr) {
+        if (count > cpu_scatter_routes_ - cpu_scatter_staged_rows_)
+            throw std::runtime_error("deferred CPU scatter staged row count exceeds capacity");
+        cpu_scatter_staged_rows_ += count;
+        return;
     }
     // Every packed row is assigned once per iteration. Staging stays immutable
     // until the publication stream is synchronized at the next iteration reset.
@@ -1034,6 +1153,9 @@ void CudaBuffers::publish_cpu_scatter_batch(const std::vector<int32_t>& ranges) 
         if (weight_destination)
             std::memcpy(reinterpret_cast<float*>(cpu_route_weights_device_) + base,
                         weight_destination, count * sizeof(float));
+        auto& publication = router_notification_publication_buffers_;
+        publication.cpu_scatter_copy_count += weight_destination ? 2 : 1;
+        publication.cpu_scatter_copy_bytes += count * (row_bytes + (weight_destination ? sizeof(float) : 0));
         return;
     }
 #if RDMA_PROXY_HAVE_CUDA
@@ -1046,6 +1168,9 @@ void CudaBuffers::publish_cpu_scatter_batch(const std::vector<int32_t>& ranges) 
             weight_destination, count * sizeof(float), cudaMemcpyHostToDevice,
             reinterpret_cast<cudaStream_t>(router_notification_publication_stream_)),
             "cudaMemcpyAsync H2D CPU route-weight batch");
+    auto& publication = router_notification_publication_buffers_;
+    publication.cpu_scatter_copy_count += weight_destination ? 2 : 1;
+    publication.cpu_scatter_copy_bytes += count * (row_bytes + (weight_destination ? sizeof(float) : 0));
 #endif
 }
 
@@ -1082,6 +1207,9 @@ void CudaBuffers::reset_router_computation_iteration_locked(uint64_t iteration) 
     scheduler.iteration = iteration;
     scheduler.published_batches = 0;
     scheduler.published_rows = 0;
+    cpu_scatter_staged_rows_ = 0;
+    cpu_scatter_submitted_ = false;
+    cpu_scatter_ready_cv_.notify_all();
 
     {
         std::lock_guard<std::mutex> timing_lock(
@@ -1477,6 +1605,7 @@ void CudaBuffers::process_router_notification_completion(
 }
 
 void CudaBuffers::flush_router_notification_publication() {
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
     flush_router_notification_publication_range(
         0, router_notification_publication_buffers_.host_table.bytes);
 }
@@ -1543,6 +1672,7 @@ void CudaBuffers::flush_router_notification_publication_range(
             publication.host_ready_rows.bytes);
         if (table_bytes != 0) ++publication.table_flush_count;
         ++publication.ready_rows_publication_count;
+        publish_deferred_cpu_scatter_locked();
         return;
     }
 #if RDMA_PROXY_HAVE_CUDA
@@ -1601,6 +1731,7 @@ void CudaBuffers::flush_router_notification_publication_range(
     }
     if (table_bytes != 0) ++publication.table_flush_count;
     ++publication.ready_rows_publication_count;
+    publish_deferred_cpu_scatter_locked();
 #else
     throw std::runtime_error(
         "CUDA router notification publication requested but CUDA support was not built");
