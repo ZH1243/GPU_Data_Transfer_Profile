@@ -553,6 +553,10 @@ void Proxy::prepare_iteration_step(uint64_t iteration) {
         throw std::runtime_error(
             "cannot prepare a new proxy iteration while another is pending");
     }
+    if (config_.router_local_input_early_ready_enabled) {
+        const auto requested = local_router_input_early_ready_requested_.load(std::memory_order_acquire);
+        if (requested) wait_for_local_router_input_ready(requested - 1);
+    }
     cuda_buffers_.begin_router_notification_iteration(iteration);
     // begin_router_notification_iteration publishes ready_rows=0 on the
     // proxy's private stream. Make that reset visible before Python queues a
@@ -815,7 +819,10 @@ void Proxy::shutdown() {
     release_local_iteration_sync();
     iteration_prepared_ = false;
     local_router_input_staged_ = false;
-    local_router_input_early_ready_published_ = false;
+    // stop_forwarding_thread has joined the mailbox consumer before reset.
+    local_router_input_early_ready_requested_.store(0, std::memory_order_relaxed);
+    local_router_input_early_ready_completed_.store(0, std::memory_order_relaxed);
+    local_router_input_early_ready_tokens_ = 0;
     rdma_qp_calibration_complete_ = false;
     calibration_barrier_sequence_ = 0;
     initialized_ = false;
@@ -2381,6 +2388,9 @@ void Proxy::flush_nvlink_forward_notification_log_queue() {
 void Proxy::drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQueue* queue) {
     if (!queue || !nvlink_forward_notification_header_) return;
     while (true) {
+        // Do not leave a newly posted local request behind an unbounded stream
+        // of ordinary notifications from another GPU.
+        consume_local_router_input_ready();
         const auto tail = atomic_load_u64(&queue->tail);
         const auto head = atomic_load_u64(&queue->head);
         if (tail >= head) return;
@@ -2433,7 +2443,7 @@ void Proxy::nvlink_forward_notification_loop() {
             // Failed prepared batches cannot publish a successful drain marker.
             // Do not wait a full receiver timeout for their abandoned records.
             if (prepared_forwarding_ && prepared_forwarding_->failed.load()) return;
-            bool progressed = false;
+            bool progressed = consume_local_router_input_ready();
             auto* base = reinterpret_cast<char*>(nvlink_forward_notification_header_);
             for (std::size_t i = 0; i < nvlink_forward_notification_header_->num_gpus_per_node; ++i) {
                 auto* queue = reinterpret_cast<NvlinkForwardNotificationQueue*>(
@@ -2456,7 +2466,9 @@ void Proxy::nvlink_forward_notification_loop() {
                     stop_deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(config_.completion_timeout_ms);
                 }
-                if (nvlink_forward_notification_queues_complete()) {
+                if (nvlink_forward_notification_queues_complete() &&
+                    local_router_input_early_ready_requested_.load(std::memory_order_acquire) ==
+                        local_router_input_early_ready_completed_.load(std::memory_order_acquire)) {
                     return;
                 }
                 if (std::chrono::steady_clock::now() >= stop_deadline) {
@@ -2489,18 +2501,18 @@ void Proxy::run_iteration(uint64_t iteration) {
     }
     synchronize_iteration_start(iteration);
     std::chrono::steady_clock::time_point start;
-    if (config_.router_local_input_early_ready_enabled) {
-        // Count the publication cost and any compute overlap in this iteration.
-        // Publish before releasing prepared producers, whose local self entries
-        // are suppressed because the full staged source is already readable.
+    if (config_.router_local_input_early_ready_enabled)
         start = std::chrono::steady_clock::now();
-        publish_local_router_input_ready(iteration);
-    }
     if (prepared_forwarding_) {
-        {
-            std::lock_guard<std::mutex> lock(forwarding_mutex_);
-            forwarding_iteration_stats_.resize(static_cast<std::size_t>(iteration) + 1);
-        }
+        std::lock_guard<std::mutex> lock(forwarding_mutex_);
+        forwarding_iteration_stats_.resize(static_cast<std::size_t>(iteration) + 1);
+    }
+    // Finish potentially allocating/locking setup before posting. The enabled
+    // timer includes this work, but no publication-completion wait or setup
+    // separates the mailbox release from prepared forwarding activation.
+    if (config_.router_local_input_early_ready_enabled)
+        request_local_router_input_ready(iteration);
+    if (prepared_forwarding_) {
         prepared_forwarding_->active_iteration.store(iteration + 1);
         prepared_forwarding_->changed.notify_all();
     }
@@ -4482,7 +4494,7 @@ void Proxy::issue_local_router_forwarding_batch(
     }
 }
 
-void Proxy::publish_local_router_input_ready(uint64_t iteration) {
+void Proxy::request_local_router_input_ready(uint64_t iteration) {
     if (!config_.router_local_input_early_ready_enabled) return;
     if (!config_.router_local_input_staging_enabled ||
         !config_.nvlink_forward_completion_notifications_enabled ||
@@ -4491,11 +4503,18 @@ void Proxy::publish_local_router_input_ready(uint64_t iteration) {
         !local_router_staging_buffer_->ptr) {
         throw std::runtime_error("early local input readiness requires this iteration's staged input");
     }
-    if (local_router_input_early_ready_published_) {
-        if (iteration < local_router_input_early_ready_iteration_)
-            throw std::runtime_error("cannot publish stale early local input readiness");
-        if (iteration == local_router_input_early_ready_iteration_) return;
-    }
+    if (iteration == std::numeric_limits<uint64_t>::max())
+        throw std::runtime_error("early local input readiness epoch overflows");
+    check_forwarding_error();
+    if (forwarding_stop_.load() || nvlink_forward_notification_receiver_stop_.load())
+        throw std::runtime_error("early local input readiness receiver is stopping");
+    const auto marker = iteration + 1;
+    const auto requested = local_router_input_early_ready_requested_.load(std::memory_order_acquire);
+    if (marker < requested)
+        throw std::runtime_error("cannot request stale early local input readiness");
+    if (marker == requested) return;
+    if (local_router_input_early_ready_completed_.load(std::memory_order_acquire) != requested)
+        throw std::runtime_error("previous early local input readiness request is still pending");
     const auto& local_x3 = router_routing_.token_indices_for_node(config_.node_rank);
     const auto token_bytes = config_.token_dimension * dtype_size(config_.dtype);
     if (!token_bytes || local_x3.size() > config_.num_tokens ||
@@ -4503,16 +4522,56 @@ void Proxy::publish_local_router_input_ready(uint64_t iteration) {
         local_x3.size() > local_router_staging_buffer_->bytes / token_bytes) {
         throw std::runtime_error("early local input readiness exceeds the staged x3 range");
     }
-    // The one-time staging gather completed in prepare_iteration_step; this
-    // allocation remains immutable across iterations. Reuse normal Head/Tail
-    // scheduling so partial clusters still wait and all scatter policies keep
-    // their usual table/weight ordering. No peer-copy completion is implied.
-    ScopedPreparedRange publication(config_.nvlink_forward_prepared_nvtx_enabled,
-                                    "router/local_input_early_ready");
-    cuda_buffers_.process_router_notification_completion(
-        config_.node_rank, config_.local_gpu_index, iteration, 0, local_x3.size());
-    local_router_input_early_ready_iteration_ = iteration;
-    local_router_input_early_ready_published_ = true;
+    // All coordinator-owned iteration/staging checks happen before release.
+    // The receiver consumes only this payload and immutable source identity.
+    local_router_input_early_ready_tokens_ = local_x3.size();
+    local_router_input_early_ready_requested_.store(marker, std::memory_order_release);
+}
+
+bool Proxy::consume_local_router_input_ready() {
+    if (!config_.router_local_input_early_ready_enabled) return false;
+    const auto requested = local_router_input_early_ready_requested_.load(std::memory_order_acquire);
+    const auto completed = local_router_input_early_ready_completed_.load(std::memory_order_relaxed);
+    if (requested == completed) return false;
+    if (requested < completed)
+        throw std::runtime_error("early local input readiness mailbox epoch regressed");
+    const auto tokens = local_router_input_early_ready_tokens_;
+    if (local_router_input_early_ready_test_hook_) local_router_input_early_ready_test_hook_();
+    {
+        // Runs only on the notification receiver, before its ordinary queue
+        // entries. Normal scheduling preserves partial-cluster and metadata
+        // ordering; this local request implies no peer-copy completion.
+        ScopedPreparedRange publication(config_.nvlink_forward_prepared_nvtx_enabled,
+                                        "router/local_input_early_ready");
+        cuda_buffers_.process_router_notification_completion(
+            config_.node_rank, config_.local_gpu_index, requested - 1, 0, tokens);
+    }
+    // Completion means all scheduler/table/ready submissions have returned.
+    // Iteration reset can now synchronize their stream and reuse host storage.
+    local_router_input_early_ready_completed_.store(requested, std::memory_order_release);
+    return true;
+}
+
+void Proxy::wait_for_local_router_input_ready(uint64_t iteration) const {
+    if (!config_.router_local_input_early_ready_enabled) return;
+    if (iteration == std::numeric_limits<uint64_t>::max() ||
+        local_router_input_early_ready_requested_.load(std::memory_order_acquire) != iteration + 1)
+        throw std::runtime_error("early local input readiness wait has no matching request");
+    const auto marker = iteration + 1;
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(config_.completion_timeout_ms);
+    while (local_router_input_early_ready_completed_.load(std::memory_order_acquire) != marker) {
+        check_forwarding_error();
+        if (forwarding_stop_.load() || nvlink_forward_notification_receiver_stop_.load())
+            throw std::runtime_error("early local input readiness wait cancelled during shutdown");
+        if (local_router_input_early_ready_requested_.load(std::memory_order_acquire) != marker)
+            throw std::runtime_error("early local input readiness request changed during wait");
+        if (std::chrono::steady_clock::now() >= deadline)
+            throw std::runtime_error("timed out waiting for early local input readiness iteration=" +
+                                     std::to_string(iteration));
+        std::this_thread::sleep_for(std::chrono::microseconds(10));
+    }
+    check_forwarding_error();
 }
 
 void Proxy::process_local_router_forwarding_iteration(uint64_t iteration) {
@@ -6064,6 +6123,9 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
             complete = false;
         }
         if (complete) {
+            // Includes legacy forwarding, whose ordinary notification queues
+            // are not otherwise drained here. The mailbox cannot cross reset.
+            wait_for_local_router_input_ready(iteration);
             if (config_.nvlink_forward_synchronize_iteration) {
                 synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
             }

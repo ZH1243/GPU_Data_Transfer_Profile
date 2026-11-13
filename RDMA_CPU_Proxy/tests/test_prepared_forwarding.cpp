@@ -4,14 +4,54 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <exception>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 
 namespace rdma_proxy {
+// Declared before proxy owners so callback storage outlives receiver shutdown.
+struct EarlyReadyReceiverGate {
+    std::mutex mutex;
+    std::condition_variable changed;
+    unsigned calls{0}, pause_call{0}, fail_call{0};
+    bool paused{false}, released{false};
+    std::thread::id receiver;
+
+    void operator()() {
+        std::unique_lock<std::mutex> lock(mutex);
+        receiver = std::this_thread::get_id();
+        ++calls;
+        if (calls == fail_call)
+            throw std::runtime_error("injected early-ready receiver failure");
+        if (calls == pause_call) {
+            paused = true;
+            changed.notify_all();
+            if (!changed.wait_for(lock, std::chrono::seconds(10), [&] { return released; }))
+                throw std::runtime_error("early-ready receiver test gate timed out");
+        }
+    }
+    void wait_paused() {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!changed.wait_for(lock, std::chrono::seconds(5), [&] { return paused; }))
+            throw std::runtime_error("early-ready receiver did not reach test gate");
+    }
+    void verify(std::thread::id expected_receiver, unsigned expected_calls) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (calls != expected_calls || (calls && receiver != expected_receiver))
+            throw std::runtime_error("early readiness was not published once by the notification receiver");
+    }
+    void release() {
+        std::lock_guard<std::mutex> lock(mutex);
+        released = true;
+        changed.notify_all();
+    }
+};
+
 // Test access stays outside the public embedding ABI.
 struct PreparedForwardingTestAccess {
     static void test_barrier_generations(bool ping_pong2 = false) {
@@ -139,12 +179,19 @@ struct PreparedForwardingTestAccess {
             proxy.router_computation_scheduler_state().published_rows != 0)
             throw std::runtime_error("early readiness did not reset across iterations");
         bool rejected = false;
-        try { proxy.publish_local_router_input_ready(iteration + 1); }
+        try { proxy.request_local_router_input_ready(iteration + 1); }
         catch (const std::runtime_error&) { rejected = true; }
         if (!rejected) throw std::runtime_error("early readiness accepted an unprepared iteration");
+        for (const auto invalid : {iteration, std::numeric_limits<uint64_t>::max()}) {
+            rejected = false;
+            try { proxy.wait_for_local_router_input_ready(invalid); }
+            catch (const std::runtime_error&) { rejected = true; }
+            if (!rejected) throw std::runtime_error("early readiness accepted an unmatched or overflowing wait");
+        }
 
         const auto queued = proxy.nvlink_forward_notifications_enqueued_.load();
-        proxy.publish_local_router_input_ready(iteration);
+        proxy.request_local_router_input_ready(iteration);
+        proxy.wait_for_local_router_input_ready(iteration);
         const auto& publication = proxy.cuda_buffers_.router_notification_publication_buffers();
         const auto state = proxy.router_computation_scheduler_state();
         const auto& inputs = proxy.cuda_buffers_.nvlink_receive_buffers();
@@ -191,7 +238,8 @@ struct PreparedForwardingTestAccess {
         // Reentry must not duplicate descriptors or mutate the selected ranges.
         const auto heads = proxy.router_expert_token_head_state_for_source(
             config.node_rank, config.local_gpu_index);
-        proxy.publish_local_router_input_ready(iteration);
+        proxy.request_local_router_input_ready(iteration);
+        proxy.wait_for_local_router_input_ready(iteration);
         const auto repeated = proxy.router_expert_token_head_state_for_source(
             config.node_rank, config.local_gpu_index);
         if (proxy.router_computation_scheduler_state().published_rows != state.published_rows ||
@@ -264,11 +312,16 @@ struct PreparedForwardingTestAccess {
     static void test_early_local_ready() {
         // Legacy, prepared with ordinary local forwarding, unified epilogue,
         // and atomic/query paths. Dense, partial, no-own-route, and empty inputs
-        // run with and without weights; final four cases retain the default.
-        for (int scenario = 0; scenario < 36; ++scenario) {
-            const bool enabled = scenario < 32;
-            const int policy = scenario % 4;
-            const int shape = enabled ? (scenario / 4) % 4 : 0;
+        // run with and without weights; four cases retain the default, followed
+        // by legacy/atomic failure and pending-request shutdown cases.
+        for (int scenario = 0; scenario < 40; ++scenario) {
+            const bool inject_failure = scenario == 36 || scenario == 37;
+            const bool shutdown_pending = scenario >= 38;
+            const bool lifecycle = scenario >= 36;
+            const bool enabled = scenario < 32 || lifecycle;
+            const int policy = lifecycle ? (scenario % 2 ? 3 : 0) : scenario % 4;
+            const int shape = lifecycle ? 1 : enabled ? (scenario / 4) % 4 : 0;
+            const bool check_overlap = enabled && !lifecycle && shape == 0;
             ProxyConfig config;
             config.mock_mode = true;
             config.num_nodes = shape == 2 ? 1 : 2;
@@ -276,7 +329,7 @@ struct PreparedForwardingTestAccess {
             config.num_tokens = shape == 0 ? 1025 : shape == 1 ? 17 : 1;
             config.token_dimension = 8;
             config.tokens_per_chunk = 32;
-            config.num_iterations = 3;
+            config.num_iterations = lifecycle ? 1 : 3;
             config.completion_timeout_ms = 10000;
             config.fill_test_data = config.validate_data = false;
             config.router_routing_enabled = true;
@@ -334,12 +387,17 @@ struct PreparedForwardingTestAccess {
             }
             std::cerr << "early local readiness scenario=" << scenario << " policy=" << policy
                       << " shape=" << shape << " enabled=" << enabled << '\n';
+            std::array<EarlyReadyReceiverGate, 2> gates;
+            if (check_overlap) gates[0].pause_call = 2; // Production-only iteration one.
+            if (inject_failure) for (auto& gate : gates) gate.fail_call = 1;
+            if (shutdown_pending) for (auto& gate : gates) gate.pause_call = 1;
             std::array<std::unique_ptr<Proxy>, 2> proxies;
             for (int gpu = 0; gpu < 2; ++gpu) {
                 auto cfg = config;
                 cfg.local_gpu_index = cfg.cuda_device_id = gpu;
                 validate_config(cfg);
                 proxies[gpu] = std::make_unique<Proxy>(cfg);
+                proxies[gpu]->local_router_input_early_ready_test_hook_ = [&gates, gpu] { gates[gpu](); };
             }
             std::array<std::exception_ptr, 2> errors;
             std::atomic<unsigned> phase{0};
@@ -357,6 +415,23 @@ struct PreparedForwardingTestAccess {
                 try {
                     auto& proxy = *proxies[gpu];
                     proxy.initialize();
+                    if (lifecycle) {
+                        proxy.prepare_iteration_step(0);
+                        proxy.request_local_router_input_ready(0);
+                        if (inject_failure) {
+                            bool observed_failure = false;
+                            try { proxy.wait_for_local_router_input_ready(0); }
+                            catch (const std::runtime_error& error) {
+                                if (std::string(error.what()).find("injected early-ready receiver failure") == std::string::npos)
+                                    throw;
+                                observed_failure = true;
+                            }
+                            if (!observed_failure || proxy.local_router_input_early_ready_completed_.load() != 0)
+                                throw std::runtime_error("receiver failure acknowledged unfinished local input");
+                            gates[gpu].verify(proxy.nvlink_forward_notification_thread_.get_id(), 1);
+                        }
+                        return;
+                    }
                     for (uint64_t iteration = 0; iteration < config.num_iterations; ++iteration) {
                         fill_source(proxy, iteration);
                         proxy.prepare_iteration_step(iteration);
@@ -372,6 +447,9 @@ struct PreparedForwardingTestAccess {
                         // before inspecting receiver state or reusing inputs.
                         if (!config.nvlink_forward_preparation_enabled)
                             proxy.drain_forwarding_iteration_notifications(iteration);
+                        if (enabled && proxy.local_router_input_early_ready_completed_.load(std::memory_order_acquire) != iteration + 1)
+                            throw std::runtime_error("iteration retired before receiver acknowledged local input");
+                        gates[gpu].verify(proxy.nvlink_forward_notification_thread_.get_id(), enabled ? iteration + 1 : 0);
                         barrier(static_cast<unsigned>(iteration * 6 + 4));
                         verify(proxy, *proxies[1 - gpu], iteration);
                         verify_early_completion(proxy, iteration);
@@ -381,13 +459,80 @@ struct PreparedForwardingTestAccess {
                 } catch (...) { errors[gpu] = std::current_exception(); failed.store(true); }
             };
             std::thread first(run, 0), second(run, 1);
+            std::exception_ptr observer_error;
+            if (check_overlap) {
+                try {
+                    gates[0].wait_paused();
+                    auto& proxy = *proxies[0];
+                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    while (true) {
+                        bool copied = false;
+                        {
+                            std::lock_guard<std::mutex> lock(proxy.forwarding_mutex_);
+                            copied = proxy.forwarding_iteration_stats_.size() > 1 &&
+                                proxy.forwarding_iteration_stats_[1].batch_count > 0;
+                        }
+                        if (copied) break;
+                        if (failed.load() || std::chrono::steady_clock::now() >= deadline)
+                            throw std::runtime_error("forwarding waited for the receiver's early publication");
+                        std::this_thread::yield();
+                    }
+                    if (proxy.router_expert_token_head_state_for_source(0, 0).received_token_frontier != 0 ||
+                        proxy.local_router_input_early_ready_completed_.load(std::memory_order_acquire) != 1)
+                        throw std::runtime_error("held receiver published or acknowledged local input");
+                } catch (...) { observer_error = std::current_exception(); failed.store(true); }
+                gates[0].release();
+            }
             first.join(); second.join();
+            if (shutdown_pending) {
+                try {
+                    for (int gpu = 0; gpu < 2; ++gpu) {
+                        gates[gpu].wait_paused();
+                        gates[gpu].verify(proxies[gpu]->nvlink_forward_notification_thread_.get_id(), 1);
+                    }
+                } catch (...) { observer_error = std::current_exception(); }
+            }
+            std::atomic<unsigned> stopped{0};
             auto stop = [&](int gpu) {
                 try { proxies[gpu]->shutdown(); }
+                catch (const std::runtime_error& error) {
+                    if (!inject_failure || std::string(error.what()).find("injected early-ready receiver failure") == std::string::npos) {
+                        if (!errors[gpu]) errors[gpu] = std::current_exception();
+                    }
+                }
                 catch (...) { if (!errors[gpu]) errors[gpu] = std::current_exception(); }
+                stopped.fetch_add(1);
             };
             std::thread stop0(stop, 0), stop1(stop, 1);
+            if (shutdown_pending) {
+                try {
+                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    while (!proxies[0]->nvlink_forward_notification_receiver_stop_.load() ||
+                           !proxies[1]->nvlink_forward_notification_receiver_stop_.load()) {
+                        if (std::chrono::steady_clock::now() >= deadline)
+                            throw std::runtime_error("shutdown did not reach the pending receiver");
+                        std::this_thread::yield();
+                    }
+                    if (stopped.load() != 0)
+                        throw std::runtime_error("shutdown returned while the receiver callback was active");
+                } catch (...) { if (!observer_error) observer_error = std::current_exception(); }
+            }
+            for (auto& gate : gates) gate.release();
             stop0.join(); stop1.join();
+            // An initialization failure can prevent the observer from ever
+            // seeing its gate. Retain that cause alongside the gate timeout.
+            if (observer_error) {
+                for (int gpu = 0; gpu < 2; ++gpu) {
+                    if (!errors[gpu]) continue;
+                    try { std::rethrow_exception(errors[gpu]); }
+                    catch (const std::exception& error) {
+                        std::cerr << "early local readiness scenario=" << scenario
+                                  << " gpu=" << gpu << " error=" << error.what() << '\n';
+                    }
+                    catch (...) { std::cerr << "early local readiness nonstandard worker exception\n"; }
+                }
+            }
+            if (observer_error) std::rethrow_exception(observer_error);
             for (auto error : errors) if (error) std::rethrow_exception(error);
         }
     }

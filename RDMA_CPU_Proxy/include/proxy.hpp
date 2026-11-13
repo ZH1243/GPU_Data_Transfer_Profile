@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -311,7 +312,9 @@ private:
         std::size_t batch_start_token,
         std::size_t batch_tokens);
     void process_local_router_forwarding_iteration(uint64_t iteration);
-    void publish_local_router_input_ready(uint64_t iteration);
+    void request_local_router_input_ready(uint64_t iteration);
+    bool consume_local_router_input_ready();
+    void wait_for_local_router_input_ready(uint64_t iteration) const;
     void forwarding_ready_loop();
     void record_out_of_order_forwarding_arrival(std::size_t peer_index, std::size_t chunk_index);
     void wait_for_forwarding_iteration(uint64_t iteration);
@@ -396,10 +399,14 @@ private:
     std::mutex forwarding_stream_mutex_;
     std::atomic<uint64_t> local_router_forwarding_completed_iterations_{0};
     bool local_router_input_staged_{false};
-    // Owned by the iteration coordinator; forwarding threads only consult the
-    // immutable configuration when suppressing their redundant self entries.
-    bool local_router_input_early_ready_published_{false};
-    uint64_t local_router_input_early_ready_iteration_{0};
+    // Separate coordinator -> notification-receiver mailbox: epoch=iteration+1,
+    // zero means no request. Payload is immutable from release-request through
+    // acquire-completion; the shared notification queues remain single-producer.
+    std::atomic<uint64_t> local_router_input_early_ready_requested_{0};
+    std::atomic<uint64_t> local_router_input_early_ready_completed_{0};
+    std::size_t local_router_input_early_ready_tokens_{0};
+    // Installed only by the friend fixture before the receiver can consume work.
+    std::function<void()> local_router_input_early_ready_test_hook_;
     std::string forwarding_error_;
     std::atomic<uint64_t> forwarding_batch_available_calls_{0};
     std::atomic<uint64_t> forwarding_batch_available_total_ns_{0};

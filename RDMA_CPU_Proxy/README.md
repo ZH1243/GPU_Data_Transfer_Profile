@@ -317,21 +317,33 @@ existing torchrun command. This native CLI/JSON option defaults to `false` and
 passes through the Python worker unchanged. It requires local input staging and
 forward-completion notifications, and rejects the diagnostic flush-only mode.
 
-After the iteration-start barrier, before activating its forwarding pipeline,
-the proxy marks `[0, local_x3.size())` of its own staged source ready. Staging
-has already completed and the input is reused across iterations. Existing
-expert lists select only routes belonging to this GPU's experts; the range is
-in staged x3 coordinates, not original token IDs or compact peer coordinates.
+After the iteration-start barrier, the iteration coordinator posts a local
+readiness request to the existing native notification receiver and releases
+forwarding without waiting for that request to finish. The receiver marks
+`[0, local_x3.size())` of its own staged source ready, builds the gather entries,
+and submits their H2D copies and ready-prefix publication. These operations can
+overlap the first NVLink forwarding batch on its separate CUDA stream. There is
+no GPU dependency between these two paths: CPU scheduling and GPU resource
+availability determine their actual start times, so exact simultaneity is not
+guaranteed. Staging has already completed and the input is reused across
+iterations. Existing expert lists select only routes belonging to this GPU's
+experts; the range is in staged x3 coordinates, not original token IDs or compact
+peer coordinates.
 Normal Head/Tail scheduling builds and publishes the gather rows and ready
-prefix, with the same per-entry or coalesced publication policy. Other sources
-may already have arrived and are handled by the same scheduler lock.
+prefix, with the same per-entry or coalesced publication policy. The same
+receiver handles later incoming notifications. Other sources may already have
+arrived and are handled by the same scheduler lock.
 
 Later local forwarding batches suppress only their redundant own-source
 notifications. Copies to other GPUs, their notifications, local batch barriers,
 phase retirement, and remote same-index RDMA visibility/completion remain
 active. Both the legacy and prepared local-forwarding paths support the option.
-The early direct publication does not add an entry to the forwarding notification
-log. With `--nvlink_forward_prepared_nvtx_enabled=true`, its CPU work is labeled
+The local request uses a separate mailbox, preserving the single-producer
+contract of each forwarding notification queue, and does not add an entry to
+the forwarding notification log. Iteration retirement waits for the receiver
+to finish submitting early publication before allowing another iteration's
+reset; CUDA stream ordering still governs device completion. With
+`--nvlink_forward_prepared_nvtx_enabled=true`, the receiver's CPU work is labeled
 `router/local_input_early_ready` in Nsight Systems.
 
 Early readiness does not force an undersized cluster: each expert still needs
@@ -343,12 +355,16 @@ scatter policies support the resulting row order, including FP32 route weights.
 In threaded mode, the scatter worker can start packing this early prefix while
 forwarding continues; its single final metadata upload keeps the existing gate.
 
-The enabled iteration timer includes early publication work. The native up-GEMM
-timer still begins at its first gather-table submission; publication is not
-moved into pre-iteration setup. Earlier GEMM activity can overlap forwarding but
-can also compete for GPU resources, and building the local prefix adds CPU work
-before forwarding activation. Compare total warmed iteration latency as well
-as the first gather publication and first useful GEMM activity.
+The enabled iteration timer starts before posting the local request. The native
+up-GEMM timer still begins at its first gather-table submission; publication is
+not moved into pre-iteration setup. Earlier GEMM activity can overlap forwarding but
+can also compete for GPU resources. Building the local prefix now occupies the
+notification receiver while forwarding proceeds independently. Compare total
+warmed iteration latency as well as the first gather publication and first
+useful GEMM activity. In an Nsight Systems trace, compare the receiver's
+`router/local_input_early_ready` range and its CUDA copy submissions with the
+forwarding thread's first `nvlink_prepared/submit_copies` range and the resulting
+GPU copy activity. A local batch barrier may still delay the forwarding stream.
 
 Rebuild and run the focused native checks on the NVIDIA host using the existing
 CUDA-compatible build directory:
@@ -362,9 +378,12 @@ ctest --test-dir "$RDMA_PROXY_BUILD_DIR" \
 ```
 
 `test_early_local_ready` is a CPU/mock integration test, including when built on
-a CUDA host. Actual GPU scheduling and overlap require the following workload
-checks. Keep all geometry, NIC maps, residency and bulk epilogue settings from
-your working single-node command. First append:
+a CUDA host. It checks receiver thread ownership, first-batch forwarding while
+the receiver is deliberately paused before publication, repeated iterations,
+partial/empty routes, and receiver failure/shutdown handling. Actual GPU
+scheduling and overlap require the following workload checks. Keep all geometry,
+NIC maps, residency and bulk epilogue settings from your working single-node
+command. First append:
 
 ```bash
 --router_local_input_early_ready_enabled=true \
