@@ -121,6 +121,148 @@ class CommunicationOnlyCliTests(unittest.TestCase):
         self.assertIn("unsupported --down-* option", result.stderr)
 
 
+class SingleNodeLauncherCliTests(unittest.TestCase):
+    """Exercise the shell-to-worker-to-native argument path without CUDA or RDMA."""
+
+    def record_launch(self, *options, environment=None):
+        site_variables = {
+            "TORCHRUN_BIN", "RDMA_PROXY_GEMM_ARCH", "RDMA_PROXY_BUILD_DIR", "RDMA_PROXY_CONFIG",
+            "CUDA_DEVICE_MAP", "RDMA_DEVICE_MAP", "NPROC_PER_NODE", "RDMA_GID_INDEX", "RDMA_PORT",
+            "MASTER_ADDR", "MASTER_PORT", "PEER_HOST",
+        }
+        env = {key: value for key, value in os.environ.items() if key not in site_variables}
+        env.update(environment or {})
+        with tempfile.TemporaryDirectory() as temp:
+            recorder = Path(temp) / "torchrun-recorder"
+            recorder.write_text(
+                f"#!{sys.executable}\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n"
+            )
+            recorder.chmod(0o700)
+            result = subprocess.run(
+                ["bash", str(WORKER.parent / "run_single_node_torchrun.sh"), *options],
+                env={**env, "TORCHRUN_BIN": str(recorder)}, capture_output=True, text=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tokens = json.loads(result.stdout)
+        worker_index = tokens.index(str(WORKER))
+        return tokens[:worker_index], tokens[worker_index + 1:]
+
+    def native_arguments(self, options, *, rank, count):
+        result = subprocess.run(
+            [sys.executable, str(WORKER), *options, "--dry-run"],
+            env={**os.environ, "LOCAL_RANK": str(rank), "LOCAL_WORLD_SIZE": str(count),
+                 "RANK": str(rank), "WORLD_SIZE": str(count), "GROUP_RANK": "0"},
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        native = shlex.split(result.stdout.splitlines()[-1])
+        values = dict(arg[2:].split("=", 1) for arg in native
+                      if arg.startswith("--") and "=" in arg)
+        self.assertEqual(values["num_nodes"], "1")
+        self.assertEqual(values["node_rank"], "0")
+        self.assertEqual(values["num_gpus_per_node"], str(count))
+        self.assertEqual(values["local_gpu_index"], str(rank))
+        self.assertNotIn("peer_host", values)
+        return values
+
+    def test_default_hopper_build_and_local_rendezvous(self):
+        legacy_nics = ["mlx5_bond_1", "mlx5_bond_4", "mlx5_bond_3", "mlx5_bond_2",
+                       "mlx5_bond_7", "mlx5_bond_6", "mlx5_bond_8", "mlx5_bond_5"]
+        for architecture in (None, "hopper"):
+            with self.subTest(architecture=architecture):
+                environment = {} if architecture is None else {"RDMA_PROXY_GEMM_ARCH": architecture}
+                launcher, options = self.record_launch(environment=environment)
+                self.assertIn("--nnodes=1", launcher)
+                self.assertIn("--nproc_per_node=8", launcher)
+                self.assertIn("--master_addr=127.0.0.1", launcher)
+                self.assertIn("--master_port=29500", launcher)
+                self.assertIn(f"--gemm-arch={architecture or 'auto'}", options)
+                self.assertIn(
+                    f"--library={WORKER.parent.parent}/build-hopper/librdma_cpu_proxy.so", options
+                )
+                self.assertEqual(options[options.index("--config") + 1],
+                                 str(WORKER.parent.parent / "config/single_node_config.json"))
+                self.assertNotIn("--down-pingpong", options)
+                for rank in (0, 7):
+                    native = self.native_arguments(options, rank=rank, count=8)
+                    self.assertEqual(native["cuda_device_id"], str(rank))
+                    self.assertEqual(native["rdma_device_name"], legacy_nics[rank])
+                    self.assertEqual(native["rdma_device_name2"], "")
+
+    def test_blackwell_environment_dual_nics_reach_every_native_rank(self):
+        rdma_map = (
+            "mlx5_000+mlx5_001,mlx5_002+mlx5_003,mlx5_004+mlx5_005,mlx5_006+mlx5_007,"
+            "mlx5_008+mlx5_009,mlx5_010+mlx5_011,mlx5_012+mlx5_013,mlx5_014+mlx5_015"
+        )
+        launcher, options = self.record_launch(
+            "--num_qps_per_peer=20", environment={
+                "RDMA_PROXY_GEMM_ARCH": "blackwell", "CUDA_DEVICE_MAP": "0,1,2,3,4,5,6,7",
+                "RDMA_DEVICE_MAP": rdma_map, "RDMA_GID_INDEX": "3", "RDMA_PORT": "2",
+            },
+        )
+        self.assertIn("--nproc_per_node=8", launcher)
+        self.assertIn("--master_addr=127.0.0.1", launcher)
+        self.assertIn("--gemm-arch=blackwell", options)
+        self.assertIn(f"--rdma-device-map={rdma_map}", options)
+        self.assertIn(
+            f"--library={WORKER.parent.parent}/build-blackwell/librdma_cpu_proxy.so", options
+        )
+        for rank, pair in enumerate(rdma_map.split(",")):
+            with self.subTest(rank=rank):
+                native = self.native_arguments(options, rank=rank, count=8)
+                self.assertEqual(native["cuda_device_id"], str(rank))
+                self.assertEqual(native["rdma_device_name"], pair.split("+")[0])
+                self.assertEqual(native["rdma_device_name2"], pair.split("+")[1])
+                self.assertEqual(native["num_qps_per_peer"], "20")
+                self.assertEqual(native["gid_index"], "3")
+                self.assertEqual(native["rdma_port"], "2")
+                self.assertEqual(native["expert_gemm_device_capacity"], "10")
+
+    def test_custom_maps_infer_process_count_without_peer(self):
+        launcher, options = self.record_launch(environment={
+            "CUDA_DEVICE_MAP": "5,2", "RDMA_DEVICE_MAP": "custom5,custom2",
+            "MASTER_ADDR": "127.0.0.8", "MASTER_PORT": "29517",
+            # A leftover two-node setting must not become a single-node peer.
+            "PEER_HOST": "unused-peer.invalid",
+        })
+        self.assertIn("--nproc_per_node=2", launcher)
+        self.assertIn("--master_addr=127.0.0.8", launcher)
+        self.assertIn("--master_port=29517", launcher)
+        for rank, device in enumerate((5, 2)):
+            native = self.native_arguments(options, rank=rank, count=2)
+            self.assertEqual(native["cuda_device_id"], str(device))
+            self.assertEqual(native["rdma_device_name"], f"custom{device}")
+            self.assertEqual(native["rdma_device_name2"], "")
+
+    def test_build_config_nproc_and_trailing_worker_overrides(self):
+        environment = {
+            "RDMA_PROXY_GEMM_ARCH": "blackwell", "RDMA_PROXY_BUILD_DIR": "/custom build",
+            "RDMA_PROXY_CONFIG": "/custom config/single.json", "NPROC_PER_NODE": "2",
+            "CUDA_DEVICE_MAP": "0,1,2,3", "RDMA_DEVICE_MAP": "old0,old1,old2,old3",
+            "RDMA_GID_INDEX": "3", "RDMA_PORT": "2",
+        }
+        _, defaults = self.record_launch(environment=environment)
+        self.assertIn("--library=/custom build/librdma_cpu_proxy.so", defaults)
+        self.assertEqual(defaults[defaults.index("--config") + 1], "/custom config/single.json")
+        overrides = (
+            "--library=/explicit/lib.so", "--config", "/explicit/single.json",
+            "--gemm-arch=hopper", "--cuda-device-map=6,7", "--rdma-device-map=new6,new7",
+            "--gid_index=-1", "--rdma_port=1", "--num_qps_per_peer=12",
+        )
+        launcher, options = self.record_launch(*overrides, environment=environment)
+        self.assertIn("--nproc_per_node=2", launcher)
+        self.assertEqual(options[-len(overrides):], list(overrides))
+        for rank in (0, 1):
+            native = self.native_arguments(options, rank=rank, count=2)
+            self.assertEqual(native["cuda_device_id"], str(rank + 6))
+            self.assertEqual(native["rdma_device_name"], f"new{rank + 6}")
+            self.assertEqual(native["rdma_device_name2"], "")
+            self.assertEqual(native["gid_index"], "-1")
+            self.assertEqual(native["rdma_port"], "1")
+            self.assertEqual(native["num_qps_per_peer"], "12")
+            self.assertEqual(native["expert_gemm_device_capacity"], "9")
+
+
 class ActivationCliTests(unittest.TestCase):
     def test_architecture_and_pingpong_selection(self):
         for capability in ((9, 0), (10, 0), (10, 3)):

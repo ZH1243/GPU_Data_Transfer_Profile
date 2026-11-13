@@ -3,28 +3,42 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 project_dir="$(cd -- "${script_dir}/.." && pwd)"
-build_dir="${RDMA_PROXY_BUILD_DIR:-${project_dir}/build-hopper}"
+gemm_arch="${RDMA_PROXY_GEMM_ARCH:-auto}"
+case "${gemm_arch}" in
+    auto|hopper) default_build=build-hopper ;;
+    blackwell) default_build=build-blackwell ;;
+    *) echo "RDMA_PROXY_GEMM_ARCH must be auto, hopper, or blackwell" >&2; exit 2 ;;
+esac
+build_dir="${RDMA_PROXY_BUILD_DIR:-${project_dir}/${default_build}}"
 torchrun_bin="${TORCHRUN_BIN:-torchrun}"
 master_addr="${MASTER_ADDR:-127.0.0.1}"
 master_port="${MASTER_PORT:-29500}"
+cuda_device_map="${CUDA_DEVICE_MAP:-0,1,2,3,4,5,6,7}"
+rdma_device_map="${RDMA_DEVICE_MAP:-mlx5_bond_1,mlx5_bond_4,mlx5_bond_3,mlx5_bond_2,mlx5_bond_7,mlx5_bond_6,mlx5_bond_8,mlx5_bond_5}"
+IFS=',' read -r -a cuda_devices <<< "${cuda_device_map}"
+nproc_per_node="${NPROC_PER_NODE:-${#cuda_devices[@]}}"
+# Unlike the two-node launchers, there is no remote peer to configure.
+site_args=("--gemm-arch=${gemm_arch}")
+if [[ -n "${RDMA_GID_INDEX:-}" ]]; then site_args+=("--gid_index=${RDMA_GID_INDEX}"); fi
+if [[ -n "${RDMA_PORT:-}" ]]; then site_args+=("--rdma_port=${RDMA_PORT}"); fi
 
-# One node, eight GPUs: local staging and NVLink forwarding only.
-# NIC initialization is still required by the library; this is node 0's NIC map.
+# One node: local staging and NVLink forwarding only (eight GPUs by default).
+# NIC initialization is still required; RDMA_DEVICE_MAP selects the local NICs.
 # Extra arguments override the defaults below.
 
 "${torchrun_bin}" \
     --nnodes=1 \
-    --nproc_per_node=8 \
+    --nproc_per_node="${nproc_per_node}" \
     --node_rank=0 \
     --master_addr="${master_addr}" \
     --master_port="${master_port}" \
     --max_restarts=0 \
     "${script_dir}/rdma_proxy_worker.py" \
     --library="${build_dir}/librdma_cpu_proxy.so" \
-    --cuda-device-map=0,1,2,3,4,5,6,7 \
-    --rdma-device-map=mlx5_bond_1,mlx5_bond_4,mlx5_bond_3,mlx5_bond_2,mlx5_bond_7,mlx5_bond_6,mlx5_bond_8,mlx5_bond_5 \
+    --cuda-device-map="${cuda_device_map}" \
+    --rdma-device-map="${rdma_device_map}" \
     --listen-port-base=18515 \
-    --config "${project_dir}/config/single_node_config.json" \
+    --config "${RDMA_PROXY_CONFIG:-${project_dir}/config/single_node_config.json}" \
     --node_rank=0 \
     --num_nodes=1 \
     --token_dimension=4096 \
@@ -93,4 +107,5 @@ master_port="${MASTER_PORT:-29500}"
     --inter-node-combine \
     --inter-node-combine-ctas=40 \
     --check-inter-node-combine \
+    "${site_args[@]}" \
     "$@"

@@ -90,6 +90,32 @@ The single-node script accepts the same options, but performs no inter-node
 traffic. One-device map entries retain the original behavior. The map controls
 both native device names, overriding any device names in JSON.
 
+The single-node launcher also honors the exported `CUDA_DEVICE_MAP` and
+`RDMA_DEVICE_MAP`; it infers the process count from the CUDA map unless
+`NPROC_PER_NODE` is set. `RDMA_PROXY_GEMM_ARCH=blackwell` selects `build-blackwell`
+and the Blackwell worker path; `auto` (the default) and `hopper` retain the
+`build-hopper` library default. `RDMA_PROXY_BUILD_DIR` overrides that directory.
+It accepts `RDMA_GID_INDEX`, `RDMA_PORT`, and `RDMA_PROXY_CONFIG` as well. Use a
+single-node JSON with no peers when overriding the config. Rendezvous defaults
+to `127.0.0.1`; no `PEER_HOST` is required or forwarded. NIC initialization is
+still required even though the run uses only local staging and NVLink.
+
+For example, on the eight-GPU B300 node with two NICs per GPU:
+
+```bash
+export RDMA_PROXY_GEMM_ARCH=blackwell
+export CUDA_DEVICE_MAP=0,1,2,3,4,5,6,7
+export RDMA_DEVICE_MAP=mlx5_000+mlx5_001,mlx5_002+mlx5_003,mlx5_004+mlx5_005,mlx5_006+mlx5_007,mlx5_008+mlx5_009,mlx5_010+mlx5_011,mlx5_012+mlx5_013,mlx5_014+mlx5_015
+# Inspect launcher arguments without launching workers or loading CUDA.
+TORCHRUN_BIN=echo bash ./scripts/run_single_node_torchrun.sh
+```
+
+Explicit trailing worker options take precedence over these defaults. With an
+older single-node launcher, append `--rdma-device-map="$RDMA_DEVICE_MAP"` to
+override its hardcoded NIC map. To check weighted projections, also append
+`--weighted-contributions --check-projections` to the single-node workload
+command; `--check-projections` alone checks the default unweighted arithmetic.
+
 Native CLI/JSON options are `rdma_device_name` and `rdma_device_name2` (empty
 second name disables the mode). Device B inherits `rdma_port` and `gid_index`
 unless `rdma_port2` (default 0 = inherit) or `gid_index2` (default -2 = inherit)
