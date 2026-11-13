@@ -70,6 +70,12 @@ int main(int argc, char** argv) {
         std::cerr << "per-iteration proxy creation failed: " << rdma_proxy_last_error() << '\n';
         return 1;
     }
+    if (rdma_proxy_configure_cpu_scatter_threaded(nullptr, 16) == 0 ||
+        rdma_proxy_configure_cpu_scatter_threaded(handle, 16) == 0) {
+        std::cerr << "threaded scatter accepted a null or uninitialized proxy\n";
+        rdma_proxy_destroy(handle);
+        return 1;
+    }
     ExternalAllocations external_allocations;
     if (rdma_proxy_set_device_buffer_allocator(
             handle, allocate_external_buffer, &external_allocations) != 0) {
@@ -80,6 +86,11 @@ int main(int argc, char** argv) {
     }
     if (rdma_proxy_initialize(handle) != 0) {
         std::cerr << "per-iteration proxy initialization failed: " << rdma_proxy_last_error() << '\n';
+        rdma_proxy_destroy(handle);
+        return 1;
+    }
+    if (rdma_proxy_configure_cpu_scatter_threaded(handle, 16) == 0) {
+        std::cerr << "threaded scatter accepted missing scatter configuration\n";
         rdma_proxy_destroy(handle);
         return 1;
     }

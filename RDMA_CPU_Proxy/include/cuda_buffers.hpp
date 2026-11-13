@@ -8,14 +8,18 @@
 #include <cuda_runtime_api.h>
 #endif
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace rdma_proxy {
@@ -88,11 +92,11 @@ struct RouterNotificationPublicationBuffers {
     // metadata rows, and successfully enqueued/copied metadata transfers.
     uint64_t table_flush_count{0};
     uint64_t ready_rows_publication_count{0};
-    uint64_t cpu_scatter_packed_rows{0};
+    std::atomic<uint64_t> cpu_scatter_packed_rows{0};
     // Ready-publication count observed when the last deferred packing began.
-    uint64_t cpu_scatter_pack_ready_publication_count{0};
-    uint64_t cpu_scatter_copy_count{0};
-    uint64_t cpu_scatter_copy_bytes{0};
+    std::atomic<uint64_t> cpu_scatter_pack_ready_publication_count{0};
+    std::atomic<uint64_t> cpu_scatter_copy_count{0};
+    std::atomic<uint64_t> cpu_scatter_copy_bytes{0};
 };
 
 struct PeerGpuBuffers {
@@ -222,6 +226,8 @@ public:
     void configure_cpu_scatter(const RdmaProxyCpuScatterConfig& config);
     void configure_cpu_route_weights(uintptr_t packed_weights, std::size_t routes);
     void configure_cpu_scatter_deferred(std::size_t bytes);
+    void configure_cpu_scatter_threaded(std::size_t bytes);
+    void stop_cpu_scatter_worker();
     void wait_cpu_scatter_ready(uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms);
     void update_expert_token_heads(
         int source_node_rank,
@@ -272,7 +278,14 @@ private:
         std::size_t table_bytes);
 
     ProxyConfig config_;
+    friend struct CpuScatterTestAccess;
+    void configure_cpu_scatter_slab_locked(std::size_t bytes);
+    std::pair<std::size_t, std::size_t> pack_cpu_scatter_batch(const int32_t* ranges);
     void prepare_cpu_scatter_batch(const int32_t* ranges);
+    void upload_cpu_scatter_slab();
+    void commit_cpu_scatter_prefix_locked();
+    void cpu_scatter_worker_loop() noexcept;
+    void wait_threaded_cpu_scatter_ready(uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms);
     void publish_deferred_cpu_scatter_locked();
     CpuPinnedBuffer cpu_scatter_staging_;
     CpuPinnedBuffer cpu_route_weights_staging_;
@@ -283,6 +296,27 @@ private:
     bool cpu_scatter_submitted_{false};
     void* cpu_scatter_ready_event_{nullptr};
     std::condition_variable cpu_scatter_ready_cv_;
+    // Notification/reset always acquire scheduler then worker state. The worker
+    // never acquires scheduler state and releases this lock for ALL packing.
+    bool cpu_scatter_threaded_{false};
+    std::thread cpu_scatter_worker_thread_;
+    std::mutex cpu_scatter_worker_mutex_;
+    std::condition_variable cpu_scatter_worker_cv_;
+    // Final consumers sleep separately from per-prefix work/progress waiters.
+    std::condition_variable cpu_scatter_worker_ready_cv_;
+    bool cpu_scatter_worker_busy_{false};
+    bool cpu_scatter_worker_stop_{false};
+    bool cpu_scatter_worker_epoch_valid_{false};
+    bool cpu_scatter_worker_cancelled_{false};
+    bool cpu_scatter_worker_submitted_{false};
+    uint64_t cpu_scatter_worker_epoch_{0};
+    std::size_t cpu_scatter_worker_committed_rows_{0};
+    std::size_t cpu_scatter_worker_consumed_rows_{0};
+    std::size_t cpu_scatter_worker_staged_rows_{0};
+    uint64_t cpu_scatter_worker_ready_publication_count_{0};
+    std::exception_ptr cpu_scatter_worker_error_;
+    // Only the friend test fixture installs this, before any epoch is active.
+    std::function<void()> cpu_scatter_pack_test_hook_;
     uintptr_t cpu_route_weights_device_{0};
     uintptr_t cpu_scatter_device_{0};
     std::size_t cpu_scatter_columns_{0};

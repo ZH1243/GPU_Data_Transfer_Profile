@@ -633,6 +633,12 @@ void Proxy::configure_cpu_scatter_deferred(std::size_t bytes) {
     cuda_buffers_.configure_cpu_scatter_deferred(bytes);
 }
 
+void Proxy::configure_cpu_scatter_threaded(std::size_t bytes) {
+    if (!initialized_ || iteration_prepared_)
+        throw std::runtime_error("threaded CPU scatter requires initialized idle proxy");
+    cuda_buffers_.configure_cpu_scatter_threaded(bytes);
+}
+
 void Proxy::wait_cpu_scatter_ready(uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms) {
     if (!initialized_)
         throw std::runtime_error("CPU scatter wait requires initialized proxy");
@@ -782,7 +788,15 @@ void Proxy::finish_run() {
 
 void Proxy::shutdown() {
     down_ready_trace_.cancel();
-    stop_forwarding_thread();
+    try {
+        stop_forwarding_thread();
+    } catch (...) {
+        // Forwarding producers have already joined before fallible CUDA/IPC
+        // cleanup. Honor borrowed scatter-buffer lifetime even on that error.
+        try { cuda_buffers_.stop_cpu_scatter_worker(); } catch (...) {}
+        throw;
+    }
+    cuda_buffers_.stop_cpu_scatter_worker();
     return_group_progress_.shutdown_publication();
     down_ready_trace_.drain_returns();
     for (auto& peer : peers_) {

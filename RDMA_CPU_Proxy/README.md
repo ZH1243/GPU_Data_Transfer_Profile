@@ -1437,8 +1437,8 @@ and throughput require these remote runs; local Mac checks do not validate them.
 ### Optional CPU scatter preparation
 
 Append `--cpu-scatter-preparation` to both torchrun commands to move the
-per-iteration local-combine mapping work from the GPU to the proxy notification
-receiver. It requires `--local-gpu-combine` and its existing prerequisites.
+per-iteration local-combine mapping work from the GPU to the CPU. It requires
+`--local-gpu-combine` and its existing prerequisites.
 The option is disabled by default; without it the existing GPU mapping path is
 unchanged. Rebuild `rdma_cpu_proxy_shared` in the matching Hopper or Blackwell
 build and update the Python scripts before enabling it:
@@ -1473,6 +1473,25 @@ The CPU then queues exactly one metadata H2D on the same publication stream.
 This needs no gather-table D2H or extra descriptor allocation. Up GEMM can
 continue consuming the published table while the CPU packs the metadata.
 
+To overlap CPU packing with gather construction, select
+`--cpu-scatter-publication=threaded`. One persistent native thread per GPU worker
+consumes committed prefixes of the host gather table. The notification receiver
+exposes each prefix only after submitting the corresponding gather table and
+ready updates. The scatter thread packs complete M batches, using the first
+descriptor of each repeated N group, outside the gather scheduler lock. It can
+start packing while later notifications are still arriving. It queues the one
+metadata H2D only when **all metadata is packed and the final gather publication
+has been submitted**. Using the same CUDA stream orders that copy after all
+gather copies and ready updates; no host GPU synchronization is needed there.
+
+Threaded mode keeps descriptor publication lightweight, but it does not promise
+zero interference: the extra CPU thread shares CPU cores and memory bandwidth.
+On Linux it inherits the configuring thread's existing CPU-affinity mask; it
+does not reserve a dedicated core. An eight-GPU run adds eight scatter threads.
+The native thread is named `rdma-scatter` for profiling.
+Compare it with deferred mode on the target node to measure whether earlier
+packing reduces the up-to-down gap enough to offset CPU contention and wakeups.
+
 Scatter addresses, optional N-tile strides, and optional FP32 routing weights
 share one contiguous allocation. Row-major addresses use 8 bytes per route;
 N-tile-major addresses use 16. Weighted mode appends 4 bytes per route, with the
@@ -1484,11 +1503,14 @@ Down GEMM explicitly waits on the upload's CUDA event. Because a CUDA event wait
 cannot target a future event record, the launching host thread first waits only
 until the native producer has **submitted** this iteration's copy and event.
 It then enqueues the compute-stream event wait; it does not synchronize the GPU.
-This host wait releases the scheduler lock and is bounded by
+This host wait releases the relevant native mutex and is bounded by
 `--return-token-timeout` (seconds). Up GEMM can keep running throughout. See
 [CUDA event-wait semantics](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html).
 Staging is reused only after publication-stream synchronization at the next
 iteration reset, and a previous iteration's event cannot satisfy a new request.
+Threaded mode also cancels and drains active CPU packing before resetting the
+host table or staging. Shutdown stops and joins the thread before borrowed
+Python buffers can be released. Worker failures propagate to the metadata wait.
 
 To compare with the former incremental behavior, select
 `--cpu-scatter-publication=per-batch`. That mode issues one scatter H2D per M
@@ -1507,7 +1529,7 @@ the intermediate `scatter_mapping` and flat `scatter_table` are setup/warmup
 scratch in this mode. Output zeroing and down wave-counter resets remain.
 Warmup still exercises the GPU mapping path, so those kernels can appear before
 iteration zero. `mapping_ms` does not measure CPU packing that overlaps up GEMM;
-in deferred mode it includes any exposed metadata wait before down. Compare
+in deferred and threaded modes it includes any exposed metadata wait before down. Compare
 complete iteration latency as well as the up-to-down gap on both architectures.
 Exclude startup and numerical-reference work when counting publication copies.
 
@@ -1523,19 +1545,22 @@ QUACK_ROOT="$QUACK_ROOT" CUDA_VISIBLE_DEVICES=0 timeout 3600 \
 ```
 
 Then repeat the existing single-node workload command, retaining its geometry,
-with `--cpu-scatter-preparation --cpu-scatter-publication=deferred
+with `--cpu-scatter-preparation --cpu-scatter-publication=threaded
 --weighted-contributions --check-projections --num_iterations=12`. Repeat with
-`--cpu-scatter-publication=per-batch`. For timing/profiling, disable numerical
-checks after both pass (`--no-check-projections --no-check-return-token-results
+`--cpu-scatter-publication=deferred` and `--cpu-scatter-publication=per-batch`.
+For timing/profiling, disable numerical checks after they pass
+(`--no-check-projections --no-check-return-token-results
 --no-check-intra-node-combine --no-check-inter-node-combine`), and compare warmed
-iterations with identical options. The expected deferred metadata traffic is
+iterations with identical options. The expected deferred/threaded metadata traffic is
 one H2D per GPU per iteration, independent of the number of M batches or N groups;
 the gather/readiness H2Ds remain. Repeat the same checks on Hopper and both nodes
 when available. This change does not modify GEMM kernels or residency settings.
 
 `test_cpu_scatter` checks zero deferred CPU packing and zero metadata uploads
 before final gather publication, one packed copy of each route afterwards,
-and a single metadata H2D. It checks both policies against expert metadata with
+and a single metadata H2D. Threaded checks allow packing before final gather
+publication but prohibit an early metadata upload; they also exercise worker
+reset, error, and shutdown handling. It checks all three policies against expert metadata with
 changed source arrival order, duplicate routes, empty sources, repeated N
 groups, both output layouts, both gather flush policies, and iteration reuse
 in mock mode. `test_cpu_scatter_cuda` runs the same checks with actual GPU

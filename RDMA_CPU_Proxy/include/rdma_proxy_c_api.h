@@ -59,9 +59,18 @@ RDMA_PROXY_C_API int rdma_proxy_configure_cpu_route_weights(
  * The existing per-batch behavior remains default unless this API is called. */
 RDMA_PROXY_C_API int rdma_proxy_configure_cpu_scatter_deferred(
     RdmaProxyHandle* handle, uint64_t bytes);
+/* Alternative opt-in policy with the same contiguous slab layout. One persistent
+ * native CPU worker consumes committed host gather prefixes while notification
+ * publication continues. It packs each complete M-batch descriptor once, outside
+ * notification locks; one slab H2D/event follows final gather submission and all
+ * packing. Configure exactly one of deferred/threaded, before iteration zero.
+ * Native shutdown joins the worker and retires its DMA before returning. */
+RDMA_PROXY_C_API int rdma_proxy_configure_cpu_scatter_threaded(
+    RdmaProxyHandle* handle, uint64_t bytes);
 /* Host-wait, bounded by timeout_ms > 0, until this prepared iteration's event
  * RECORD is submitted, then enqueue cudaStreamWaitEvent on a nonzero caller
- * stream. This does not synchronize the GPU. Call before down GEMM submission;
+ * stream. Supports deferred and threaded modes; worker errors are reported.
+ * This does not synchronize the GPU. Call before down GEMM submission;
  * another host thread must continue driving notification/communication work.
  * Join compute consumers before preparing the next iteration or shutting down. */
 RDMA_PROXY_C_API int rdma_proxy_wait_cpu_scatter_ready(

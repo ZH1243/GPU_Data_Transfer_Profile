@@ -10,6 +10,9 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#if defined(__linux__) || defined(__APPLE__)
+#include <pthread.h>
+#endif
 
 #if RDMA_PROXY_HAVE_CUDA
 #include <cuda.h>
@@ -133,6 +136,10 @@ void CudaBuffers::set_external_device_buffer_allocator(
 }
 
 CudaBuffers::~CudaBuffers() {
+    try { stop_cpu_scatter_worker(); }
+    catch (const std::exception& error) {
+        RDMA_PROXY_LOG_WARN("CPU scatter worker cleanup failed: ", error.what());
+    }
 #if RDMA_PROXY_HAVE_CUDA
     if (!config_.mock_mode && router_notification_publication_stream_) {
         const auto set_device_status = cudaSetDevice(config_.cuda_device_id);
@@ -1007,6 +1014,25 @@ void CudaBuffers::configure_cpu_route_weights(uintptr_t packed_weights, std::siz
 
 void CudaBuffers::configure_cpu_scatter_deferred(std::size_t bytes) {
     std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    configure_cpu_scatter_slab_locked(bytes);
+}
+
+void CudaBuffers::configure_cpu_scatter_threaded(std::size_t bytes) {
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    const auto& publication = router_notification_publication_buffers_;
+    const auto groups = publication.n_groups_per_m_cluster;
+    if (!cpu_scatter_routes_ || !groups || !publication.table_rows ||
+        publication.table_rows % groups ||
+        publication.table_width != 2 + 2 * cpu_scatter_lookup_.size() ||
+        publication.table_row_bytes != publication.table_width * sizeof(int32_t) ||
+        !publication.host_table.ptr)
+        throw std::runtime_error("threaded CPU scatter requires nonempty complete gather geometry");
+    configure_cpu_scatter_slab_locked(bytes);
+    cpu_scatter_threaded_ = true;
+    cpu_scatter_worker_thread_ = std::thread(&CudaBuffers::cpu_scatter_worker_loop, this);
+}
+
+void CudaBuffers::configure_cpu_scatter_slab_locked(std::size_t bytes) {
     if (!cpu_scatter_device_ || cpu_scatter_deferred_staging_.ptr ||
         router_computation_scheduler_state_.iteration_initialized ||
         cpu_scatter_device_ % 16 ||
@@ -1040,6 +1066,10 @@ void CudaBuffers::configure_cpu_scatter_deferred(std::size_t bytes) {
 
 void CudaBuffers::wait_cpu_scatter_ready(
     uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms) {
+    if (cpu_scatter_threaded_) {
+        wait_threaded_cpu_scatter_ready(iteration, cuda_stream, timeout_ms);
+        return;
+    }
     std::unique_lock<std::mutex> lock(expert_token_heads_mutex_);
     const auto& scheduler = router_computation_scheduler_state_;
     const auto max_wait = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1077,6 +1107,10 @@ void CudaBuffers::wait_cpu_scatter_ready(
 }
 
 void CudaBuffers::publish_deferred_cpu_scatter_locked() {
+    if (cpu_scatter_threaded_) {
+        commit_cpu_scatter_prefix_locked();
+        return;
+    }
     if (!cpu_scatter_deferred_staging_.ptr || cpu_scatter_submitted_) return;
     const auto& scheduler = router_computation_scheduler_state_;
     auto& publication = router_notification_publication_buffers_;
@@ -1102,6 +1136,12 @@ void CudaBuffers::publish_deferred_cpu_scatter_locked() {
     }
     if (cpu_scatter_staged_rows_ != cpu_scatter_routes_)
         throw std::runtime_error("completed gather table has incomplete CPU scatter staging");
+    upload_cpu_scatter_slab();
+    cpu_scatter_submitted_ = true;
+    cpu_scatter_ready_cv_.notify_all();
+}
+
+void CudaBuffers::upload_cpu_scatter_slab() {
     if (config_.mock_mode) {
         std::memcpy(reinterpret_cast<void*>(cpu_scatter_device_), cpu_scatter_deferred_staging_.ptr,
                     cpu_scatter_deferred_staging_.bytes);
@@ -1115,13 +1155,12 @@ void CudaBuffers::publish_deferred_cpu_scatter_locked() {
                    "cudaEventRecord CPU scatter ready");
 #endif
     }
+    auto& publication = router_notification_publication_buffers_;
     ++publication.cpu_scatter_copy_count;
     publication.cpu_scatter_copy_bytes += cpu_scatter_deferred_staging_.bytes;
-    cpu_scatter_submitted_ = true;
-    cpu_scatter_ready_cv_.notify_all();
 }
 
-void CudaBuffers::prepare_cpu_scatter_batch(const int32_t* ranges) {
+std::pair<std::size_t, std::size_t> CudaBuffers::pack_cpu_scatter_batch(const int32_t* ranges) {
     std::size_t base = 0, count = 0;
     for (std::size_t j = 0; j < cpu_scatter_lookup_.size(); ++j) {
         const auto start = ranges[2*j], end = ranges[2*j+1];
@@ -1131,7 +1170,6 @@ void CudaBuffers::prepare_cpu_scatter_batch(const int32_t* ranges) {
         base += start;
         count += end - start;
     }
-    const auto row_bytes = cpu_scatter_columns_ * sizeof(int64_t);
     if (base > cpu_scatter_routes_ || count > cpu_scatter_routes_ - base)
         throw std::runtime_error("CPU scatter packed output out of bounds");
     void* staging = cpu_scatter_deferred_staging_.ptr ?
@@ -1157,6 +1195,11 @@ void CudaBuffers::prepare_cpu_scatter_batch(const int32_t* ranges) {
                                       weights.begin() + ranges[2*j+1], weight_cursor);
         }
     }
+    return {base, count};
+}
+
+void CudaBuffers::prepare_cpu_scatter_batch(const int32_t* ranges) {
+    const auto [base, count] = pack_cpu_scatter_batch(ranges);
     router_notification_publication_buffers_.cpu_scatter_packed_rows += count;
     if (cpu_scatter_deferred_staging_.ptr) {
         if (count > cpu_scatter_routes_ - cpu_scatter_staged_rows_)
@@ -1166,6 +1209,10 @@ void CudaBuffers::prepare_cpu_scatter_batch(const int32_t* ranges) {
     }
     // Every packed row is assigned once per iteration. Staging stays immutable
     // until the publication stream is synchronized at the next iteration reset.
+    const auto row_bytes = cpu_scatter_columns_ * sizeof(int64_t);
+    auto* destination = static_cast<int64_t*>(cpu_scatter_staging_.ptr) + base * cpu_scatter_columns_;
+    auto* weight_destination = cpu_route_weights_device_ ?
+        static_cast<float*>(cpu_route_weights_staging_.ptr) + base : nullptr;
     auto* device = reinterpret_cast<uint8_t*>(cpu_scatter_device_) + base * row_bytes;
     if (config_.mock_mode) {
         std::memcpy(device, destination, count * row_bytes);
@@ -1193,6 +1240,164 @@ void CudaBuffers::prepare_cpu_scatter_batch(const int32_t* ranges) {
 #endif
 }
 
+void CudaBuffers::commit_cpu_scatter_prefix_locked() {
+    // The caller has already enqueued this prefix's table and ready writes.
+    // The state mutex provides release/acquire visibility of immutable host rows.
+    std::lock_guard<std::mutex> lock(cpu_scatter_worker_mutex_);
+    if (cpu_scatter_worker_error_) std::rethrow_exception(cpu_scatter_worker_error_);
+    if (cpu_scatter_worker_stop_)
+        throw std::runtime_error("CPU scatter worker is stopped");
+    const auto& scheduler = router_computation_scheduler_state_;
+    const auto& publication = router_notification_publication_buffers_;
+    if (!cpu_scatter_worker_epoch_valid_ || cpu_scatter_worker_cancelled_ ||
+        cpu_scatter_worker_epoch_ != scheduler.iteration)
+        throw std::runtime_error("CPU scatter worker publication epoch mismatch");
+    const auto ready_rows = static_cast<std::size_t>(
+        *static_cast<const int32_t*>(publication.host_ready_rows.ptr));
+    if (ready_rows < cpu_scatter_worker_committed_rows_ || ready_rows > publication.table_rows)
+        throw std::runtime_error("CPU scatter worker committed prefix is invalid");
+    cpu_scatter_worker_committed_rows_ = ready_rows;
+    cpu_scatter_worker_ready_publication_count_ = publication.ready_rows_publication_count;
+    cpu_scatter_worker_cv_.notify_all();
+}
+
+void CudaBuffers::cpu_scatter_worker_loop() noexcept {
+    try {
+#if defined(__linux__)
+        pthread_setname_np(pthread_self(), "rdma-scatter");
+#elif defined(__APPLE__)
+        pthread_setname_np("rdma-scatter");
+#endif
+        select_cuda_device_for_thread(config_.cuda_device_id, config_.mock_mode);
+        auto& publication = router_notification_publication_buffers_;
+        const auto groups = publication.n_groups_per_m_cluster;
+        if (!groups || publication.table_rows % groups ||
+            publication.table_width != 2 + 2 * cpu_scatter_lookup_.size() ||
+            publication.table_row_bytes != publication.table_width * sizeof(int32_t) ||
+            !publication.host_table.ptr)
+            throw std::runtime_error("invalid host gather geometry for threaded CPU scatter");
+        std::unique_lock<std::mutex> lock(cpu_scatter_worker_mutex_);
+        for (;;) {
+            cpu_scatter_worker_cv_.wait(lock, [&] {
+                return cpu_scatter_worker_stop_ ||
+                    (cpu_scatter_worker_epoch_valid_ && !cpu_scatter_worker_cancelled_ &&
+                     !cpu_scatter_worker_submitted_ &&
+                     cpu_scatter_worker_consumed_rows_ < cpu_scatter_worker_committed_rows_ / groups * groups);
+            });
+            if (cpu_scatter_worker_stop_) return;
+            const auto epoch = cpu_scatter_worker_epoch_;
+            const auto row = cpu_scatter_worker_consumed_rows_;
+            const auto ready_count = cpu_scatter_worker_ready_publication_count_;
+            cpu_scatter_worker_busy_ = true;
+            lock.unlock();
+            // Neither scheduler nor worker-state locks are held during packing.
+            // Reset/shutdown cannot touch host rows or the slab while busy=true.
+            if (cpu_scatter_pack_test_hook_) cpu_scatter_pack_test_hook_();
+            const auto* descriptor = static_cast<const int32_t*>(publication.host_table.ptr) +
+                row * publication.table_width;
+            if (descriptor[1] != 0)
+                throw std::runtime_error("threaded CPU scatter expected first N group of each M batch");
+            const auto packed = pack_cpu_scatter_batch(descriptor + 2);
+            publication.cpu_scatter_packed_rows.fetch_add(packed.second, std::memory_order_relaxed);
+            publication.cpu_scatter_pack_ready_publication_count.store(ready_count, std::memory_order_relaxed);
+            lock.lock();
+            if (cpu_scatter_worker_stop_ || cpu_scatter_worker_cancelled_ ||
+                cpu_scatter_worker_epoch_ != epoch) {
+                cpu_scatter_worker_busy_ = false;
+                cpu_scatter_worker_cv_.notify_all();
+                continue;
+            }
+            if (packed.second > cpu_scatter_routes_ - cpu_scatter_worker_staged_rows_)
+                throw std::runtime_error("threaded CPU scatter staged row count exceeds capacity");
+            cpu_scatter_worker_staged_rows_ += packed.second;
+            cpu_scatter_worker_consumed_rows_ += groups;
+            if (cpu_scatter_worker_consumed_rows_ == publication.table_rows &&
+                cpu_scatter_worker_committed_rows_ == publication.table_rows) {
+                if (cpu_scatter_worker_staged_rows_ != cpu_scatter_routes_)
+                    throw std::runtime_error("completed gather table has incomplete threaded CPU scatter staging");
+                // Final ready submission happened before the producer's prefix
+                // commit. Retain the busy lease through copy/event submission.
+                lock.unlock();
+                upload_cpu_scatter_slab();
+                lock.lock();
+                if (!cpu_scatter_worker_stop_ && !cpu_scatter_worker_cancelled_ &&
+                    cpu_scatter_worker_epoch_ == epoch) {
+                    cpu_scatter_worker_submitted_ = true;
+                    cpu_scatter_worker_ready_cv_.notify_all();
+                }
+            }
+            cpu_scatter_worker_busy_ = false;
+            cpu_scatter_worker_cv_.notify_all();
+        }
+    } catch (...) {
+        // Any failing pack, CUDA submission or device selection wakes waiters;
+        // subsequent producer commits/reset/synchronization also see the error.
+        std::lock_guard<std::mutex> lock(cpu_scatter_worker_mutex_);
+        cpu_scatter_worker_error_ = std::current_exception();
+        cpu_scatter_worker_busy_ = false;
+        cpu_scatter_worker_cv_.notify_all();
+        cpu_scatter_worker_ready_cv_.notify_all();
+    }
+}
+
+void CudaBuffers::wait_threaded_cpu_scatter_ready(
+    uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms) {
+    std::unique_lock<std::mutex> lock(cpu_scatter_worker_mutex_);
+    const auto max_wait = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::time_point::max() - std::chrono::steady_clock::now()).count();
+    if (cpu_scatter_worker_error_) std::rethrow_exception(cpu_scatter_worker_error_);
+    if (!cuda_stream || !timeout_ms || timeout_ms > static_cast<uint64_t>(max_wait) ||
+        !cpu_scatter_worker_epoch_valid_ || cpu_scatter_worker_epoch_ != iteration ||
+        cpu_scatter_worker_cancelled_ || cpu_scatter_worker_stop_)
+        throw std::runtime_error("invalid threaded CPU scatter wait stream, timeout, or epoch");
+#if RDMA_PROXY_HAVE_CUDA
+    if (!config_.mock_mode) {
+        check_cuda(cudaSetDevice(config_.cuda_device_id), "cudaSetDevice CPU scatter waiter");
+        unsigned flags = 0;
+        check_cuda(cudaStreamGetFlags(reinterpret_cast<cudaStream_t>(cuda_stream), &flags),
+                   "cudaStreamGetFlags CPU scatter waiter");
+    }
+#endif
+    if (!cpu_scatter_worker_ready_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
+            return cpu_scatter_worker_error_ || cpu_scatter_worker_stop_ ||
+                cpu_scatter_worker_cancelled_ || cpu_scatter_worker_epoch_ != iteration ||
+                cpu_scatter_worker_submitted_;
+        }))
+        throw std::runtime_error("timed out waiting for threaded CPU scatter submission iteration=" +
+            std::to_string(iteration) + " staged_rows=" + std::to_string(cpu_scatter_worker_staged_rows_) +
+            "/" + std::to_string(cpu_scatter_routes_) + " committed_rows=" +
+            std::to_string(cpu_scatter_worker_committed_rows_) + "/" +
+            std::to_string(router_notification_publication_buffers_.table_rows));
+    if (cpu_scatter_worker_error_) std::rethrow_exception(cpu_scatter_worker_error_);
+    if (cpu_scatter_worker_stop_ || cpu_scatter_worker_cancelled_ ||
+        cpu_scatter_worker_epoch_ != iteration || !cpu_scatter_worker_submitted_)
+        throw std::runtime_error("CPU scatter worker stopped or epoch changed during wait");
+    // Hold state only through the short wait submission: the current event has
+    // already been recorded, and reset cannot re-record it until this returns.
+#if RDMA_PROXY_HAVE_CUDA
+    if (!config_.mock_mode)
+        check_cuda(cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(cuda_stream),
+            reinterpret_cast<cudaEvent_t>(cpu_scatter_ready_event_), 0),
+            "cudaStreamWaitEvent threaded CPU scatter ready");
+#endif
+}
+
+void CudaBuffers::stop_cpu_scatter_worker() {
+    if (!cpu_scatter_threaded_) return;
+    {
+        std::lock_guard<std::mutex> lock(cpu_scatter_worker_mutex_);
+        cpu_scatter_worker_stop_ = true;
+        cpu_scatter_worker_cancelled_ = true;
+        cpu_scatter_worker_cv_.notify_all();
+        cpu_scatter_worker_ready_cv_.notify_all();
+    }
+    if (cpu_scatter_worker_thread_.joinable()) cpu_scatter_worker_thread_.join();
+    // No producer may submit after join; retire all DMA reads before borrowed
+    // device allocations may be released at Proxy::shutdown return.
+    select_cuda_device_for_thread(config_.cuda_device_id, config_.mock_mode);
+    synchronize_cuda_stream(router_notification_publication_stream_, config_.mock_mode);
+}
+
 void CudaBuffers::reset_router_computation_iteration_locked(uint64_t iteration) {
     auto& scheduler = router_computation_scheduler_state_;
     if (!scheduler.initialized) {
@@ -1201,6 +1406,18 @@ void CudaBuffers::reset_router_computation_iteration_locked(uint64_t iteration) 
     if (cpu_scatter_device_ && config_.router_weighted_contributions_enabled &&
         !cpu_route_weights_device_)
         throw std::runtime_error("weighted CPU scatter requires packed route-weight storage");
+    if (cpu_scatter_threaded_) {
+        std::unique_lock<std::mutex> lock(cpu_scatter_worker_mutex_);
+        cpu_scatter_worker_cancelled_ = true;
+        cpu_scatter_worker_epoch_valid_ = false;
+        cpu_scatter_worker_cv_.notify_all();
+        cpu_scatter_worker_ready_cv_.notify_all();
+        if (!cpu_scatter_worker_cv_.wait_for(lock, std::chrono::milliseconds(config_.completion_timeout_ms),
+                [&] { return !cpu_scatter_worker_busy_; }))
+            throw std::runtime_error("timed out quiescing CPU scatter worker for iteration reset");
+        if (cpu_scatter_worker_error_) std::rethrow_exception(cpu_scatter_worker_error_);
+        if (cpu_scatter_worker_stop_) throw std::runtime_error("CPU scatter worker is stopped");
+    }
     const bool reset_existing_iteration = scheduler.iteration_initialized;
     if (reset_existing_iteration) {
         // Rows are immutable within an iteration, but a new iteration reuses
@@ -1244,6 +1461,18 @@ void CudaBuffers::reset_router_computation_iteration_locked(uint64_t iteration) 
         std::memset(publication.host_table.ptr, 0, publication.host_table.bytes);
     }
     *static_cast<int32_t*>(publication.host_ready_rows.ptr) = 0;
+    if (cpu_scatter_threaded_) {
+        std::lock_guard<std::mutex> lock(cpu_scatter_worker_mutex_);
+        cpu_scatter_worker_epoch_ = iteration;
+        cpu_scatter_worker_committed_rows_ = 0;
+        cpu_scatter_worker_consumed_rows_ = 0;
+        cpu_scatter_worker_staged_rows_ = 0;
+        cpu_scatter_worker_submitted_ = false;
+        cpu_scatter_worker_cancelled_ = false;
+        cpu_scatter_worker_epoch_valid_ = true;
+        cpu_scatter_worker_cv_.notify_all();
+        cpu_scatter_worker_ready_cv_.notify_all();
+    }
     // Publish zero before any row for this iteration. A QuACK persistent
     // scheduler must never observe the previous iteration's ready prefix.
     flush_router_notification_publication_range(0, 0);
@@ -1271,6 +1500,24 @@ void CudaBuffers::synchronize_router_notification_publication() {
     if (!config_.router_routing_enabled ||
         !config_.nvlink_forward_completion_notifications_enabled) {
         return;
+    }
+    if (cpu_scatter_threaded_) {
+        std::unique_lock<std::mutex> lock(cpu_scatter_worker_mutex_);
+        if (cpu_scatter_worker_error_) std::rethrow_exception(cpu_scatter_worker_error_);
+        const auto groups = router_notification_publication_buffers_.n_groups_per_m_cluster;
+        if (!groups) throw std::runtime_error("invalid threaded CPU scatter group count");
+        const auto target = cpu_scatter_worker_committed_rows_ / groups * groups;
+        const auto epoch = cpu_scatter_worker_epoch_;
+        if (!cpu_scatter_worker_cv_.wait_for(lock, std::chrono::milliseconds(config_.completion_timeout_ms), [&] {
+                return cpu_scatter_worker_error_ || cpu_scatter_worker_stop_ ||
+                    cpu_scatter_worker_cancelled_ || cpu_scatter_worker_epoch_ != epoch ||
+                    (cpu_scatter_worker_consumed_rows_ >= target &&
+                     (target != router_notification_publication_buffers_.table_rows || cpu_scatter_worker_submitted_));
+            }))
+            throw std::runtime_error("timed out draining committed CPU scatter worker prefix");
+        if (cpu_scatter_worker_error_) std::rethrow_exception(cpu_scatter_worker_error_);
+        if (cpu_scatter_worker_stop_ || cpu_scatter_worker_cancelled_ || cpu_scatter_worker_epoch_ != epoch)
+            throw std::runtime_error("CPU scatter worker stopped or epoch changed during synchronization");
     }
     synchronize_cuda_stream(
         router_notification_publication_stream_, config_.mock_mode);
@@ -1533,8 +1780,8 @@ CudaBuffers::schedule_ready_computation_batches_for_expert_locked(
         }
 
         // Only the per-batch policy prepares/uploads scatter metadata here.
-        // Deferred mode reconstructs it from the completed host gather table
-        // after the final publication, leaving this streaming path undisturbed.
+        // Deferred mode packs after the final publication; threaded mode packs
+        // committed host-table prefixes on its worker outside this hot path.
         if (cpu_scatter_device_ && !cpu_scatter_deferred_staging_.ptr)
             prepare_cpu_scatter_batch(ranges.data());
 

@@ -491,9 +491,10 @@ class GroupedGemmRunner:
 
 def add_down_arguments(parser):
     parser.add_argument("--cpu-scatter-preparation", action="store_true",
-                        help="prepare down scatter addresses in the CPU notification receiver; requires local GPU combine")
-    parser.add_argument("--cpu-scatter-publication", choices=("deferred", "per-batch"), default=None,
-                        help="CPU metadata policy: deferred (default) packs and uploads one buffer after all up gather entries; "
+                        help="prepare down scatter addresses on the CPU; requires local GPU combine")
+    parser.add_argument("--cpu-scatter-publication", choices=("deferred", "threaded", "per-batch"), default=None,
+                        help="CPU metadata policy: threaded packs on a dedicated CPU thread with one final upload; "
+                             "deferred (default) packs and uploads after all up gather entries; "
                              "per-batch uploads each M batch before gather readiness")
     parser.add_argument("--inter-node-combine", action="store_true",
                         help="combine node sums into original token order after local combine and any RDMA returns")
@@ -860,7 +861,7 @@ class DownProjectionRunner:
         self.inputs = pregather.prepare_grouped_inputs(
             args, up.output[:routes], self.weights, counts, **external
         )
-        if self.cpu_scatter and self.cpu_scatter_publication == "deferred":
+        if self.cpu_scatter and self.cpu_scatter_publication in ("deferred", "threaded"):
             (self.cpu_scatter_metadata, self.inputs.scatter_row_addresses,
              self.route_weights) = make_cpu_scatter_metadata_storage(
                 torch, self.inputs.scatter_row_addresses, self.route_weights)
@@ -981,18 +982,20 @@ class DownProjectionRunner:
             require_proxy_success(library, configure_weights(
                 handle, self.route_weights.data_ptr(), self.routes),
                 "configuring CPU packed routing weights")
-        if self.cpu_scatter_publication == "deferred":
+        if self.cpu_scatter_publication in ("deferred", "threaded"):
             try:
-                configure_deferred = library.rdma_proxy_configure_cpu_scatter_deferred
+                configure_publication = getattr(
+                    library, f"rdma_proxy_configure_cpu_scatter_{self.cpu_scatter_publication}")
                 wait_ready = library.rdma_proxy_wait_cpu_scatter_ready
             except AttributeError as error:
-                raise RuntimeError("deferred CPU scatter requires rebuilding librdma_cpu_proxy") from error
-            configure_deferred.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
-            configure_deferred.restype = ctypes.c_int
+                raise RuntimeError(
+                    f"{self.cpu_scatter_publication} CPU scatter requires rebuilding librdma_cpu_proxy") from error
+            configure_publication.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+            configure_publication.restype = ctypes.c_int
             wait_ready.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_size_t, ctypes.c_uint64]
             wait_ready.restype = ctypes.c_int
-            require_proxy_success(library, configure_deferred(handle, self.cpu_scatter_metadata.numel()),
-                                  "configuring deferred CPU scatter publication")
+            require_proxy_success(library, configure_publication(handle, self.cpu_scatter_metadata.numel()),
+                                  f"configuring {self.cpu_scatter_publication} CPU scatter publication")
             self._cpu_scatter_wait = wait_ready
             self._cpu_scatter_library, self._cpu_scatter_handle = library, handle
         with torch.inference_mode():
@@ -1000,9 +1003,14 @@ class DownProjectionRunner:
             self.combine_output_to_input.copy_(inverse)
         self.cpu_scatter_counts = counts
         torch.cuda.synchronize(self.up.cuda_device_id)
-        policy = (f"CPU packing then one {self.cpu_scatter_metadata.numel()}-byte metadata H2D after final gather publication"
-                  if self.cpu_scatter_publication == "deferred" else
-                  "scatter batches published before gather readiness")
+        if self.cpu_scatter_publication == "threaded":
+            policy = ("dedicated CPU scatter thread; "
+                      f"one {self.cpu_scatter_metadata.numel()}-byte metadata H2D after final gather publication")
+        elif self.cpu_scatter_publication == "deferred":
+            policy = (f"CPU packing then one {self.cpu_scatter_metadata.numel()}-byte "
+                      "metadata H2D after final gather publication")
+        else:
+            policy = "scatter batches published before gather readiness"
         print(f"CPU scatter preparation enabled: compact metadata fixed at setup; {policy}", flush=True)
 
     def wait_cpu_scatter_ready(self, iteration):
@@ -1013,7 +1021,7 @@ class DownProjectionRunner:
         submission, then queues the event dependency without synchronizing the GPU.
         """
         if self._cpu_scatter_wait is None:
-            raise RuntimeError("deferred CPU scatter publication is not configured")
+            raise RuntimeError("CPU scatter publication wait is not configured")
         stream = self.up.torch.cuda.current_stream(self.up.cuda_device_id)
         require_proxy_success(self._cpu_scatter_library, self._cpu_scatter_wait(
             self._cpu_scatter_handle, iteration, int(stream.cuda_stream), self.cpu_scatter_timeout_ms),
@@ -1718,9 +1726,10 @@ def run_proxy_with_concurrent_kernel(
                 )
                 with torch.cuda.stream(kernel_stream):
                     if down is not None:
-                        deferred = down.cpu_scatter and down.cpu_scatter_publication == "deferred"
+                        needs_metadata_wait = (down.cpu_scatter and
+                                               down.cpu_scatter_publication in ("deferred", "threaded"))
                         down.launch(wait_for_metadata=(lambda: down.wait_cpu_scatter_ready(iteration))
-                                    if deferred else None)
+                                    if needs_metadata_wait else None)
                     if return_exchange is not None:
                         return_exchange.arm(iteration)
                     kernel_finished.record(kernel_stream)

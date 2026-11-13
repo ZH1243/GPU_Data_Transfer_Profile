@@ -41,6 +41,7 @@ public:
     void configure_cpu_scatter(const RdmaProxyCpuScatterConfig& config);
     void configure_cpu_route_weights(uintptr_t packed_weights, std::size_t routes);
     void configure_cpu_scatter_deferred(std::size_t bytes);
+    void configure_cpu_scatter_threaded(std::size_t bytes);
     void wait_cpu_scatter_ready(uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms);
     const std::vector<int32_t>& original_router_experts() const;
     const std::vector<float>& original_router_weights() const;

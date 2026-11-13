@@ -305,7 +305,7 @@ class ActivationCliTests(unittest.TestCase):
         common = ("--cpu-scatter-preparation", "--concurrent-kernel",
                   "--grouped-gemm-activation=swiglu", "--down-projection2",
                   "--local-gpu-combine")
-        for mode in ("deferred", "per-batch"):
+        for mode in ("deferred", "per-batch", "threaded"):
             with self.subTest(mode=mode):
                 result = self.run_cli(*common, f"--cpu-scatter-publication={mode}")
                 self.assertEqual(result.returncode, 0, result.stderr)

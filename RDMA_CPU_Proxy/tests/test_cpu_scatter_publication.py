@@ -1,4 +1,4 @@
-"""CPU coverage for deferred scatter metadata layout and option validation.
+"""CPU coverage for deferred/threaded metadata layout and option validation.
 
 GPU publication ordering is exercised by test_worker_composition.py; the actual
 native event generations and H2D submission are covered by test_cpu_scatter.
@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import rdma_proxy_worker as worker
@@ -29,14 +30,14 @@ class PublicationOptionsTests(unittest.TestCase):
         defaults = self.parse(*common)
         self.assertIsNone(defaults.cpu_scatter_publication)
         worker.validate_down_arguments(defaults)
-        for mode in ("deferred", "per-batch"):
+        for mode in ("deferred", "per-batch", "threaded"):
             with self.subTest(mode=mode):
                 args = self.parse(*common, f"--cpu-scatter-publication={mode}")
                 worker.validate_down_arguments(args)
                 self.assertEqual(args.cpu_scatter_publication, mode)
 
     def test_explicit_mode_requires_cpu_preparation(self):
-        for mode in ("deferred", "per-batch"):
+        for mode in ("deferred", "per-batch", "threaded"):
             args = self.parse("--local-gpu-combine", "--down-projection2",
                               f"--cpu-scatter-publication={mode}")
             with self.assertRaisesRegex(ValueError, "cpu-scatter-preparation"):
@@ -124,6 +125,73 @@ class MetadataSlabTests(unittest.TestCase):
             with self.subTest(shape=weights.shape, dtype=weights.dtype):
                 with self.assertRaisesRegex(ValueError, "contiguous FP32"):
                     worker.make_cpu_scatter_metadata_storage(torch, addresses, weights)
+
+    def test_native_configuration_selects_policy_and_retains_slab(self):
+        torch = self.torch
+        for mode in ("deferred", "threaded", "per-batch"):
+            for weighted in (False, True):
+                with self.subTest(mode=mode, weighted=weighted):
+                    calls = []
+                    runner = worker.DownProjectionRunner.__new__(worker.DownProjectionRunner)
+                    runner.up = SimpleNamespace(torch=torch, cuda_device_id=0, source_pairs=((0, 0), (0, 1)),
+                                                x_buffers=(torch.zeros(3, 4), torch.zeros(3, 4)),
+                                                output=torch.zeros(3, 4, dtype=torch.bfloat16))
+                    runner.routes, runner.combine_rows, runner.combine_tile_n = 3, 3, None
+                    storage, addresses, weights = worker.make_cpu_scatter_metadata_storage(
+                        torch, torch.zeros(3, dtype=torch.int64), torch.ones(3) if weighted else None)
+                    runner.cpu_scatter_metadata = storage if mode != "per-batch" else None
+                    runner.route_weights = weights
+                    runner.inputs = SimpleNamespace(scatter_row_addresses=addresses,
+                                                     output_buffers=lambda: runner.up.x_buffers)
+                    runner.combine_valid_rows = torch.zeros(2, dtype=torch.int64)
+                    runner.combine_output_to_input = torch.full((2, 3), -1, dtype=torch.int64)
+                    runner.cpu_scatter_publication = mode
+                    runner._cpu_scatter_wait = None
+
+                    def configure(handle, pointer):
+                        config = pointer._obj
+                        calls.append(("scatter", handle, config.scatter_addresses))
+                        config.counts[0], config.counts[1] = 2, 1
+                        for index, value in enumerate((0, 2, -1, 1, -1, -1)):
+                            config.output_to_input[index] = value
+                        return 0
+
+                    def configure_weights(handle, pointer, routes):
+                        calls.append(("weights", handle, pointer, routes))
+                        return 0
+
+                    def configure_deferred(handle, size):
+                        calls.append(("deferred", handle, size))
+                        return 0
+
+                    def configure_threaded(handle, size):
+                        calls.append(("threaded", handle, size))
+                        return 0
+
+                    def wait(*arguments):
+                        return 0
+
+                    library = SimpleNamespace(rdma_proxy_configure_cpu_scatter=configure,
+                                              rdma_proxy_configure_cpu_route_weights=configure_weights,
+                                              rdma_proxy_configure_cpu_scatter_deferred=configure_deferred,
+                                              rdma_proxy_configure_cpu_scatter_threaded=configure_threaded,
+                                              rdma_proxy_wait_cpu_scatter_ready=wait)
+                    with mock.patch.object(torch.cuda, "synchronize"):
+                        runner.configure_cpu_scatter(library, 123)
+                    expected = [("scatter", 123, addresses.data_ptr())]
+                    if weighted:
+                        expected.append(("weights", 123, weights.data_ptr(), 3))
+                    if mode != "per-batch":
+                        expected.append((mode, 123, storage.numel()))
+                        self.assertIs(runner.cpu_scatter_metadata, storage)
+                        self.assertIs(runner._cpu_scatter_wait, wait)
+                        self.assertIs(runner._cpu_scatter_library, library)
+                        self.assertEqual(runner._cpu_scatter_handle, 123)
+                    else:
+                        self.assertIsNone(runner._cpu_scatter_wait)
+                    self.assertEqual(calls, expected)
+                    self.assertEqual(runner.cpu_scatter_counts.tolist(), [2, 1])
+                    self.assertEqual(runner.combine_output_to_input.tolist(), [[0, 2, -1], [1, -1, -1]])
 
 
 class MetadataDependencyTests(unittest.TestCase):

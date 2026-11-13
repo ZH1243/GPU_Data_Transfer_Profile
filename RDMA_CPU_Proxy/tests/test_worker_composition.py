@@ -160,18 +160,21 @@ class CompositionCudaTests(unittest.TestCase):
 
     def test_weighted_streamed_composition(self):
         for tile_m in ((128, 256) if self.arch == 10 else (128,)):
-            for preparation in ("gpu", "per-batch", "deferred"):
+            for preparation in ("gpu", "per-batch", "deferred", "threaded"):
                 for policy in ("distinct", "ones", "zeros"):
                     with self.subTest(tile_m=tile_m, preparation=preparation, weights=policy):
                         self._composition(tile_m, 4, policy=policy, preparation=preparation)
 
     def test_unweighted_deferred_metadata_after_up_completion(self):
         for tile_m in ((128, 256) if self.arch == 10 else (128,)):
-            with self.subTest(tile_m=tile_m):
-                self._composition(tile_m, 4, preparation="deferred", publication_default=True)
+            for preparation in ("deferred", "threaded"):
+                with self.subTest(tile_m=tile_m, preparation=preparation):
+                    self._composition(tile_m, 4, preparation=preparation,
+                                      publication_default=preparation == "deferred")
 
     def _composition(self, tile_m, sm_count, policy=None, preparation="gpu", publication_default=False):
         torch = self.torch
+        single_upload = preparation in ("deferred", "threaded")
         root = Path(os.environ.get("QUACK_ROOT", SCRIPTS.parents[2] / "quack_for_communication_overlap"))
         sys.path.insert(0, str(root))
         from quack.gemm_config import cta_tile_shape_m
@@ -331,7 +334,7 @@ class CompositionCudaTests(unittest.TestCase):
                     expected_values = [up.route_weights[source][position].item()
                                        for _, source, position in validation.route_positions(up, routes)]
                     pinned_route_weights = torch.tensor(expected_values, dtype=torch.float32).pin_memory()
-                if preparation == "deferred":
+                if single_upload:
                     pinned_metadata = down.cpu_scatter_metadata.cpu().pin_memory()
                     self.assertEqual(down.inputs.scatter_row_addresses.data_ptr(),
                                      down.cpu_scatter_metadata.data_ptr())
@@ -350,7 +353,7 @@ class CompositionCudaTests(unittest.TestCase):
                 combine.output.fill_(float("nan"))
                 if down.route_weights is not None:
                     down.route_weights.fill_(float("nan"))
-                if preparation == "deferred":
+                if single_upload:
                     # Includes invalid addresses and NaN weights. Only the
                     # current-generation slab upload can make down safe to run.
                     down.cpu_scatter_metadata.fill_(255)
@@ -358,12 +361,12 @@ class CompositionCudaTests(unittest.TestCase):
             torch.cuda.synchronize()
             with torch.cuda.stream(producer):
                 up.launch()  # Enqueue before any descriptor/input publication.
-                if preparation == "deferred":
+                if single_upload:
                     publication_up_done = torch.cuda.Event()
                     publication_up_done.record(producer)
             publish()
             with torch.cuda.stream(producer):
-                if preparation == "deferred":
+                if single_upload:
                     down.launch(wait_for_metadata=lambda: producer.wait_event(metadata_ready))
                 else:
                     down.launch()
