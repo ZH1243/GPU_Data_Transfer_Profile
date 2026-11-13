@@ -5,8 +5,15 @@ FP32 one column block at a time. Call only after the iteration's GPU work and
 return/combine consumers have completed, before reusing any input buffers.
 """
 
-def route_metadata(up, routes):
-    """Decode N-group zero independently of the GPU combine mapping helper."""
+from collections import Counter
+import ctypes
+import math
+import os
+import tempfile
+
+
+def route_positions(up, routes):
+    """Return exact (expert, source, A_idx position), ignoring repeated N groups."""
     indices = [index.cpu().tolist() for index in up.a_idx]
     result = [None] * routes
     for descriptor in up.work_table.cpu().tolist():
@@ -24,11 +31,141 @@ def route_metadata(up, routes):
                 token = index[position]
                 if not 0 <= token < up.x_buffers[source].shape[0]:
                     raise AssertionError("gather descriptor references a padded/invalid input row")
-                result[offset] = (expert, source, token)
+                result[offset] = (expert, source, position)
                 offset += 1
     if any(row is None for row in result):
         raise AssertionError("gather descriptors leave routed output rows uncovered")
     return result
+
+
+def route_metadata(up, routes):
+    """Decode N-group zero independently of the GPU combine mapping helper."""
+    indices = [index.cpu().tolist() for index in up.a_idx]
+    return [(expert, source, indices[source][position])
+            for expert, source, position in route_positions(up, routes)]
+
+
+def route_weight_reference(up, down, routes):
+    """Decode immutable source/list weights, never trusting packed GPU mapping."""
+    source_weights = getattr(up, "route_weights", None)
+    packed = getattr(down, "route_weights", None) if down is not None else None
+    if source_weights is None:
+        if packed is not None:
+            raise AssertionError("packed routing weights have no immutable source reference")
+        return [1.0] * routes
+    weights = [weight.cpu().tolist() for weight in source_weights]
+    result = [weights[source][position]
+              for _, source, position in route_positions(up, routes)]
+    if any(not math.isfinite(value) or value < 0 for value in result):
+        raise AssertionError("routing weights must be finite and nonnegative")
+    if down is not None:
+        if packed is None or packed.cpu().tolist() != result:
+            raise AssertionError("packed routing weights disagree with source/list positions")
+    return result
+
+
+def original_source_routes(experts, weights, *, source_gpu, destination_node,
+                           destination_gpu, num_nodes, gpus_per_node, num_experts):
+    """Independently reconstruct x3/x4 from original [token, top-k] assignments.
+
+    Return (local expert, destination input row, FP32 weight, original token).
+    The source-local GPU consumes the full node x3; other GPUs consume compact
+    x4-selected rows. x3 sorts descending source-relative GPU mask, stably by
+    original token. This uses neither A_idx nor native destination metadata.
+    """
+    if len(experts) != len(weights) or num_experts % (num_nodes * gpus_per_node):
+        raise AssertionError("invalid original assignment dimensions")
+    per_gpu = num_experts // (num_nodes * gpus_per_node)
+    per_node = per_gpu * gpus_per_node
+    first = (destination_node * gpus_per_node + destination_gpu) * per_gpu
+    node_tokens = []
+    for token, (selected, values) in enumerate(zip(experts, weights)):
+        if len(selected) != len(values) or len(set(selected)) != len(selected):
+            raise AssertionError("invalid original selected expert set")
+        mask = 0
+        for expert, value in zip(selected, values):
+            if not 0 <= expert < num_experts or not math.isfinite(value) or value < 0:
+                raise AssertionError("invalid original expert/weight assignment")
+            if expert // per_node == destination_node:
+                gpu = expert // per_gpu % gpus_per_node
+                mask |= 1 << ((source_gpu - gpu) % gpus_per_node)
+        if mask:
+            node_tokens.append((mask, token))
+    node_tokens.sort(key=lambda pair: -pair[0])
+    if source_gpu != destination_gpu:
+        bit = 1 << ((source_gpu - destination_gpu) % gpus_per_node)
+        node_tokens = [pair for pair in node_tokens if pair[0] & bit]
+    result = []
+    for row, (_, token) in enumerate(node_tokens):
+        for expert, value in zip(experts[token], weights[token]):
+            if first <= expert < first + per_gpu:
+                result.append((expert - first, row, value, token))
+    return result
+
+
+def configure_original_reference(up, down, library, handle, return_exchange, *, num_experts):
+    """Capture original local-node assignments once, outside measured iterations.
+
+    SharedExchange is node-local and has bounded JSON storage. Only small file
+    descriptors travel through it; temporary binary assignment files are read by
+    every local worker and unlinked after a collective read barrier. Remote-node
+    sources still receive descriptor/source-weight checks. No distributed torch
+    process group, additional GPU kernels, or data-plane exchange is introduced.
+    """
+    query = library.rdma_proxy_get_local_router_assignments
+    query.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                      ctypes.POINTER(ctypes.c_float), ctypes.c_uint64,
+                      ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+                      ctypes.POINTER(ctypes.c_uint64)]
+    query.restype = ctypes.c_int
+    count, tokens, top_k = ctypes.c_uint64(), ctypes.c_uint64(), ctypes.c_uint64()
+    return_exchange.require(query(handle, None, None, 0, ctypes.byref(count),
+                                  ctypes.byref(tokens), ctypes.byref(top_k)))
+    selected, weights = (ctypes.c_int32 * count.value)(), (ctypes.c_float * count.value)()
+    return_exchange.require(query(handle, selected, weights, count.value, ctypes.byref(count),
+                                  ctypes.byref(tokens), ctypes.byref(top_k)))
+    if count.value != tokens.value * top_k.value:
+        raise AssertionError("native original assignment dimensions disagree")
+    descriptor, path = tempfile.mkstemp(prefix="rdma-route-reference-", dir="/dev/shm")
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(bytes(selected))
+            stream.write(bytes(weights))
+        entries = return_exchange.control.gather("original-route-reference-files", {
+            "path": path, "tokens": tokens.value, "top_k": top_k.value,
+        })
+        up.original_reference = {}
+        nodes = sorted({node for node, _ in up.source_pairs})
+        for source, (node, gpu) in enumerate(up.source_pairs):
+            if node != return_exchange.node:
+                continue
+            entry = entries[gpu]
+            size = entry["tokens"] * entry["top_k"]
+            with open(entry["path"], "rb") as stream:
+                payload = stream.read()
+            if len(payload) != 8 * size:
+                raise AssertionError("original assignment reference payload has invalid size")
+            selected = list((ctypes.c_int32 * size).from_buffer_copy(payload[:4 * size]))
+            weights = list((ctypes.c_float * size).from_buffer_copy(payload[4 * size:]))
+            width = entry["top_k"]
+            up.original_reference[source] = original_source_routes(
+                [selected[start:start + width] for start in range(0, size, width)],
+                [weights[start:start + width] for start in range(0, size, width)],
+                source_gpu=gpu, destination_node=return_exchange.node,
+                destination_gpu=return_exchange.rank, num_nodes=len(nodes),
+                gpus_per_node=return_exchange.world, num_experts=num_experts)
+        return_exchange.control.gather("original-route-reference-read")
+    finally:
+        os.unlink(path)
+
+
+def _validate_original_routes(up, metadata, weights):
+    for source, original in getattr(up, "original_reference", {}).items():
+        actual = Counter((expert, token, weights[row])
+                         for row, (expert, src, token) in enumerate(metadata) if src == source)
+        expected = Counter((expert, token, value) for expert, token, value, _ in original)
+        if actual != expected:
+            raise AssertionError(f"source {source}: original token/expert/weight assignments disagree")
 
 
 def _activation(torch, value, name, other=None):
@@ -75,14 +212,19 @@ def _assert_values(torch, actual, expected, label, *, reduction=False):
 def check_projections(torch, up, down, routes, *, column_chunk=256, row_chunk=512):
     """Validate every valid up row, and every down destination, against FP32 GEMMs.
 
-    Down uses the already-checked BF16/FP16 up output, and rounds individual down
-    contributions to output dtype before FP32 scatter-add, matching the bulk
-    reduction contract. Compact destinations are reconstructed from source token
-    IDs rather than trusting the worker's GPU mapping or scatter-address table.
+    Down scales FP32 accumulators using immutable source/list weights, then
+    rounds contributions to output dtype before FP32 reference scatter-add.
+    Actual output-dtype atomic reductions can round again in arrival order, so
+    reduction comparisons use a larger tolerance. Compact destinations are
+    reconstructed without the worker's scatter-address table. Available
+    original source assignments independently validate native input-row mapping
+    and weights; the synthetic fixture also recomputes the entire up projection.
     """
     if column_chunk <= 0 or row_chunk <= 0:
         raise ValueError("reference chunk sizes must be positive")
     metadata = route_metadata(up, routes)
+    route_weights = route_weight_reference(up, down, routes)
+    _validate_original_routes(up, metadata, route_weights)
     device = up.output.device
     groups = {}
     for row, (expert, source, token) in enumerate(metadata):
@@ -140,8 +282,16 @@ def check_projections(torch, up, down, routes, *, column_chunk=256, row_chunk=51
                                 if down.inputs.scatter_table is not None else list(range(routes)))
             destination = torch.tensor(destinations, dtype=torch.int64, device=device)
             expert_rows = {}
-            for row, (expert, _, _) in enumerate(metadata):
+            originals = getattr(up, "original_reference", {})
+            checked_rows = {(expert, source, token): row
+                            for row, (expert, source, token) in enumerate(metadata)}
+            for row, (expert, source, _) in enumerate(metadata):
+                # Original assignments drive this source's contribution set;
+                # the packed mapping does not select its weights/destinations.
+                if source in originals and down.combine:
+                    continue
                 expert_rows.setdefault(expert, []).append(row)
+            scale = torch.tensor(route_weights, device=device, dtype=torch.float32)
             width = down.weights.shape[-1]
             for col in range(0, width, column_chunk):
                 end = min(col + column_chunk, width)
@@ -150,8 +300,43 @@ def check_projections(torch, up, down, routes, *, column_chunk=256, row_chunk=51
                     weight = down.weights[expert, :, col:end].float()
                     for start in range(0, len(rows), row_chunk):
                         positions = torch.tensor(rows[start:start + row_chunk], device=device)
-                        contribution = (up.output[positions].float() @ weight).to(outputs[0].dtype).float()
+                        accumulator = up.output[positions].float() @ weight
+                        contribution = (accumulator * scale[positions, None]).to(outputs[0].dtype).float()
                         reference.index_add_(0, destination[positions], contribution)
+                if down.combine:
+                    for source, original in originals.items():
+                        for expert in range(up.weights.shape[0]):
+                            selected = [(token, value) for exp, token, value, _ in original
+                                        if exp == expert]
+                            for start in range(0, len(selected), row_chunk):
+                                chunk = selected[start:start + row_chunk]
+                                tokens = torch.tensor([token for token, _ in chunk], device=device)
+                                values = torch.tensor([value for _, value in chunk], device=device,
+                                                      dtype=torch.float32)
+                                up_width = up.output.shape[1]
+                                if getattr(up, "original_reference_recompute", False):
+                                    # Synthetic composition tests independently compute
+                                    # the entire composition. The large production check
+                                    # reuses rows already checked against FP32 up GEMMs.
+                                    x = up.x_buffers[source][tokens].float()
+                                    intermediate = torch.empty((len(chunk), up_width), device=device,
+                                                               dtype=up.output.dtype)
+                                    for begin in range(0, up_width, column_chunk):
+                                        stop = min(begin + column_chunk, up_width)
+                                        gate = x @ up.weights[expert, :, begin:stop].float()
+                                        other = (x @ up.weights[expert, :, begin + up_width:stop + up_width].float()
+                                                 if up.gated else None)
+                                        intermediate[:, begin:stop] = _activation(
+                                            torch, gate, up.activation, other).to(up.output.dtype)
+                                else:
+                                    positions = torch.tensor([checked_rows[expert, source, token]
+                                                              for token, _ in chunk], device=device)
+                                    intermediate = up.output[positions]
+                                accumulator = intermediate.float() @ down.weights[expert, :, col:end].float()
+                                contribution = (accumulator * values[:, None]).to(outputs[0].dtype).float()
+                                target = torch.tensor([offsets[source] + compact[source][token]
+                                                       for token, _ in chunk], device=device)
+                                reference.index_add_(0, target, contribution)
                 columns = torch.arange(col, end, device=device)
                 for source, (output, size) in enumerate(zip(outputs, sizes)):
                     if tile is None:

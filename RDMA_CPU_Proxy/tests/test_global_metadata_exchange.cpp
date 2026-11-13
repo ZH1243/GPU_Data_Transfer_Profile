@@ -1,4 +1,5 @@
 #include "rdma_connection.hpp"
+#include "router_routing.hpp"
 
 #include <arpa/inet.h>
 #include <atomic>
@@ -65,6 +66,15 @@ int main() {
                 config.mock_mode = false;
                 config.completion_timeout_ms = 5000;
                 rdma_proxy::ConnectionManager manager(config);
+                auto router_config = config;
+                router_config.mock_mode = true;
+                router_config.router_routing_enabled = true;
+                router_config.router_weighted_contributions_enabled = true;
+                router_config.router_num_experts = 16;
+                router_config.router_top_k = 3;
+                router_config.num_tokens = 17;
+                rdma_proxy::RouterRouting routing(router_config);
+                routing.initialize();
 
                 std::vector<std::string> received;
                 std::exception_ptr receive_error;
@@ -73,7 +83,7 @@ int main() {
                         received = manager.receive_global_control_messages(
                             static_cast<uint16_t>(port_base + gpu),
                             kGpuCount - 1,
-                            1024,
+                            4096,
                             config.completion_timeout_ms);
                     } catch (...) {
                         receive_error = std::current_exception();
@@ -90,8 +100,8 @@ int main() {
                         endpoint.port = static_cast<uint16_t>(port_base + destination);
                         manager.send_global_control_message(
                             endpoint,
-                            "source=" + std::to_string(gpu) +
-                                " destination=" + std::to_string(destination),
+                            rdma_proxy::serialize_router_expert_metadata(
+                                routing.expert_metadata_for_gpu(0, destination)),
                             config.completion_timeout_ms);
                     } catch (...) {
                         if (!send_error) send_error = std::current_exception();
@@ -105,9 +115,19 @@ int main() {
                 std::set<std::string> expected;
                 for (int source = 0; source < kGpuCount; ++source) {
                     if (source == gpu) continue;
-                    expected.insert(
-                        "source=" + std::to_string(source) +
-                        " destination=" + std::to_string(gpu));
+                    auto source_config = router_config;
+                    source_config.local_gpu_index = source;
+                    rdma_proxy::RouterRouting source_routing(source_config);
+                    source_routing.initialize();
+                    expected.insert(rdma_proxy::serialize_router_expert_metadata(
+                        source_routing.expert_metadata_for_gpu(0, gpu)));
+                }
+                for (const auto& payload : received) {
+                    const auto metadata = rdma_proxy::deserialize_router_expert_metadata(payload, 17, 51);
+                    if (!metadata.weighted_contributions || metadata.top_k != 3 ||
+                        metadata.destination_gpu_index != gpu ||
+                        metadata.expert_route_weights.size() != metadata.expert_token_indices.size())
+                        throw std::runtime_error("weighted metadata decode mismatch after TCP exchange");
                 }
                 if (actual != expected) {
                     throw std::runtime_error("global metadata all-to-all payload mismatch");

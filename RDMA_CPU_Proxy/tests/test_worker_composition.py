@@ -27,23 +27,26 @@ worker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(worker)
 
 
-def descriptor_rows(counts, cluster_rows, n_groups):
+def descriptor_rows(counts, cluster_rows, n_groups, source_order=None):
     """Synthetic proxy order: each batch followed by its repeated N groups."""
     offsets = [[0] for _ in counts]
     for source, values in enumerate(counts):
         for value in values:
             offsets[source].append(offsets[source][-1] + value)
     descriptors = []
+    source_order = list(range(len(counts))) if source_order is None else source_order
     for expert in range(len(counts[0])):
         consumed = [0] * len(counts)
         while any(consumed[source] < values[expert] for source, values in enumerate(counts)):
-            room, ranges = cluster_rows, []
-            for source, values in enumerate(counts):
+            room, by_source = cluster_rows, {}
+            for source in source_order:
+                values = counts[source]
                 begin = offsets[source][expert] + consumed[source]
                 take = min(room, values[expert] - consumed[source])
-                ranges += [begin, begin + take]
+                by_source[source] = [begin, begin + take]
                 consumed[source] += take
                 room -= take
+            ranges = [value for source in range(len(counts)) for value in by_source[source]]
             for group in range(n_groups):
                 descriptors.append([expert, group, *ranges])
     # Arrival order is deliberately different from expert/output order.
@@ -140,6 +143,12 @@ class CompositionCudaTests(unittest.TestCase):
             raise unittest.SkipTest("requires SM90 or SM100/SM103")
         cls.torch = torch
         cls.arch = torch.cuda.get_device_capability()[0]
+        cls.previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.torch.backends.cuda.matmul.allow_tf32 = cls.previous_tf32
 
     def test_streamed_up_compact_down_and_concurrent_combine(self):
         for tile_m in ((128, 256) if self.arch == 10 else (128,)):
@@ -147,7 +156,14 @@ class CompositionCudaTests(unittest.TestCase):
                 with self.subTest(tile_m=tile_m, sm_count=sm_count):
                     self._composition(tile_m, sm_count)
 
-    def _composition(self, tile_m, sm_count):
+    def test_weighted_streamed_composition(self):
+        for tile_m in ((128, 256) if self.arch == 10 else (128,)):
+            for preparation in ("gpu", "cpu-publication"):
+                for policy in ("distinct", "ones", "zeros"):
+                    with self.subTest(tile_m=tile_m, preparation=preparation, weights=policy):
+                        self._composition(tile_m, 4, policy=policy, preparation=preparation)
+
+    def _composition(self, tile_m, sm_count, policy=None, preparation="gpu"):
         torch = self.torch
         root = Path(os.environ.get("QUACK_ROOT", SCRIPTS.parents[2] / "quack_for_communication_overlap"))
         sys.path.insert(0, str(root))
@@ -159,18 +175,36 @@ class CompositionCudaTests(unittest.TestCase):
         torch.manual_seed(134)
         tile_n, cluster_m, hidden, intermediate = 128, 2, 384, 256
         span = cta_tile_shape_m(tile_m, cluster_m, self.arch) * cluster_m
-        counts = [[span + 3, 9], [5, span // 2 + 1], [span // 2 - 1, 0]]
+        counts = [[span + 3, 9], [5, span // 2 + 1], [span // 2 - 1, 0], [0, 0]]
         rows = descriptor_rows(counts, span, 2 * intermediate // tile_n)
         capacity = max(map(sum, counts)) + 13
-        sources, unique = 3, (37, 43, 29)
+        sources, input_rows = len(counts), span + 17
+        original = {}
         buffers = worker.TorchDeviceBuffers(torch, torch.cuda.current_device(), node_rank=0,
                                             local_gpu_index=0)
         for source in range(sources):
-            x = torch.randn(64, hidden, dtype=torch.bfloat16, device="cuda") * 0.2
+            x = torch.randn(input_rows, hidden, dtype=torch.bfloat16, device="cuda") * 0.2
             index = torch.full((capacity,), -12345, dtype=torch.int32, device="cuda")
-            index[:sum(counts[source])] = torch.arange(sum(counts[source]), device="cuda") % unique[source]
+            # Original source-token/expert assignments are created before any
+            # gather table or packed-row order. Experts share source tokens;
+            # each (source, original token, expert) assignment is unique.
+            original[source] = []
+            selected = []
+            values = []
+            for expert, count in enumerate(counts[source]):
+                for token in range(count):
+                    value = (1.0 if policy in (None, "ones") else 0.0 if policy == "zeros"
+                             else (source + 1) * 0.125 + (token % 7 + 1) * 0.0625 + expert * 0.1875)
+                    selected.append(token)
+                    values.append(value)
+                    original[source].append((expert, token, value, token))
+            index[:len(selected)] = torch.tensor(selected, dtype=torch.int32, device="cuda")
             buffers.tensors[(worker.DEVICE_BUFFER_NVLINK_RECEIVE, -1, 0, source)] = x
             buffers.tensors[(worker.DEVICE_BUFFER_ROUTER_A_IDX, -1, 0, source)] = index
+            if policy is not None:
+                weights = torch.full((capacity,), float("nan"), dtype=torch.float32, device="cuda")
+                weights[:len(values)] = torch.tensor(values, dtype=torch.float32, device="cuda")
+                buffers.tensors[(worker.DEVICE_BUFFER_ROUTER_ROUTE_WEIGHTS, -1, 0, source)] = weights
         table = torch.tensor(rows, dtype=torch.int32, device="cuda")
         ready = torch.full((1,), len(rows), dtype=torch.int32, device="cuda")
         buffers.tensors[(worker.DEVICE_BUFFER_GATHER_TABLE, -1, -1, -1)] = table
@@ -180,6 +214,8 @@ class CompositionCudaTests(unittest.TestCase):
             num_experts=2, output_dimension=intermediate, activation="swiglu",
             tile_m=tile_m, tile_n=tile_n, tile_k=None, cluster_m=cluster_m,
             max_swizzle_size=1, quack_root=root)
+        up.original_reference = original
+        up.original_reference_recompute = True
         parser = argparse.ArgumentParser()
         worker.add_down_arguments(parser)
         options = parser.parse_args([
@@ -188,6 +224,7 @@ class CompositionCudaTests(unittest.TestCase):
             "--down-gather-table-wave-barrier", "--down-gather-table-publish-ready",
             "--trace-down-ready", f"--down-tile-m={tile_m}", f"--down-tile-n={tile_n}",
             "--down-cluster-m=2", "--down-max-swizzle-size=1", f"--down-sm-count={sm_count}"])
+        options.weighted_contributions = policy is not None
         host_ready = torch.zeros(1, dtype=torch.int32, pin_memory=True)
 
         def configure_trace(groups):
@@ -214,7 +251,7 @@ class CompositionCudaTests(unittest.TestCase):
                    for source, size in enumerate(valid)]
         compact = [output.flatten()[:size * hidden]
                    for output, size in zip(down.inputs.output_buffers(), valid)]
-        combine = FinalCombine(compact, indices, 64, hidden, tile_n=tile_n, num_ctas=2,
+        combine = FinalCombine(compact, indices, input_rows, hidden, tile_n=tile_n, num_ctas=2,
                                register_prefetch=True, ready_groups=down.inputs.ready_groups)
         combine()  # Warm the real callable before any waiting kernel is launched.
         torch.cuda.synchronize()
@@ -224,19 +261,49 @@ class CompositionCudaTests(unittest.TestCase):
                          for end in range(1, len(rows) + 1)]
         pinned_x = [x.cpu().pin_memory() for x in up.x_buffers]
 
+        pinned_route_weights = None
+        pinned_addresses = None
+
         def publish():
             # H2D copies use copy engines: a spinning full-SM up GEMM cannot
             # starve a CUDA fill kernel needed to publish its own readiness.
-            with torch.cuda.stream(publication):
+            with torch.inference_mode(), torch.cuda.stream(publication):
                 for destination, source in zip(up.x_buffers, pinned_x):
                     destination.copy_(source, non_blocking=True)
                 for index, count in enumerate(pinned_counts):
+                    if pinned_route_weights is not None and pinned_table[index, 1].item() == 0:
+                        # Mirrors native CPU scatter preparation: route weights
+                        # and addresses become visible before gather readiness.
+                        # The actual C++ publisher is covered by test_cpu_scatter_cuda.
+                        ranges = pinned_table[index, 2:].tolist()
+                        begin = sum(ranges[::2])
+                        end = begin + sum(stop - start for start, stop in zip(ranges[::2], ranges[1::2]))
+                        down.route_weights[begin:end].copy_(pinned_route_weights[begin:end], non_blocking=True)
+                        down.inputs.scatter_row_addresses[begin:end].copy_(pinned_addresses[begin:end],
+                                                                          non_blocking=True)
                     table[index:index + 1].copy_(pinned_table[index:index + 1], non_blocking=True)
                     ready.copy_(count, non_blocking=True)
 
         publish()
         publication.synchronize()
         for iteration in range(3):
+            changed = descriptor_rows(counts, span, 2 * intermediate // tile_n,
+                                      list(range(sources))[::-1] if iteration % 2 else None)
+            pinned_table.copy_(torch.tensor(changed, dtype=torch.int32))
+            table.copy_(pinned_table)
+            if policy is not None and preparation == "cpu-publication":
+                # Use the tested GPU address builder only to obtain invariant
+                # compact destination addresses; source weights are packed by a
+                # separate CPU descriptor walk, never by the implementation.
+                down.cpu_scatter = False
+                with torch.inference_mode():
+                    down._prepare_combine(up.work_table, up.a_idx)
+                torch.cuda.synchronize()
+                pinned_addresses = down.inputs.scatter_row_addresses.cpu().pin_memory()
+                expected_values = [up.route_weights[source][position].item()
+                                   for _, source, position in validation.route_positions(up, routes)]
+                pinned_route_weights = torch.tensor(expected_values, dtype=torch.float32).pin_memory()
+                down.cpu_scatter = True
             for source in pinned_x:
                 source.mul_(-1.1)  # New values each iteration detect stale reads.
             with torch.inference_mode():
@@ -245,6 +312,8 @@ class CompositionCudaTests(unittest.TestCase):
                 ready.zero_()
                 down.inputs.wave_store_workspace.zero_()
                 combine.output.fill_(float("nan"))
+                if down.route_weights is not None:
+                    down.route_weights.fill_(float("nan"))
             host_ready.zero_()
             torch.cuda.synchronize()
             with torch.cuda.stream(producer):
@@ -261,10 +330,29 @@ class CompositionCudaTests(unittest.TestCase):
             self.assertEqual(down.inputs.ready_groups.item(), hidden // tile_n)
             self.assertTrue(torch.isnan(up.output[routes:]).all().item())
             validation.check_projections(torch, up, down, routes, column_chunk=128)
-            expected = torch.zeros(64, hidden, device="cuda")
+            expected = torch.zeros(input_rows, hidden, device="cuda")
             for selected, output in zip(indices, down.collected_combine_outputs()):
                 expected.index_add_(0, selected.long(), output.float())
             torch.testing.assert_close(combine.output, expected.to(torch.bfloat16), rtol=0, atol=0)
+            # Full independent end-to-end reference uses original assignments,
+            # original source input rows, and both expert matrices. It never
+            # reads A_idx, a work/scatter table, or the packed scaling vector.
+            independent = torch.zeros(input_rows, hidden, device="cuda")
+            for source, assignments in original.items():
+                for expert in range(2):
+                    selected = [(token, value) for exp, token, value, _ in assignments if exp == expert]
+                    if not selected:
+                        continue
+                    tokens = torch.tensor([token for token, _ in selected], device="cuda")
+                    scale = torch.tensor([value for _, value in selected], device="cuda")
+                    gate_up = pinned_x[source][tokens.cpu()].to("cuda").float() @ up.weights[expert].float()
+                    intermediate_ref = (torch.nn.functional.silu(gate_up[:, :intermediate]) *
+                                        gate_up[:, intermediate:]).to(up.output.dtype)
+                    contribution = ((intermediate_ref.float() @ down.weights[expert].float()) *
+                                    scale[:, None]).to(up.output.dtype).float()
+                    independent.index_add_(0, tokens, contribution)
+            validation._assert_values(torch, combine.output, independent, "independent original composition",
+                                      reduction=True)
             for output, size in zip(down.inputs.output_buffers(), valid):
                 torch.testing.assert_close(output.flatten()[size * hidden:],
                                            torch.zeros_like(output.flatten()[size * hidden:]))

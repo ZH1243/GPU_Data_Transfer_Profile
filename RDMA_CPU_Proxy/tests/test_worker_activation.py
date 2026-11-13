@@ -159,6 +159,22 @@ class ActivationCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("--cpu-scatter-preparation", result.stdout)
 
+    def test_weighted_contributions_cli(self):
+        common = ("--concurrent-kernel", "--grouped-gemm-activation=swiglu",
+                  "--down-projection2", "--down-gather-table", "--local-gpu-combine")
+        for preparation in ((), ("--cpu-scatter-preparation",)):
+            result = self.run_cli(*common, *preparation, "--weighted-contributions")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("--router_weighted_contributions_enabled=true", result.stdout)
+        for flags in ((), ("--weighted-contributions", "--no-weighted-contributions")):
+            result = self.run_cli(*common, *flags)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("--router_weighted_contributions_enabled=false", result.stdout)
+        self.assertNotEqual(self.run_cli("--weighted-contributions").returncode, 0)
+        result = self.run_cli("--weighted-contributions", "--communication-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--router_weighted_contributions_enabled=false", result.stdout)
+
     def test_return_results_cli(self):
         common = ("--concurrent-kernel", "--grouped-gemm-activation=swiglu",
                   "--down-projection2", "--local-gpu-combine", "--down-pingpong",

@@ -39,6 +39,7 @@ enum class DeviceBufferKind : int32_t {
     kRouterAIdx = 4,
     kGatherTable = 5,
     kGatherReadyRows = 6,
+    kRouterRouteWeights = 7,
 };
 
 enum class DeviceBufferElementType : int32_t {
@@ -127,6 +128,7 @@ struct NvlinkReceiveBuffer {
     // QuACK A_idx_j. All source buffers use the same padded device allocation
     // size; expert_token_index_count records the meaningful prefix.
     GpuBuffer expert_token_indices_device;
+    GpuBuffer expert_route_weights_device;
     std::size_t expert_token_index_count{0};
     RouterExpertMetadata expert_metadata;
     bool expert_metadata_ready{false};
@@ -212,6 +214,7 @@ public:
     float router_computation_elapsed_ms(uint64_t iteration);
     std::size_t router_computation_num_tokens() const;
     void configure_cpu_scatter(const RdmaProxyCpuScatterConfig& config);
+    void configure_cpu_route_weights(uintptr_t packed_weights, std::size_t routes);
     void update_expert_token_heads(
         int source_node_rank,
         int source_gpu_index,
@@ -263,6 +266,8 @@ private:
     ProxyConfig config_;
     void publish_cpu_scatter_batch(const std::vector<int32_t>& ranges);
     CpuPinnedBuffer cpu_scatter_staging_;
+    CpuPinnedBuffer cpu_route_weights_staging_;
+    uintptr_t cpu_route_weights_device_{0};
     uintptr_t cpu_scatter_device_{0};
     std::size_t cpu_scatter_columns_{0};
     // Per-source A_idx entry -> final address (and optional N-tile stride).

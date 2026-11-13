@@ -1175,13 +1175,13 @@ projection, local down-output combine, and CPU readiness tracing:
 ```
 
 `--local-gpu-combine` selects the additive bulk-row epilogue required by this
-configuration. It combines into local per-source buffers without routing
-weights. Add `--return-token-results` below to return these outputs to their
+configuration. It combines into local per-source buffers; add
+`--weighted-contributions` to enable routing weights. Add `--return-token-results` below to return these outputs to their
 same-node NVLink senders.
 
-Scatter matches the standalone benchmark: a random permutation distributes
+Without `--local-gpu-combine`, scatter matches the standalone benchmark: a random permutation distributes
 routed rows across separately allocated local outputs. It does not map results
-back to original tokens, apply routing weights, or return results over RDMA.
+back to original tokens or return results over RDMA. Routing weights remain opt-in.
 Although `bulk_rows_reduce` uses additive stores, permutation destinations do
 not collide. Destination buffers are zeroed before every down invocation to
 prevent accumulation across iterations. N-tile-major buffers have shape
@@ -1194,7 +1194,7 @@ stages (including reset, excluding gaps between stages). Down FLOPs are
 `2 * meaningful_routes * activated_width * token_dimension`. Cold compilation
 can inflate initial event timings; use later iterations for performance analysis.
 
-### Local GPU combine without routing weights
+### Local GPU combine
 
 Append `--local-gpu-combine` together with `--down-projection2` and a fused
 up activation to the existing concurrent commands on both nodes, for example:
@@ -1242,8 +1242,8 @@ capacity-based shape. An empty source has a zero-length prefix and no stores.
 `down.collected_combine_outputs()` synchronizes the last launch and returns one
 row-major valid tensor per source for inspection. Do not use QuACK's generic
 `inputs.collected_up_output()` for combine: it assumes capacity-based strides.
-Input-row indices are not necessarily original source-token indices. No
-cross-GPU reduction or routing weights are applied. Return transfer is opt-in
+Input-row indices are not necessarily original source-token indices. Routing
+weights are opt-in as described below. Return transfer is opt-in
 with `--return-token-results`.
 
 The up scheduler's packed row order can change with notification arrival order.
@@ -1258,6 +1258,153 @@ is validated once during initialization. No host readback of the live table is
 needed. This adds GPU mapping work between up and down, reported separately as
 `mapping_ms`; `up_plus_down_ms` includes reset, mapping, and down time in addition
 to the existing up timing.
+
+### Weighted expert contributions
+
+Append `--weighted-contributions` to both existing torchrun commands to compute
+`sum_expert(routing_weight[token, expert] * expert_output[token, expert])`.
+The default and `--no-weighted-contributions` retain the unweighted sum. This
+worker option requires `--down-projection2 --down-gather-table`; the existing
+two-node launchers already provide both. `--communication-only` disables it.
+The worker owns the native `router_weighted_contributions_enabled` setting;
+native-only callers can set that Boolean through CLI or JSON. All ranks must
+agree. Routing weights are separate from the up/down expert GEMM matrices.
+
+Test-data policy: source initialization retains the original `[num_tokens, top_k]`
+expert assignments and generates one positive FP32 weight per selected slot.
+SplitMix64 draws use `router_seed`, source node, source GPU, and token/slot identity.
+The top 24 random bits plus one form exactly representable positive integers;
+their sum is computed in FP64 and each normalized quotient is rounded to FP32.
+Normalization covers each token's **complete selected top-k set before any
+destination partitioning**, so FP32 weights sum approximately to one across all
+GPUs/nodes, never separately per destination. Assignments and weights stay fixed
+across iterations. Changing source identity changes the weights without changing
+the established expert-assignment generator. Production-generated weights are
+positive; the protocol and epilogue also support finite nonnegative weights,
+including zero and all-one test vectors.
+
+Expert metadata wire format `router_expert_metadata_v2` carries a mode bit and
+one FP32 weight per `expert_token_indices` entry. FP32 bit patterns are serialized
+as decimal uint32 values, preserving them exactly. Length, payload capacity,
+finite/nonnegative values, topology, and mode agreement are checked. Upgrade
+the native library on every rank together; v1 expert payloads are rejected.
+Source x3/x4 mappings recover original tokens before attaching expert weights:
+same-index GPU inputs retain the full destination-node x3 domain, while forwarded
+inputs use their compact x4 domain. A destination input-row index alone cannot
+identify a routing weight because different experts may share that row.
+
+Each source owns an immutable FP32 buffer padded exactly like its `A_idx`.
+Every iteration builds a separate FP32 vector in the actual packed up-output
+row order using the gather descriptor's exact source/list positions. GPU
+preparation shares the scatter mapping calculation; `--cpu-scatter-preparation`
+copies selected source ranges into pinned weight staging and publishes them
+on the same stream as scatter addresses, before gather readiness. Repeated N
+groups reuse those weights. Python retains all borrowed GPU tensors until native
+shutdown, and native pinned staging remains alive until publication completes.
+
+QuACK's optional `route_weights` argument uses a dedicated row loader in the
+shared default epilogue on Hopper and Blackwell. It multiplies the FP32 down
+accumulator before BF16/FP16 conversion and existing `bulk_rows_reduce` stores.
+It indexes logical routed rows before scatter, handles partial CTA rows and the
+scheduler's Blackwell two-CTA offsets, and leaves traversal and buffered-store
+settings unchanged. With no vector, the extra loader/math compile out; tensor
+specialization participates in both caches while values and pointers remain
+runtime arguments. Zero weights still store/complete and publish readiness.
+Intra-node and inter-node combine only sum already-weighted partials. RDMA
+visibility, readiness ordering, output resets, and residency policy are unchanged.
+
+`--check-projections` checks immutable-to-packed weights and weighted down
+arithmetic, converting each contribution to output dtype before the reduction
+reference. With result returns enabled it also exchanges the original source
+assignments among local workers once, and independently reconstructs x3/x4 and
+token/expert/weight identities for local-node sources. Remote-source routes are
+checked against received immutable metadata. The composition tests additionally
+compute a complete original-assignment up/SwiGLU/down reference independent of
+the implementation's packed mapping. Reduction comparisons allow accumulated
+BF16/FP16 rounding, rather than assuming exact FP32 scatter-add equivalence.
+
+Run the following stages on each remote NVIDIA architecture after syncing both
+repositories. Set paths and select an existing matching CUDA/PyTorch environment:
+
+```bash
+export PROXY_ROOT=/path/to/GPU_Data_Transfer_Profile/RDMA_CPU_Proxy
+export QUACK_ROOT=/path/to/quack_for_communication_overlap
+export RDMA_PROXY_GEMM_ARCH=blackwell  # hopper on H100
+export RDMA_PROXY_BUILD_DIR="$PROXY_ROOT/build-$RDMA_PROXY_GEMM_ARCH"
+ARCH=100; [ "$RDMA_PROXY_GEMM_ARCH" = hopper ] && ARCH=90
+cmake -S "$PROXY_ROOT" -B "$RDMA_PROXY_BUILD_DIR" \
+  -DCMAKE_CUDA_ARCHITECTURES="$ARCH" -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \
+  -DRDMA_PROXY_REQUIRE_CUDA=ON -DRDMA_PROXY_REQUIRE_VERBS=ON
+cmake --build "$RDMA_PROXY_BUILD_DIR" -j4
+ctest --test-dir "$RDMA_PROXY_BUILD_DIR" --output-on-failure
+
+# Stage 1: fused scaling, partial rows, zero/one/non-unit weights, cache reuse.
+cd "$QUACK_ROOT"
+CUDA_VISIBLE_DEVICES=0 timeout 1800 python -m pytest -q \
+  tests/test_gemm_route_weights.py -x
+
+# Stage 2: actual streamed SwiGLU -> weighted compact down -> concurrent combine.
+cd "$PROXY_ROOT"
+CUDA_VISIBLE_DEVICES=0 timeout 1800 python -m unittest discover \
+  -s tests -p test_worker_composition.py -v
+# Additional Blackwell buffered-store/host-readiness integration coverage:
+if [ "$RDMA_PROXY_GEMM_ARCH" = blackwell ]; then
+  cd "$QUACK_ROOT"
+  CUDA_VISIBLE_DEVICES=0 timeout 1800 python -m pytest -q \
+    run/test_proxy_gemm_integration.py -x
+fi
+```
+
+Stage 3 uses the existing per-node fabric configuration (`MASTER_ADDR`,
+`PEER_HOST`, `CUDA_DEVICE_MAP`, `RDMA_DEVICE_MAP`, `RDMA_GID_INDEX`; see the
+Blackwell setup above). Set `NODE_RANK=0` on node 0 and `NODE_RANK=1` on node 1,
+and run this same loop concurrently on both nodes. All existing return and
+intra/inter-node numerical checks remain enabled:
+
+```bash
+cd "$PROXY_ROOT"
+for preparation in gpu cpu; do
+  extra=()
+  if [ "$preparation" = cpu ]; then extra+=(--cpu-scatter-preparation); fi
+  bash "./scripts/run_node${NODE_RANK}_torchrun.sh" \
+    --weighted-contributions --check-projections \
+    --num_tokens=1024 --num_iterations=12 --completion_timeout_ms=600000 \
+    "${extra[@]}" 2>&1 | tee "weighted-${preparation}-node${NODE_RANK}.log"
+done
+```
+
+After correctness passes, compare unweighted/weighted runs with identical
+settings and warm iterations. On the reported 148-SM B300, this preserves the
+existing allowed down cap of 128, cluster M=2, and 10 concurrent combine CTAs.
+Run concurrently on both nodes, then repeat the loop in reverse order. Compare
+down, mapping, communication, and full pipeline timing; exclude compilation and
+initial warm iterations. Keep normal QuACK caching enabled:
+
+```bash
+cd "$PROXY_ROOT"
+for weighting in --no-weighted-contributions --weighted-contributions; do
+  bash "./scripts/run_node${NODE_RANK}_torchrun.sh" "$weighting" \
+    --num_tokens=20480 --num_iterations=30 \
+    --token_dimension=7168 --grouped-gemm-output-dimension=2048 \
+    --grouped-gemm-m-tile=256 --grouped-gemm-n-tile=512 \
+    --grouped-gemm-cluster-m=2 --grouped-gemm-max-swizzle-size=1 \
+    --down-tile-m=256 --down-tile-n=512 --down-cluster-m=2 \
+    --down-max-swizzle-size=1 --down-sm-count=128 --intra-node-combine-ctas=10 \
+    --down-bulk-smem-padding=16 --down-bulk-smem-cols=128 \
+    --down-bulk-smem-buffers=1 --down-bulk-store-warps=4 \
+    --no-check-projections --no-check-return-token-results \
+    --no-check-intra-node-combine --no-check-rdma-return-token-results \
+    --no-check-inter-node-combine \
+    2>&1 | tee "perf${weighting}-node${NODE_RANK}.log"
+done
+```
+
+First run that model-shaped geometry with `--weighted-contributions
+--check-projections`, all return/combine checks enabled, and `--num_iterations=8`.
+Repeat both numerical and performance runs with `--cpu-scatter-preparation`.
+For Hopper, use the established Hopper tile/SM settings and omit Blackwell-only
+bulk overrides. CUDA compilation, numerical execution, transport concurrency,
+and throughput require these remote runs; local Mac checks do not validate them.
 
 ### Optional CPU scatter preparation
 
@@ -1393,7 +1540,8 @@ The layout option changes storage only. Add
 below. The input HBM ready prefix must not be used as an output-completion signal.
 The kernel reduces 14 received plus two retained contributions in one launch;
 single-node mode reduces seven received plus one retained contribution.
-This adds no routing weights, reverse RDMA, or final cross-node reduction.
+This stage sums already-weighted partials when enabled; reverse RDMA and final
+cross-node reduction are separate stages.
 Existing GEMM event timings exclude combine completion and its additional barrier,
 although concurrent execution can affect down-GEMM performance.
 
@@ -1571,7 +1719,7 @@ Return transfers and the rank barrier are excluded from the existing GEMM event
 timings, although overlapping transfers can affect down-GEMM performance. The
 small count readback is included in mapping time. This feature performs only the
 reverse intra-node NVLink hop: remote-origin results still need a later reverse
-RDMA transfer, and final token reduction/routing weights are not implemented.
+RDMA transfer and final token reduction, described in their separate sections.
 
 To notify each destination GPU's forwarding thread after every returned column
 group, append this option on every local rank (on both nodes for a two-node run):
@@ -2256,8 +2404,9 @@ CuTe kernel gathers the local staging node sum and each remote returned node sum
 accumulates in FP32 in ascending node order, and writes a contiguous
 `[num_tokens, token_dimension]` tensor in original source-token order. There is
 no separate scatter kernel, no atomics, and no group-readiness polling. Tokens
-without contributions are written zero. Routing weights are not applied; input
-node sums have already been rounded to their BF16/FP16 storage precision.
+without contributions are written zero. Routing weights, when enabled, have
+already been applied by the down epilogue; this stage only sums input node
+partials already rounded to their BF16/FP16 storage precision.
 
 For a single-node run, retain the existing down-GEMM, NVLink-return, and
 intra-node-combine prerequisites, and append only:

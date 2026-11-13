@@ -625,6 +625,7 @@ size_t read_expert_header(const Config& c, const std::string& header, size_t pay
     m.num_nodes = r.integer(); m.num_gpus_per_node = r.integer(); m.num_experts = r.integer();
     m.experts_per_gpu = r.integer(); m.first_global_expert = r.integer();
     m.num_tokens = r.word(); auto count = r.word();
+    m.top_k = c.a.top_k; // This benchmark's fixed binary header uses collective configuration.
     require(m.num_nodes > 0 && m.num_gpus_per_node > 0 && m.num_experts > 0 &&
             m.experts_per_gpu == c.epg() && m.num_tokens <= size_t(c.a.num_tokens) &&
             count <= uint64_t(c.a.num_tokens) * c.a.top_k, "invalid binary expert dimensions");
@@ -1140,6 +1141,7 @@ std::pair<Record, Installed> exchange(const Config& c, Mesh& mesh, LocalMemory& 
                 m.num_nodes = c.hosts.size(); m.num_gpus_per_node = c.a.gpus_per_node;
                 m.num_experts = c.a.num_experts; m.experts_per_gpu = c.epg();
                 m.first_global_expert = c.a.rank * c.epg(); m.num_tokens = c.a.num_tokens;
+                m.top_k = c.a.top_k;
                 resize_reserved(m.expert_offsets, c.epg() + 1);
                 resize_reserved(m.expert_token_indices, h->counts[c.gpu(c.a.rank)]);
                 double decode_ms = ms(Clock::now(), before);

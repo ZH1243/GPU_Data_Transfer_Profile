@@ -55,6 +55,7 @@ DEVICE_BUFFER_NVLINK_RECEIVE = 3
 DEVICE_BUFFER_ROUTER_A_IDX = 4
 DEVICE_BUFFER_GATHER_TABLE = 5
 DEVICE_BUFFER_GATHER_READY_ROWS = 6
+DEVICE_BUFFER_ROUTER_ROUTE_WEIGHTS = 7
 
 DEVICE_BUFFER_BF16 = 1
 DEVICE_BUFFER_FP16 = 2
@@ -94,6 +95,7 @@ class TorchDeviceBuffers:
         DEVICE_BUFFER_ROUTER_A_IDX: "router_a_idx",
         DEVICE_BUFFER_GATHER_TABLE: "gather_table",
         DEVICE_BUFFER_GATHER_READY_ROWS: "gather_ready_rows",
+        DEVICE_BUFFER_ROUTER_ROUTE_WEIGHTS: "router_route_weights",
     }
 
     def __init__(
@@ -407,11 +409,22 @@ class GroupedGemmRunner:
             dtype=first_x.dtype,
             device=first_x.device,
         )
-        torch_module.cuda.synchronize(cuda_device_id)
-
         self.x_buffers = tuple(x_buffers)
         self.source_pairs = tuple(source_pairs)
         self.a_idx = tuple(a_idx)
+        weight_entries = device_buffers.tensors_of_kind(DEVICE_BUFFER_ROUTER_ROUTE_WEIGHTS)
+        self.route_weights = None
+        if weight_entries:
+            self.route_weights = tuple(device_buffers.tensors[
+                (DEVICE_BUFFER_ROUTER_ROUTE_WEIGHTS, -1, node, gpu)
+            ] for node, gpu in source_pairs)
+            if any(weight.shape != index.shape or weight.dtype != torch_module.float32
+                   for weight, index in zip(self.route_weights, self.a_idx)):
+                raise RuntimeError("routing weights must be FP32 and aligned with each source A_idx")
+        # Immutable lookup storage; only the routed-row vector changes per iteration.
+        self.route_weights_stacked = (torch_module.stack(self.route_weights)
+                                      if self.route_weights is not None else None)
+        torch_module.cuda.synchronize(cuda_device_id)
         self.work_table = work_table
         self.ready_rows = ready_rows
         self.transposed_weights = self.weights.transpose(1, 2)
@@ -641,8 +654,8 @@ def validate_down_arguments(args):
                               args.down_gather_table_wave_barrier)
 
 
-def local_combine_mapping(torch, work_table, a_idx, routes, n_groups, trace=None):
-    """Recover each packed up-output row's (source, input row) on device.
+def local_route_positions(torch, work_table, num_sources, routes, n_groups, trace=None):
+    """Recover each packed row's exact (source, A_idx list position) on device.
 
     Multi-buffer QuACK places a table row at sum(start_j), concatenating its
     source ranges. N groups repeat those ranges. Publication order is arbitrary;
@@ -654,7 +667,7 @@ def local_combine_mapping(torch, work_table, a_idx, routes, n_groups, trace=None
             trace("mapping: " + message)
 
     mark("table conversion begin")
-    ranges = work_table[::n_groups, 2:].long().reshape(-1, len(a_idx), 2)
+    ranges = work_table[::n_groups, 2:].long().reshape(-1, num_sources, 2)
     starts, ends = ranges[:, :, 0], ranges[:, :, 1]
     mark("table conversion submitted; lengths begin")
     lengths = ends - starts
@@ -680,16 +693,19 @@ def local_combine_mapping(torch, work_table, a_idx, routes, n_groups, trace=None
     segments = order[positions]
     del sorted_keys, positions
     mark("segment gather submitted; source and index arithmetic begin")
-    source = segments % len(a_idx)
+    source = segments % num_sources
     output_starts = (output_ends - lengths).flatten()
     index = starts.flatten()[segments] + rows - output_starts[segments]
-    mark("index arithmetic submitted; A_idx stack begin")
+    mark("index arithmetic submitted")
+    return source, index
+
+
+def local_combine_mapping(torch, work_table, a_idx, routes, n_groups, trace=None):
+    """Map routed rows to input rows; list positions also distinguish expert weights."""
+    source, index = local_route_positions(torch, work_table, len(a_idx), routes, n_groups, trace)
     indices = torch.stack(a_idx)
-    mark("A_idx stack submitted; token index gather begin")
     token_indices = indices[source, index].long()
-    mark("token index gather submitted; result stack begin")
     result = torch.stack((source, token_indices), dim=1)
-    mark("result stack submitted")
     return result
 
 
@@ -743,6 +759,16 @@ class DownProjectionRunner:
         self.cpu_scatter_counts = None
         self.up = up
         self.routes = routes
+        self.route_weights = None
+        if getattr(options, "weighted_contributions", False):
+            if up.route_weights is None:
+                raise RuntimeError("weighted contributions require native per-source routing weights")
+            # Own the packed runtime argument through every launch and native shutdown.
+            self.route_weights = torch.zeros(routes, dtype=torch.float32, device=up.output.device)
+        elif getattr(up, "route_weights", None) is not None:
+            raise RuntimeError("native routing weights disagree with --no-weighted-contributions")
+        clusters_n = math.ceil(up.gemm_dimension / up.tile_n)
+        self.combine_n_groups = clusters_n // min(up.max_swizzle_size, clusters_n)
         if self.combine:
             args.scatter_table = True
             args.multi_buffer_scatter = True
@@ -782,10 +808,10 @@ class DownProjectionRunner:
                 len(outputs), dtype=torch.int64, device=up.output.device)
             self.combine_output_to_input = torch.full(
                 (len(outputs), rows), -1, dtype=torch.int64, device=up.output.device)
-            clusters_n = math.ceil(up.gemm_dimension / up.tile_n)
-            self.combine_n_groups = clusters_n // min(up.max_swizzle_size, clusters_n)
             external = dict(output_buffers=outputs, scatter_mapping=torch.zeros(
                 (routes, 2), dtype=torch.int64, device=up.output.device))
+        if self.route_weights is not None:
+            external["route_weights"] = self.route_weights
         self.inputs = pregather.prepare_grouped_inputs(
             args, up.output[:routes], self.weights, counts, **external
         )
@@ -818,7 +844,8 @@ class DownProjectionRunner:
         if self.combine:
             print(f"Local GPU combine: sources={up.source_pairs} "
                   f"rows_per_source={self.combine_rows} epilogue=bulk_rows_reduce "
-                  "positions=compact prefixes in input-row order; no routing weights",
+                  "positions=compact prefixes in input-row order; "
+                  f"routing_weights={'FP32' if self.route_weights is not None else 'disabled'}",
                   flush=True)
 
     def warmup(self):
@@ -894,6 +921,16 @@ class DownProjectionRunner:
                         ctypes.cast(inverse.data_ptr(), ctypes.POINTER(ctypes.c_int64)))
         require_proxy_success(library, configure(handle, ctypes.byref(config)),
                               "configuring CPU scatter preparation")
+        if self.route_weights is not None:
+            try:
+                configure_weights = library.rdma_proxy_configure_cpu_route_weights
+            except AttributeError as error:
+                raise RuntimeError("weighted CPU preparation requires rebuilding librdma_cpu_proxy") from error
+            configure_weights.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint64]
+            configure_weights.restype = ctypes.c_int
+            require_proxy_success(library, configure_weights(
+                handle, self.route_weights.data_ptr(), self.routes),
+                "configuring CPU packed routing weights")
         with torch.inference_mode():
             self.combine_valid_rows.copy_(counts)
             self.combine_output_to_input.copy_(inverse)
@@ -903,11 +940,13 @@ class DownProjectionRunner:
               "scatter batches published before gather readiness", flush=True)
 
     def _prepare_combine(self, work_table, a_idx):
-        mapping = local_combine_mapping(
-            self.up.torch, work_table, a_idx,
-            self.routes, self.combine_n_groups,
-            trace=self._log_combine_startup if self._trace_first_combine_launch else None,
-        )
+        torch = self.up.torch
+        source, index = local_route_positions(
+            torch, work_table, len(a_idx), self.routes, self.combine_n_groups,
+            trace=self._log_combine_startup if self._trace_first_combine_launch else None)
+        mapping = torch.stack((source, torch.stack(a_idx)[source, index].long()), dim=1)
+        if self.route_weights is not None:
+            self.route_weights.copy_(self.up.route_weights_stacked[source, index])
         self._log_combine_startup("route mapping submitted; compaction begin")
         mapping, valid_rows, output_to_input = compact_combine_mapping(
             self.up.torch, mapping, len(self.up.x_buffers), self.combine_rows,
@@ -937,6 +976,11 @@ class DownProjectionRunner:
             if self.combine and not self.cpu_scatter:
                 self._log_combine_startup("route mapping begin")
                 self._prepare_combine(self.up.work_table, self.up.a_idx)
+            elif self.route_weights is not None and not self.cpu_scatter:
+                source, index = local_route_positions(
+                    self.up.torch, self.up.work_table, len(self.up.a_idx),
+                    self.routes, self.combine_n_groups)
+                self.route_weights.copy_(self.up.route_weights_stacked[source, index])
             if self.return_exchange is not None:
                 self.return_exchange.publish_counts()
             self.gemm_start.record()
@@ -1081,6 +1125,8 @@ def build_proxy_argv(
         f"--rdma_device_name={local_devices[0]}",
         f"--rdma_device_name2={local_devices[1] if len(local_devices) == 2 else ''}",
         f"--listen_port={listen_port}",
+        "--router_weighted_contributions_enabled="
+        + str(getattr(args, "weighted_contributions", False)).lower(),
     ]
     if args.num_experts is not None:
         generated_args.append(f"--num_experts={args.num_experts}")
@@ -1508,6 +1554,12 @@ def run_proxy_with_concurrent_kernel(
                                   flush=True)
                         down.intra_node_combine.inter_node_combine = InterNodeCombine(
                             down.intra_node_combine, down_options)
+            if (down_options.check_projections and down.route_weights is not None
+                    and return_exchange is not None):
+                from projection_validation import configure_original_reference
+                configure_original_reference(
+                    grouped_gemm, down, library, handle, return_exchange,
+                    num_experts=num_experts)
         useful_flops = (
             2
             * int(computation_tokens.value)
@@ -1739,6 +1791,9 @@ def main() -> int:
                         help="resolve GEMM/table geometry before native initialization; explicit values are checked against the GPU")
     parser.add_argument("--check-projections", action=argparse.BooleanOptionalAction, default=False,
                         help="check up/down numerical values each iteration, outside GEMM timing")
+    parser.add_argument("--weighted-contributions", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="multiply down FP32 accumulators by fixed normalized routing weights")
     parser.add_argument(
         "--grouped-gemm-activation",
         choices=("none", *ORDINARY_ACTIVATIONS, *GATED_ACTIVATIONS),
@@ -1788,6 +1843,7 @@ def main() -> int:
         vars(args).update(vars(down_parser.parse_args([])))
         args.concurrent_kernel = False
         args.check_projections = False
+        args.weighted_contributions = False
         args.grouped_gemm_activation = "none"
         for name in vars(args):
             if name.startswith("expert_gemm_"):
@@ -1804,6 +1860,8 @@ def main() -> int:
         parser.error("--grouped-gemm-activation requires --concurrent-kernel")
     if args.check_projections and not args.concurrent_kernel:
         parser.error("--check-projections requires --concurrent-kernel")
+    if args.weighted_contributions and not (args.down_projection2 and args.down_gather_table):
+        parser.error("--weighted-contributions requires --down-projection2 and --down-gather-table")
     if args.expert_gemm_dimension <= 0:
         parser.error("--grouped-gemm-output-dimension must be positive")
     args.grouped_gemm_activation = (

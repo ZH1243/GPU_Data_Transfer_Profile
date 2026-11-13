@@ -123,6 +123,7 @@ int main() {
     expert_metadata.experts_per_gpu = 8;
     expert_metadata.first_global_expert = 8;
     expert_metadata.num_tokens = 64;
+    expert_metadata.top_k = 8;
     expert_metadata.expert_token_indices = {0, 3, 1, 4, 7};
     expert_metadata.expert_offsets = {0, 2, 2, 3, 3, 5, 5, 5, 5};
     const auto decoded_expert_metadata = deserialize_router_expert_metadata(

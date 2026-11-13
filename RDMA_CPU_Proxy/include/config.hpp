@@ -64,6 +64,7 @@ struct ProxyConfig {
     bool rdma_chunk_per_token_sge_enabled{false};
     bool rdma_discontinuous_token_payload_enabled{false};
     bool router_routing_enabled{false};
+    bool router_weighted_contributions_enabled{false};
     int router_num_experts{0};
     int router_top_k{0};
     uint64_t router_seed{1234};

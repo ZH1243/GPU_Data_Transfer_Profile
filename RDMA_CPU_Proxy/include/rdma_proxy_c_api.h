@@ -41,6 +41,20 @@ typedef struct RdmaProxyHandle RdmaProxyHandle;
 RDMA_PROXY_C_API int rdma_proxy_configure_cpu_scatter(
     RdmaProxyHandle* handle, const RdmaProxyCpuScatterConfig* config);
 
+/* Optional weighted CPU scatter setup: call after configure_cpu_scatter and
+ * before iteration zero. Borrowed FP32[routes] storage must survive shutdown.
+ * Each selected range is copied once, before its gather readiness publication. */
+RDMA_PROXY_C_API int rdma_proxy_configure_cpu_route_weights(
+    RdmaProxyHandle* handle, uintptr_t packed_weights, uint64_t routes);
+
+/* Original source [num_tokens,top_k] assignments, before destination row mapping.
+ * Query with both arrays NULL and capacity=0; otherwise copy both host arrays.
+ * Weights are normalized FP32 when enabled, exactly one when disabled.
+ * These immutable arrays allow references independent of gather/scatter packing. */
+RDMA_PROXY_C_API int rdma_proxy_get_local_router_assignments(
+    RdmaProxyHandle* handle, int32_t* experts, float* weights, uint64_t capacity,
+    uint64_t* count, uint64_t* num_tokens, uint64_t* top_k);
+
 /* Device-buffer kinds requested through RdmaProxyDeviceBufferAllocator. */
 typedef enum RdmaProxyDeviceBufferKind {
     RDMA_PROXY_DEVICE_BUFFER_RDMA_SEND = 1,
@@ -49,6 +63,7 @@ typedef enum RdmaProxyDeviceBufferKind {
     RDMA_PROXY_DEVICE_BUFFER_ROUTER_A_IDX = 4,
     RDMA_PROXY_DEVICE_BUFFER_GATHER_TABLE = 5,
     RDMA_PROXY_DEVICE_BUFFER_GATHER_READY_ROWS = 6,
+    RDMA_PROXY_DEVICE_BUFFER_ROUTER_ROUTE_WEIGHTS = 7,
 } RdmaProxyDeviceBufferKind;
 
 typedef enum RdmaProxyDeviceBufferElementType {

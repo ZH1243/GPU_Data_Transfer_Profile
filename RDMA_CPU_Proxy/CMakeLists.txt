@@ -148,6 +148,12 @@ if(RDMA_PROXY_BUILD_TESTS)
   add_test(NAME test_qp_calibration_transport COMMAND test_qp_calibration --transport-only)
   set_tests_properties(test_qp_calibration test_qp_calibration_transport PROPERTIES TIMEOUT 30)
 
+  add_executable(test_route_weights tests/test_route_weights.cpp)
+  target_link_libraries(test_route_weights PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_route_weights COMMAND test_route_weights)
+  add_test(NAME test_route_weights_cuda COMMAND test_route_weights --cuda)
+  set_tests_properties(test_route_weights_cuda PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
   add_executable(test_router_routing tests/test_router_routing.cpp)
   target_link_libraries(test_router_routing PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_router_routing COMMAND test_router_routing)

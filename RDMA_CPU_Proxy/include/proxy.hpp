@@ -39,6 +39,9 @@ public:
     float router_computation_elapsed_ms(uint64_t iteration);
     std::size_t router_computation_num_tokens() const;
     void configure_cpu_scatter(const RdmaProxyCpuScatterConfig& config);
+    void configure_cpu_route_weights(uintptr_t packed_weights, std::size_t routes);
+    const std::vector<int32_t>& original_router_experts() const;
+    const std::vector<float>& original_router_weights() const;
     void finish_run();
     uintptr_t configure_down_ready_trace(int groups);
     std::vector<std::pair<int32_t, double>> read_down_ready_trace(uint64_t iteration);

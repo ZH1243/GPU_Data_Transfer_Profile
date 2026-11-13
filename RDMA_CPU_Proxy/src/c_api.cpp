@@ -141,6 +141,42 @@ extern "C" int rdma_proxy_configure_cpu_scatter(
     }
 }
 
+extern "C" int rdma_proxy_configure_cpu_route_weights(
+    RdmaProxyHandle* handle, uintptr_t packed_weights, uint64_t routes) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down || handle->finished ||
+            handle->next_iteration != 0 || routes > std::numeric_limits<std::size_t>::max())
+            throw std::runtime_error("CPU route weights must be configured before iteration zero");
+        select_proxy_cuda_device(*handle);
+        handle->proxy.configure_cpu_route_weights(packed_weights, static_cast<std::size_t>(routes));
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
+extern "C" int rdma_proxy_get_local_router_assignments(
+    RdmaProxyHandle* handle, int32_t* experts, float* weights, uint64_t capacity,
+    uint64_t* count, uint64_t* num_tokens, uint64_t* top_k) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down || !count ||
+            !num_tokens || !top_k || ((experts == nullptr) != (weights == nullptr)) ||
+            (!experts && capacity))
+            throw std::runtime_error("invalid original router assignment query");
+        const auto& original_experts = handle->proxy.original_router_experts();
+        const auto& original_weights = handle->proxy.original_router_weights();
+        *count = original_experts.size();
+        *num_tokens = handle->config.num_tokens;
+        *top_k = static_cast<uint64_t>(handle->config.router_top_k);
+        if (!experts) return 0;
+        if (capacity < original_experts.size())
+            throw std::runtime_error("original router assignment capacity too small");
+        std::copy(original_experts.begin(), original_experts.end(), experts);
+        std::copy(original_weights.begin(), original_weights.end(), weights);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
 extern "C" RdmaProxyHandle* rdma_proxy_create(
     int argc,
     const char* const* argv) {

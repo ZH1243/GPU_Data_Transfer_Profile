@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cmath>
 #include <condition_variable>
 #include <iomanip>
 #include <limits>
@@ -186,6 +187,7 @@ CudaBuffers::~CudaBuffers() {
     for (auto& entry : nvlink_recv_buffers_) {
         free_buffer(entry.recv);
         free_buffer(entry.expert_token_indices_device);
+        free_buffer(entry.expert_route_weights_device);
     }
     free_buffer(router_notification_publication_buffers_.device_table);
     free_buffer(router_notification_publication_buffers_.device_ready_rows);
@@ -193,6 +195,7 @@ CudaBuffers::~CudaBuffers() {
     free_pinned_buffer(router_notification_publication_buffers_.host_ready_rows);
     free_pinned_buffer(router_notification_ready_values_);
     free_pinned_buffer(cpu_scatter_staging_);
+    free_pinned_buffer(cpu_route_weights_staging_);
 }
 
 void CudaBuffers::initialize() {
@@ -594,6 +597,15 @@ void CudaBuffers::install_expert_metadata(RouterExpertMetadata metadata) {
             })) {
         throw std::runtime_error("expert metadata contains an invalid token index");
     }
+    if ((metadata.top_k != 0 && metadata.top_k != config_.router_top_k) ||
+        (metadata.weighted_contributions && metadata.top_k != config_.router_top_k) ||
+        metadata.weighted_contributions != config_.router_weighted_contributions_enabled ||
+        metadata.expert_route_weights.size() !=
+            (metadata.weighted_contributions ? metadata.expert_token_indices.size() : 0))
+        throw std::runtime_error("expert metadata weighted configuration or length mismatch");
+    for (float weight : metadata.expert_route_weights)
+        if (!std::isfinite(weight) || weight < 0.0f)
+            throw std::runtime_error("expert metadata weights must be finite and nonnegative");
     for (int expert = 0; expert < expected_experts_per_gpu; ++expert) {
         const auto begin = metadata.expert_token_indices.begin() +
             metadata.expert_offsets[static_cast<std::size_t>(expert)];
@@ -786,6 +798,28 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
         }
     }
 
+    if (config_.router_weighted_contributions_enabled) {
+        for (const auto index : router_computation_buffer_indices_) {
+            auto& buffer = nvlink_recv_buffers_[index];
+            allocate_buffer(buffer.expert_route_weights_device,
+                DeviceBufferAllocationRequest{DeviceBufferKind::kRouterRouteWeights,
+                    DeviceBufferElementType::kFP32, -1, buffer.source_node_rank,
+                    buffer.source_gpu_index, a_idx_capacity * sizeof(float), {a_idx_capacity}});
+            std::vector<float> padded(a_idx_capacity, 0.0f);
+            std::copy(buffer.expert_metadata.expert_route_weights.begin(),
+                      buffer.expert_metadata.expert_route_weights.end(), padded.begin());
+            if (config_.mock_mode) {
+                std::memcpy(buffer.expert_route_weights_device.ptr, padded.data(),
+                            padded.size() * sizeof(float));
+            } else {
+#if RDMA_PROXY_HAVE_CUDA
+                check_cuda(cudaMemcpy(buffer.expert_route_weights_device.ptr, padded.data(),
+                    padded.size() * sizeof(float), cudaMemcpyHostToDevice),
+                    "cudaMemcpy H2D QuACK route weights");
+#endif
+            }
+        }
+    }
     std::size_t total_batches = 0;
     for (std::size_t expert = 0; expert < experts_per_gpu; ++expert) {
         const auto tokens = state.expert_total_tokens[expert];
@@ -947,6 +981,18 @@ void CudaBuffers::configure_cpu_scatter(const RdmaProxyCpuScatterConfig& c) {
     cpu_scatter_device_ = c.scatter_addresses;
 }
 
+void CudaBuffers::configure_cpu_route_weights(uintptr_t packed_weights, std::size_t routes) {
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    if (!config_.router_weighted_contributions_enabled || !cpu_scatter_device_ ||
+        cpu_route_weights_device_ || router_computation_scheduler_state_.iteration_initialized ||
+        !packed_weights || packed_weights % alignof(float) ||
+        routes != cpu_scatter_staging_.bytes / (cpu_scatter_columns_ * sizeof(int64_t)) ||
+        routes > std::numeric_limits<std::size_t>::max() / sizeof(float))
+        throw std::runtime_error("invalid CPU route-weight setup; configure scatter before weights");
+    allocate_pinned_buffer(cpu_route_weights_staging_, routes * sizeof(float));
+    cpu_route_weights_device_ = packed_weights;
+}
+
 void CudaBuffers::publish_cpu_scatter_batch(const std::vector<int32_t>& ranges) {
     std::size_t base = 0, count = 0;
     for (std::size_t j = 0; j < cpu_scatter_lookup_.size(); ++j) {
@@ -969,11 +1015,25 @@ void CudaBuffers::publish_cpu_scatter_batch(const std::vector<int32_t>& ranges) 
         cursor = std::copy(lookup.begin() + ranges[2*j]*cpu_scatter_columns_,
                            lookup.begin() + ranges[2*j+1]*cpu_scatter_columns_, cursor);
     }
+    float* weight_destination = nullptr;
+    if (cpu_route_weights_device_) {
+        weight_destination = static_cast<float*>(cpu_route_weights_staging_.ptr) + base;
+        auto* weight_cursor = weight_destination;
+        for (std::size_t j = 0; j < cpu_scatter_lookup_.size(); ++j) {
+            const auto& weights = nvlink_recv_buffers_[router_computation_buffer_indices_[j]]
+                                      .expert_metadata.expert_route_weights;
+            weight_cursor = std::copy(weights.begin() + ranges[2*j],
+                                      weights.begin() + ranges[2*j+1], weight_cursor);
+        }
+    }
     // Every packed row is assigned once per iteration. Staging stays immutable
     // until the publication stream is synchronized at the next iteration reset.
     auto* device = reinterpret_cast<uint8_t*>(cpu_scatter_device_) + base * row_bytes;
     if (config_.mock_mode) {
         std::memcpy(device, destination, count * row_bytes);
+        if (weight_destination)
+            std::memcpy(reinterpret_cast<float*>(cpu_route_weights_device_) + base,
+                        weight_destination, count * sizeof(float));
         return;
     }
 #if RDMA_PROXY_HAVE_CUDA
@@ -981,6 +1041,11 @@ void CudaBuffers::publish_cpu_scatter_batch(const std::vector<int32_t>& ranges) 
         cudaMemcpyHostToDevice,
         reinterpret_cast<cudaStream_t>(router_notification_publication_stream_)),
         "cudaMemcpyAsync H2D CPU scatter batch");
+    if (weight_destination)
+        check_cuda(cudaMemcpyAsync(reinterpret_cast<float*>(cpu_route_weights_device_) + base,
+            weight_destination, count * sizeof(float), cudaMemcpyHostToDevice,
+            reinterpret_cast<cudaStream_t>(router_notification_publication_stream_)),
+            "cudaMemcpyAsync H2D CPU route-weight batch");
 #endif
 }
 
@@ -989,6 +1054,9 @@ void CudaBuffers::reset_router_computation_iteration_locked(uint64_t iteration) 
     if (!scheduler.initialized) {
         throw std::runtime_error("router computation scheduler is not initialized");
     }
+    if (cpu_scatter_device_ && config_.router_weighted_contributions_enabled &&
+        !cpu_route_weights_device_)
+        throw std::runtime_error("weighted CPU scatter requires packed route-weight storage");
     const bool reset_existing_iteration = scheduler.iteration_initialized;
     if (reset_existing_iteration) {
         // Rows are immutable within an iteration, but a new iteration reuses

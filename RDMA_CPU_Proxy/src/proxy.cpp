@@ -621,6 +621,20 @@ void Proxy::configure_cpu_scatter(const RdmaProxyCpuScatterConfig& config) {
     cuda_buffers_.configure_cpu_scatter(config);
 }
 
+void Proxy::configure_cpu_route_weights(uintptr_t packed_weights, std::size_t routes) {
+    if (!initialized_ || iteration_prepared_)
+        throw std::runtime_error("CPU route weights require initialized idle proxy");
+    cuda_buffers_.configure_cpu_route_weights(packed_weights, routes);
+}
+
+const std::vector<int32_t>& Proxy::original_router_experts() const {
+    return router_routing_.original_experts();
+}
+
+const std::vector<float>& Proxy::original_router_weights() const {
+    return router_routing_.original_weights();
+}
+
 uintptr_t Proxy::configure_down_ready_trace(int groups) {
     if (!initialized_ || iteration_prepared_ || !config_.router_routing_enabled ||
         !config_.nvlink_forward_completion_notifications_enabled ||
@@ -1150,7 +1164,9 @@ void Proxy::exchange_router_expert_metadata_all_to_all() {
             metadata.num_gpus_per_node != config_.num_gpus_per_node ||
             metadata.num_experts != config_.router_num_experts ||
             metadata.experts_per_gpu != router_routing_.experts_per_gpu() ||
-            metadata.num_tokens != config_.num_tokens) {
+            metadata.num_tokens != config_.num_tokens ||
+            metadata.weighted_contributions != config_.router_weighted_contributions_enabled ||
+            metadata.top_k != config_.router_top_k) {
             throw std::runtime_error(
                 "received router expert metadata does not match local topology");
         }
@@ -1228,12 +1244,13 @@ void Proxy::exchange_router_expert_metadata_all_to_all() {
     }
 
     if (maximum_index_count >
-        (std::numeric_limits<std::size_t>::max() - 4096) / 16) {
+        (std::numeric_limits<std::size_t>::max() - 4096 -
+         static_cast<std::size_t>(router_routing_.experts_per_gpu() + 1) * 16) / 32) {
         throw std::runtime_error("router expert metadata payload bound overflows size_t");
     }
     const auto maximum_payload_bytes = std::size_t{4096} +
-        (maximum_index_count +
-         static_cast<std::size_t>(router_routing_.experts_per_gpu() + 1)) * 16;
+        maximum_index_count * 32 +
+        static_cast<std::size_t>(router_routing_.experts_per_gpu() + 1) * 16;
     std::vector<std::string> received_payloads;
     std::exception_ptr receive_error;
     std::thread receiver([&] {

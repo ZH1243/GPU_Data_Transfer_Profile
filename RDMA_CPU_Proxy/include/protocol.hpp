@@ -73,6 +73,10 @@ struct RouterExpertMetadata {
     std::size_t num_tokens{0};
     std::vector<int32_t> expert_token_indices;
     std::vector<int32_t> expert_offsets;
+    int top_k{0};
+    bool weighted_contributions{false};
+    // Immutable FP32 weights aligned with A_idx list positions, not token IDs.
+    std::vector<float> expert_route_weights;
 };
 
 // Return traffic has its own immediate namespace; forward marker remains UINT32_MAX.

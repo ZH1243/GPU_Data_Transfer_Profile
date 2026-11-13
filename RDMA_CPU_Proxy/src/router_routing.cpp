@@ -73,6 +73,7 @@ void RouterRouting::initialize() {
     } else {
         initialize_cuda();
     }
+    align_expert_weights();
     initialized_ = true;
     for (int node = 0; node < config_.num_nodes; ++node) {
         RDMA_PROXY_LOG_INFO(
@@ -127,6 +128,82 @@ const RouterExpertMetadata& RouterRouting::expert_metadata_for_gpu(
     return expert_metadata_by_gpu_[global_gpu];
 }
 
+const std::vector<int32_t>& RouterRouting::original_experts() const {
+    if (!initialized_) throw std::runtime_error("router routing is not initialized");
+    return original_experts_;
+}
+
+const std::vector<float>& RouterRouting::original_weights() const {
+    if (!initialized_) throw std::runtime_error("router routing is not initialized");
+    return original_weights_;
+}
+
+void RouterRouting::generate_source_weights() {
+    const auto top_k = static_cast<std::size_t>(config_.router_top_k);
+    if (original_experts_.size() != config_.num_tokens * top_k)
+        throw std::runtime_error("original routing assignment length mismatch");
+    original_weights_.assign(original_experts_.size(), 1.0f);
+    if (!config_.router_weighted_contributions_enabled) return;
+    // Fixed integer PRNG; exactly representable positive 24-bit FP32 draws.
+    // Normalize over the COMPLETE selected top-k before destination partitioning.
+    const auto source_seed = splitmix64(config_.router_seed ^
+        (static_cast<uint64_t>(config_.node_rank) << 32) ^
+        static_cast<uint64_t>(config_.local_gpu_index) ^ 0xd1b54a32d192ed03ULL);
+    for (std::size_t token = 0; token < config_.num_tokens; ++token) {
+        double sum = 0.0;
+        for (std::size_t k = 0; k < top_k; ++k) {
+            const auto i = token * top_k + k;
+            const uint64_t bits = splitmix64(source_seed ^ splitmix64(i));
+            const float value = static_cast<float>(1 + (bits >> 40));
+            original_weights_[i] = value;
+            sum += value;
+        }
+        for (std::size_t k = 0; k < top_k; ++k)
+            original_weights_[token * top_k + k] = static_cast<float>(
+                static_cast<double>(original_weights_[token * top_k + k]) / sum);
+    }
+}
+
+void RouterRouting::align_expert_weights() {
+    for (auto& metadata : expert_metadata_by_gpu_) {
+        metadata.top_k = config_.router_top_k;
+        metadata.weighted_contributions = config_.router_weighted_contributions_enabled;
+        if (!metadata.weighted_contributions) continue;
+        const auto node = static_cast<std::size_t>(metadata.destination_node_rank);
+        const auto& x3 = token_indices_by_node_[node];
+        const auto& x4 = token_masks_by_node_[node];
+        std::vector<std::size_t> original_tokens;
+        if (metadata.destination_gpu_index == config_.local_gpu_index) {
+            original_tokens = x3; // same-index inputs retain the full node x3 domain
+        } else {
+            int bit = config_.local_gpu_index - metadata.destination_gpu_index;
+            if (bit < 0) bit += config_.num_gpus_per_node;
+            for (std::size_t i = 0; i < x3.size(); ++i)
+                if (x4[i] & (1U << bit)) original_tokens.push_back(x3[i]);
+        }
+        metadata.expert_route_weights.resize(metadata.expert_token_indices.size());
+        for (int expert = 0; expert < metadata.experts_per_gpu; ++expert) {
+            for (int32_t i = metadata.expert_offsets[expert];
+                 i < metadata.expert_offsets[expert + 1]; ++i) {
+                const auto row = metadata.expert_token_indices[i];
+                if (row < 0 || static_cast<std::size_t>(row) >= original_tokens.size())
+                    throw std::runtime_error("weighted route input row is out of bounds");
+                const auto token = original_tokens[row];
+                const auto begin = token * static_cast<std::size_t>(config_.router_top_k);
+                bool found = false;
+                for (int k = 0; k < config_.router_top_k; ++k) {
+                    if (original_experts_[begin + k] == metadata.first_global_expert + expert) {
+                        metadata.expert_route_weights[i] = original_weights_[begin + k];
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) throw std::runtime_error("expert row does not match original routing assignment");
+            }
+        }
+    }
+}
+
 void RouterRouting::initialize_mock() {
     const int experts_per_node = experts_per_gpu() * config_.num_gpus_per_node;
     std::vector<std::vector<std::pair<int, std::size_t>>> entries(
@@ -150,6 +227,7 @@ void RouterRouting::initialize_mock() {
         std::map<int, int> masks;
         for (int route = 0; route < config_.router_top_k; ++route) {
             routes[token].push_back(expert);
+            original_experts_.push_back(expert);
             const int node = expert / experts_per_node;
             const int local_gpu = (expert / experts_per_gpu()) % config_.num_gpus_per_node;
             int bit = config_.local_gpu_index - local_gpu;
@@ -163,6 +241,7 @@ void RouterRouting::initialize_mock() {
         }
     }
 
+    generate_source_weights();
     std::vector<std::vector<int32_t>> expert_lists(
         static_cast<std::size_t>(config_.router_num_experts));
 
@@ -325,6 +404,10 @@ void RouterRouting::initialize_cuda() {
         pinned_x4_, x4, static_cast<std::size_t>(total_x3) * sizeof(uint8_t),
         cudaMemcpyDeviceToHost), "cudaMemcpy D2H router x4 to pinned memory");
 
+    original_experts_.resize(num_tokens * top_k);
+    check_cuda(cudaMemcpy(original_experts_.data(), r, original_experts_.size() * sizeof(int32_t),
+                          cudaMemcpyDeviceToHost), "cudaMemcpy D2H original routing assignments");
+    generate_source_weights();
     std::vector<int32_t> host_expert_offsets(num_experts + 1);
     std::vector<int32_t> host_expert_token_indices(num_tokens * top_k);
     check_cuda(cudaMemcpy(

@@ -25,9 +25,13 @@ public:
         int local_gpu_index) const;
     const int32_t* device_token_indices_for_node(int node_rank) const;
     int experts_per_gpu() const;
+    const std::vector<int32_t>& original_experts() const;
+    const std::vector<float>& original_weights() const;
 
 private:
     void initialize_mock();
+    void generate_source_weights();
+    void align_expert_weights();
     void initialize_cuda();
     void release_cuda() noexcept;
 
@@ -35,6 +39,9 @@ private:
     std::vector<std::vector<std::size_t>> token_indices_by_node_;
     std::vector<std::vector<uint8_t>> token_masks_by_node_;
     std::vector<RouterExpertMetadata> expert_metadata_by_gpu_;
+    // Original [token, top_k] assignments retained independently of row packing.
+    std::vector<int32_t> original_experts_;
+    std::vector<float> original_weights_;
     std::vector<void*> device_allocations_;
     int32_t* pinned_x3_{nullptr};
     uint8_t* pinned_x4_{nullptr};

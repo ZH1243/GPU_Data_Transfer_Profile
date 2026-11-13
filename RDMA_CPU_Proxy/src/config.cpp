@@ -316,6 +316,9 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "top_k" || key == "router_top_k") {
         config.router_top_k = std::stoi(value);
     }
+    else if (key == "router_weighted_contributions_enabled") {
+        config.router_weighted_contributions_enabled = (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "router_seed") {
         config.router_seed = static_cast<uint64_t>(std::stoull(value));
     }
@@ -662,6 +665,8 @@ static ProxyConfig parse_config_file(const std::string& path) {
         object, "num_experts", number_as<int>(object, "router_num_experts", config.router_num_experts));
     config.router_top_k = number_as<int>(
         object, "top_k", number_as<int>(object, "router_top_k", config.router_top_k));
+    config.router_weighted_contributions_enabled = get_bool(
+        object, "router_weighted_contributions_enabled", config.router_weighted_contributions_enabled);
     config.router_seed = number_as<uint64_t>(object, "router_seed", config.router_seed);
     config.router_metadata_port_base = number_as<uint16_t>(
         object, "router_metadata_port_base", config.router_metadata_port_base);
@@ -926,6 +931,8 @@ void validate_config(const ProxyConfig& config) {
         throw std::runtime_error(
             "rdma_discontinuous_token_payload_enabled is only supported when NVLink forwarding is disabled");
     }
+    if (config.router_weighted_contributions_enabled && !config.router_routing_enabled)
+        throw std::runtime_error("router_weighted_contributions_enabled requires router_routing_enabled");
     if (config.router_routing_enabled) {
         if (config.num_gpus_per_node < 2 || config.num_gpus_per_node > 8) {
             throw std::runtime_error("router_routing_enabled requires num_gpus_per_node in [2, 8]");
@@ -1324,6 +1331,7 @@ std::string config_summary(const ProxyConfig& config) {
         << " router_routing_enabled=" << (config.router_routing_enabled ? "true" : "false")
         << " num_experts=" << config.router_num_experts
         << " top_k=" << config.router_top_k
+        << " router_weighted_contributions_enabled=" << (config.router_weighted_contributions_enabled ? "true" : "false")
         << " router_seed=" << config.router_seed
         << " router_metadata_port_base=" << config.router_metadata_port_base
         << " iterations=" << config.num_iterations

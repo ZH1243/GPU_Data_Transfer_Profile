@@ -1,6 +1,7 @@
 #include "rdma_proxy_c_api.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -186,6 +187,7 @@ int main(int argc, char** argv) {
             for (const char* option : {
                      "--num_gpus_per_node=2", "--router_routing_enabled=true",
                      "--router_local_input_staging_enabled=true",
+                     "--router_weighted_contributions_enabled=true",
                      "--nvlink_forwarding_enabled=true", "--num_experts=64",
                      "--nvlink_forward_synchronize_batches=true",
                      "--nvlink_forward_completion_notifications_enabled=true",
@@ -203,7 +205,31 @@ int main(int argc, char** argv) {
                 rdma_proxy_destroy(router);
                 return;
             }
-            bool ok = rdma_proxy_get_computation_expert_counts(router, nullptr, 0, &n) == 0 && n == 8;
+            uint64_t assignment_count = 0, source_tokens = 0, top_k = 0;
+            bool assignments_ok = rdma_proxy_get_local_router_assignments(
+                router, nullptr, nullptr, 0, &assignment_count, &source_tokens, &top_k) == 0 &&
+                source_tokens == 32 && assignment_count == source_tokens * top_k && top_k > 1;
+            std::vector<int32_t> original_experts(assignment_count);
+            std::vector<float> original_weights(assignment_count);
+            assignments_ok = assignments_ok && rdma_proxy_get_local_router_assignments(
+                router, original_experts.data(), original_weights.data(), assignment_count,
+                &assignment_count, &source_tokens, &top_k) == 0;
+            for (uint64_t token = 0; token < source_tokens; ++token) {
+                double sum_weights = 0;
+                for (uint64_t k = 0; k < top_k; ++k) {
+                    const auto i = token * top_k + k;
+                    assignments_ok = assignments_ok && original_experts[i] >= 0 && original_experts[i] < 64 &&
+                        original_weights[i] > 0 && original_weights[i] <= 1;
+                    sum_weights += original_weights[i];
+                }
+                assignments_ok = assignments_ok && std::abs(sum_weights - 1.0) < 1e-6;
+            }
+            assignments_ok = assignments_ok && rdma_proxy_get_local_router_assignments(
+                router, original_experts.data(), original_weights.data(), 1,
+                &assignment_count, &source_tokens, &top_k) != 0 &&
+                rdma_proxy_get_local_router_assignments(router, nullptr, original_weights.data(), 0,
+                &assignment_count, &source_tokens, &top_k) != 0;
+            bool ok = assignments_ok && rdma_proxy_get_computation_expert_counts(router, nullptr, 0, &n) == 0 && n == 8;
             std::vector<uint64_t> counts(n);
             uint64_t total = 0;
             ok = ok && rdma_proxy_get_computation_expert_counts(router, counts.data(), n, &n) == 0 &&
