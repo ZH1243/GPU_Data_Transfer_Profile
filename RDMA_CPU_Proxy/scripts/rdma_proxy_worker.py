@@ -535,6 +535,10 @@ def add_down_arguments(parser):
     parser.add_argument("--check-intra-node-combine", action=argparse.BooleanOptionalAction, default=False,
                         help="compare intra-node output with an FP32 reference each iteration")
     parser.add_argument("--intra-node-combine-ctas", type=int, default=4)
+    parser.add_argument("--intra-node-combine-relax-sm-guard",
+                        action=argparse.BooleanOptionalAction, default=False,
+                        help="allow down-sm-count <= total SMs - combine CTAs, instead of "
+                             "subtracting combine CTAs * down-cluster-m; requires intra-node combine")
     parser.add_argument("--intra-node-combine-elements-per-thread", type=int,
                         choices=(8, 16, 32, 64, 128), default=32)
     parser.add_argument("--intra-node-combine-threads-per-cta", type=int,
@@ -621,6 +625,8 @@ def validate_down_arguments(args):
         raise ValueError("--intra-node-combine-n-tile-major-output requires --intra-node-combine")
     if args.check_intra_node_combine and not args.intra_node_combine:
         raise ValueError("--check-intra-node-combine requires --intra-node-combine")
+    if getattr(args, "intra_node_combine_relax_sm_guard", False) and not args.intra_node_combine:
+        raise ValueError("--intra-node-combine-relax-sm-guard requires --intra-node-combine")
     if args.intra_node_combine:
         if not (args.local_gpu_combine and args.return_token_results_per_group):
             raise ValueError("--intra-node-combine requires --local-gpu-combine and "

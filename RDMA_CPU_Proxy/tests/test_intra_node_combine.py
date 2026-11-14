@@ -11,7 +11,7 @@ import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from intra_node_combine import contribution_indices
+from intra_node_combine import contribution_indices, validate_intra_node_sm_budget
 
 
 class MappingTests(unittest.TestCase):
@@ -34,6 +34,31 @@ class MappingTests(unittest.TestCase):
         for masks in ([0], [256], [-1]):
             with self.assertRaises(ValueError):
                 contribution_indices(masks, 8)
+
+
+class SmBudgetTests(unittest.TestCase):
+    def test_cluster_headroom_remains_the_default(self):
+        validate_intra_node_sm_budget(148, 128, 10, 2)
+        with self.assertRaisesRegex(ValueError, r"--down-sm-count <= 128"):
+            validate_intra_node_sm_budget(148, 130, 10, 2)
+        with self.assertRaisesRegex(ValueError, r"--down-sm-count <= 116"):
+            validate_intra_node_sm_budget(148, 132, 16, 2)
+
+    def test_relaxed_guard_leaves_one_sm_per_combine_cta(self):
+        for down, combine in ((138, 10), (132, 16)):
+            with self.subTest(down=down, combine=combine):
+                validate_intra_node_sm_budget(148, down, combine, 2, relax_guard=True)
+                with self.assertRaisesRegex(ValueError, rf"--down-sm-count <= {down}"):
+                    validate_intra_node_sm_budget(148, down + 2, combine, 2,
+                                                 relax_guard=True)
+
+    def test_single_cta_clusters_and_missing_budget(self):
+        for relaxed in (False, True):
+            with self.subTest(relaxed=relaxed):
+                validate_intra_node_sm_budget(132, 128, 4, 1, relax_guard=relaxed)
+                for down in (129, None):
+                    with self.assertRaisesRegex(ValueError, r"--down-sm-count <= 128"):
+                        validate_intra_node_sm_budget(132, down, 4, 1, relax_guard=relaxed)
 
 
 @unittest.skipUnless(os.environ.get("RDMA_PROXY_TEST_CUDA") == "1", "requires CUDA opt-in")

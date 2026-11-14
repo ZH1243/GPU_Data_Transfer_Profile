@@ -2026,8 +2026,39 @@ prefetched peers. Tune with `--intra-node-combine-ctas`,
 with feature width divisible by down tile N and tile N divisible by elements/thread.
 Column groups may contain multiple N tiles; readiness uses the down swizzle group
 width. `--down-sm-count` defaults to 40 when intra-node combine is enabled. The
-worker checks that the down CTA budget leaves room for the combine CTAs (one
-whole cluster reserved per combine CTA). These are launch budgets, not SM affinity.
+worker applies a conservative software check by default:
+`down_sm_count <= total_sms - combine_ctas * down_cluster_m`. It allows one
+whole down cluster's worth of placement headroom per combine CTA; it does not
+physically reserve SMs for either kernel.
+
+Append `--intra-node-combine-relax-sm-guard` to use the less conservative check
+`down_sm_count <= total_sms - combine_ctas` instead. The flag defaults to false;
+`--no-intra-node-combine-relax-sm-guard` restores the default check. The down
+budget must still be positive and divisible by `--down-cluster-m`. On a 148-SM
+GPU with `--down-cluster-m=2`, the relaxed check accepts `132` down CTAs with
+`16` combine CTAs, or `138` down CTAs with `10` combine CTAs. The default check
+allows at most `116` and `128` down CTAs, respectively. These are launch budgets,
+not SM affinity, and passing either check does not guarantee hardware concurrent
+residency or progress. Other kernel geometry and launch constraints still apply.
+This flag changes Python validation only; it requires no native or QuACK rebuild.
+
+On the remote NVIDIA machine, append the following to an existing working
+single-node workload, retaining its geometry, return, and scatter options:
+
+```bash
+--intra-node-combine-relax-sm-guard \
+--down-sm-count=132 --intra-node-combine-ctas=16 \
+--check-projections --check-return-token-results --check-intra-node-combine \
+--num_iterations=12
+```
+
+Check repeated-iteration numerical results and completion first. Then disable
+the numerical checks for timing, and compare warmed complete-iteration and
+down-GEMM times plus group-readiness/combine delays against the default-policy
+baseline. Also try `--down-sm-count=138 --intra-node-combine-ctas=10` with the
+relaxed flag to compare against the existing `128/10` baseline while keeping
+the combine CTA count fixed. Repeat on both nodes for a two-node deployment,
+including its existing RDMA-return and inter-node numerical checks.
 
 The combine stream waits for an event recorded after down-output reset and
 mapping, before down GEMM. It then polls the native HBM ready prefix with

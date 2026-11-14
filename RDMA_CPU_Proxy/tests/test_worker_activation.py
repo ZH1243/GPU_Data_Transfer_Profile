@@ -615,6 +615,55 @@ class ActivationCliTests(unittest.TestCase):
                         (*common, "--intra-node-combine-ctas=0")):
             self.assertNotEqual(self.run_cli(*options).returncode, 0)
 
+    def test_intra_node_combine_relaxed_sm_guard_cli(self):
+        flag = "--intra-node-combine-relax-sm-guard"
+        parser = argparse.ArgumentParser()
+        worker.add_down_arguments(parser)
+        self.assertFalse(parser.parse_args([]).intra_node_combine_relax_sm_guard)
+        self.assertTrue(parser.parse_args([flag]).intra_node_combine_relax_sm_guard)
+        self.assertFalse(parser.parse_args(
+            [flag, "--no-intra-node-combine-relax-sm-guard"]
+        ).intra_node_combine_relax_sm_guard)
+
+        common = ("--concurrent-kernel", "--grouped-gemm-activation=swiglu",
+                  "--down-projection2", "--local-gpu-combine",
+                  "--down-gather-table", "--down-gather-table-expert-waves",
+                  "--down-gather-table-wave-barrier", "--down-gather-table-publish-ready",
+                  "--return-token-results", "--return-token-results-per-group",
+                  "--down-n-tile-major-output", "--intra-node-combine",
+                  "--down-cluster-m=2", "--down-sm-count=132", "--intra-node-combine-ctas=16")
+        for architecture in ("hopper", "blackwell"):
+            for nodes in (1, 2):
+                with self.subTest(architecture=architecture, nodes=nodes):
+                    result = self.run_cli(*common, flag, f"--gemm-arch={architecture}", nodes=nodes)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    native = shlex.split(result.stdout.splitlines()[-1])
+                    self.assertFalse(any("relax-sm-guard" in option for option in native))
+                    self.assertIn("--nvlink_return_ready_gpu_publication_enabled=true", native)
+
+        # Relaxing residency headroom must not bypass launch geometry validation.
+        for count in (0, -2, 131):
+            result = self.run_cli(*common, flag, f"--down-sm-count={count}")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must be positive and divisible by --down-cluster-m", result.stderr)
+        result = self.run_cli(*common, flag, "--intra-node-combine-ctas=0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--intra-node-combine-ctas must be positive", result.stderr)
+
+    def test_intra_node_combine_relaxed_sm_guard_requires_combine(self):
+        flag = "--intra-node-combine-relax-sm-guard"
+        result = self.run_cli(flag)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"{flag} requires --intra-node-combine", result.stderr)
+        # Communication-only clears the option before compute validation.
+        for flags in ((flag, "--communication-only"),
+                      ("--communication-only", flag),
+                      (flag, "--no-intra-node-combine-relax-sm-guard")):
+            with self.subTest(flags=flags):
+                result = self.run_cli(*flags)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("relax-sm-guard", result.stdout.splitlines()[-1])
+
     def test_single_node_inter_node_combine(self):
         common = ("--concurrent-kernel", "--grouped-gemm-activation=swiglu",
                   "--down-projection2", "--local-gpu-combine", "--down-pingpong",

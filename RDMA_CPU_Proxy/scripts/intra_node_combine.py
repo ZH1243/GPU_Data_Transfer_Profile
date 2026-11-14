@@ -2,6 +2,19 @@
 import ctypes
 
 
+def validate_intra_node_sm_budget(total_sms, down_sm_count, combine_ctas, down_cluster_m,
+                                  *, relax_guard=False):
+    """Check launch headroom; this does not reserve or pin physical SMs."""
+    # The default budgets a whole down cluster per combine CTA to allow for
+    # fragmentation. Opting in budgets one SM per CTA, retaining a total cap.
+    available = total_sms - combine_ctas * (1 if relax_guard else down_cluster_m)
+    if down_sm_count is None or down_sm_count > available:
+        policy = "relaxed" if relax_guard else "cluster"
+        raise ValueError(f"intra-node combine requires --down-sm-count <= {available} "
+                         "to leave room for persistent combine CTAs "
+                         f"(SM guard: {policy}; total SMs: {total_sms})")
+
+
 def contribution_indices(masks, world):
     """Output row k of peer p corresponds to the k-th selected full-input row."""
     if not 2 <= world <= 8 or any(mask <= 0 or mask >= (1 << world) for mask in masks):
@@ -37,12 +50,11 @@ class IntraNodeCombine:
         if width % tile or tile % vec:
             raise ValueError("intra-node combine requires tile_n dividing width and elements/thread dividing tile_n")
         properties = torch.cuda.get_device_properties(self.device)
-        # A persistent down grid with wave barriers must fit alongside combine.
-        # Reserve a whole cluster per combine CTA to allow for fragmentation.
-        available = properties.multi_processor_count - ctas * options.down_cluster_m
-        if options.down_sm_count is None or options.down_sm_count > available:
-            raise ValueError(f"intra-node combine requires --down-sm-count <= {available} "
-                             "to leave room for persistent combine CTAs")
+        relax_sm_guard = getattr(options, "intra_node_combine_relax_sm_guard", False)
+        validate_intra_node_sm_budget(
+            properties.multi_processor_count, options.down_sm_count, ctas,
+            options.down_cluster_m, relax_guard=relax_sm_guard,
+        )
         query = exchange.library.rdma_proxy_get_intra_node_source_masks
         query.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_uint8),
                           ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64)]
@@ -151,7 +163,9 @@ class IntraNodeCombine:
         print(f"Intra-node combine: register-prefetch, rows_by_source="
               f"{[(n, c) for n, _, c in self.domains]} CTAs={ctas}, "
               f"outputs={'N-tile-major' if self.output_tile_n else 'row-major'} "
-              "in staging/RDMA input-row order", flush=True)
+              "in staging/RDMA input-row order; "
+              f"SM guard={'relaxed' if relax_sm_guard else 'cluster'}, "
+              f"down CTA budget={options.down_sm_count}", flush=True)
 
     def _warmup(self):
         """Exercise the compiled callable before readiness-gated GPU work starts.
