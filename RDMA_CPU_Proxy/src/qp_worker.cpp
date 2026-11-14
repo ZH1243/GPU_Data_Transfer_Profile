@@ -163,7 +163,10 @@ void QPWorker::start() {
 }
 
 void QPWorker::stop() {
-    stop_.store(true);
+    {
+        std::lock_guard<std::mutex> lock(completion_mutex_);
+        stop_.store(true);
+    }
     send_queue_.close();
     completion_cv_.notify_all();
     if (send_thread_.joinable()) send_thread_.join();
@@ -250,7 +253,10 @@ void QPWorker::send_loop() {
                 last_error_ = e.what();
             }
             RDMA_PROXY_LOG_ERROR("send worker peer=", qp_.peer_rank(), " qp=", qp_.qp_index(), " failed: ", e.what());
-            stop_.store(true);
+            {
+                std::lock_guard<std::mutex> lock(completion_mutex_);
+                stop_.store(true);
+            }
             completion_cv_.notify_all();
         }
     }
@@ -365,7 +371,13 @@ void QPWorker::cq_loop() {
                         }
                         completion_cv_.notify_all();
                     } else {
-                        send_completions_.fetch_add(1);
+                        {
+                            // Publish under the waiter's mutex so the last
+                            // completion cannot notify between its predicate
+                            // check and sleep, stranding the following marker.
+                            std::lock_guard<std::mutex> lock(completion_mutex_);
+                            send_completions_.fetch_add(1);
+                        }
                         {
                             std::lock_guard<std::mutex> lock(stats_mutex_);
                             latest_send_completion_time_ = std::chrono::steady_clock::now();
@@ -417,7 +429,10 @@ void QPWorker::cq_loop() {
                 last_error_ = e.what();
             }
             RDMA_PROXY_LOG_ERROR("CQ worker peer=", qp_.peer_rank(), " qp=", qp_.qp_index(), " failed: ", e.what());
-            stop_.store(true);
+            {
+                std::lock_guard<std::mutex> lock(completion_mutex_);
+                stop_.store(true);
+            }
             completion_cv_.notify_all();
         }
     }

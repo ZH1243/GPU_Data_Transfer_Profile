@@ -2057,6 +2057,7 @@ def main() -> int:
         # Last CLI values override both the launch script and JSON settings.
         proxy_argv.extend([
             "--nvlink_return_completion_notifications_enabled=false",
+            "--nvlink_return_local_batch_sync_enabled=false",
             "--nvlink_return_ready_gpu_publication_enabled=false",
         ])
         print("communication-only mode: GEMM, result returns, and combine disabled", flush=True)

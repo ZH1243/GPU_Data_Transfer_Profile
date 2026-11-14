@@ -66,12 +66,15 @@ struct PreparedForwardingTestAccess {
                 reader_config.nvlink_forward_notification_scheduling_mode = "complete_round";
             if (mismatch == 2) reader_config.router_local_input_staging_enabled = true;
             if (mismatch == 5) reader_config.nvlink_forward_notification_scheduling_diagnostics = true;
-            // The initial magic/version prefix is stable across v4 and v5.
+            // The initial magic/version prefix is stable across v4 through v6.
             // Alter only that wire field to simulate an older live receiver.
             if (mismatch == 3) {
                 const uint32_t old_version = 4;
                 std::memcpy(reinterpret_cast<char*>(owner.nvlink_forward_notification_header_) +
                                 sizeof(uint64_t), &old_version, sizeof(old_version));
+                // A newer reader can expect a larger segment. It must still
+                // reject the old live protocol from the fixed prefix.
+                reader_config.nvlink_forward_notification_queue_depth = 8;
             }
             if (mismatch == 4) {
                 // The fixed header has magic, version, initialized, then node.
@@ -82,7 +85,7 @@ struct PreparedForwardingTestAccess {
             }
             Proxy reader(reader_config);
             reject([&] { reader.prepare_forwarding_notification_destinations(); },
-                   "metadata incomplete or mismatched");
+                   "mismatch");
             require(reader.forwarding_notification_destinations_.empty(),
                     "mismatched shared-memory metadata was retained for publication");
         }

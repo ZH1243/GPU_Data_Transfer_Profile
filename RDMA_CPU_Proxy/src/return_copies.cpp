@@ -20,14 +20,18 @@ ReturnCopies::ReturnCopies(
     std::size_t count, const int64_t* rows, std::size_t row_count,
     std::size_t width, std::size_t tile, std::size_t group_tiles,
     std::size_t element_bytes, bool per_group, uintptr_t down_done,
-    std::function<void(int)> group_completed)
+    std::function<void(int)> group_completed,
+    std::function<bool(int)> group_start_ready)
     : device_(device), groups_(groups), mock_(mock), per_group_(per_group),
       rows_(rows), width_(width), tile_(tile),
       group_tiles_(group_tiles), element_bytes_(element_bytes), down_done_(down_done),
-      group_completed_(std::move(group_completed)) {
+      group_completed_(std::move(group_completed)),
+      group_start_ready_(std::move(group_start_ready)) {
     if (!copies || !count || !rows || !row_count || !width || !element_bytes ||
         groups <= 0 || (!mock && !down_done) || (per_group && (!tile || !group_tiles)))
         throw std::runtime_error("invalid return-copy configuration");
+    if (group_start_ready_ && !per_group_)
+        throw std::runtime_error("return group-start synchronization requires per-group returns");
     if (tile) {
         const auto tiles = 1 + (width - 1) / tile;
         if (!group_tiles || 1 + (tiles - 1) / group_tiles != static_cast<std::size_t>(groups))
@@ -98,6 +102,9 @@ bool ReturnCopies::poll(int ready) {
     if (ready < 0 || ready > groups_) throw std::runtime_error("invalid return ready prefix");
     if (per_group_) {
         while (submitted_ < ready) {
+            // A false gate leaves this group untouched and gives the receiver
+            // a chance to drain notifications needed by the other producers.
+            if (group_start_ready_ && !group_start_ready_(submitted_)) return false;
             submit(submitted_);
             // Wait for this group's batches to all destination GPUs before
             // submitting another group, even if its ready prefix is visible.

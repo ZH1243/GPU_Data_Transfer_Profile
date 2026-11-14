@@ -47,7 +47,8 @@ traffic. The current native library still initializes the configured RDMA NIC.
 
 This worker option overrides the scripts' GEMM, down-projection, result-return,
 combine, and associated check/trace options regardless of argument order. It
-also forces native return notifications and return-ready GPU publication off.
+also forces native return notifications, return batch-start synchronization,
+and return-ready GPU publication off.
 Routing, local-input staging, RDMA dispatch, NVLink forwarding, and their
 configured preparation/notification settings remain active. QuACK is not
 imported in this mode; CUDA-enabled PyTorch still owns the proxy buffers.
@@ -591,7 +592,7 @@ any required per-batch scatter metadata copies still precede ready-prefix
 publication on the existing stream; deferred/threaded scatter keeps its existing
 final upload and down-GEMM dependency.
 
-The receiver shared-memory notification protocol is version **5**. Rebuild and
+The receiver shared-memory notification protocol is version **6**. Rebuild and
 restart all local proxies together; layout/version and scheduling-policy
 mismatches are rejected during connection. Use a fresh
 `local_iteration_sync_run_id` for independent launches. The default policy keeps
@@ -2289,7 +2290,8 @@ It does not imply final reduction or reverse RDMA. No further GPU work is
 launched by the consumer. Empty contributions still advance the prefix.
 
 Rebuild the shared library and upgrade all local workers together: notification
-protocol version 5 includes self readiness and round scheduling, and rejects older workers. Self uses
+protocol version 6 includes self readiness, round scheduling, and return
+batch-start synchronization, and rejects older workers. Self uses
 the same ordered queue and retirement checks as peers. Its notification waits
 for outgoing return copies to complete, conservatively delaying self readiness.
 
@@ -2305,6 +2307,124 @@ and consumed by their destinations.
 The Python worker already calls this before its existing same-node barrier,
 so normal iteration reuse and shutdown occur after notifications drain.
 Exceptional shutdown cancels unfinished work rather than claiming completion.
+
+#### Optional same-node return batch-start synchronization
+
+Append this native CLI/JSON option to the existing per-group return command on
+every local rank (on both nodes for a two-node run):
+
+```bash
+--nvlink_return_local_batch_sync_enabled=true
+```
+
+The default is `false`, preserving independent return submission. One batch is
+**one column group's copies to all destination GPUs**, including all original
+source-node segments for those destinations. It is not one destination's copy
+call. The barrier is keyed by iteration and column-group index, and coordinates
+only proxies on the same node. No cross-node batch-start barrier is added.
+
+A producer arrives after its own down-GEMM ready prefix covers the group and
+its preceding group's return copies have completed. All local GPUs participate
+in every group, including producers with zero valid rows or no nonempty outgoing
+copies. Once every producer has arrived, each may submit that group's copies.
+This aligns CPU submissions; GPU copy start times may still differ. The existing
+return-stream synchronization completes each group's copies before its completion
+notification and before the next group's arrival. It does not wait for combine
+or final GEMM consumption.
+
+Waiting for another producer is a nonblocking retry: the notification receiver
+returns to its loop and keeps draining forwarding completions instead of parking
+behind the barrier. Copy completion still uses the existing per-group stream
+synchronization. Slow producers can delay the whole node, so this policy is an
+experiment rather than an assumed throughput improvement.
+
+This option requires `nvlink_return_completion_notifications_enabled=true` and
+`--return-token-results --return-token-results-per-group`; the current single-
+and two-node pipeline launchers already enable these prerequisites. The existing
+prepared submit/epilogue requirements of return notifications still apply.
+Whole-buffer returns are rejected when the barrier is enabled. There is no new
+`nvlink_return_synchronize_batches` option: per-group returns already synchronize
+their own stream. The return barrier is independent of
+`nvlink_forward_local_batch_sync_enabled` and works with either forwarding
+scheduling policy, either CPU/GPU scatter preparation, and both down-output reset
+policies. Existing SM budgets, GEMM geometry, and epilogue settings are unchanged.
+
+Upgrade and restart all local workers together: shared notification protocol v6
+versions the new barrier state and validates the policy. Local workers must agree
+on the option and column-group geometry. Iteration-qualified state prevents an
+old arrival from releasing a new iteration; errors, shutdown, and the existing
+`completion_timeout_ms` timeout cancel pending waits. A missing producer is an
+error rather than implicit retirement. `--communication-only` explicitly turns
+this option off, including when it was enabled in JSON or earlier CLI arguments.
+
+On the remote Blackwell CUDA 13 node, retain the existing CUDA/RDMA device maps,
+activate the compatible PyTorch/QuACK environment, and build the native library:
+
+```bash
+export PROXY_ROOT=/sjtu-aisys-workspace/GPU_Data_Transfer_Profile/RDMA_CPU_Proxy
+export QUACK_ROOT=/sjtu-aisys-workspace/quack_for_communication_overlap
+export CUDA_HOME=/usr/local/cuda-13.0
+export RDMA_PROXY_GEMM_ARCH=blackwell
+export RDMA_PROXY_BUILD_DIR="$PROXY_ROOT/build-blackwell-cu130"
+cmake -S "$PROXY_ROOT" -B "$RDMA_PROXY_BUILD_DIR" \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=100 \
+  -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" -DCUDAToolkit_ROOT="$CUDA_HOME" \
+  -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \
+  -DRDMA_PROXY_REQUIRE_CUDA=ON -DRDMA_PROXY_REQUIRE_VERBS=ON
+cmake --build "$RDMA_PROXY_BUILD_DIR" -j4
+ctest --test-dir "$RDMA_PROXY_BUILD_DIR" \
+  -R '^test_(config|return_batch_sync|return_copies|return_notifications|return_ready_publication(_cuda)?|down_ready_trace)$' --output-on-failure
+cd "$PROXY_ROOT"
+python -m unittest discover -s tests -p test_worker_activation.py -v
+CUDA_VISIBLE_DEVICES=0 python -m unittest discover -s tests -p test_worker_composition.py -v
+```
+
+For Hopper, use `RDMA_PROXY_GEMM_ARCH=hopper`, a separate build directory, and
+`-DCMAKE_CUDA_ARCHITECTURES=90` with the site's compatible CUDA installation.
+The tests above include CPU/mock state-machine and CLI checks; only the remote
+CUDA tests and integrated runs validate actual IPC, copy visibility, and numerics.
+
+For numerical validation, append the options below to the existing single-node
+workload command. Repeat on both two-node commands, with identical return-sync
+settings on all ranks. Retain weighted contributions and existing transport/
+combine checks, and use at least three iterations to exercise resets:
+
+```bash
+--nvlink_return_local_batch_sync_enabled=true --check-projections --num_iterations=5
+```
+
+Repeat with `false` as the baseline, with GPU scatter preparation and CPU scatter
+publication (`per-batch`, `deferred`, `threaded`), and with the forwarding local
+batch-start barrier disabled. Keep the return notification queue deep enough for
+all column groups, as required above. Native tests cover deliberately empty
+producers, skewed arrivals, repeated iterations, cancellation, and timeout;
+random routing alone does not reliably produce those cases.
+Fully empty return producers are covered by the native tests. The existing
+Python GEMM worker rejects a GPU with zero total meaningful routed rows before
+GEMM setup, so the integrated launcher cannot validate that case. Empty
+contributions to individual destinations remain supported.
+
+For timing, alternate `false`, `true`, `true`, `false` on the same workload and
+GPU count. Omit `--trace-down-ready`, and disable numerical checks and forwarding
+traces for these samples:
+
+```bash
+--num_iterations=30 --no-check-projections --no-check-return-token-results \
+--no-check-intra-node-combine --no-check-rdma-return-token-results \
+--no-check-inter-node-combine \
+--nvlink_forward_notification_scheduling_diagnostics=false \
+--nvlink_forward_prepared_nvtx_enabled=false --nvlink_forward_log_batches=false
+```
+
+Use separate Nsight Systems samples (`nsys profile --trace=cuda,nvtx
+--sample=none --gpu-metrics-device=all`) with the same workload and policy.
+Compare complete `pipeline iteration ... elapsed_ms`, down-GEMM and up-GEMM
+durations, forwarding duration, first-to-last return-copy duration, and the gap
+from down-ready publication to the first copy of each group. Inspect how closely
+each GPU starts a group, together with Tensor Active and DRAM activity. A shorter
+copy interval does not establish a win if waiting for the slowest down-GEMM
+producer increases iteration time. Return copies overlap down-GEMM and must not
+be inferred by subtracting GEMM times from iteration time.
 
 To additionally publish the aggregate return-ready prefix into this GPU's HBM,
 enable the following alongside return notifications:

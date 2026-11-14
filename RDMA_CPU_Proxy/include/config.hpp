@@ -109,6 +109,8 @@ struct ProxyConfig {
     bool nvlink_forward_synchronize_batches{false};
     bool nvlink_forward_completion_notifications_enabled{false};
     bool nvlink_return_completion_notifications_enabled{false};
+    // Align same-node return submissions: one column group to every local peer.
+    bool nvlink_return_local_batch_sync_enabled{false};
     bool nvlink_return_ready_gpu_publication_enabled{false};
     bool nvlink_forward_notification_flush_only_enabled{false};
     bool nvlink_forward_notification_flush_per_entry_enabled{false};

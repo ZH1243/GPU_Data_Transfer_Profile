@@ -123,6 +123,18 @@ struct alignas(64) Proxy::NvlinkForwardNotificationHeader {
     uint32_t notification_bytes{0};
     uint32_t entry_bytes{0};
     uint32_t reserved{0};
+    // Version 6: one persistent arrival watermark per producing local GPU.
+    // Publish group before iteration (both one-based); never clear on reset.
+    // A later group/iteration proves arrival at an earlier barrier.
+    uint64_t return_sync_iteration{0};
+    uint64_t return_sync_group{0};
+    uint64_t return_sync_width{0};
+    uint64_t return_sync_tile{0};
+    uint64_t return_sync_group_tiles{0};
+    uint64_t return_sync_element_bytes{0};
+    uint32_t return_sync_groups{0};
+    uint32_t return_sync_configured{0}; // Release-publishes immutable geometry.
+    uint32_t return_sync_cancelled{0}; // Sticky until this proxy is destroyed.
 };
 
 struct Proxy::NvlinkForwardNotificationDispatchState {
@@ -268,7 +280,7 @@ public:
 constexpr uint64_t kLocalIterationSyncMagic = 0x52444d415053594eULL;  // "RDMAPSyn"
 constexpr uint32_t kLocalIterationSyncVersion = 7;
 constexpr uint64_t kNvlinkForwardNotificationMagic = 0x52444d414e464e51ULL;  // "RDMANFNQ"
-constexpr uint32_t kNvlinkForwardNotificationVersion = 5;
+constexpr uint32_t kNvlinkForwardNotificationVersion = 6;
 constexpr uint32_t kNvlinkForwardRoundRobinFlag = 1U;
 constexpr uint32_t kDirectRdmaInputFlag = 1U << 1;
 constexpr uint32_t kForwardRoundBatchFlag = 1U << 2;
@@ -779,6 +791,15 @@ void Proxy::configure_return_copies(
     if (!initialized_ || iteration_prepared_)
         throw std::runtime_error("return copies require initialized, idle proxy");
     std::function<void(uint64_t, int)> completed;
+    std::function<bool(uint64_t, int)> start_ready;
+    if (config_.nvlink_return_local_batch_sync_enabled) {
+        if (!per_group || !config_.nvlink_return_completion_notifications_enabled ||
+            !nvlink_forward_notification_header_ || return_notification_groups_ <= 0)
+            throw std::runtime_error("return batch synchronization requires configured per-group return notifications");
+        start_ready = [this](uint64_t iteration, int group) {
+            return poll_local_nvlink_return_batch_start(iteration, group);
+        };
+    }
     if (config_.nvlink_return_completion_notifications_enabled) {
         if (!per_group || !copies || !return_notification_groups_)
             throw std::runtime_error("return notifications require configured trace and per-group returns");
@@ -798,7 +819,10 @@ void Proxy::configure_return_copies(
     }
     down_ready_trace_.configure_returns(copies, count, rows, row_count, width,
                                        tile, group_tiles, element_bytes, per_group, down_done,
-                                       std::move(completed));
+                                       std::move(completed), std::move(start_ready));
+    if (config_.nvlink_return_local_batch_sync_enabled)
+        configure_local_nvlink_return_batch_sync(
+            return_notification_groups_, width, tile, group_tiles, element_bytes);
     return_copies_configured_ = true;
 }
 
@@ -814,6 +838,7 @@ void Proxy::finish_run() {
 }
 
 void Proxy::shutdown() {
+    cancel_local_nvlink_return_batch_sync();
     down_ready_trace_.cancel();
     try {
         stop_forwarding_thread();
@@ -1743,13 +1768,15 @@ void Proxy::initialize_nvlink_forward_notifications() {
     header->notification_bytes = static_cast<uint32_t>(sizeof(NvlinkForwardNotification));
     header->entry_bytes = static_cast<uint32_t>(entry_bytes);
     // Bits: ping-pong watermarks, return queues, complete rounds, local staging,
-    // diagnostics (legacy diagnostics also require iteration drain watermarks).
+    // diagnostics, return batch-start barrier. Legacy diagnostics also require
+    // iteration drain watermarks.
     // All local proxies must agree on policy and participating phase contexts.
     header->reserved = (config_.nvlink_forward_ping_pong_enabled ? 1U : 0U) |
         (config_.nvlink_return_completion_notifications_enabled ? 2U : 0U) |
         (config_.nvlink_forward_notification_scheduling_mode == "complete_round" ? 4U : 0U) |
         (config_.router_local_input_staging_enabled ? 8U : 0U) |
-        (config_.nvlink_forward_notification_scheduling_diagnostics ? 16U : 0U);
+        (config_.nvlink_forward_notification_scheduling_diagnostics ? 16U : 0U) |
+        (config_.nvlink_return_local_batch_sync_enabled ? 32U : 0U);
 
     auto* queues = reinterpret_cast<NvlinkForwardNotificationQueue*>(
         reinterpret_cast<char*>(mapping) + sizeof(NvlinkForwardNotificationHeader));
@@ -1787,6 +1814,7 @@ void Proxy::initialize_nvlink_forward_notifications() {
 }
 
 void Proxy::release_nvlink_forward_notifications() {
+    cancel_local_nvlink_return_batch_sync();
 #if defined(__unix__) || defined(__APPLE__)
     const bool owned = nvlink_forward_notification_fd_ >= 0;
     for (auto& dst : forwarding_notification_destinations_) {
@@ -1830,6 +1858,12 @@ void Proxy::prepare_forwarding_notification_destinations() {
     forwarding_notification_destinations_.clear();
     forwarding_notification_destinations_.reserve(
         static_cast<std::size_t>(config_.num_gpus_per_node));
+    const uint32_t expected_policy = (config_.nvlink_forward_ping_pong_enabled ? 1U : 0U) |
+        (config_.nvlink_return_completion_notifications_enabled ? 2U : 0U) |
+        (config_.nvlink_forward_notification_scheduling_mode == "complete_round" ? 4U : 0U) |
+        (config_.router_local_input_staging_enabled ? 8U : 0U) |
+        (config_.nvlink_forward_notification_scheduling_diagnostics ? 16U : 0U) |
+        (config_.nvlink_return_local_batch_sync_enabled ? 32U : 0U);
     const auto queue_count = static_cast<std::size_t>(config_.num_gpus_per_node) *
         (config_.nvlink_return_completion_notifications_enabled ? 2 : 1);
     const auto entry_bytes = sizeof(NvlinkForwardNotification);
@@ -1872,8 +1906,30 @@ void Proxy::prepare_forwarding_notification_destinations() {
                 continue;
             }
             struct stat st {};
-            if (fstat(fd, &st) != 0 ||
-                st.st_size < static_cast<off_t>(expected_size)) {
+            const bool stat_ok = fstat(fd, &st) == 0;
+            // The v5/v6 fixed prefix is readable even when an old segment is
+            // smaller than our expected v6 size. Reject a live mismatched
+            // worker immediately instead of waiting for its file to grow.
+            constexpr auto prefix_bytes = offsetof(NvlinkForwardNotificationHeader, return_sync_iteration);
+            if (stat_ok && st.st_size >= static_cast<off_t>(prefix_bytes)) {
+                void* prefix = mmap(nullptr, prefix_bytes, PROT_READ, MAP_SHARED, fd, 0);
+                if (prefix != MAP_FAILED) {
+                    const auto* peer = static_cast<const NvlinkForwardNotificationHeader*>(prefix);
+                    const bool mismatch = atomic_load_u32(&peer->initialized) == 1 &&
+                        peer->magic == kNvlinkForwardNotificationMagic &&
+                        peer->node_rank == config_.node_rank && peer->gpu_index == destination_gpu &&
+                        process_is_alive(atomic_load_i32(&peer->pid)) &&
+                        (peer->version != kNvlinkForwardNotificationVersion ||
+                         peer->reserved != expected_policy);
+                    munmap(prefix, prefix_bytes);
+                    if (mismatch) {
+                        close(fd);
+                        throw std::runtime_error("NVLink notification protocol/policy mismatch with local GPU " +
+                            std::to_string(destination_gpu) + "; rebuild/restart all local proxies with matching policies");
+                    }
+                }
+            }
+            if (!stat_ok || st.st_size < static_cast<off_t>(expected_size)) {
                 last_wait_reason = "shared memory is not fully sized";
                 close(fd);
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1901,11 +1957,7 @@ void Proxy::prepare_forwarding_notification_destinations() {
                 header->queue_bytes != sizeof(NvlinkForwardNotificationQueue) ||
                 header->notification_bytes != sizeof(NvlinkForwardNotification) ||
                 header->entry_bytes != entry_bytes ||
-                header->reserved != ((config_.nvlink_forward_ping_pong_enabled ? 1U : 0U) |
-                    (config_.nvlink_return_completion_notifications_enabled ? 2U : 0U) |
-                    (config_.nvlink_forward_notification_scheduling_mode == "complete_round" ? 4U : 0U) |
-                    (config_.router_local_input_staging_enabled ? 8U : 0U) |
-                    (config_.nvlink_forward_notification_scheduling_diagnostics ? 16U : 0U))) {
+                header->reserved != expected_policy) {
                 last_wait_reason = "metadata incomplete or mismatched";
                 munmap(mapping, expected_size);
                 close(fd);
@@ -2344,6 +2396,100 @@ bool Proxy::nvlink_forward_notification_queues_complete() const {
         }
     }
     return true;
+}
+
+void Proxy::configure_local_nvlink_return_batch_sync(
+    int groups, std::size_t width, std::size_t tile,
+    std::size_t group_tiles, std::size_t element_bytes) {
+    auto* header = nvlink_forward_notification_header_;
+    if (!header || groups <= 0 || !width || !tile || !group_tiles || !element_bytes ||
+        atomic_load_u32(&header->return_sync_configured))
+        throw std::runtime_error("invalid return batch synchronization configuration");
+    header->return_sync_groups = static_cast<uint32_t>(groups);
+    header->return_sync_width = width;
+    header->return_sync_tile = tile;
+    header->return_sync_group_tiles = group_tiles;
+    header->return_sync_element_bytes = element_bytes;
+    atomic_store_u32(&header->return_sync_configured, 1);
+}
+
+void Proxy::cancel_local_nvlink_return_batch_sync() noexcept {
+    if (config_.nvlink_return_local_batch_sync_enabled && nvlink_forward_notification_header_)
+        atomic_store_u32(&nvlink_forward_notification_header_->return_sync_cancelled, 1);
+}
+
+bool Proxy::poll_local_nvlink_return_batch_start(uint64_t iteration, int group) {
+    if (!config_.nvlink_return_local_batch_sync_enabled) return true;
+    auto* local = nvlink_forward_notification_header_;
+    if (!local || !atomic_load_u32(&local->return_sync_configured) || group < 0 ||
+        static_cast<uint32_t>(group) >= local->return_sync_groups ||
+        iteration == std::numeric_limits<uint64_t>::max())
+        throw std::runtime_error("invalid return batch-start barrier state/iteration/group");
+    if (forwarding_stop_.load() || forwarding_notification_failed_.load() ||
+        atomic_load_u32(&local->return_sync_cancelled))
+        throw std::runtime_error("return batch-start barrier cancelled");
+    if (forwarding_notification_destinations_.size() !=
+        static_cast<std::size_t>(config_.num_gpus_per_node))
+        throw std::runtime_error("return batch-start barrier requires every local proxy");
+
+    const auto marker = iteration + 1;
+    const auto round = static_cast<uint64_t>(group) + 1;
+    const auto previous_iteration = atomic_load_u64(&local->return_sync_iteration);
+    const auto previous_group = atomic_load_u64(&local->return_sync_group);
+    if (marker < previous_iteration ||
+        (marker == previous_iteration && (round < previous_group || round > previous_group + 1)) ||
+        (marker > previous_iteration && (round != 1 ||
+            (previous_iteration && previous_group != local->return_sync_groups))))
+        throw std::runtime_error("return batch-start barrier arrival is stale or skips a group");
+
+    // The gate is called only when this GPU's down-ready prefix covers this
+    // group, and after its previous group's return stream has completed.
+    // No rows/bytes is still an arrival; no participant retires mid-iteration.
+    if (marker != previous_iteration || round != previous_group) {
+        atomic_store_u64(&local->return_sync_group, round);
+        atomic_store_u64(&local->return_sync_iteration, marker);
+    }
+    if (return_batch_wait_iteration_ != iteration || return_batch_wait_group_ != group) {
+        return_batch_wait_iteration_ = iteration;
+        return_batch_wait_group_ = group;
+        return_batch_wait_start_ = std::chrono::steady_clock::now();
+    }
+
+    bool ready = true;
+    int waiting_gpu = -1;
+    for (const auto& destination : forwarding_notification_destinations_) {
+        const auto* peer = destination.header;
+        if (atomic_load_u32(&peer->return_sync_cancelled) || atomic_load_i32(&peer->pid) <= 0)
+            throw std::runtime_error("return batch-start barrier cancelled by local GPU " +
+                                     std::to_string(destination.gpu_index));
+        bool arrived = atomic_load_u32(&peer->return_sync_configured) != 0;
+        if (arrived) {
+            if (peer->return_sync_groups != local->return_sync_groups ||
+                peer->return_sync_width != local->return_sync_width ||
+                peer->return_sync_tile != local->return_sync_tile ||
+                peer->return_sync_group_tiles != local->return_sync_group_tiles ||
+                peer->return_sync_element_bytes != local->return_sync_element_bytes)
+                throw std::runtime_error("return batch-start barrier geometry mismatch with local GPU " +
+                                         std::to_string(destination.gpu_index));
+            const auto peer_iteration = atomic_load_u64(&peer->return_sync_iteration);
+            arrived = peer_iteration > marker || (peer_iteration == marker &&
+                atomic_load_u64(&peer->return_sync_group) >= round);
+        }
+        if (!arrived) {
+            ready = false;
+            if (waiting_gpu < 0) waiting_gpu = destination.gpu_index;
+        }
+    }
+    if (ready) return true;
+    if (std::chrono::steady_clock::now() - return_batch_wait_start_ >=
+        std::chrono::milliseconds(config_.completion_timeout_ms)) {
+        throw std::runtime_error("timed out waiting for return batch-start barrier node=" +
+            std::to_string(config_.node_rank) + " iteration=" + std::to_string(iteration) +
+            " group=" + std::to_string(group) + " waiting_gpu=" + std::to_string(waiting_gpu));
+    }
+    // Never wait here: the same receiver must drain forward queues to let
+    // slower peers finish their up/down GEMMs and reach this group.
+    return false;
 }
 
 void Proxy::enqueue_return_group_notification(uint64_t iteration, int group) {
@@ -3717,6 +3863,7 @@ void Proxy::start_forwarding_thread() {
 }
 
 void Proxy::stop_forwarding_thread() {
+    cancel_local_nvlink_return_batch_sync();
     forwarding_stop_.store(true);
     if (prepared_forwarding_) {
         prepared_forwarding_->changed.notify_all();
@@ -6456,6 +6603,7 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
 }
 
 void Proxy::set_forwarding_error(const std::string& error) {
+    cancel_local_nvlink_return_batch_sync();
     std::lock_guard<std::mutex> lock(forwarding_mutex_);
     if ((config_.nvlink_forward_ping_pong_enabled || config_.nvlink_forward_preparation_enabled) &&
         !forwarding_error_.empty()) return;

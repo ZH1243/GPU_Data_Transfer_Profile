@@ -95,12 +95,85 @@ void jumps_and_bounds() {
     rejects([&] { trace.read(1, observations); });
 }
 
+// A prefix may jump to the final group while peer readiness still advances one
+// group at a time. Empty destinations and all-empty producers must participate
+// in exactly the same start/completion protocol as nonempty producers.
+void gated_groups() {
+    constexpr int capacity = 32, groups = 4;
+    std::array<std::array<unsigned char, capacity>, 2> src{}, dst{};
+    std::array<int64_t, 2> rows{2, 0};
+    std::array<RdmaProxyReturnCopy, 2> copies{};
+    for (int i = 0; i < 2; ++i) {
+        copies[i] = {reinterpret_cast<uintptr_t>(src[i].data()),
+                     reinterpret_cast<uintptr_t>(dst[i].data()), capacity,
+                     static_cast<uint64_t>(i), i};
+        for (int j = 0; j < capacity; ++j) src[i][j] = 1 + i * capacity + j;
+    }
+    int allowed = 0;
+    std::vector<int> starts, completed;
+    rdma_proxy::ReturnCopies returns(
+        0, true, groups, copies.data(), copies.size(), rows.data(), rows.size(),
+        16, 4, 1, 1, true, 0,
+        [&](int group) {
+            require(group == static_cast<int>(completed.size()));
+            // Notification follows this group's copies, including empty batches.
+            for (int i = 0; i < 2; ++i)
+                for (int j = 0; j < capacity; ++j)
+                    require(dst[i][j] == (j < rows[i] * 4 * (group + 1) ? src[i][j] : 255));
+            completed.push_back(group);
+        },
+        [&](int group) {
+            starts.push_back(group);
+            return group < allowed;
+        });
+    for (int iteration = 0; iteration < 3; ++iteration) {
+        if (iteration == 1) rows = {0, 2};
+        if (iteration == 2) rows = {0, 0};
+        for (auto& output : dst) output.fill(255);
+        allowed = 0;
+        starts.clear();
+        completed.clear();
+        returns.reset();
+        require(!returns.poll(groups));  // Unarmed: do not announce a batch.
+        require(starts.empty());
+        returns.arm();
+        require(!returns.poll(0));        // No local readiness: no peer gate.
+        require(starts.empty());
+        require(!returns.poll(groups));
+        require(starts == std::vector<int>{0});
+        require(completed.empty());
+        for (const auto& output : dst)
+            require(std::all_of(output.begin(), output.end(), [](auto byte) { return byte == 255; }));
+        rejects([&] { returns.reset(); });
+        for (allowed = 1; allowed <= groups; ++allowed) {
+            require(returns.poll(groups) == (allowed == groups));
+            require(completed.size() == static_cast<std::size_t>(allowed));
+            for (int i = 0; i < allowed; ++i) require(completed[i] == i);
+            // A repeated unsuccessful poll cannot recopy earlier groups or
+            // report completion for the pending one.
+            require(returns.poll(groups) == (allowed == groups));
+            require(completed.size() == static_cast<std::size_t>(allowed));
+        }
+        const auto start_count = starts.size();
+        dst[0][0] = 254;
+        require(returns.poll(groups));
+        require(starts.size() == start_count && dst[0][0] == 254);
+    }
+    returns.drain();
+    rejects([&] {
+        rdma_proxy::ReturnCopies invalid(
+            0, true, groups, copies.data(), copies.size(), rows.data(), rows.size(),
+            16, 4, 1, 1, false, 0, {}, [](int) { return true; });
+    });
+}
+
 int main() {
     try {
         exercise(false, false);
         exercise(true, false);
         exercise(true, true);
         jumps_and_bounds();
+        gated_groups();
         std::cout << "return-copy checks passed\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

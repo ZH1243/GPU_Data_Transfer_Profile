@@ -17,7 +17,8 @@ public:
                  const int64_t* rows, std::size_t row_count,
                  std::size_t width, std::size_t tile, std::size_t group_tiles,
                  std::size_t element_bytes, bool per_group, uintptr_t down_done,
-                 std::function<void(int)> group_completed = {});
+                 std::function<void(int)> group_completed = {},
+                 std::function<bool(int)> group_start_ready = {});
     ~ReturnCopies();
     void reset();
     void arm();
@@ -35,5 +36,7 @@ private:
     std::map<int, std::vector<RdmaProxyReturnCopy>> peers_;
     std::map<int, CudaPreparedForwardBatch> batches_;
     std::function<void(int)> group_completed_;
+    // Must not block: this poller also drains forwarding notification queues.
+    std::function<bool(int)> group_start_ready_;
 };
 }  // namespace rdma_proxy

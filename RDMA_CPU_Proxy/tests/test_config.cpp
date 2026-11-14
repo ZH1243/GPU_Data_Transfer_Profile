@@ -71,6 +71,7 @@ int main(int argc, char** argv) {
     assert(!config.nvlink_forward_synchronize_batches);
     assert(!config.nvlink_forward_completion_notifications_enabled);
     assert(!config.nvlink_return_completion_notifications_enabled);
+    assert(!config.nvlink_return_local_batch_sync_enabled);
     assert(!config.nvlink_return_ready_gpu_publication_enabled);
     assert(!config.nvlink_forward_notification_flush_only_enabled);
     assert(!config.nvlink_forward_notification_flush_per_entry_enabled);
@@ -394,6 +395,21 @@ int main(int argc, char** argv) {
     return_notifications.nvlink_forward_completion_notifications_enabled = true;
     return_notifications.nvlink_return_completion_notifications_enabled = true;
     rdma_proxy::validate_config(return_notifications);
+    auto synchronized_returns = return_notifications;
+    synchronized_returns.nvlink_return_local_batch_sync_enabled = true;
+    // The return start barrier is independent of the forwarding start barrier.
+    synchronized_returns.nvlink_forward_local_batch_sync_enabled = false;
+    rdma_proxy::validate_config(synchronized_returns);
+    synchronized_returns.nvlink_return_completion_notifications_enabled = false;
+    bool rejected_return_sync_without_notifications = false;
+    try { rdma_proxy::validate_config(synchronized_returns); }
+    catch (const std::runtime_error& error) {
+        const std::string message = error.what();
+        assert(message.find("nvlink_return_local_batch_sync_enabled requires") != std::string::npos);
+        assert(message.find("nvlink_return_completion_notifications_enabled=true") != std::string::npos);
+        rejected_return_sync_without_notifications = true;
+    }
+    assert(rejected_return_sync_without_notifications);
     auto gpu_return_notifications = return_notifications;
     gpu_return_notifications.nvlink_return_ready_gpu_publication_enabled = true;
     rdma_proxy::validate_config(gpu_return_notifications);
@@ -509,6 +525,16 @@ int main(int argc, char** argv) {
     const auto parsed_returns = rdma_proxy::load_config(
         static_cast<int>(return_args.size()), const_cast<char**>(return_args.data()));
     assert(parsed_returns.nvlink_return_completion_notifications_enabled);
+    auto return_sync_args = return_args;
+    return_sync_args.push_back("--nvlink_return_local_batch_sync_enabled=true");
+    const auto parsed_return_sync = rdma_proxy::load_config(
+        static_cast<int>(return_sync_args.size()), const_cast<char**>(return_sync_args.data()));
+    assert(parsed_return_sync.nvlink_return_local_batch_sync_enabled);
+    assert(rdma_proxy::config_summary(parsed_return_sync).find(
+        "nvlink_return_local_batch_sync_enabled=true") != std::string::npos);
+    return_sync_args.push_back("--nvlink_return_local_batch_sync_enabled=false");
+    assert(!rdma_proxy::load_config(static_cast<int>(return_sync_args.size()),
+        const_cast<char**>(return_sync_args.data())).nvlink_return_local_batch_sync_enabled);
     auto gpu_return_args = return_args;
     gpu_return_args.push_back("--nvlink_return_ready_gpu_publication_enabled=true");
     const auto parsed_gpu_returns = rdma_proxy::load_config(
@@ -611,10 +637,13 @@ int main(int argc, char** argv) {
                        "nvlink_forward_prepared_batch_chunks":19,
                        "nvlink_forward_submit_epilogue_enabled":true,
                        "nvlink_return_completion_notifications_enabled":true,
+                       "nvlink_return_local_batch_sync_enabled":true,
                        "nvlink_return_ready_gpu_publication_enabled":true})json";
     }
     assert(rdma_proxy::load_config_file("return_notifications_config.json")
         .nvlink_return_completion_notifications_enabled);
+    assert(rdma_proxy::load_config_file("return_notifications_config.json")
+        .nvlink_return_local_batch_sync_enabled);
     assert(rdma_proxy::load_config_file("return_notifications_config.json")
         .nvlink_return_ready_gpu_publication_enabled);
     for (int conflict = 0; conflict < 2; ++conflict) {

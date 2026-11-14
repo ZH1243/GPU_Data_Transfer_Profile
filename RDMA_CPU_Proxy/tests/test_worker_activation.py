@@ -107,7 +107,9 @@ class CommunicationOnlyCliTests(unittest.TestCase):
             for mode_first in (False, True):
                 with self.subTest(script=script_name, mode_first=mode_first):
                     mode = ["--communication-only"]
-                    argv = mode + options if mode_first else options + mode
+                    native_return_sync = ["--nvlink_return_local_batch_sync_enabled=true"]
+                    argv = (mode + options + native_return_sync if mode_first
+                            else options + native_return_sync + mode)
                     result = subprocess.run(
                         [sys.executable, str(WORKER), *argv, "--dry-run"],
                         env={**os.environ, "LOCAL_RANK": "0", "LOCAL_WORLD_SIZE": "8",
@@ -125,6 +127,7 @@ class CommunicationOnlyCliTests(unittest.TestCase):
                                 "nvlink_forward_submit_epilogue_enabled"):
                         self.assertEqual(values[key], "true")
                     for key in ("nvlink_return_completion_notifications_enabled",
+                                "nvlink_return_local_batch_sync_enabled",
                                 "nvlink_return_ready_gpu_publication_enabled", "mock_mode"):
                         self.assertEqual(values[key], "false")
                     self.assertNotIn("--concurrent-kernel", native)
@@ -143,6 +146,19 @@ class CommunicationOnlyCliTests(unittest.TestCase):
 
 class SingleNodeLauncherCliTests(unittest.TestCase):
     """Exercise the shell-to-worker-to-native argument path without CUDA or RDMA."""
+
+    def test_return_batch_sync_passthrough(self):
+        for enabled in ("false", "true"):
+            with self.subTest(enabled=enabled):
+                _, options = self.record_launch(
+                    f"--nvlink_return_local_batch_sync_enabled={enabled}",
+                    environment={"CUDA_DEVICE_MAP": "0,1,2,3",
+                                 "RDMA_DEVICE_MAP": "nic0,nic1,nic2,nic3"},
+                )
+                for rank in (0, 3):
+                    native = self.native_arguments(options, rank=rank, count=4)
+                    self.assertEqual(native["nvlink_return_local_batch_sync_enabled"], enabled)
+                    self.assertEqual(native["nvlink_return_completion_notifications_enabled"], "true")
 
     def record_launch(self, *options, environment=None):
         site_variables = {

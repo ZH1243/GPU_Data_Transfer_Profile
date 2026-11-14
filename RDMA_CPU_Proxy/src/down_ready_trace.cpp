@@ -97,16 +97,22 @@ void DownReadyTrace::configure_returns(
     const RdmaProxyReturnCopy* copies, std::size_t count, const int64_t* rows,
     std::size_t row_count, std::size_t width, std::size_t tile,
     std::size_t group_tiles, std::size_t element_bytes, bool per_group, uintptr_t down_done,
-    std::function<void(uint64_t, int)> group_completed) {
+    std::function<void(uint64_t, int)> group_completed,
+    std::function<bool(uint64_t, int)> group_start_ready) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!host_ || armed_ || returns_) throw std::runtime_error("invalid return configuration state");
     std::function<void(int)> completed;
     if (group_completed) completed = [this, group_completed](int group) {
         group_completed(iteration_, group);
     };
+    std::function<bool(int)> start_ready;
+    if (group_start_ready) start_ready = [this, group_start_ready](int group) {
+        return group_start_ready(iteration_, group);
+    };
     returns_ = std::make_unique<ReturnCopies>(
         device_, mock_, groups_, copies, count, rows, row_count, width,
-        tile, group_tiles, element_bytes, per_group, down_done, std::move(completed));
+        tile, group_tiles, element_bytes, per_group, down_done,
+        std::move(completed), std::move(start_ready));
 }
 
 void DownReadyTrace::arm_returns(uint64_t iteration) {

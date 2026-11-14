@@ -14,6 +14,7 @@
 #include <chrono>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -247,6 +248,11 @@ private:
     void dispatch_return_group_notification(uint64_t iteration, int group);
     void drain_return_notifications();
     bool return_notifications_complete(uint64_t iteration) const;
+    void configure_local_nvlink_return_batch_sync(
+        int groups, std::size_t width, std::size_t tile,
+        std::size_t group_tiles, std::size_t element_bytes);
+    bool poll_local_nvlink_return_batch_start(uint64_t iteration, int group);
+    void cancel_local_nvlink_return_batch_sync() noexcept;
     void nvlink_forward_notification_loop();
     void drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQueue* queue);
     std::string format_nvlink_forward_notification_log(
@@ -442,6 +448,10 @@ private:
     int return_notification_groups_{0};
     bool return_copies_configured_{false};
     std::atomic<uint64_t> return_notifications_sent_{0}; // Completed group envelopes.
+    // Only the notification receiver polls this state, under DownReadyTrace's lock.
+    uint64_t return_batch_wait_iteration_{std::numeric_limits<uint64_t>::max()};
+    int return_batch_wait_group_{-1};
+    std::chrono::steady_clock::time_point return_batch_wait_start_;
     std::mutex nvlink_forward_notification_log_mutex_;
     std::deque<std::string> nvlink_forward_notification_log_queue_;
     std::vector<double> rdma_iteration_bandwidth_gbps_;
