@@ -97,6 +97,7 @@ void DownReadyTrace::configure_returns(
     const RdmaProxyReturnCopy* copies, std::size_t count, const int64_t* rows,
     std::size_t row_count, std::size_t width, std::size_t tile,
     std::size_t group_tiles, std::size_t element_bytes, bool per_group, uintptr_t down_done,
+    int local_gpu_index,
     std::function<void(uint64_t, int)> group_completed,
     std::function<bool(uint64_t, int)> group_start_ready) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -111,7 +112,7 @@ void DownReadyTrace::configure_returns(
     };
     returns_ = std::make_unique<ReturnCopies>(
         device_, mock_, groups_, copies, count, rows, row_count, width,
-        tile, group_tiles, element_bytes, per_group, down_done,
+        tile, group_tiles, element_bytes, per_group, down_done, local_gpu_index,
         std::move(completed), std::move(start_ready));
 }
 

@@ -27,7 +27,7 @@ void gated_returns() {
     DownReadyTrace trace;
     auto* flag = reinterpret_cast<int32_t*>(trace.configure(0, 2, 1000, true));
     trace.configure_returns(
-        &copy, 1, &rows, 1, 8, 4, 1, 1, true, 0,
+        &copy, 1, &rows, 1, 8, 4, 1, 1, true, 0, 1,
         [&](uint64_t iteration, int group) { completed.emplace_back(iteration, group); },
         [&](uint64_t iteration, int group) {
             starts.emplace_back(iteration, group);
@@ -79,7 +79,7 @@ void gated_returns() {
 
     DownReadyTrace timeout;
     auto* timeout_flag = reinterpret_cast<int32_t*>(timeout.configure(0, 2, 1, true));
-    timeout.configure_returns(&copy, 1, &rows, 1, 8, 4, 1, 1, true, 0, {},
+    timeout.configure_returns(&copy, 1, &rows, 1, 8, 4, 1, 1, true, 0, 1, {},
                               [](uint64_t, int) { return false; });
     timeout.reset(0);
     timeout.arm_returns(0);

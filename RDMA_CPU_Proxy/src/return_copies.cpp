@@ -20,15 +20,18 @@ ReturnCopies::ReturnCopies(
     std::size_t count, const int64_t* rows, std::size_t row_count,
     std::size_t width, std::size_t tile, std::size_t group_tiles,
     std::size_t element_bytes, bool per_group, uintptr_t down_done,
+    int local_gpu_index,
     std::function<void(int)> group_completed,
     std::function<bool(int)> group_start_ready)
-    : device_(device), groups_(groups), mock_(mock), per_group_(per_group),
+    : device_(device), local_gpu_index_(local_gpu_index), groups_(groups),
+      mock_(mock), per_group_(per_group),
       rows_(rows), width_(width), tile_(tile),
       group_tiles_(group_tiles), element_bytes_(element_bytes), down_done_(down_done),
       group_completed_(std::move(group_completed)),
       group_start_ready_(std::move(group_start_ready)) {
     if (!copies || !count || !rows || !row_count || !width || !element_bytes ||
-        groups <= 0 || (!mock && !down_done) || (per_group && (!tile || !group_tiles)))
+        groups <= 0 || local_gpu_index < 0 || (!mock && !down_done) ||
+        (per_group && (!tile || !group_tiles)))
         throw std::runtime_error("invalid return-copy configuration");
     if (group_start_ready_ && !per_group_)
         throw std::runtime_error("return group-start synchronization requires per-group returns");
@@ -40,7 +43,7 @@ ReturnCopies::ReturnCopies(
     for (std::size_t i = 0; i < count; ++i) {
         const auto& copy = copies[i];
         if (!copy.source || !copy.destination || !copy.capacity_bytes ||
-            copy.row_index >= row_count || copy.peer < 0)
+            copy.row_index >= row_count || copy.peer < 0 || copy.peer == local_gpu_index)
             throw std::runtime_error("invalid return-copy descriptor");
         peers_[copy.peer].push_back(copy);
     }
@@ -93,8 +96,14 @@ void ReturnCopies::submit(int group) {
                                     reinterpret_cast<const void*>(copy.source + offset), bytes);
         }
     }
-    for (auto& batch : batches_)
-        launch_cuda_prepared_forward_batch_async(batch.second, stream_, mock_);
+    // Match forwarding's sender-relative cyclic destination order. Keys are
+    // logical local GPU ranks, which need not match CUDA device ordinals.
+    // Missing/empty peers need no copy; source-node segments remain together.
+    const auto first = batches_.upper_bound(local_gpu_index_);
+    for (auto it = first; it != batches_.end(); ++it)
+        launch_cuda_prepared_forward_batch_async(it->second, stream_, mock_);
+    for (auto it = batches_.begin(); it != first; ++it)
+        launch_cuda_prepared_forward_batch_async(it->second, stream_, mock_);
 }
 
 bool ReturnCopies::poll(int ready) {

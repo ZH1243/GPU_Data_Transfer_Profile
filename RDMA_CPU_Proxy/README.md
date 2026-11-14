@@ -2214,6 +2214,17 @@ allocates 14 separate persistent receive buffers keyed by
 the combine outputs; only valid prefixes are copied. At 10,240 rows, width
 4,096 and BF16 this adds about 1.09 GiB of receive storage per GPU.
 
+Return copies use forwarding's cyclic destination order. For logical local GPU
+`g` among `N` GPUs, each group visits `g+1, ..., N-1, 0, ..., g-1`, skipping
+empty copy batches. For example, GPU 0 visits `1,2,3,4,5,6,7` and GPU 1 visits
+`2,3,4,5,6,7,0` on an eight-GPU node. The order uses logical ranks, including
+with a non-identity CUDA device map; it excludes self. All original-source-node
+segments remain grouped within their destination's copy call. This order applies
+to both per-group and whole-buffer returns without a new option. Per-group
+returns use the same order with return batch-start synchronization enabled or
+disabled. It changes CPU submission order; it adds no per-destination barrier
+and does not guarantee globally aligned transfer slots or a bandwidth improvement.
+
 Source and destination use identical physical layouts. For tiled output,
 each valid prefix is `[ceil(width / tile_n), valid_rows, tile_n]`, independent
 of the capacity-based allocation shape. Each group's byte offset and size
@@ -2330,7 +2341,9 @@ copies. Once every producer has arrived, each may submit that group's copies.
 This aligns CPU submissions; GPU copy start times may still differ. The existing
 return-stream synchronization completes each group's copies before its completion
 notification and before the next group's arrival. It does not wait for combine
-or final GEMM consumption.
+or final GEMM consumption. Within each released group, every producer uses the
+cyclic destination order described above; the barrier does not synchronize
+individual destination copy calls.
 
 Waiting for another producer is a nonblocking retry: the notification receiver
 returns to its loop and keeps draining forwarding completions instead of parking

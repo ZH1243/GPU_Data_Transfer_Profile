@@ -819,6 +819,7 @@ void Proxy::configure_return_copies(
     }
     down_ready_trace_.configure_returns(copies, count, rows, row_count, width,
                                        tile, group_tiles, element_bytes, per_group, down_done,
+                                       config_.local_gpu_index,
                                        std::move(completed), std::move(start_ready));
     if (config_.nvlink_return_local_batch_sync_enabled)
         configure_local_nvlink_return_batch_sync(

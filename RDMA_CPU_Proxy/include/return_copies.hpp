@@ -17,6 +17,7 @@ public:
                  const int64_t* rows, std::size_t row_count,
                  std::size_t width, std::size_t tile, std::size_t group_tiles,
                  std::size_t element_bytes, bool per_group, uintptr_t down_done,
+                 int local_gpu_index,
                  std::function<void(int)> group_completed = {},
                  std::function<bool(int)> group_start_ready = {});
     ~ReturnCopies();
@@ -27,7 +28,7 @@ public:
 
 private:
     void submit(int group);
-    int device_, groups_, submitted_{0};
+    int device_, local_gpu_index_, groups_, submitted_{0};
     bool mock_, per_group_, armed_{false};
     const int64_t* rows_;
     std::size_t width_, tile_, group_tiles_, element_bytes_;
