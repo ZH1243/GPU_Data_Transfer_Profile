@@ -253,6 +253,10 @@ struct PreparedForwardingTestAccess {
         // records. Only the local-self direct records may disappear.
         std::size_t expected_notifications = 0;
         auto count = [&](const auto& chunks, const std::vector<uint8_t>& masks, bool local) {
+            if (config.nvlink_forward_notification_scheduling_mode == "complete_round") {
+                expected_notifications += std::max(std::size_t{1}, chunks.size()) * config.num_gpus_per_node;
+                return; // Fused data/completion, including zero-route and empty-phase markers.
+            }
             for (const auto& chunk : chunks) {
                 if (!local || !config.router_local_input_early_ready_enabled)
                     ++expected_notifications;
@@ -309,7 +313,7 @@ struct PreparedForwardingTestAccess {
                 throw std::runtime_error("early readiness omitted a routed row");
     }
 
-    static void test_early_local_ready() {
+    static void test_early_local_ready(bool complete_round = false) {
         // Legacy, prepared with ordinary local forwarding, unified epilogue,
         // and atomic/query paths. Dense, partial, no-own-route, and empty inputs
         // run with and without weights; four cases retain the default, followed
@@ -343,6 +347,7 @@ struct PreparedForwardingTestAccess {
             config.router_local_input_early_ready_enabled = enabled;
             config.nvlink_forwarding_enabled = true;
             config.nvlink_forward_completion_notifications_enabled = true;
+            if (complete_round) config.nvlink_forward_notification_scheduling_mode = "complete_round";
             config.nvlink_forward_preparation_enabled = policy != 0;
             config.nvlink_forward_local_staging_prepared_enabled = policy >= 2;
             config.nvlink_forward_submit_epilogue_enabled = policy >= 2;
@@ -496,7 +501,9 @@ struct PreparedForwardingTestAccess {
             auto stop = [&](int gpu) {
                 try { proxies[gpu]->shutdown(); }
                 catch (const std::runtime_error& error) {
-                    if (!inject_failure || std::string(error.what()).find("injected early-ready receiver failure") == std::string::npos) {
+                    const bool expected_cancel = complete_round && shutdown_pending &&
+                        std::string(error.what()).find("incomplete forwarding rounds") != std::string::npos;
+                    if (!expected_cancel && (!inject_failure || std::string(error.what()).find("injected early-ready receiver failure") == std::string::npos)) {
                         if (!errors[gpu]) errors[gpu] = std::current_exception();
                     }
                 }
@@ -622,11 +629,12 @@ int main(int argc, char** argv) {
     using namespace rdma_proxy;
     Logger::instance().set_level(LogLevel::kError);
     const std::string mode_arg = argc == 2 ? argv[1] : "";
-    if (mode_arg == "--early-local-ready") {
-        PreparedForwardingTestAccess::test_early_local_ready();
+    if (mode_arg == "--early-local-ready" || mode_arg == "--complete-round") {
+        PreparedForwardingTestAccess::test_early_local_ready(mode_arg == "--complete-round");
         std::cout << "test_early_local_ready passed\n";
         return 0;
     }
+    const bool complete_round_forwarding = mode_arg == "--complete-round-forwarding";
     const bool dual = mode_arg == "--dual-device";
     const bool unified = dual || mode_arg == "--unified-local" || mode_arg == "--unified-local-atomic" ||
         mode_arg == "--unified-local-query";
@@ -637,23 +645,42 @@ int main(int argc, char** argv) {
     const bool atomic_ring_only = dual || mode_arg == "--unified-local-atomic" || query_atomic || atomic_ring_depth4 ||
         (argc == 2 && std::string(argv[1]) == "--atomic-ring-only");
     const bool submit_epilogue_only = argc == 2 && std::string(argv[1]) == "--submit-epilogue-only";
-    if (argc != 1 && !unified && !ping_pong2_only && !submit_epilogue_only && !atomic_ring_only && !query_mode) throw std::runtime_error("unknown test argument");
+    if (argc != 1 && !complete_round_forwarding && !unified && !ping_pong2_only &&
+        !submit_epilogue_only && !atomic_ring_only && !query_mode)
+        throw std::runtime_error("unknown test argument");
     PreparedForwardingTestAccess::test_barrier_generations(ping_pong2_only);
-    if (ping_pong2_only) PreparedForwardingTestAccess::test_ping_pong2_dispatch_order();
+    if (complete_round_forwarding) PreparedForwardingTestAccess::test_barrier_generations(true);
+    if (ping_pong2_only || complete_round_forwarding)
+        PreparedForwardingTestAccess::test_ping_pong2_dispatch_order();
     // Two-entry ring is exercised over many batches/iterations; one-entry
     // notification rings force dispatch backpressure. n=1 includes empty-copy
     // batches; n=3 gives unequal tails; large n gives a single short batch.
     // Exercise both notification modes with and without the batch barrier.
-    for (int scenario = ping_pong2_only ? 36 : 0; scenario < (ping_pong2_only ? 72 : 36); ++scenario) {
+    // Complete-round mode runs the same shapes, no-early-local behavior and
+    // lifecycle failures through six forwarding policies. Keep both barrier
+    // settings, but notifications must stay enabled for explicit round markers.
+    // Policies: prepared coordinator, ping-pong2, submit/epilogue, atomic ring,
+    // stream-query mutex, and stream-query atomic. Other arguments retain their
+    // original per-notification and notification-disabled baseline matrices.
+    const int scenario_end = complete_round_forwarding ? 6 * 18 : ping_pong2_only ? 72 : 36;
+    for (int scenario = ping_pong2_only ? 36 : 0; scenario < scenario_end; ++scenario) {
         const int mode = scenario % 9;
+        const int policy = complete_round_forwarding ? scenario / 18 : -1;
         const bool local_batch_sync = (scenario / 9) % 2 == 0;
-        const bool notifications = scenario % 36 < 18;
-        const bool ping_pong2 = scenario >= 36;
+        const bool notifications = complete_round_forwarding || scenario % 36 < 18;
+        const bool ping_pong2 = complete_round_forwarding ? policy == 1 : scenario >= 36;
+        const bool scenario_atomic = atomic_ring_only ||
+            (complete_round_forwarding && (policy == 3 || policy == 5));
+        const bool scenario_query = query_mode || (complete_round_forwarding && policy >= 4);
+        const bool scenario_submit = unified || submit_epilogue_only || scenario_atomic ||
+            scenario_query || (complete_round_forwarding && policy == 2);
         std::cerr << "prepared forwarding test mode=" << mode
+                  << " scheduling=" << (complete_round_forwarding ? "complete_round" : "per_notification")
                   << " local_batch_sync=" << local_batch_sync
                   << " ping_pong2=" << ping_pong2
-                  << " submit_epilogue=" << submit_epilogue_only
-                  << " atomic_ring=" << atomic_ring_only
+                  << " submit_epilogue=" << scenario_submit
+                  << " atomic_ring=" << scenario_atomic
+                  << " stream_query=" << scenario_query
                   << " notifications=" << notifications << '\n';
         ProxyConfig config;
         config.node_rank = 0;
@@ -679,15 +706,17 @@ int main(int argc, char** argv) {
         config.nvlink_forward_preparation_enabled = true;
         config.nvlink_forward_ping_pong2_enabled = ping_pong2;
         config.nvlink_forward_local_staging_prepared_enabled = unified;
-        config.nvlink_forward_submit_epilogue_enabled = unified || submit_epilogue_only || atomic_ring_only || query_mode;
-        config.nvlink_forward_completion_mode = query_mode ? "stream_query" : "stream_sync";
-        config.nvlink_forward_prepared_atomic_ring_enabled = atomic_ring_only;
+        config.nvlink_forward_submit_epilogue_enabled = scenario_submit;
+        config.nvlink_forward_completion_mode = scenario_query ? "stream_query" : "stream_sync";
+        config.nvlink_forward_prepared_atomic_ring_enabled = scenario_atomic;
         config.nvlink_forward_prepared_batch_chunks = mode == 0 ? 1 : mode == 2 ? 1000 : 3;
         config.nvlink_forward_prepared_queue_depth = atomic_ring_depth4 ? 4 : 2;
         config.nvlink_forward_synchronize_batches = true;
         config.nvlink_forward_synchronize_iteration = false;
         config.nvlink_forward_local_batch_sync_enabled = local_batch_sync;
         config.nvlink_forward_completion_notifications_enabled = notifications;
+        if (complete_round_forwarding)
+            config.nvlink_forward_notification_scheduling_mode = "complete_round";
         config.nvlink_forward_notification_queue_depth = 1;
         config.local_iteration_sync_enabled = true;
         config.router_local_input_staging_enabled = unified || mode < 5;

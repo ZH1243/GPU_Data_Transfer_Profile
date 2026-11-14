@@ -125,10 +125,23 @@ struct RouterComputationSchedulerState {
     // QuACK gather-table rows made available. One M-cluster contributes one
     // row for every N group.
     std::size_t published_rows{0};
+    // Explicit scheduler passes, including passes that find no complete cluster.
+    uint64_t scheduling_passes{0};
     std::vector<std::size_t> expert_total_tokens;
     std::vector<std::size_t> expert_num_ready_tokens;
     std::vector<std::size_t> expert_num_notified_batches;
     std::vector<std::size_t> expert_total_batches;
+};
+
+// Computed on request, outside the notification hot path. N-group repetitions
+// count as one M cluster. Publication counts are cumulative across iterations.
+struct RouterNotificationSchedulingDiagnostics {
+    uint64_t scheduling_passes{0};
+    std::size_t m_clusters{0};
+    std::size_t expert_runs{0};
+    std::size_t max_consecutive_m_clusters{0};
+    uint64_t table_flush_count{0};
+    uint64_t ready_rows_publication_count{0};
 };
 
 struct NvlinkReceiveBuffer {
@@ -218,6 +231,7 @@ public:
         int source_node_rank,
         int source_gpu_index) const;
     RouterComputationSchedulerState router_computation_scheduler_state() const;
+    RouterNotificationSchedulingDiagnostics router_notification_scheduling_diagnostics() const;
     void begin_router_notification_iteration(uint64_t iteration);
     void synchronize_router_notification_publication();
     void record_router_computation_end(uint64_t iteration, uintptr_t cuda_stream);
@@ -241,6 +255,20 @@ public:
         uint64_t iteration,
         std::size_t start_token,
         std::size_t num_tokens);
+    // The receiver must finish transfer visibility handling before ingestion.
+    // Ingestion advances contiguous source Heads only: no descriptors, scatter
+    // metadata or nonzero ready prefixes are constructed/published here.
+    // As with the immediate API, an implicit iteration start can publish zero.
+    void ingest_router_notification_completion(
+        int source_node_rank,
+        int source_gpu_index,
+        uint64_t iteration,
+        std::size_t start_token,
+        std::size_t num_tokens);
+    // Schedule one complete collection, grouped in increasing expert order.
+    // The caller controls completion boundaries and must not expose pending
+    // collections to an immediate/early-local scheduling pass.
+    void schedule_router_notification_completions(uint64_t iteration);
     void flush_router_notification_publication();
     const RouterNotificationPublicationBuffers& router_notification_publication_buffers() const {
         return router_notification_publication_buffers_;
@@ -268,11 +296,16 @@ private:
         uint64_t iteration,
         std::size_t start_token,
         std::size_t num_tokens,
-        bool flush_ready_entries_per_entry);
+        bool flush_ready_entries_per_entry = false);
+    void ingest_router_notification_completion_locked(
+        int source_node_rank, int source_gpu_index, uint64_t iteration,
+        std::size_t start_token, std::size_t num_tokens,
+        bool flush_ready_entries_per_entry = false);
     std::size_t schedule_ready_computation_batches_for_expert_locked(
         std::size_t expert,
         bool flush_per_entry);
-    std::size_t schedule_ready_computation_batches_locked();
+    std::size_t schedule_ready_computation_batches_locked(bool flush_per_entry);
+    void schedule_router_notification_completions_locked();
     void flush_router_notification_publication_range(
         std::size_t table_offset,
         std::size_t table_bytes);

@@ -74,6 +74,8 @@ int main(int argc, char** argv) {
     assert(!config.nvlink_return_ready_gpu_publication_enabled);
     assert(!config.nvlink_forward_notification_flush_only_enabled);
     assert(!config.nvlink_forward_notification_flush_per_entry_enabled);
+    assert(config.nvlink_forward_notification_scheduling_mode == "per_notification");
+    assert(!config.nvlink_forward_notification_scheduling_diagnostics);
     assert(!config.router_local_input_staging_enabled);
     assert(!config.router_local_input_early_ready_enabled);
     assert(config.nvlink_forward_notification_flag_update_mode ==
@@ -711,6 +713,58 @@ int main(int argc, char** argv) {
     assert(early_local_cli.router_local_input_early_ready_enabled);
     assert(rdma_proxy::config_summary(early_local_cli).find(
         "router_local_input_early_ready_enabled=true") != std::string::npos);
+
+    // Scheduling policy and publication policy are independent, including the
+    // immediate own-source readiness path. Check both CLI and JSON entry points.
+    auto complete_round = early_local;
+    complete_round.nvlink_forward_notification_scheduling_mode = "complete_round";
+    complete_round.nvlink_forward_notification_scheduling_diagnostics = true;
+    for (const bool per_entry : {false, true}) {
+        complete_round.nvlink_forward_notification_flush_per_entry_enabled = per_entry;
+        rdma_proxy::validate_config(complete_round);
+    }
+    for (int conflict = 0; conflict < 4; ++conflict) {
+        auto bad = complete_round;
+        bad.nvlink_forward_notification_flush_per_entry_enabled = false;
+        bad.router_local_input_early_ready_enabled = false;
+        bad.router_local_input_staging_enabled = false;
+        if (conflict == 0) bad.nvlink_forward_notification_scheduling_mode = "drain_queue";
+        if (conflict == 1) bad.router_routing_enabled = false;
+        if (conflict == 2) bad.nvlink_forward_completion_notifications_enabled = false;
+        if (conflict == 3) bad.nvlink_forward_notification_flush_only_enabled = true;
+        bool rejected = false;
+        try { rdma_proxy::validate_config(bad); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+    }
+    const char* scheduling_args[] = {"test_config", "--config", "early_local_config.json",
+        "--nvlink_forward_notification_scheduling_mode=complete_round",
+        "--nvlink_forward_notification_scheduling_diagnostics=true",
+        "--nvlink_forward_notification_scheduling_mode=per_notification",
+        "--nvlink_forward_notification_scheduling_diagnostics=false"};
+    const auto parsed_scheduling = rdma_proxy::load_config(5, const_cast<char**>(scheduling_args));
+    assert(parsed_scheduling.nvlink_forward_notification_scheduling_mode == "complete_round");
+    assert(parsed_scheduling.nvlink_forward_notification_scheduling_diagnostics);
+    const auto scheduling_summary = rdma_proxy::config_summary(parsed_scheduling);
+    assert(scheduling_summary.find("nvlink_forward_notification_scheduling_mode=complete_round") !=
+           std::string::npos);
+    assert(scheduling_summary.find("nvlink_forward_notification_scheduling_diagnostics=true") !=
+           std::string::npos);
+    const auto restored_scheduling = rdma_proxy::load_config(7, const_cast<char**>(scheduling_args));
+    assert(restored_scheduling.nvlink_forward_notification_scheduling_mode == "per_notification");
+    assert(!restored_scheduling.nvlink_forward_notification_scheduling_diagnostics);
+    {
+        std::ifstream input("early_local_config.json");
+        std::string base((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        base.insert(base.find('{') + 1,
+            "\"nvlink_forward_notification_scheduling_mode\":\"complete_round\","
+            "\"nvlink_forward_notification_scheduling_diagnostics\":true,");
+        std::ofstream output("round_scheduling_config.json");
+        output << base;
+    }
+    const auto json_scheduling = rdma_proxy::load_config_file("round_scheduling_config.json");
+    assert(json_scheduling.nvlink_forward_notification_scheduling_mode == "complete_round");
+    assert(json_scheduling.nvlink_forward_notification_scheduling_diagnostics);
 
     auto invalid_local_staging_fill_config = valid_local_staging_config;
     invalid_local_staging_fill_config.fill_test_data = true;

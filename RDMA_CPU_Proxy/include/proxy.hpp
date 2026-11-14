@@ -169,6 +169,20 @@ private:
     struct NvlinkForwardNotificationHeader;
     struct NvlinkForwardNotificationQueue;
     struct NvlinkForwardNotificationDispatchState;
+    struct ForwardingRoundState;
+    std::unique_ptr<ForwardingRoundState> forwarding_rounds_;
+    // Receiver owns the collector; coordinator only exchanges release/acquire epochs.
+    std::atomic<uint64_t> forwarding_round_requested_{0};
+    std::atomic<uint64_t> forwarding_round_completed_{0};
+    std::atomic<bool> forwarding_notification_failed_{false};
+    void initialize_forwarding_rounds();
+    void begin_forwarding_round_iteration();
+    void collect_forwarding_round_notification(const NvlinkForwardNotification& notification);
+    void complete_forwarding_round_records(NvlinkForwardNotification* entries, std::size_t& count,
+        uint64_t iteration, int source_node, std::size_t peer_slot, bool has_batch, bool final);
+    void complete_forwarding_round_records(std::vector<NvlinkForwardNotification>& entries,
+        uint64_t iteration, int source_node, std::size_t peer_slot, bool final);
+    void enqueue_empty_forwarding_phases(uint64_t iteration);
     struct ForwardingBatchCompletion;
     struct ForwardingPingPongState;
     struct PreparedForwardingBatch;

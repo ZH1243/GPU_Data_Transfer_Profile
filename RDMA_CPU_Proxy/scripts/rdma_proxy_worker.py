@@ -13,6 +13,7 @@ import re
 import shlex
 import sys
 import threading
+import time
 
 
 EXPECTED_ABI_VERSION = 1
@@ -1683,6 +1684,7 @@ def run_proxy_with_concurrent_kernel(
             * grouped_gemm.gemm_dimension
         )
         iteration_throughputs: list[tuple[int, float, float]] = []
+        pipeline_timings: list[tuple[int, float]] = []
         down_timings = []
         down_traces = []
         kernel_finished = torch.cuda.Event(enable_timing=False, blocking=False)
@@ -1717,6 +1719,8 @@ def run_proxy_with_concurrent_kernel(
         )
 
         for iteration in range(num_iterations.value):
+            pipeline_started_ns = time.perf_counter_ns()
+
             def log_startup(message):
                 if iteration == 0 and down is not None and down.combine:
                     print(f"[gpu={cuda_device_id}] iteration=0: {message}", flush=True)
@@ -1786,6 +1790,9 @@ def run_proxy_with_concurrent_kernel(
                         down.intra_node_combine.inter_node_combine.run()
                     # No rank may overwrite returned buffers while a peer still combines.
                     return_exchange.control.gather(f"intra-node-done-{iteration}")
+            # Reuse existing completion joins; timing adds no GPU synchronization.
+            # Return/combine check flags must also be disabled for performance runs.
+            pipeline_timings.append((iteration, (time.perf_counter_ns() - pipeline_started_ns) / 1e6))
             if down_options.check_projections:
                 from projection_validation import check_projections
                 check_projections(torch, grouped_gemm, down, int(computation_tokens.value))
@@ -1836,6 +1843,11 @@ def run_proxy_with_concurrent_kernel(
                 f"effective_throughput={effective_tflops:.2f} TFLOP/s",
                 flush=True,
             )
+        print("Complete pipeline host timing (preparation through existing GPU, return/combine "
+              "completion and reuse barriers; excludes projection checks; disable all other "
+              "checks for performance):", flush=True)
+        for iteration, pipeline_ms in pipeline_timings:
+            print(f"  pipeline iteration {iteration}: elapsed_ms={pipeline_ms:.4f}", flush=True)
         for iteration, reset_ms, mapping_ms, down_ms, combined_ms in down_timings:
             print(f"  down iteration {iteration}: reset_ms={reset_ms:.4f} "
                   f"mapping_ms={mapping_ms:.4f} "

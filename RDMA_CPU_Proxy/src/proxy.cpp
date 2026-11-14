@@ -1,4 +1,5 @@
 #include "proxy.hpp"
+#include "forwarding_rounds.hpp"
 
 #include "logging.hpp"
 
@@ -92,7 +93,8 @@ struct alignas(64) Proxy::NvlinkForwardNotification {
     int32_t destination_gpu{-1};
     int32_t peer_rank{-1};
     uint32_t flags{0};
-    char padding[12]{};
+    uint64_t round_index{0}; // Per (iteration, local/remote phase, source node) ordinal.
+    char padding[4]{};
 };
 
 struct alignas(64) Proxy::NvlinkForwardNotificationQueue {
@@ -146,6 +148,19 @@ struct Proxy::NvlinkForwardNotificationDispatchState {
         std::vector<PreparedEntry> entries;
         std::size_t head{0}, tail{0}, count{0};
     } lanes[2];
+};
+
+struct Proxy::ForwardingRoundState {
+    struct Sender {
+        uint64_t iteration{std::numeric_limits<uint64_t>::max()};
+        uint64_t next{0};
+        bool finished{false};
+    };
+    std::vector<Sender> senders; // One producer per source-node context.
+    std::vector<ForwardingRoundPhase> phases;
+    std::unique_ptr<ForwardingRoundCollector<NvlinkForwardNotification>> collector;
+    uint64_t receiver_epoch{0};
+    uint64_t rounds{0}, delay_ns{0}, max_delay_ns{0};
 };
 
 struct Proxy::PreparedForwardingBatch {
@@ -253,9 +268,12 @@ public:
 constexpr uint64_t kLocalIterationSyncMagic = 0x52444d415053594eULL;  // "RDMAPSyn"
 constexpr uint32_t kLocalIterationSyncVersion = 7;
 constexpr uint64_t kNvlinkForwardNotificationMagic = 0x52444d414e464e51ULL;  // "RDMANFNQ"
-constexpr uint32_t kNvlinkForwardNotificationVersion = 4;
+constexpr uint32_t kNvlinkForwardNotificationVersion = 5;
 constexpr uint32_t kNvlinkForwardRoundRobinFlag = 1U;
 constexpr uint32_t kDirectRdmaInputFlag = 1U << 1;
+constexpr uint32_t kForwardRoundBatchFlag = 1U << 2;
+constexpr uint32_t kForwardRoundPhaseEndFlag = 1U << 3;
+constexpr uint32_t kForwardRoundLocalFlag = 1U << 4;
 
 std::size_t checked_add(std::size_t a, std::size_t b, const char* description) {
     if (b > std::numeric_limits<std::size_t>::max() - a) {
@@ -557,6 +575,9 @@ void Proxy::prepare_iteration_step(uint64_t iteration) {
         const auto requested = local_router_input_early_ready_requested_.load(std::memory_order_acquire);
         if (requested) wait_for_local_router_input_ready(requested - 1);
     }
+    if (forwarding_rounds_ && forwarding_round_requested_.load(std::memory_order_acquire) !=
+        forwarding_round_completed_.load(std::memory_order_acquire))
+        throw std::runtime_error("cannot reset while forwarding rounds are pending");
     cuda_buffers_.begin_router_notification_iteration(iteration);
     // begin_router_notification_iteration publishes ready_rows=0 on the
     // proxy's private stream. Make that reset visible before Python queues a
@@ -585,6 +606,8 @@ void Proxy::prepare_iteration_step(uint64_t iteration) {
     prepare_rdma_returns(iteration);
     down_ready_trace_.reset(iteration);
     iteration_prepared_ = true;
+    if (forwarding_rounds_)
+        forwarding_round_requested_.store(iteration + 1, std::memory_order_release);
 }
 
 void Proxy::run_iteration_step(uint64_t iteration) {
@@ -1644,11 +1667,14 @@ void Proxy::initialize_nvlink_forward_notifications() {
         int stale_fd = shm_open(nvlink_forward_notification_name_.c_str(), O_RDWR, 0600);
         if (stale_fd >= 0) {
             struct stat st {};
+            // The fixed prefix through PID is shared by protocol versions.
+            // Never unlink a live old-version owner just because its layout is smaller.
+            constexpr auto owner_prefix_bytes = offsetof(NvlinkForwardNotificationHeader, pid) + sizeof(int32_t);
             if (fstat(stale_fd, &st) == 0 &&
-                st.st_size >= static_cast<off_t>(nvlink_forward_notification_size_)) {
+                st.st_size >= static_cast<off_t>(owner_prefix_bytes)) {
                 void* stale_mapping = mmap(
                     nullptr,
-                    nvlink_forward_notification_size_,
+                    owner_prefix_bytes,
                     PROT_READ | PROT_WRITE,
                     MAP_SHARED,
                     stale_fd,
@@ -1657,11 +1683,10 @@ void Proxy::initialize_nvlink_forward_notifications() {
                     auto* stale_header = reinterpret_cast<NvlinkForwardNotificationHeader*>(stale_mapping);
                     const bool same_segment =
                         stale_header->magic == kNvlinkForwardNotificationMagic &&
-                        stale_header->version == kNvlinkForwardNotificationVersion &&
                         stale_header->node_rank == config_.node_rank &&
                         stale_header->gpu_index == config_.local_gpu_index;
                     const bool live_owner = same_segment && process_is_alive(atomic_load_i32(&stale_header->pid));
-                    munmap(stale_mapping, nvlink_forward_notification_size_);
+                    munmap(stale_mapping, owner_prefix_bytes);
                     if (live_owner) {
                         close(stale_fd);
                         throw std::runtime_error("NVLink notification shared memory already has a live owner: " +
@@ -1717,10 +1742,14 @@ void Proxy::initialize_nvlink_forward_notifications() {
     header->queue_bytes = static_cast<uint32_t>(sizeof(NvlinkForwardNotificationQueue));
     header->notification_bytes = static_cast<uint32_t>(sizeof(NvlinkForwardNotification));
     header->entry_bytes = static_cast<uint32_t>(entry_bytes);
-    // Bit 0 enables ping-pong iteration watermarks; bit 1 adds return queues.
-    // Disabled mode retains its wire layout; mixed local modes are rejected.
+    // Bits: ping-pong watermarks, return queues, complete rounds, local staging,
+    // diagnostics (legacy diagnostics also require iteration drain watermarks).
+    // All local proxies must agree on policy and participating phase contexts.
     header->reserved = (config_.nvlink_forward_ping_pong_enabled ? 1U : 0U) |
-        (config_.nvlink_return_completion_notifications_enabled ? 2U : 0U);
+        (config_.nvlink_return_completion_notifications_enabled ? 2U : 0U) |
+        (config_.nvlink_forward_notification_scheduling_mode == "complete_round" ? 4U : 0U) |
+        (config_.router_local_input_staging_enabled ? 8U : 0U) |
+        (config_.nvlink_forward_notification_scheduling_diagnostics ? 16U : 0U);
 
     auto* queues = reinterpret_cast<NvlinkForwardNotificationQueue*>(
         reinterpret_cast<char*>(mapping) + sizeof(NvlinkForwardNotificationHeader));
@@ -1759,6 +1788,7 @@ void Proxy::initialize_nvlink_forward_notifications() {
 
 void Proxy::release_nvlink_forward_notifications() {
 #if defined(__unix__) || defined(__APPLE__)
+    const bool owned = nvlink_forward_notification_fd_ >= 0;
     for (auto& dst : forwarding_notification_destinations_) {
         if (dst.header) {
             munmap(dst.header, dst.bytes);
@@ -1779,7 +1809,7 @@ void Proxy::release_nvlink_forward_notifications() {
         close(nvlink_forward_notification_fd_);
         nvlink_forward_notification_fd_ = -1;
     }
-    if (!nvlink_forward_notification_name_.empty()) {
+    if (owned && !nvlink_forward_notification_name_.empty()) {
         shm_unlink(nvlink_forward_notification_name_.c_str());
     }
     nvlink_forward_notification_size_ = 0;
@@ -1872,7 +1902,10 @@ void Proxy::prepare_forwarding_notification_destinations() {
                 header->notification_bytes != sizeof(NvlinkForwardNotification) ||
                 header->entry_bytes != entry_bytes ||
                 header->reserved != ((config_.nvlink_forward_ping_pong_enabled ? 1U : 0U) |
-                    (config_.nvlink_return_completion_notifications_enabled ? 2U : 0U))) {
+                    (config_.nvlink_return_completion_notifications_enabled ? 2U : 0U) |
+                    (config_.nvlink_forward_notification_scheduling_mode == "complete_round" ? 4U : 0U) |
+                    (config_.router_local_input_staging_enabled ? 8U : 0U) |
+                    (config_.nvlink_forward_notification_scheduling_diagnostics ? 16U : 0U))) {
                 last_wait_reason = "metadata incomplete or mismatched";
                 munmap(mapping, expected_size);
                 close(fd);
@@ -2065,10 +2098,159 @@ void Proxy::drain_forwarding_iteration_notifications(uint64_t iteration) {
         auto* queue = nvlink_forward_notification_queue_for_source(
             nvlink_forward_notification_header_, source);
         while (atomic_load_u64(&queue->completed_iteration) < iteration + 1 ||
-               atomic_load_u64(&queue->tail) != atomic_load_u64(&queue->head)) {
+               (!forwarding_rounds_ && atomic_load_u64(&queue->tail) != atomic_load_u64(&queue->head))) {
             poll("incoming_drain", source);
         }
     }
+    if (forwarding_rounds_) {
+        // The collector proves this epoch's records were consumed. A faster
+        // source can already have next-epoch records queued behind its marker;
+        // those must remain gated until local reset, not hold this drain open.
+        while (forwarding_round_completed_.load(std::memory_order_acquire) < iteration + 1)
+            poll("pending_complete_round", -1);
+    }
+}
+
+void Proxy::initialize_forwarding_rounds() {
+    if (config_.nvlink_forward_notification_scheduling_mode != "complete_round") return;
+    forwarding_rounds_ = std::make_unique<ForwardingRoundState>();
+    auto& state = *forwarding_rounds_;
+    state.senders.resize(config_.num_nodes);
+    if (config_.router_local_input_staging_enabled)
+        state.phases.push_back({ForwardingRoundPhase::Kind::kLocal, config_.node_rank});
+    for (auto p : nvlink_forward_peer_order())
+        state.phases.push_back({ForwardingRoundPhase::Kind::kRemote, peers_[p].peer_rank});
+    // Each nonempty batch consumes at least one input token. Buffering the
+    // entire maximum iteration keeps draining independent of a slow source.
+    const auto bound = checked_multiply(checked_multiply(config_.num_nodes,
+        config_.num_gpus_per_node, "forward round sources"),
+        checked_add(config_.num_tokens, 1, "forward round tokens"), "forward round records");
+    state.collector = std::make_unique<ForwardingRoundCollector<NvlinkForwardNotification>>(
+        config_.num_gpus_per_node, state.phases, bound);
+    forwarding_round_requested_.store(0);
+    forwarding_round_completed_.store(0);
+}
+
+void Proxy::begin_forwarding_round_iteration() {
+    if (!forwarding_rounds_) return;
+    auto& state = *forwarding_rounds_;
+    const auto epoch = forwarding_round_requested_.load(std::memory_order_acquire);
+    if (epoch == state.receiver_epoch) return;
+    state.collector->begin_iteration(epoch - 1);
+    state.receiver_epoch = epoch;
+    state.rounds = state.delay_ns = state.max_delay_ns = 0;
+    if (state.collector->complete())
+        forwarding_round_completed_.store(epoch, std::memory_order_release);
+}
+
+void Proxy::complete_forwarding_round_records(
+    NvlinkForwardNotification* entries, std::size_t& count, uint64_t iteration,
+    int source_node, std::size_t peer_slot, bool has_batch, bool final) {
+    if (!forwarding_rounds_) return;
+    auto& sender = forwarding_rounds_->senders.at(source_node);
+    if (sender.iteration != iteration) {
+        if (sender.iteration != std::numeric_limits<uint64_t>::max() &&
+            (iteration <= sender.iteration || !sender.finished))
+            throw std::runtime_error("forward round sender crossed an unfinished iteration");
+        sender.iteration = iteration;
+        sender.next = 0;
+        sender.finished = false;
+    }
+    if (sender.finished || (!has_batch && (!final || count != 0)))
+        throw std::runtime_error("invalid forward round completion marker");
+    for (int gpu = 0; gpu < config_.num_gpus_per_node; ++gpu) {
+        auto* entry = std::find_if(entries, entries + count,
+            [gpu](const auto& n) { return n.destination_gpu == gpu; });
+        if (entry == entries + count) {
+            if (count >= 8) throw std::runtime_error("forward round destination overflow");
+            entry = &entries[count++];
+            *entry = {};
+            entry->iteration = iteration;
+            entry->peer_slot = peer_slot;
+            entry->source_gpu = config_.local_gpu_index;
+            entry->destination_gpu = gpu;
+            entry->peer_rank = source_node;
+        }
+        entry->round_index = sender.next;
+        entry->flags |= (has_batch ? kForwardRoundBatchFlag : 0U) |
+            (final ? kForwardRoundPhaseEndFlag : 0U) |
+            (source_node == config_.node_rank ? kForwardRoundLocalFlag : 0U);
+    }
+    if (has_batch) ++sender.next;
+    sender.finished = final;
+}
+
+void Proxy::complete_forwarding_round_records(
+    std::vector<NvlinkForwardNotification>& entries, uint64_t iteration,
+    int source_node, std::size_t peer_slot, bool final) {
+    if (!forwarding_rounds_) return;
+    auto count = entries.size();
+    entries.resize(8);
+    complete_forwarding_round_records(entries.data(), count, iteration, source_node, peer_slot, true, final);
+    entries.resize(count);
+}
+
+void Proxy::enqueue_empty_forwarding_phases(uint64_t iteration) {
+    if (!forwarding_rounds_) return;
+    auto empty_phase = [&](int node, std::size_t slot) {
+        std::vector<NvlinkForwardNotification> entries(8);
+        std::size_t count = 0;
+        complete_forwarding_round_records(entries.data(), count, iteration, node, slot, false, true);
+        entries.resize(count);
+        enqueue_forward_completion_notifications(std::move(entries));
+    };
+    if (config_.router_local_input_staging_enabled && local_router_forwarding_chunks_.empty())
+        empty_phase(config_.node_rank, peers_.size());
+    for (std::size_t p = 0; p < peers_.size(); ++p)
+        if (peers_[p].receive_chunks.empty()) empty_phase(peers_[p].peer_rank, p);
+}
+
+void Proxy::collect_forwarding_round_notification(const NvlinkForwardNotification& notification) {
+    auto& state = *forwarding_rounds_;
+    const auto kind = (notification.flags & kForwardRoundLocalFlag) ?
+        ForwardingRoundPhase::Kind::kLocal : ForwardingRoundPhase::Kind::kRemote;
+    const auto phase_it = std::find_if(state.phases.begin(), state.phases.end(), [&](const auto& phase) {
+        return phase.kind == kind && phase.source_node_rank == notification.peer_rank;
+    });
+    if (phase_it == state.phases.end() ||
+        !(notification.flags & (kForwardRoundBatchFlag | kForwardRoundPhaseEndFlag)) ||
+        (notification.flags & ~(kDirectRdmaInputFlag | kForwardRoundBatchFlag |
+                               kForwardRoundPhaseEndFlag | kForwardRoundLocalFlag)))
+        throw std::runtime_error("invalid forward round phase or flags");
+    const auto phase = static_cast<std::size_t>(phase_it - state.phases.begin());
+    const auto source = notification.source_gpu;
+    const auto round = notification.round_index;
+    if (notification.flags & kForwardRoundBatchFlag) {
+        if (notification.num_tokens)
+            state.collector->add_data(notification.iteration, phase, source, round, notification);
+        uint64_t now = 0;
+        if (config_.nvlink_forward_notification_scheduling_diagnostics)
+            now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        state.collector->complete_batch(notification.iteration, phase, source, round, now);
+    } else if (notification.num_tokens || notification.bytes) {
+        throw std::runtime_error("empty forward phase marker contains data");
+    }
+    if (notification.flags & kForwardRoundPhaseEndFlag)
+        state.collector->complete_phase(notification.iteration, phase, source,
+            round + ((notification.flags & kForwardRoundBatchFlag) ? 1 : 0));
+    ForwardingRound<NvlinkForwardNotification> ready;
+    while (state.collector->pop_ready(ready)) {
+        for (const auto& data : ready.payloads)
+            cuda_buffers_.ingest_router_notification_completion(data.peer_rank, data.source_gpu,
+                data.iteration, data.start_token, data.num_tokens);
+        cuda_buffers_.schedule_router_notification_completions(ready.iteration);
+        if (config_.nvlink_forward_notification_scheduling_diagnostics) {
+            const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+            const auto delay = ready.first_completion_ns ? now - ready.first_completion_ns : 0;
+            ++state.rounds;
+            state.delay_ns += delay;
+            state.max_delay_ns = std::max(state.max_delay_ns, delay);
+        }
+    }
+    if (state.collector->complete())
+        forwarding_round_completed_.store(notification.iteration + 1, std::memory_order_release);
 }
 
 void Proxy::publish_forward_completion_notification(
@@ -2089,8 +2271,8 @@ void Proxy::publish_forward_completion_notification(
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(config_.completion_timeout_ms);
     while (true) {
-        if (prepared_forwarding_ && prepared_forwarding_->failed.load()) {
-            throw std::runtime_error("prepared notification publication cancelled");
+        if (forwarding_notification_failed_.load()) {
+            throw std::runtime_error("notification publication cancelled after forwarding failure");
         }
         const auto head = atomic_load_u64(&queue->head);
         const auto tail = atomic_load_u64(&queue->tail);
@@ -2286,6 +2468,7 @@ void Proxy::nvlink_forward_notification_dispatch_loop() {
         }
         while (true) {
             NvlinkForwardNotificationDispatchState::Entry entry;
+            if (forwarding_notification_failed_.load()) return;
             bool have_notification = false;
             {
                 std::lock_guard<std::mutex> lock(nvlink_forward_notification_dispatch_->mutex);
@@ -2331,6 +2514,7 @@ std::string Proxy::format_nvlink_forward_notification_log(
         << " peer_rank=" << notification.peer_rank
         << " peer_slot=" << notification.peer_slot
         << " iteration=" << notification.iteration
+        << " round=" << notification.round_index
         << " batch=" << notification.batch_index
         << " start_token=" << notification.start_token
         << " num_tokens=" << notification.num_tokens
@@ -2390,6 +2574,7 @@ void Proxy::drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQue
     while (true) {
         // Do not leave a newly posted local request behind an unbounded stream
         // of ordinary notifications from another GPU.
+        begin_forwarding_round_iteration();
         consume_local_router_input_ready();
         const auto tail = atomic_load_u64(&queue->tail);
         const auto head = atomic_load_u64(&queue->head);
@@ -2403,7 +2588,15 @@ void Proxy::drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQue
             throw std::runtime_error(
                 "NVLink forwarding notification source/destination identity mismatch");
         }
-        if (config_.router_routing_enabled) {
+        if (forwarding_rounds_) {
+            // A faster peer may enqueue the next epoch before local reset.
+            // Do not feed it to either readiness or the current collector.
+            // Use the receiver's installed epoch: the coordinator can publish
+            // a new request after begin_forwarding_round_iteration() above.
+            if (notification.iteration >= forwarding_rounds_->receiver_epoch)
+                return;
+            collect_forwarding_round_notification(notification);
+        } else if (config_.router_routing_enabled) {
             cuda_buffers_.process_router_notification_completion(
                 notification.peer_rank,
                 notification.source_gpu,
@@ -2442,7 +2635,11 @@ void Proxy::nvlink_forward_notification_loop() {
         while (true) {
             // Failed prepared batches cannot publish a successful drain marker.
             // Do not wait a full receiver timeout for their abandoned records.
-            if (prepared_forwarding_ && prepared_forwarding_->failed.load()) return;
+            if (forwarding_notification_failed_.load()) {
+                if (forwarding_rounds_) forwarding_rounds_->collector->cancel();
+                return;
+            }
+            begin_forwarding_round_iteration();
             bool progressed = consume_local_router_input_ready();
             auto* base = reinterpret_cast<char*>(nvlink_forward_notification_header_);
             for (std::size_t i = 0; i < nvlink_forward_notification_header_->num_gpus_per_node; ++i) {
@@ -2466,7 +2663,14 @@ void Proxy::nvlink_forward_notification_loop() {
                     stop_deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(config_.completion_timeout_ms);
                 }
+                if (nvlink_forward_notification_queues_complete() && forwarding_rounds_ &&
+                    forwarding_rounds_->collector->active() && !forwarding_rounds_->collector->complete()) {
+                    forwarding_rounds_->collector->cancel();
+                    throw std::runtime_error("shutdown with incomplete forwarding rounds");
+                }
                 if (nvlink_forward_notification_queues_complete() &&
+                    (!forwarding_rounds_ || !forwarding_rounds_->collector->active() ||
+                     forwarding_rounds_->collector->complete()) &&
                     local_router_input_early_ready_requested_.load(std::memory_order_acquire) ==
                         local_router_input_early_ready_completed_.load(std::memory_order_acquire)) {
                     return;
@@ -2478,6 +2682,7 @@ void Proxy::nvlink_forward_notification_loop() {
             }
         }
     } catch (const std::exception& e) {
+        if (forwarding_rounds_) forwarding_rounds_->collector->cancel();
         set_forwarding_error(e.what());
     }
 }
@@ -2512,6 +2717,7 @@ void Proxy::run_iteration(uint64_t iteration) {
     // separates the mailbox release from prepared forwarding activation.
     if (config_.router_local_input_early_ready_enabled)
         request_local_router_input_ready(iteration);
+    enqueue_empty_forwarding_phases(iteration);
     if (prepared_forwarding_) {
         prepared_forwarding_->active_iteration.store(iteration + 1);
         prepared_forwarding_->changed.notify_all();
@@ -3483,6 +3689,8 @@ void Proxy::start_forwarding_thread() {
         forwarding_ping_pong_.reset(new ForwardingPingPongState);
     }
     forwarding_stop_.store(false);
+    forwarding_notification_failed_.store(false);
+    initialize_forwarding_rounds();
     if (config_.nvlink_forward_preparation_enabled) initialize_prepared_forwarding();
     if (config_.nvlink_forward_completion_notifications_enabled) {
         nvlink_forward_notification_dispatch_thread_ =
@@ -3529,6 +3737,9 @@ void Proxy::stop_forwarding_thread() {
     if (nvlink_forward_notification_thread_.joinable()) {
         nvlink_forward_notification_thread_.join();
     }
+    forwarding_rounds_.reset();
+    forwarding_round_requested_.store(0);
+    forwarding_round_completed_.store(0);
     // Release all event consumers before any later cleanup can throw. Failed
     // or unconfirmed recordings have remained quarantined until this point.
     nvlink_forward_notification_dispatch_.reset();
@@ -4280,6 +4491,8 @@ Proxy::ForwardingBatchCompletion Proxy::issue_forwarding_batch(
             forwarding_compaction_next_source_token_by_peer_[peer_slot] += batch_tokens;
         }
     }
+    complete_forwarding_round_records(completed_notifications, iteration, peer.peer_rank,
+        peer_slot, batch_start_token + batch_tokens == forwarding_tokens_for_peer(peer));
     if (config_.nvlink_forward_ping_pong_enabled) {
         if (forwarding_rdma_owner_flush_required_) {
             // Submit all destination copies before flushing direct same-GPU
@@ -4469,6 +4682,8 @@ void Proxy::issue_local_router_forwarding_batch(
         }
     }
 
+    complete_forwarding_round_records(completed_notifications, iteration, config_.node_rank,
+        peers_.size(), batch_start_token + batch_tokens == forwarding_tokens);
     // Completion notifications are enabled only with synchronized batches, so
     // their publication proves both the staging read and peer copies complete.
     synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
@@ -4778,6 +4993,8 @@ void Proxy::prepare_forwarding_batch(
         batch.bytes += selected * token_bytes;
         if (selected != 0) notify(destination.gpu_index, destination_start, selected, base, 0);
     }
+    complete_forwarding_round_records(batch.notifications.data(), batch.notification_count,
+        iteration, source_node, peer_index, true, first_chunk + chunk_count == chunks.size());
     if (!local) forwarding_compaction_next_source_token_by_peer_[peer_index] = end;
 }
 
@@ -6132,8 +6349,24 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
             mark_local_nvlink_batch_phase_complete(
                 LocalNvlinkBatchSyncPhase::kRemoteForwarding,
                 iteration);
-            if (config_.nvlink_forward_ping_pong_enabled || config_.nvlink_forward_preparation_enabled) {
+            if (config_.nvlink_forward_ping_pong_enabled || config_.nvlink_forward_preparation_enabled ||
+                forwarding_rounds_ || config_.nvlink_forward_notification_scheduling_diagnostics) {
                 drain_forwarding_iteration_notifications(iteration);
+            }
+            if (config_.nvlink_forward_notification_scheduling_diagnostics) {
+                const auto d = cuda_buffers_.router_notification_scheduling_diagnostics();
+                const auto rounds = forwarding_rounds_ ? forwarding_rounds_->rounds : 0;
+                RDMA_PROXY_LOG_INFO("forwarding_round_schedule iteration=", iteration,
+                    " local_rank=", config_.node_rank, " local_gpu=", config_.local_gpu_index,
+                    " policy=", config_.nvlink_forward_notification_scheduling_mode,
+                    " scheduling_passes=", d.scheduling_passes,
+                    " table_flush_count_total=", d.table_flush_count,
+                    " ready_publications_total=", d.ready_rows_publication_count,
+                    " m_clusters=", d.m_clusters, " expert_runs=", d.expert_runs,
+                    " max_consecutive_m_clusters=", d.max_consecutive_m_clusters,
+                    " completed_rounds=", rounds,
+                    " collection_delay_mean_us=", rounds ? forwarding_rounds_->delay_ns / (1000.0 * rounds) : 0.0,
+                    " collection_delay_max_us=", forwarding_rounds_ ? forwarding_rounds_->max_delay_ns / 1000.0 : 0.0);
             }
             ForwardingIterationStats stats;
             if (config_.nvlink_forward_synchronize_batches) {
@@ -6227,6 +6460,7 @@ void Proxy::set_forwarding_error(const std::string& error) {
     if ((config_.nvlink_forward_ping_pong_enabled || config_.nvlink_forward_preparation_enabled) &&
         !forwarding_error_.empty()) return;
     forwarding_error_ = error;
+    forwarding_notification_failed_.store(true);
     if (prepared_forwarding_) {
         prepared_forwarding_->failed.store(true);
         prepared_forwarding_->changed.notify_all();

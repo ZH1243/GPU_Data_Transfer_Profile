@@ -416,6 +416,13 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
         config.nvlink_forward_notification_flush_per_entry_enabled =
             (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "nvlink_forward_notification_scheduling_mode") {
+        config.nvlink_forward_notification_scheduling_mode = value;
+    }
+    else if (key == "nvlink_forward_notification_scheduling_diagnostics") {
+        config.nvlink_forward_notification_scheduling_diagnostics =
+            (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "router_computation_forwarded_inputs_only") {
         config.router_computation_forwarded_inputs_only =
             (value == "1" || value == "true" || value == "yes");
@@ -748,6 +755,12 @@ static ProxyConfig parse_config_file(const std::string& path) {
         object,
         "nvlink_forward_notification_flush_per_entry_enabled",
         config.nvlink_forward_notification_flush_per_entry_enabled);
+    config.nvlink_forward_notification_scheduling_mode = get_string(
+        object, "nvlink_forward_notification_scheduling_mode",
+        config.nvlink_forward_notification_scheduling_mode);
+    config.nvlink_forward_notification_scheduling_diagnostics = get_bool(
+        object, "nvlink_forward_notification_scheduling_diagnostics",
+        config.nvlink_forward_notification_scheduling_diagnostics);
     config.nvlink_forward_notification_flag_update_mode =
         nvlink_forward_notification_flag_update_mode_from_string(get_string(
             object,
@@ -1139,6 +1152,31 @@ void validate_config(const ProxyConfig& config) {
             }
         }
     }
+    if (config.nvlink_forward_notification_scheduling_mode != "per_notification" &&
+        config.nvlink_forward_notification_scheduling_mode != "complete_round") {
+        throw std::runtime_error(
+            "nvlink_forward_notification_scheduling_mode must be per_notification or complete_round");
+    }
+    if (config.nvlink_forward_notification_scheduling_mode == "complete_round") {
+        if (!config.router_routing_enabled ||
+            !config.nvlink_forward_completion_notifications_enabled) {
+            throw std::runtime_error(
+                "complete_round scheduling requires router_routing_enabled=true and "
+                "nvlink_forward_completion_notifications_enabled=true");
+        }
+        if (config.nvlink_forward_notification_flush_only_enabled) {
+            throw std::runtime_error(
+                "complete_round scheduling cannot be combined with "
+                "nvlink_forward_notification_flush_only_enabled");
+        }
+    }
+    if (config.nvlink_forward_notification_scheduling_diagnostics &&
+        (!config.router_routing_enabled ||
+         !config.nvlink_forward_completion_notifications_enabled)) {
+        throw std::runtime_error(
+            "nvlink_forward_notification_scheduling_diagnostics requires "
+            "router_routing_enabled=true and nvlink_forward_completion_notifications_enabled=true");
+    }
     if (config.nvlink_forward_notification_flush_only_enabled) {
         if (!config.nvlink_forward_completion_notifications_enabled) {
             throw std::runtime_error(
@@ -1393,6 +1431,10 @@ std::string config_summary(const ProxyConfig& config) {
         << (config.nvlink_forward_notification_flush_only_enabled ? "true" : "false")
         << " nvlink_forward_notification_flush_per_entry_enabled="
         << (config.nvlink_forward_notification_flush_per_entry_enabled ? "true" : "false")
+        << " nvlink_forward_notification_scheduling_mode="
+        << config.nvlink_forward_notification_scheduling_mode
+        << " nvlink_forward_notification_scheduling_diagnostics="
+        << (config.nvlink_forward_notification_scheduling_diagnostics ? "true" : "false")
         << " router_computation_forwarded_inputs_only="
         << (config.router_computation_forwarded_inputs_only ? "true" : "false")
         << " router_local_input_staging_enabled="

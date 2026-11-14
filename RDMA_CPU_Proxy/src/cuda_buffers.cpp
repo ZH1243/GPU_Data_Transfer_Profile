@@ -1443,6 +1443,7 @@ void CudaBuffers::reset_router_computation_iteration_locked(uint64_t iteration) 
     scheduler.iteration = iteration;
     scheduler.published_batches = 0;
     scheduler.published_rows = 0;
+    scheduler.scheduling_passes = 0;
     cpu_scatter_staged_rows_ = 0;
     cpu_scatter_submitted_ = false;
     cpu_scatter_ready_cv_.notify_all();
@@ -1662,6 +1663,9 @@ void CudaBuffers::update_expert_token_heads_locked(
             ++head;
         }
         scheduler.expert_num_ready_tokens[expert_index] += head - old_head;
+        // Keep the original per-notification/per-entry baseline: an expert
+        // can publish before this notification advances the next expert Head.
+        // Aggregated ingestion always disables this path.
         if (flush_ready_entries_per_entry) {
             schedule_ready_computation_batches_for_expert_locked(
                 expert_index, /*flush_per_entry=*/true);
@@ -1676,6 +1680,28 @@ void CudaBuffers::update_expert_token_heads(
     uint64_t iteration,
     std::size_t start_token,
     std::size_t num_tokens) {
+    ingest_router_notification_completion(
+        source_node_rank, source_gpu_index, iteration, start_token, num_tokens);
+}
+
+void CudaBuffers::ingest_router_notification_completion(
+    int source_node_rank,
+    int source_gpu_index,
+    uint64_t iteration,
+    std::size_t start_token,
+    std::size_t num_tokens) {
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    ingest_router_notification_completion_locked(
+        source_node_rank, source_gpu_index, iteration, start_token, num_tokens);
+}
+
+void CudaBuffers::ingest_router_notification_completion_locked(
+    int source_node_rank,
+    int source_gpu_index,
+    uint64_t iteration,
+    std::size_t start_token,
+    std::size_t num_tokens,
+    bool flush_ready_entries_per_entry) {
     if (!config_.router_routing_enabled || !config_.nvlink_forwarding_enabled) {
         throw std::runtime_error(
             "expert token heads require combined router/NVLink mode");
@@ -1685,7 +1711,6 @@ void CudaBuffers::update_expert_token_heads(
         throw std::runtime_error("received NVLink token range exceeds buffer capacity");
     }
 
-    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
     auto it = std::find_if(
         nvlink_recv_buffers_.begin(), nvlink_recv_buffers_.end(),
         [&](const auto& entry) {
@@ -1703,8 +1728,7 @@ void CudaBuffers::update_expert_token_heads(
             "received a completion for a source buffer excluded from QuACK inputs");
     }
     update_expert_token_heads_locked(
-        *it, iteration, start_token, num_tokens,
-        /*flush_ready_entries_per_entry=*/false);
+        *it, iteration, start_token, num_tokens, flush_ready_entries_per_entry);
 }
 
 std::size_t
@@ -1811,13 +1835,14 @@ CudaBuffers::schedule_ready_computation_batches_for_expert_locked(
     return scheduler.published_rows - first_new_row;
 }
 
-std::size_t CudaBuffers::schedule_ready_computation_batches_locked() {
+std::size_t CudaBuffers::schedule_ready_computation_batches_locked(bool flush_per_entry) {
     auto& scheduler = router_computation_scheduler_state_;
+    ++scheduler.scheduling_passes;
     const auto first_new_row = scheduler.published_rows;
     for (std::size_t expert = 0;
          expert < scheduler.expert_total_tokens.size(); ++expert) {
         schedule_ready_computation_batches_for_expert_locked(
-            expert, /*flush_per_entry=*/false);
+            expert, flush_per_entry);
     }
     return scheduler.published_rows - first_new_row;
 }
@@ -1834,42 +1859,68 @@ void CudaBuffers::process_router_notification_completion(
         flush_router_notification_publication_range(0, row_bytes);
         return;
     }
-    if (start_token > config_.num_tokens ||
-        num_tokens > config_.num_tokens - start_token) {
-        throw std::runtime_error("received NVLink token range exceeds buffer capacity");
-    }
-
     std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
-    auto it = std::find_if(
-        nvlink_recv_buffers_.begin(), nvlink_recv_buffers_.end(),
-        [&](const auto& entry) {
-            return entry.source_node_rank == source_node_rank &&
-                entry.source_gpu_index == source_gpu_index;
-        });
-    if (it == nvlink_recv_buffers_.end()) {
-        throw std::runtime_error("unknown NVLink source node/GPU");
-    }
-    if (!it->expert_metadata_ready) {
-        throw std::runtime_error("router expert metadata is not ready for source GPU");
-    }
     const bool flush_per_entry =
         config_.nvlink_forward_notification_flush_per_entry_enabled;
-    update_expert_token_heads_locked(
-        *it, iteration, start_token, num_tokens,
-        /*flush_ready_entries_per_entry=*/flush_per_entry);
+    ingest_router_notification_completion_locked(
+        source_node_rank, source_gpu_index, iteration, start_token, num_tokens,
+        flush_per_entry);
     if (flush_per_entry) {
+        ++router_computation_scheduler_state_.scheduling_passes;
         return;
     }
+    schedule_router_notification_completions_locked();
+}
+
+void CudaBuffers::schedule_router_notification_completions(uint64_t iteration) {
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    const auto& scheduler = router_computation_scheduler_state_;
+    if (!scheduler.iteration_initialized || scheduler.iteration != iteration)
+        throw std::runtime_error("router scheduling collection iteration mismatch");
+    schedule_router_notification_completions_locked();
+}
+
+void CudaBuffers::schedule_router_notification_completions_locked() {
     const auto first_new_row =
         router_computation_scheduler_state_.published_rows;
-    const auto new_rows = schedule_ready_computation_batches_locked();
-    if (new_rows != 0) {
+    const bool flush_per_entry =
+        config_.nvlink_forward_notification_flush_per_entry_enabled;
+    const auto new_rows = schedule_ready_computation_batches_locked(flush_per_entry);
+    if (new_rows != 0 && !flush_per_entry) {
         flush_router_notification_publication_range(
             first_new_row *
                 router_notification_publication_buffers_.table_row_bytes,
             new_rows *
                 router_notification_publication_buffers_.table_row_bytes);
     }
+}
+
+RouterNotificationSchedulingDiagnostics
+CudaBuffers::router_notification_scheduling_diagnostics() const {
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    const auto& scheduler = router_computation_scheduler_state_;
+    const auto& publication = router_notification_publication_buffers_;
+    RouterNotificationSchedulingDiagnostics result;
+    result.scheduling_passes = scheduler.scheduling_passes;
+    result.table_flush_count = publication.table_flush_count;
+    result.ready_rows_publication_count = publication.ready_rows_publication_count;
+    const auto groups = publication.n_groups_per_m_cluster;
+    if (!groups || !publication.host_table.ptr) return result;
+    const auto* table = static_cast<const int32_t*>(publication.host_table.ptr);
+    int32_t previous_expert = -1;
+    std::size_t run = 0;
+    for (std::size_t row = 0; row < scheduler.published_rows; row += groups) {
+        const auto expert = table[row * publication.table_width];
+        ++result.m_clusters;
+        if (expert == previous_expert) ++run;
+        else {
+            previous_expert = expert;
+            run = 1;
+            ++result.expert_runs;
+        }
+        result.max_consecutive_m_clusters = std::max(result.max_consecutive_m_clusters, run);
+    }
+    return result;
 }
 
 void CudaBuffers::flush_router_notification_publication() {

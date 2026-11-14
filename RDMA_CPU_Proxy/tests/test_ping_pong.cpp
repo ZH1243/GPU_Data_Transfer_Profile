@@ -8,9 +8,11 @@
 #include <stdexcept>
 #include <thread>
 
-int main() {
+int main(int argc, char** argv) {
     using namespace rdma_proxy;
     Logger::instance().set_level(LogLevel::kError);
+    const bool complete_round = argc == 2 && std::string(argv[1]) == "--complete-round";
+    if (argc != 1 && !complete_round) throw std::runtime_error("unknown test argument");
 
     auto make_config = [] {
         ProxyConfig config;
@@ -56,6 +58,7 @@ int main() {
         config0.nvlink_forward_synchronize_batches = true;
         config0.nvlink_forward_local_batch_sync_enabled = true;
         config0.nvlink_forward_completion_notifications_enabled = true;
+        if (complete_round) config0.nvlink_forward_notification_scheduling_mode = "complete_round";
         config0.router_local_input_staging_enabled = true;
         config0.nvlink_forward_ping_pong_enabled = mode != 0;
         config0.nvlink_forward_ping_pong_handoff_copy = mode == 2 ? 8 : 1;
@@ -164,7 +167,7 @@ int main() {
         validate_config(config1);
 
         auto verify_drained = [&](const Proxy& proxy, int gpu) {
-            if (mode == 0) return;
+            if (mode == 0 && !complete_round) return;
             const auto& own = gpu == 0 ? shape0 : shape1;
             const auto& other = gpu == 0 ? shape1 : shape0;
             const auto check = [&](int node, int source, std::size_t expected) {

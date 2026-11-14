@@ -112,6 +112,10 @@ struct ProxyConfig {
     bool nvlink_return_ready_gpu_publication_enabled{false};
     bool nvlink_forward_notification_flush_only_enabled{false};
     bool nvlink_forward_notification_flush_per_entry_enabled{false};
+    // Readiness scheduling is independent of per-entry/coalesced publication.
+    // complete_round waits for explicit completion knowledge from every source.
+    std::string nvlink_forward_notification_scheduling_mode{"per_notification"};
+    bool nvlink_forward_notification_scheduling_diagnostics{false};
     // Limit QuACK's gather inputs to remote-node buffers. Cross-local-GPU
     // inputs are populated by NVLink forwarding; same-local-GPU inputs alias
     // the corresponding direct RDMA receive buffers.

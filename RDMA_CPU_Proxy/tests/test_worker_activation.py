@@ -21,6 +21,23 @@ spec.loader.exec_module(worker)
 
 
 class CommunicationOnlyCliTests(unittest.TestCase):
+    def test_notification_scheduling_options_reach_native(self):
+        for mode in ("per_notification", "complete_round"):
+            result = subprocess.run(
+                [sys.executable, str(WORKER), "--library=/unused.so",
+                 "--cuda-device-map=0,1", "--rdma-device-map=nic0,nic1",
+                 f"--nvlink_forward_notification_scheduling_mode={mode}",
+                 "--nvlink_forward_notification_scheduling_diagnostics=true",
+                 "--communication-only", "--dry-run"],
+                env={**os.environ, "LOCAL_RANK": "0", "LOCAL_WORLD_SIZE": "2",
+                     "RANK": "0", "WORLD_SIZE": "2", "GROUP_RANK": "0"},
+                text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            native = shlex.split(result.stdout.splitlines()[-1])
+            self.assertIn(f"--nvlink_forward_notification_scheduling_mode={mode}", native)
+            self.assertIn("--nvlink_forward_notification_scheduling_diagnostics=true", native)
+
     def test_hopper_launcher_defaults(self):
         # An empty optional site-argument array fails under macOS Bash 3 + nounset.
         env = {key: value for key, value in os.environ.items()

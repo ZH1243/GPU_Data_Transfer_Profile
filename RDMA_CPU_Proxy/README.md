@@ -514,6 +514,259 @@ Set `nvlink_forward_notification_log_enabled=true` to record receiver-side notif
 
 Set `nvlink_forward_local_batch_sync_enabled=true` to add a same-node GPU-proxy barrier before every synchronized NVLink forwarding batch. The barrier is keyed by phase, iteration, and batch round. Router local-input staging and remote receive-buffer forwarding use separate phases, so completing the staging phase does not prevent a proxy from participating in remote forwarding. Once a proxy has observed that its next batch is ready, it publishes that round in shared memory and waits until every local proxy is either ready for the same round or has completed that phase for the iteration. A completed proxy retires from later rounds in that phase, allowing router-driven proxies with shorter `x3`/`x4` arrays to stop participating while the remaining proxies continue together. With ping-pong forwarding disabled, each forwarding path reaches the next batch-start barrier only after the previous batch's `cudaStreamSynchronize()` has returned, so active proxies still start each round together. This option requires `nvlink_forward_synchronize_batches=true` and uses the same local shared-memory run identity as `local_iteration_sync_run_id`.
 
+### Optional complete-round gather scheduling
+
+`nvlink_forward_notification_scheduling_mode=per_notification` remains the
+default. Each data notification updates contiguous per-source readiness, then
+the scheduler appends all eligible M clusters in increasing expert-ID order.
+`nvlink_forward_notification_scheduling_mode=complete_round` first collects the
+completions of a forwarding round across source GPUs at this destination, then
+updates their readiness and invokes that same scheduler once. For example,
+three sources can expose enough rows for `E0 E0 E0 | E1 E1 E1` instead of three
+separate `E0 E1` runs. Each label represents an M cluster; repeated N-group
+descriptors do not count as extra M clusters. GPU execution remains concurrent.
+
+Enable it on **every local proxy** by appending:
+
+```bash
+--nvlink_forward_notification_scheduling_mode=complete_round
+```
+
+CLI and JSON accept `per_notification` and `complete_round`. Complete-round
+scheduling requires router routing and forwarding completion notifications;
+`nvlink_forward_notification_flush_only_enabled=true` is incompatible because
+that mode bypasses readiness and scheduling. No new batch-start barrier is
+required, and the existing batch-start barrier is not completion evidence.
+Prepared forwarding, submit/epilogue, both ping-pong paths, fixed/dynamic batch
+thresholds, single-node staging, and remote forwarding use the same completion
+contract. One sender already produces at most one data notification to a given
+destination per batch: this policy aggregates different source GPUs, not the
+sender's array of notifications to different destinations.
+
+A round is identified by **iteration, local/remote forwarding phase, source-node
+context, and zero-based batch ordinal within that context**. The source GPU
+identifies a participant, not the round. The old `batch_index` alone is not a
+global identity. Each source emits one completion record to every destination
+for each batch, including destinations with zero routed rows. The record carries
+its data range if any, plus explicit completion knowledge. The final batch also
+marks source exhaustion; an empty context emits an explicit zero-batch end
+record. Every local source GPU participates until its exhaustion is known, so
+unequal batch counts and partial final rounds have an unambiguous boundary.
+Local staging is consumed before remote source-node contexts, which are processed
+in deterministic peer order. Contexts and iterations cannot complete one another.
+
+The receiver continuously drains its per-source FIFO queues while collecting;
+future-round records are held by the receiver instead of occupying the bounded
+shared-memory ring. It does not wait inside one source queue, or interpret a
+temporarily empty queue as a completed round. Readiness from future rounds is
+not exposed to an earlier scheduling pass. Explicit completion records are
+published only after the existing transfer completion and required GPUDirect
+visibility handling. Iteration retirement includes collected but unscheduled
+records. Errors cancel pending work and report failure; shutdown with missing
+completion markers reports an incomplete round instead of publishing it.
+Pending storage retains notification records, with a checked upper bound of
+`num_nodes * num_gpus_per_node * (num_tokens + 1)` batches for one iteration;
+exceeding it is a protocol error, not a queue wait. Next-iteration records remain
+gated until local reset. Retiring an iteration requires its completion markers
+and scheduling submissions, without requiring the next iteration's queues to
+be empty.
+
+`router_local_input_early_ready_enabled=true` still publishes already-staged
+own-source readiness immediately. Its later round records carry completion
+without duplicating data readiness; other sources are aggregated normally.
+Nothing waits for GEMM consumption. Previously published descriptors remain
+immutable and the gather-table ABI is unchanged; QuACK needs no source change.
+Cluster capacity continues to use the architecture geometry helpers, including
+Blackwell's two-CTA MMA split. GPU scatter preparation and CPU `per-batch`,
+`deferred`, and `threaded` preparation consume the actual constructed descriptor
+order, including weights, final partial clusters, and repeated N groups.
+
+Scheduling and publication are separate controls. With
+`nvlink_forward_notification_flush_per_entry_enabled=false`, one completed
+collection uses coalesced table/ready publication. With `true`, its newly appended
+entries are published individually during the scheduling pass, **after** the
+complete collection has updated readiness.
+Neither mode constructs entries before collection completion. Gather copies and
+any required per-batch scatter metadata copies still precede ready-prefix
+publication on the existing stream; deferred/threaded scatter keeps its existing
+final upload and down-GEMM dependency.
+
+The receiver shared-memory notification protocol is version **5**. Rebuild and
+restart all local proxies together; layout/version and scheduling-policy
+mismatches are rejected during connection. Use a fresh
+`local_iteration_sync_run_id` for independent launches. The default policy keeps
+per-notification scheduling as the baseline; the extra round protocol is active
+only for `complete_round`.
+
+Opt-in `nvlink_forward_notification_scheduling_diagnostics=true` reports
+collection delays, scheduler passes, gather flushes/ready publications, M-cluster
+count, expert-run count and longest consecutive M-cluster run per iteration.
+Enable or disable it consistently on every local proxy; mismatches are rejected.
+Legacy per-notification diagnostics also drain iteration notifications before
+sampling the table, so keep diagnostics off when measuring the original baseline.
+The `forwarding_round_schedule` log includes `scheduling_passes`,
+`table_flush_count_total`, `ready_publications_total`, `m_clusters`, `expert_runs`,
+`max_consecutive_m_clusters`, `completed_rounds`, `collection_delay_mean_us` and
+`collection_delay_max_us`. Collection delay runs from the first dequeued
+completion to the scheduling pass returning, including prior-phase waiting and
+CPU scheduling; it is not a GPU timestamp or H2D completion latency.
+N-group repetitions count once. Publication counters are cumulative, so compare
+successive differences. Diagnostics are disabled by default; descriptor scans,
+aggregation-delay timestamps and reporting are confined to diagnostic runs.
+Compare both policies with diagnostics enabled for ordering analysis, then turn
+them off for latency measurements. Increased expert locality is a hypothesis;
+waiting for a slow source can outweigh any cache benefit.
+
+#### Remote validation and performance sequence
+
+The following commands run on NVIDIA Linux nodes, **not the Mac**. Activate the
+existing compatible CUDA/PyTorch/QuACK environment, synchronize this source to
+all nodes, then set paths and the architecture on each node:
+
+```bash
+export PROXY_ROOT=/path/to/GPU_Data_Transfer_Profile/RDMA_CPU_Proxy
+export QUACK_ROOT=/path/to/quack_for_communication_overlap
+export CUDA_HOME=/path/to/cuda-12.9
+export RDMA_PROXY_GEMM_ARCH=hopper  # blackwell on B200/B300
+case "$RDMA_PROXY_GEMM_ARCH" in
+  hopper) CUDA_ARCH=90 ;;
+  blackwell) CUDA_ARCH=100 ;;
+esac
+export RDMA_PROXY_BUILD_DIR="$PROXY_ROOT/build-$RDMA_PROXY_GEMM_ARCH"
+cmake -S "$PROXY_ROOT" -B "$RDMA_PROXY_BUILD_DIR" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" -DCUDAToolkit_ROOT="$CUDA_HOME" \
+  -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \
+  -DRDMA_PROXY_REQUIRE_CUDA=ON -DRDMA_PROXY_REQUIRE_VERBS=ON
+cmake --build "$RDMA_PROXY_BUILD_DIR" -j4
+ctest --test-dir "$RDMA_PROXY_BUILD_DIR" \
+  -R '^test_forward(ing_rounds|_round_scheduler|_round_integration|_round_forwarding|_round_ping_pong|_round_protocol)$' --output-on-failure
+ctest --test-dir "$RDMA_PROXY_BUILD_DIR" --output-on-failure
+cd "$PROXY_ROOT"
+CUDA_VISIBLE_DEVICES=0 timeout 3600 \
+  python -m unittest discover -s tests -p test_worker_composition.py -v
+CUDA_VISIBLE_DEVICES=0 timeout 3600 \
+  python -m pytest -q "$QUACK_ROOT/run/test_proxy_gemm_integration.py" -x
+```
+
+The standalone composition checks exercise numerical up/SwiGLU/down/compact
+scatter/combine alignment with partial multi-source descriptors, repeated N
+groups, weighted/unweighted routes and GPU/CPU metadata. They complement the
+native round/queue tests; the integrated launch below validates the actual
+notification-driven descriptor order. Run the sequence on both architectures.
+`test_forward_round_forwarding` runs 108 mock cases spanning prepared
+coordinator, ping-pong2, submit/epilogue, atomic ring, and mutex/atomic
+stream-query paths, with batch barriers on/off, empty/unequal source tails,
+multiple peer contexts, repeated iterations, and failure/shutdown paths.
+
+Configure `CUDA_DEVICE_MAP`, `RDMA_DEVICE_MAP`, and `RDMA_GID_INDEX` for the
+actual machine as described above. In Bash, run the correctness matrix below
+on a single node first. To repeat on two nodes, set `LAUNCHER` to
+`scripts/run_node0_torchrun.sh` on node 0 and `scripts/run_node1_torchrun.sh` on
+node 1, set `MASTER_ADDR` and each node's `PEER_HOST`, and start the **same matrix
+in the same order on both nodes**. The launcher retains its existing up/down SM
+budgets, residency rules and per-call bulk epilogue settings. Put any existing
+site-specific overrides in `COMMON` unchanged for every policy.
+
+```bash
+LAUNCHER=scripts/run_single_node_torchrun.sh
+COMMON=()  # Your existing geometry/SM-count/bulk-epilogue overrides, if any.
+RUN_TAG="round-$(date +%s)"
+mkdir -p results/round-scheduling
+for mode in per_notification complete_round; do
+  for publication in false true; do
+    for preparation in gpu per-batch deferred threaded; do
+      scatter=()
+      if [[ "$preparation" != gpu ]]; then
+        scatter=(--cpu-scatter-preparation --cpu-scatter-publication="$preparation")
+      fi
+      for weighting in --no-weighted-contributions --weighted-contributions; do
+        label="${mode}_entry${publication}_${preparation}_${weighting#--}"
+        timeout 1800 bash "$LAUNCHER" "${COMMON[@]}" "${scatter[@]}" "$weighting" \
+          --local_iteration_sync_run_id="${RUN_TAG}_${label}" \
+          --num_tokens=4097 --num_iterations=4 --check-projections \
+          --nvlink_forward_prepared_batch_chunks=3 \
+          --nvlink_forward_notification_queue_depth=2 \
+          --router_local_input_early_ready_enabled=true \
+          --nvlink_forward_notification_scheduling_mode="$mode" \
+          --nvlink_forward_notification_flush_per_entry_enabled="$publication" \
+          --nvlink_forward_notification_scheduling_diagnostics=true \
+          2>&1 | tee "results/round-scheduling/check_${label}.log"
+        test "${PIPESTATUS[0]}" -eq 0 || exit 1
+      done
+    done
+  done
+done
+```
+
+Small batches and depth two stress draining under backpressure; 4097 input
+tokens exercise non-divisible tails. Native tests supply deliberately empty
+sources and zero-route destinations rather than relying on random routing to
+produce them. Repeat a complete-round integrated case with
+`--router_local_input_early_ready_enabled=false` and
+`--nvlink_forward_local_batch_sync_enabled=false` to check aggregation without
+early work or batch-start synchronization. Checks inherited from the launchers
+also validate local returns, intra-node combine, and (for two nodes) RDMA returns
+and final original-token-order combine.
+
+For performance, return to the original workload size and prepared batch size.
+Use the same `COMMON` and choose one scatter/weighting configuration at a time;
+do not include the small-batch correctness overrides. Run alternating policies
+on an otherwise idle node, then reverse their order. For two nodes, coordinate
+the same launch on both nodes for each sample.
+
+```bash
+CHECKS_OFF=(--no-check-projections --no-check-return-token-results
+  --no-check-intra-node-combine --no-check-rdma-return-token-results
+  --no-check-inter-node-combine)
+for mode in per_notification complete_round complete_round per_notification; do
+  stamp=$(date +%s)
+  timeout 1800 bash "$LAUNCHER" "${COMMON[@]}" "${CHECKS_OFF[@]}" \
+    --local_iteration_sync_run_id="perf_${mode}_${stamp}" \
+    --num_iterations=30 --router_local_input_early_ready_enabled=true \
+    --nvlink_forward_notification_scheduling_mode="$mode" \
+    --nvlink_forward_notification_scheduling_diagnostics=false \
+    --nvlink_forward_notification_log_enabled=false \
+    --nvlink_forward_prepared_nvtx_enabled=false --nvlink_forward_log_batches=false \
+    2>&1 | tee "results/round-scheduling/perf_${mode}_${stamp}.log"
+  test "${PIPESTATUS[0]}" -eq 0 || exit 1
+done
+# Separate instrumented samples: retain identical workload/SM/scatter settings.
+for mode in per_notification complete_round; do
+  nsys profile --trace=cuda,nvtx --sample=none --gpu-metrics-device=all \
+    --force-overwrite=true -o "results/round-scheduling/trace_${mode}" \
+    bash "$LAUNCHER" "${COMMON[@]}" "${CHECKS_OFF[@]}" \
+    --local_iteration_sync_run_id="trace_${mode}_$(date +%s)" \
+    --num_iterations=8 --router_local_input_early_ready_enabled=true \
+    --nvlink_forward_notification_scheduling_mode="$mode" \
+    --nvlink_forward_notification_scheduling_diagnostics=true \
+    --nvlink_forward_prepared_nvtx_enabled=true --trace-down-ready \
+    2>&1 | tee "results/round-scheduling/trace_${mode}.log"
+  test "${PIPESTATUS[0]}" -eq 0 || exit 1
+done
+```
+
+Discard initialization and warmup iterations and compare warmed medians and
+tails across ranks. `pipeline iteration ... elapsed_ms` measures host wall time
+from preparation through existing GPU, return/combine completion and reuse
+barriers; it adds no synchronization and excludes projection checks. Other
+enabled validation inside return/combine completion is included, hence the
+explicit `CHECKS_OFF`. Existing `iteration ... elapsed_ms` is the CUDA-event
+up-GEMM duration; `up_plus_down_ms` excludes host gaps and final returns/combine.
+The native RDMA `elapsed_us` also excludes the final forwarding wait and is not
+complete iteration latency.
+
+In Nsight, compare the interval from first forwarding submission through the
+last forwarding completion, gaps between batches, first/last gather-ready
+publication, aggregation delay, and down-ready detection times. Summed batch
+durations may overlap in ping-pong mode and are not forwarding wall time.
+Compare Tensor Active and DRAM activity over matching overlap intervals, not
+whole-run averages containing compilation or checks. GPU metrics require the
+target node's Nsight support and permissions. Keep traces separate from the
+unprofiled timings because tracing, metrics, diagnostics and readiness polling
+can perturb them. Accept a locality gain only if full pipeline latency and
+readiness delay remain acceptable, not merely because expert runs grow longer.
+
 ### Opt-in ping-pong forwarding
 
 Set `nvlink_forward_ping_pong_enabled=true` to alternate remote RDMA forwarding
@@ -1998,7 +2251,7 @@ It does not imply final reduction or reverse RDMA. No further GPU work is
 launched by the consumer. Empty contributions still advance the prefix.
 
 Rebuild the shared library and upgrade all local workers together: notification
-protocol version 4 includes self readiness and rejects older workers. Self uses
+protocol version 5 includes self readiness and round scheduling, and rejects older workers. Self uses
 the same ordered queue and retirement checks as peers. Its notification waits
 for outgoing return copies to complete, conservatively delaying self readiness.
 
@@ -2181,6 +2434,8 @@ Required parameters are represented in `config/example_config.json`:
 - `nvlink_forward_notification_flush_only_enabled`
 - `nvlink_forward_notification_flush_per_entry_enabled`
 - `nvlink_forward_notification_flag_update_mode` (`stream-write` or `memcpy`)
+- `nvlink_forward_notification_scheduling_mode` (`per_notification` or `complete_round`)
+- `nvlink_forward_notification_scheduling_diagnostics`
 - `expert_gemm_m_tile` (MMA M tile, not per-CTA M)
 - `expert_gemm_device_capacity` (`9` Hopper/native default, `10` Blackwell; worker resolves automatically)
 - `expert_gemm_n_tile`
