@@ -551,6 +551,11 @@ def add_down_arguments(parser):
                         help="same-node return setup/completion and CPU metadata submission timeout in seconds")
     parser.add_argument("--down-projection2", action="store_true")
     parser.add_argument(
+        "--down-output-reset", choices=("before-down", "end-of-iteration"), default="before-down",
+        help="when to zero down outputs: before down GEMM (default), or after all iteration "
+             "consumers and checks; end-of-iteration still includes reset in pipeline timing",
+    )
+    parser.add_argument(
         "--down-sm-count", type=int, default=None,
         help="cap down GEMM persistent CTAs; positive multiple of --down-cluster-m. "
              "Defaults to hardware capacity; does not reserve physical SMs",
@@ -581,6 +586,8 @@ def add_down_arguments(parser):
 
 
 def validate_down_arguments(args):
+    if args.down_output_reset != "before-down" and not args.down_projection2:
+        raise ValueError("--down-output-reset requires --down-projection2")
     if args.cpu_scatter_preparation and not args.local_gpu_combine:
         raise ValueError("--cpu-scatter-preparation requires --local-gpu-combine")
     if args.cpu_scatter_publication is not None and not args.cpu_scatter_preparation:
@@ -804,7 +811,7 @@ class DownProjectionRunner:
         pregather.add_kernel_arguments(parser)
         args = parser.parse_args([])
         for name, value in vars(options).items():
-            if name.startswith("down_") and name != "down_projection2":
+            if name.startswith("down_") and name not in ("down_projection2", "down_output_reset"):
                 setattr(args, name[5:], value)
         args.device_capacity = up.device_capacity
         args.pingpong = resolve_down_pingpong(
@@ -815,6 +822,7 @@ class DownProjectionRunner:
                           hidden=hidden, output_dim=output_dim, activation=None,
                           down_projection=False, iterations=1, timing_samples=1, warmup=0)
         self.combine = options.local_gpu_combine
+        self.output_reset_policy = options.down_output_reset
         self.cpu_scatter = options.cpu_scatter_preparation
         self.cpu_scatter_publication = options.cpu_scatter_publication or "deferred"
         self.cpu_scatter_metadata = None
@@ -899,6 +907,7 @@ class DownProjectionRunner:
         self._trace_first_combine_launch = self.combine
         self.flops = 2 * routes * hidden * output_dim
         self.reset_start = torch.cuda.Event(enable_timing=True)
+        self.reset_end = torch.cuda.Event(enable_timing=True)
         self.mapping_start = torch.cuda.Event(enable_timing=True)
         self.gemm_start = torch.cuda.Event(enable_timing=True)
         self.end = torch.cuda.Event(enable_timing=True)
@@ -908,6 +917,7 @@ class DownProjectionRunner:
               f"pingpong={args.pingpong} sm_count={args.sm_count} "
               f"wave_work_ids={self.inputs.wave_work_ids} "
               f"bulk_store_config={pregather.bulk_store_config_for_args(args)} "
+              f"output_reset={self.output_reset_policy} "
               f"routes={routes} H={hidden} K={output_dim} "
               f"counts={counts} output_shapes="
               f"{[tuple(x.shape) for x in self.inputs.output_buffers()]}", flush=True)
@@ -948,8 +958,12 @@ class DownProjectionRunner:
                       flush=True)
             # Warm the selected down kernel using the prepared scatter addresses.
             self.launch_gemm()
-            for event in (self.reset_start, self.mapping_start, self.gemm_start, self.end):
+            for event in (self.reset_start, self.reset_end, self.mapping_start, self.gemm_start, self.end):
                 event.record()
+            if self.output_reset_policy == "end-of-iteration":
+                # Warmup leaves additive results in the destinations. Establish
+                # zeros for the first measured iteration before dropping its reset.
+                self.reset_outputs()
         torch.cuda.synchronize(self.up.cuda_device_id)
         print(f"[gpu={self.up.cuda_device_id}] DownGEMM warmup complete", flush=True)
 
@@ -1072,13 +1086,31 @@ class DownProjectionRunner:
                                * self.up.output.element_size())
         self.inputs.scatter_row_addresses.copy_(addresses)
 
+    def reset_outputs(self):
+        """Clear only down destinations on the caller's stream, with independent timing."""
+        with self.up.torch.inference_mode():
+            self.reset_start.record()
+            self.inputs.zero_up_output()
+            self.reset_end.record()
+
+    def finish_iteration(self):
+        """Reset after all output readers/checks have joined the caller's stream.
+
+        Return copies, combine streams, peer validation and projection checks
+        must finish before this call. The scoped wait charges this reset to the
+        completed iteration and leaves the destinations ready for the next one.
+        """
+        if self.output_reset_policy == "end-of-iteration":
+            self.reset_outputs()
+            self.reset_end.synchronize()
+
     def launch(self, wait_for_metadata=None):
         # QuACK prepares output and metadata tensors under inference_mode.
         # Keep their resets and in-place updates in the same mode.
         with self.up.torch.inference_mode():
-            self._log_combine_startup("reset begin")
-            self.reset_start.record()
-            self.inputs.zero_up_output()
+            if self.output_reset_policy == "before-down":
+                self._log_combine_startup("reset begin")
+                self.reset_outputs()
             self.mapping_start.record()
             if wait_for_metadata is not None:
                 # Include an exposed upload/wakeup gap in mapping_ms. CPU packing
@@ -1790,15 +1822,27 @@ def run_proxy_with_concurrent_kernel(
                         down.intra_node_combine.inter_node_combine.run()
                     # No rank may overwrite returned buffers while a peer still combines.
                     return_exchange.control.gather(f"intra-node-done-{iteration}")
-            # Reuse existing completion joins; timing adds no GPU synchronization.
+            # Snapshot existing completion joins before projection validation;
+            # append the optional tail reset separately without hiding its cost.
             # Return/combine check flags must also be disabled for performance runs.
-            pipeline_timings.append((iteration, (time.perf_counter_ns() - pipeline_started_ns) / 1e6))
+            pipeline_ms = (time.perf_counter_ns() - pipeline_started_ns) / 1e6
             if down_options.check_projections:
                 from projection_validation import check_projections
                 check_projections(torch, grouped_gemm, down, int(computation_tokens.value))
                 if return_exchange is not None:
                     return_exchange.control.gather(f"projections-checked-{iteration}")
                 print(f"Projection numerical checks passed: iteration={iteration}", flush=True)
+            if down is not None and down.output_reset_policy == "end-of-iteration":
+                # All local/remote readers and validation barriers above must
+                # precede reuse. Order any check work on the Python stream too.
+                # Keep projection validation outside pipeline timing, but include
+                # the tail reset and its completion even on the final iteration.
+                reset_started_ns = time.perf_counter_ns()
+                kernel_stream.wait_stream(torch.cuda.current_stream(cuda_device_id))
+                with torch.cuda.stream(kernel_stream):
+                    down.finish_iteration()
+                pipeline_ms += (time.perf_counter_ns() - reset_started_ns) / 1e6
+            pipeline_timings.append((iteration, pipeline_ms))
             elapsed_ms = ctypes.c_float()
             require_proxy_success(
                 library,
@@ -1817,11 +1861,11 @@ def run_proxy_with_concurrent_kernel(
                 (iteration, float(elapsed_ms.value), effective_tflops)
             )
             if down is not None:
-                reset_ms = down.reset_start.elapsed_time(down.mapping_start)
+                reset_ms = down.reset_start.elapsed_time(down.reset_end)
                 mapping_ms = down.mapping_start.elapsed_time(down.gemm_start)
                 down_ms = down.gemm_start.elapsed_time(down.end)
                 # Sum measured stages; excludes host launch gaps between stages.
-                tail_ms = down.reset_start.elapsed_time(down.end)
+                tail_ms = reset_ms + mapping_ms + down_ms
                 down_timings.append((iteration, reset_ms, mapping_ms, down_ms,
                                      elapsed_ms.value + tail_ms))
 
@@ -1843,8 +1887,8 @@ def run_proxy_with_concurrent_kernel(
                 f"effective_throughput={effective_tflops:.2f} TFLOP/s",
                 flush=True,
             )
-        print("Complete pipeline host timing (preparation through existing GPU, return/combine "
-              "completion and reuse barriers; excludes projection checks; disable all other "
+        print("Complete pipeline host timing (preparation through GPU, return/combine "
+              "completion, reuse barriers and output resets; excludes projection checks; disable all other "
               "checks for performance):", flush=True)
         for iteration, pipeline_ms in pipeline_timings:
             print(f"  pipeline iteration {iteration}: elapsed_ms={pipeline_ms:.4f}", flush=True)

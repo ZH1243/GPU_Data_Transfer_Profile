@@ -1589,8 +1589,8 @@ Without `--local-gpu-combine`, scatter matches the standalone benchmark: a rando
 routed rows across separately allocated local outputs. It does not map results
 back to original tokens or return results over RDMA. Routing weights remain opt-in.
 Although `bulk_rows_reduce` uses additive stores, permutation destinations do
-not collide. Destination buffers are zeroed before every down invocation to
-prevent accumulation across iterations. N-tile-major buffers have shape
+not collide. Destination buffers are zeroed each iteration to prevent
+accumulation across iterations. N-tile-major buffers have shape
 `[ceil(token_dimension / down_tile_n), rows_in_buffer * down_tile_n]`; they are
 not row-major tensors and require layout conversion for ordinary consumers.
 
@@ -1599,6 +1599,44 @@ reset time, down GEMM time/TFLOP/s, and `up_plus_down_ms`, the sum of measured
 stages (including reset, excluding gaps between stages). Down FLOPs are
 `2 * meaningful_routes * activated_width * token_dimension`. Cold compilation
 can inflate initial event timings; use later iterations for performance analysis.
+
+`--down-output-reset=before-down` is the default: the per-source output clears
+run between up and down on the compute stream. To move these clears to the
+iteration tail, append `--down-output-reset=end-of-iteration` to the existing
+single-node command, or to both node commands. This is a Python worker setting;
+it requires `--down-projection2` and does not require a native or QuACK rebuild.
+The down outputs are separate allocations from the up inputs and intermediate
+output. Only those down destinations move; wave counters and readiness resets
+retain their existing ordering.
+
+The tail policy clears once after warmup to initialize the first iteration.
+Each successful measured iteration then clears after outgoing/incoming returns,
+local and inter-node combine, reuse barriers, and enabled numerical checks have
+finished reading the outputs. It waits for the reset event on the compute
+stream before proceeding, including after the final iteration. Thus it removes
+the zeroing gap between up and down, but does not overlap reset with the next
+up GEMM or eliminate the reset cost. It adds no device-wide synchronization.
+`reset_ms` uses its own start/end events under both policies;
+`up_plus_down_ms` and the complete pipeline timing still include one reset per
+measured iteration. Projection checks remain outside pipeline timing.
+
+For remote validation, first run the existing command with
+`--down-output-reset=end-of-iteration --check-projections` for at least three
+iterations, keeping return/combine checks enabled. Repeat on both nodes for
+the two-node pipeline. The focused numerical composition test covers both reset
+placements, changing inputs across iterations, weighted contributions, GPU/CPU
+scatter preparation and a concurrent combine consumer:
+
+```bash
+cd "$PROXY_ROOT"
+QUACK_ROOT="$QUACK_ROOT" CUDA_VISIBLE_DEVICES=0 \
+  python -m unittest discover -s tests -p test_worker_composition.py -v
+```
+
+For timing, compare `--down-output-reset=before-down` with
+`--down-output-reset=end-of-iteration` using otherwise identical commands and
+checks disabled. Compare complete pipeline time and `reset_ms` as well as the
+up/down gap; relocating the clear alone is not a guaranteed throughput gain.
 
 ### Local GPU combine
 

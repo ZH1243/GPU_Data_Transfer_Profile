@@ -8,6 +8,8 @@ tables, use partial multi-source clusters, run fused SwiGLU -> compact additive
 down -> concurrent ready-gated combine, and compare values on every iteration.
 CPU metadata covers per-batch publication and a deferred single-slab upload
 intentionally delayed until after up completes, with an explicit event dependency.
+Both output-reset placements preserve values through combine and numerical
+checks, then prevent additive results leaking into the next iteration.
 """
 
 import argparse
@@ -176,8 +178,17 @@ class CompositionCudaTests(unittest.TestCase):
         # Up budgets change and repeat while down retains its independent cap.
         self._composition(128, 2, policy="distinct", up_sm_counts=(2, 4, 2))
 
+    def test_end_of_iteration_reset_preserves_weighted_composition(self):
+        for preparation in ("gpu", "per-batch", "deferred", "threaded"):
+            with self.subTest(preparation=preparation):
+                self._composition(128, 4, policy="distinct", preparation=preparation,
+                                  output_reset="end-of-iteration")
+
+    def test_end_of_iteration_reset_preserves_unweighted_composition(self):
+        self._composition(128, 4, output_reset="end-of-iteration")
+
     def _composition(self, tile_m, sm_count, policy=None, preparation="gpu",
-                     publication_default=False, up_sm_counts=None):
+                     publication_default=False, up_sm_counts=None, output_reset="before-down"):
         torch = self.torch
         single_upload = preparation in ("deferred", "threaded")
         root = Path(os.environ.get("QUACK_ROOT", SCRIPTS.parents[2] / "quack_for_communication_overlap"))
@@ -239,7 +250,8 @@ class CompositionCudaTests(unittest.TestCase):
             "--down-gather-table", "--down-gather-table-expert-waves",
             "--down-gather-table-wave-barrier", "--down-gather-table-publish-ready",
             "--trace-down-ready", f"--down-tile-m={tile_m}", f"--down-tile-n={tile_n}",
-            "--down-cluster-m=2", "--down-max-swizzle-size=1", f"--down-sm-count={sm_count}"])
+            "--down-cluster-m=2", "--down-max-swizzle-size=1", f"--down-sm-count={sm_count}",
+            f"--down-output-reset={output_reset}"])
         options.weighted_contributions = policy is not None
         options.cpu_scatter_preparation = preparation != "gpu"
         options.cpu_scatter_publication = (preparation if preparation != "gpu" and not publication_default
@@ -259,6 +271,9 @@ class CompositionCudaTests(unittest.TestCase):
         if preparation != "gpu":
             self.assertEqual(down.cpu_scatter_publication, preparation)
         down.warmup()
+        if output_reset == "end-of-iteration":
+            for output in down.inputs.output_buffers():
+                torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
         if up_sm_counts is not None:
             # Compile capped up variants before poisoning the streaming table.
             for count in dict.fromkeys(up_sm_counts):
@@ -284,6 +299,7 @@ class CompositionCudaTests(unittest.TestCase):
                                register_prefetch=True, ready_groups=down.inputs.ready_groups)
         combine()  # Warm the real callable before any waiting kernel is launched.
         torch.cuda.synchronize()
+        down.finish_iteration()
         producer, publication, consumer = torch.cuda.Stream(), torch.cuda.Stream(), torch.cuda.Stream()
         pinned_table = table.cpu().pin_memory()
         pinned_counts = [torch.tensor([end], dtype=torch.int32, pin_memory=True)
@@ -420,6 +436,12 @@ class CompositionCudaTests(unittest.TestCase):
             for output, size in zip(down.inputs.output_buffers(), valid):
                 torch.testing.assert_close(output.flatten()[size * hidden:],
                                            torch.zeros_like(output.flatten()[size * hidden:]))
+            # Reset only after the concurrent consumer and every independent
+            # numerical check have read this iteration's nonzero contributions.
+            down.finish_iteration()
+            if output_reset == "end-of-iteration":
+                for output in down.inputs.output_buffers():
+                    torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,8 @@
 Run: python -m unittest discover -s RDMA_CPU_Proxy/tests -p test_worker_activation.py -v
 """
 
+import argparse
+from contextlib import nullcontext
 import importlib.util
 import json
 import os
@@ -11,6 +13,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 
@@ -294,7 +297,105 @@ class SingleNodeLauncherCliTests(unittest.TestCase):
             self.assertEqual(native["expert_gemm_device_capacity"], "9")
 
 
+class DownOutputResetTests(unittest.TestCase):
+    def test_additive_results_survive_consumers_and_do_not_leak_between_iterations(self):
+        # Exercise the real runner lifecycle without importing CUDA or PyTorch.
+        # Each GEMM stand-in adds colliding expert contributions into destinations.
+        for policy in ("before-down", "end-of-iteration"):
+            with self.subTest(policy=policy):
+                outputs = [[41.0, -19.0], [83.0, 7.0]]
+                operations = []
+
+                class Event:
+                    def __init__(self, name):
+                        self.name = name
+
+                    def record(self):
+                        operations.append(self.name)
+
+                    def synchronize(self):
+                        operations.append(self.name + "-synchronize")
+
+                def clear_outputs():
+                    operations.append("zero")
+                    for buffer in outputs:
+                        buffer[:] = [0.0] * len(buffer)
+
+                contributions = [(0, 0, 2.0), (0, 0, 3.0), (1, 1, -4.0)]
+
+                def additive_gemm():
+                    operations.append("gemm")
+                    for source, row, value in contributions:
+                        outputs[source][row] += value
+
+                runner = worker.DownProjectionRunner.__new__(worker.DownProjectionRunner)
+                runner.output_reset_policy = policy
+                runner.up = SimpleNamespace(
+                    cuda_device_id=0, output=SimpleNamespace(zero_=lambda: None),
+                    torch=SimpleNamespace(
+                        inference_mode=nullcontext,
+                        cuda=SimpleNamespace(synchronize=lambda device: operations.append("device-sync")),
+                    ),
+                )
+                runner.inputs = SimpleNamespace(zero_up_output=clear_outputs)
+                runner.combine = runner.cpu_scatter = runner._trace_first_combine_launch = False
+                runner.route_weights = runner.return_exchange = runner.intra_node_combine = None
+                runner.launch_gemm = additive_gemm
+                for name in ("reset_start", "reset_end", "mapping_start", "gemm_start", "end"):
+                    setattr(runner, name, Event(name))
+
+                # Nonzero warmup writes expose a missing initial clear in tail mode.
+                runner.warmup()
+                if policy == "end-of-iteration":
+                    self.assertEqual(outputs, [[0.0, 0.0], [0.0, 0.0]])
+                    self.assertEqual(operations[-2:], ["reset_end", "device-sync"])
+                for iteration in range(3):
+                    contributions = [(0, 0, 2.0 + iteration), (0, 0, -0.5),
+                                     (0, 1, -3.0 * iteration), (1, 1, 4.0 - iteration)]
+                    expected = [[1.5 + iteration, -3.0 * iteration], [0.0, 4.0 - iteration]]
+                    operations.clear()
+                    runner.launch()
+                    self.assertEqual(outputs, expected)
+                    self.assertEqual(operations.count("zero"), int(policy == "before-down"))
+                    # Transport, combine, and numerical checks consume results here.
+                    consumed = [list(buffer) for buffer in outputs]
+                    self.assertEqual(consumed, expected)
+                    runner.finish_iteration()
+                    if policy == "end-of-iteration":
+                        self.assertEqual(outputs, [[0.0, 0.0], [0.0, 0.0]])
+                        self.assertGreater(operations.index("zero"), operations.index("gemm"))
+                        self.assertEqual(operations[-1], "reset_end-synchronize")
+                    else:
+                        self.assertEqual(outputs, expected)
+                        self.assertLess(operations.index("zero"), operations.index("gemm"))
+                    self.assertEqual(consumed, expected)
+                    self.assertEqual(operations.count("zero"), 1)
+
+
 class ActivationCliTests(unittest.TestCase):
+    def test_down_output_reset_cli(self):
+        parser = argparse.ArgumentParser()
+        worker.add_down_arguments(parser)
+        self.assertEqual(parser.parse_args([]).down_output_reset, "before-down")
+        common = ("--concurrent-kernel", "--grouped-gemm-activation=swiglu",
+                  "--down-projection2")
+        for policy in ("before-down", "end-of-iteration"):
+            with self.subTest(policy=policy):
+                result = self.run_cli(*common, f"--down-output-reset={policy}")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                native = shlex.split(result.stdout.splitlines()[-1])
+                self.assertFalse(any(option.startswith("--down-output-reset") for option in native))
+        result = self.run_cli(*common, "--down-output-reset=invalid")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid choice", result.stderr)
+        result = self.run_cli("--concurrent-kernel", "--down-output-reset=end-of-iteration")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires --down-projection2", result.stderr)
+        # Communication-only must remove this compute policy before validation.
+        result = self.run_cli("--down-output-reset=end-of-iteration", "--communication-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--down-output-reset", result.stdout.splitlines()[-1])
+
     def test_up_sm_count_validation(self):
         for count, cluster in ((None, 1), (2, 2), (128, 2), (256, 2)):
             # Oversized requests retain the established QuACK hardware clamp.
